@@ -11,7 +11,15 @@ def test_evaluate_against_gp_returns_finite_metrics_and_figure():
     config = PFNConfig()
     metrics, fig = evaluate_against_gp(build_model(config), build_criterion(config), title="t")
 
-    assert set(metrics) == {"rmse_mean", "mean_abs_dsigma", "pfn_nll", "gp_nll", "nll_gap"}
+    assert set(metrics) == {
+        "rmse_mean",
+        "mean_abs_dsigma",
+        "pfn_nll",
+        "gp_nll",
+        "nll_gap",
+        "zero_ctx_mean",
+        "zero_ctx_std",
+    }
     assert all(math.isfinite(v) for v in metrics.values())
     assert metrics["nll_gap"] == metrics["pfn_nll"] - metrics["gp_nll"]
     assert isinstance(fig, Figure)

@@ -1,7 +1,8 @@
 # GP prior PFN 학습: databricks air run -f runs/train_pfn.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
-# 기본은 실행 확인용(large, 500 step). 논문 재현은 override로 바꾼다:
+# 기본은 실행 확인용(A10, large, 500 step). 논문 재현은 override로 바꾼다 (H100에서 약 16분):
+#   --override compute.accelerator_type=GPU_1xH100 \
 #   --override env_variables.PFN_CONFIG_NAME=paper --override env_variables.PFN_STEPS=10000 \
-#   --override mlflow_run_name=paper-10000steps --override timeout_minutes=240
+#   --override mlflow_run_name=pfn-paper-10000steps-h100 --override timeout_minutes=90
 experiment_name: pfn-gp-reproduction
 mlflow_run_name: large-500steps
 environment:
