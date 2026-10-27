@@ -11,6 +11,8 @@ body { color: var(--color-ink-2); word-break: keep-all; overflow-wrap: break-wor
 .m { font-family: var(--font-outlier); font-style: italic; font-size: 1em; white-space: nowrap; }
 .m sub { font-size: 0.72em; }
 .num { font-variant-numeric: lining-nums tabular-nums; }
+/* Vollkorn은 기본이 old-style 숫자라 1.0이 I.O처럼 읽힌다. 문항의 수치는 lining 숫자로, old-style은 결과 점수 하나에만 */
+h1, h2, h3, .miss-q { font-variant-numeric: lining-nums; }
 
 /* ── 상단 막대 ── */
 .bar { border-bottom: var(--rule-hair) solid var(--color-rule); }
