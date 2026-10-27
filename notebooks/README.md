@@ -9,7 +9,7 @@
 | 01 | [베이지안 추론과 PPD](01_pfn/01_bayesian_primer.ipynb) | PFN이 근사하려는 대상 $p(y \mid x, D)$는 무엇인가? |
 | 02 | [논문 walkthrough](01_pfn/02_pfn_paper_walkthrough.ipynb) | PPD를 "계산"하는 대신 "학습"하면 왜 PPD 근사가 되는가? |
 | 03 | [구현 디테일](01_pfn/03_pfn_implementation_details.ipynb) | bar distribution, Transformer encoder, GP prior의 정답 posterior는 어떻게 생겼나? |
-| 04 | [GP prior 1D 회귀 재현](01_pfn/04_pfn_gp_reproduction.ipynb) | 직접 학습한 PFN이 정확한 GP posterior와 얼마나 비슷한가? |
+| 04 | [GP prior 1D 회귀 재현](01_pfn/04_pfn_gp_reproduction.ipynb) | 논문 크기로 학습한 PFN(H100)이 정확한 GP posterior와 얼마나 비슷한가? |
 
 실행 파일: `scripts/train_pfn.py`, `runs/train_pfn.yaml`
 

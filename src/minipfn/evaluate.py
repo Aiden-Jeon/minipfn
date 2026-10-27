@@ -1,7 +1,9 @@
 """학습된 PFN을 analytic GP posterior와 대조하는 재현 검증.
 
 노트북 03 §8과 같은 setup(고정 5점 context, y = sin(x))에서 PFN 예측을 정답 GP posterior에
-겹쳐 그리고, 평균·표준편차 오차와 query NLL(GP가 Bayes-optimal 하한)을 지표로 낸다.
+겹쳐 그리고, 평균·표준편차 오차와 query NLL을 지표로 낸다. GP posterior는 prior에서 뽑은
+데이터셋들의 평균 NLL로 보면 가장 낮은(Bayes-optimal) 예측이라 기준으로 쓴다. 여기 query는
+sin 함수 하나라서 PFN NLL이 GP보다 조금 낮게 나올 수도 있다(하한이 아니다).
 """
 
 from __future__ import annotations
@@ -25,7 +27,9 @@ def evaluate_against_gp(
 ) -> tuple[dict[str, float], Figure]:
     """PFN 예측을 analytic GP posterior와 비교해 (metrics, 오버레이 figure)를 반환한다.
 
-    metrics: rmse_mean, mean_abs_dsigma, pfn_nll, gp_nll, nll_gap(= pfn_nll - gp_nll).
+    metrics: rmse_mean, mean_abs_dsigma, pfn_nll, gp_nll, nll_gap(= pfn_nll - gp_nll),
+    zero_ctx_abs_mean, zero_ctx_std(context 0개일 때 grid 점별 예측 평균의 절댓값 평균과
+    예측 표준편차의 평균. 학습 범위 밖이라 참고값).
     """
     x_grid = np.linspace(-5, 5, 200)
     x_tr = np.array([-4.0, -2.5, -0.5, 1.0, 3.5])
@@ -69,11 +73,18 @@ def evaluate_against_gp(
     yq_t = torch.tensor(yq, dtype=torch.float32, device=predq["logits"].device)
     pfn_nll = float(criterion(predq["logits"], yq_t).mean())
 
+    # context 0개: 정확한 답은 prior 자체다 (평균 0, 표준편차 √(variance + noise²) ≈ 1).
+    # 학습은 context를 min_context(기본 5)개부터 뽑으므로 학습 범위 밖의 외삽을 보는 참고값이다.
+    empty = torch.zeros(0, dtype=torch.float32)
+    pred0 = pfn_predict(model, criterion, empty, empty, torch.tensor(x_grid, dtype=torch.float32))
+
     metrics = {
         "rmse_mean": float(np.sqrt(np.mean((pfn_mean - mu) ** 2))),
         "mean_abs_dsigma": float(np.mean(np.abs(pfn_sd - sd))),
         "pfn_nll": pfn_nll,
         "gp_nll": gp_nll,
         "nll_gap": pfn_nll - gp_nll,
+        "zero_ctx_abs_mean": float(pred0["mean"].abs().mean()),
+        "zero_ctx_std": float(pred0["std"].mean()),
     }
     return metrics, fig

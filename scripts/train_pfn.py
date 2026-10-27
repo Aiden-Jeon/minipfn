@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"best val NLL={history['best_val_nll']:.3f} (step {history['best_step']})")
     print(f"RMSE(mean)={metrics['rmse_mean']:.4f}  mean|Δσ|={metrics['mean_abs_dsigma']:.4f}")
     print(
-        f"PFN NLL={metrics['pfn_nll']:.3f}  GP NLL(하한)={metrics['gp_nll']:.3f}  "
+        f"PFN NLL={metrics['pfn_nll']:.3f}  GP NLL(기준)={metrics['gp_nll']:.3f}  "
         f"gap={metrics['nll_gap']:+.3f}"
     )
 
