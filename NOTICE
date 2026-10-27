@@ -1,0 +1,8 @@
+minipfn
+Copyright 2026 Aiden-Jeon
+
+This product includes software derived from TabPFN v1
+(https://github.com/automl/TabPFN, branch tabpfn_v1), licensed under the
+Apache License, Version 2.0, with the following notice:
+
+Copyright 2022 The University of Freiburg (Noah Hollmann, Samuel Müller, Katharina Eggensperger, Frank Hutter)

@@ -1,0 +1,33 @@
+# TabPFN prior-fitting (arXiv:2207.01848 재현): databricks air run -f runs/train_tabpfn.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 기본은 8×H100 다중 GPU 경로 점검(논문 크기 모델·batch 512로 50 step). 규모는 override로 바꾼다:
+#   medium(예산 1/10): --override env_variables.TABPFN_STEPS=1800 --override mlflow_run_name=tabpfn-medium
+#   논문 규모:        --override env_variables.TABPFN_CONFIG_NAME=paper --override env_variables.TABPFN_STEPS=18000 \
+#                     --override mlflow_run_name=tabpfn-paper --override timeout_minutes=<추정 시간>
+#   이어서 학습:      --override env_variables.TABPFN_RESUME_RUN_ID=<run_id>
+experiment_name: tabpfn-reproduction
+mlflow_run_name: tabpfn-medium-50steps-8gpu
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+compute:
+  accelerator_type: GPU_8xH100
+  num_accelerators: 8
+code_source:
+  type: snapshot
+  snapshot:
+    # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
+    root_path: ..
+    include_paths:
+      - src
+      - scripts/train_tabpfn.py
+env_variables:
+  TABPFN_CONFIG_NAME: medium
+  TABPFN_STEPS: "50"
+  # GPU당 prior 생성 worker 수. 노드의 CPU 수에 맞춰 조정한다.
+  TABPFN_NUM_WORKERS: "8"
+max_retries: 0
+timeout_minutes: 30
+# torchrun이 GPU마다 프로세스를 하나씩 띄운다 (batch 512 = group 8 × 누적 8 × GPU 8).
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  torchrun --standalone --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/train_tabpfn.py

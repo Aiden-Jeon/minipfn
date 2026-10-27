@@ -1,0 +1,22 @@
+# 환경 점검: databricks air run -f runs/setup_check.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+experiment_name: pfn-setup-check
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+compute:
+  accelerator_type: GPU_1xA10
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
+    root_path: ..
+    include_paths:
+      - src
+      - scripts/setup_check.py
+max_retries: 0
+timeout_minutes: 15
+# 패키지를 설치하지 않고 src/를 import 경로에 넣는다 (노트북 첫 셀의 import shim과 같은 방식)
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/setup_check.py --require-cuda

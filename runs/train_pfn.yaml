@@ -1,0 +1,28 @@
+# GP prior PFN 학습: databricks air run -f runs/train_pfn.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 기본은 실행 확인용(large, 500 step). 논문 재현은 override로 바꾼다:
+#   --override env_variables.PFN_CONFIG_NAME=paper --override env_variables.PFN_STEPS=10000 \
+#   --override mlflow_run_name=paper-10000steps --override timeout_minutes=240
+experiment_name: pfn-gp-reproduction
+mlflow_run_name: large-500steps
+environment:
+  version: databricks_ai_v6
+compute:
+  accelerator_type: GPU_1xA10
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
+    root_path: ..
+    include_paths:
+      - src
+      - scripts/train_pfn.py
+env_variables:
+  PFN_CONFIG_NAME: large
+  PFN_STEPS: "500"
+# 실패한 학습을 그대로 재시도하면 MLflow run만 늘어난다
+max_retries: 0
+timeout_minutes: 60
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/train_pfn.py

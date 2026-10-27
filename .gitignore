@@ -1,0 +1,44 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Training artifacts (체크포인트·로그는 커밋하지 않는다)
+checkpoints/
+# runs/는 어디서든 산출물(TensorBoard 등의 기본 출력 폴더)로 보고, 저장소 루트 runs/의 AI Runtime 설정(*.yaml)만 추적한다
+runs/
+!/runs/
+/runs/**
+!/runs/*.yaml
+# scripts/의 기본 출력 폴더 (저장소 루트에서 실행할 때)
+tabpfn_run/
+tabpfn_eval/
+tabpfn_hub/
+*.safetensors
+mlruns/
+mlartifacts/
+mlflow.db
+*.pt
+*.ckpt
+
+# Local tool state
+.env.local
+.isaac/
+.databricks/
+.vscode/
+
+# OS
+.DS_Store
