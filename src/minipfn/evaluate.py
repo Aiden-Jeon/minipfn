@@ -28,7 +28,8 @@ def evaluate_against_gp(
     """PFN 예측을 analytic GP posterior와 비교해 (metrics, 오버레이 figure)를 반환한다.
 
     metrics: rmse_mean, mean_abs_dsigma, pfn_nll, gp_nll, nll_gap(= pfn_nll - gp_nll),
-    zero_ctx_mean, zero_ctx_std(context 0개일 때의 평균 예측).
+    zero_ctx_abs_mean, zero_ctx_std(context 0개일 때 grid 점별 예측 평균의 절댓값 평균과
+    예측 표준편차의 평균. 학습 범위 밖이라 참고값).
     """
     x_grid = np.linspace(-5, 5, 200)
     x_tr = np.array([-4.0, -2.5, -0.5, 1.0, 3.5])
@@ -72,7 +73,8 @@ def evaluate_against_gp(
     yq_t = torch.tensor(yq, dtype=torch.float32, device=predq["logits"].device)
     pfn_nll = float(criterion(predq["logits"], yq_t).mean())
 
-    # context 0개: prior 자체를 돌려줘야 한다 (평균 ≈ 0, 표준편차 ≈ √(variance + noise²) ≈ 1)
+    # context 0개: 정확한 답은 prior 자체다 (평균 0, 표준편차 √(variance + noise²) ≈ 1).
+    # 학습은 context를 min_context(기본 5)개부터 뽑으므로 학습 범위 밖의 외삽을 보는 참고값이다.
     empty = torch.zeros(0, dtype=torch.float32)
     pred0 = pfn_predict(model, criterion, empty, empty, torch.tensor(x_grid, dtype=torch.float32))
 
@@ -82,7 +84,7 @@ def evaluate_against_gp(
         "pfn_nll": pfn_nll,
         "gp_nll": gp_nll,
         "nll_gap": pfn_nll - gp_nll,
-        "zero_ctx_mean": float(pred0["mean"].mean()),
+        "zero_ctx_abs_mean": float(pred0["mean"].abs().mean()),
         "zero_ctx_std": float(pred0["std"].mean()),
     }
     return metrics, fig
