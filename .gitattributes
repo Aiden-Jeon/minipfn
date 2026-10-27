@@ -9,3 +9,7 @@ notebooks/02_tabpfn/01_scm_primer.ipynb !filter
 notebooks/02_tabpfn/02_bnn_primer.ipynb !filter
 notebooks/02_tabpfn/03_tabpfn_paper_walkthrough.ipynb !filter
 notebooks/02_tabpfn/04_tabpfn_reproduction.ipynb !filter
+notebooks/03_tabpfn_v2/01_two_way_attention_primer.ipynb !filter
+notebooks/03_tabpfn_v2/02_prior_primer.ipynb !filter
+notebooks/03_tabpfn_v2/03_tabpfn_v2_paper_walkthrough.ipynb !filter
+notebooks/03_tabpfn_v2/04_tabicl_prior.ipynb !filter

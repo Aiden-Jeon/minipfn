@@ -1,0 +1,31 @@
+# TabPFN v2 benchmark 평가 (직접 학습한 체크포인트, 논문 Supplementary Tables 1·2와 비교).
+# 체크포인트를 어디서 받을지는 학습 단계에서 정한다. 지금은 TABPFN_V2_EXTRA_ARGS로 경로를 넘긴다:
+#   databricks air run -f runs/eval_tabpfn_v2.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--classifier-path <clf.pt> --regressor-path <reg.pt>"
+experiment_name: tabpfn-v2-reproduction
+mlflow_run_name: tabpfn-v2-eval
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+  # 기본 환경에 없는 패키지 (OpenML 데이터, Hugging Face 가중치)
+  dependencies:
+    - openml>=0.15
+    - huggingface-hub>=0.34
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
+    root_path: ..
+    include_paths:
+      - src
+      - scripts/eval_tabpfn_v2.py
+env_variables:
+  TABPFN_V2_EXTRA_ARGS: ""
+max_retries: 0
+timeout_minutes: 180
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/eval_tabpfn_v2.py --suite all $TABPFN_V2_EXTRA_ARGS

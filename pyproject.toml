@@ -21,6 +21,7 @@ dependencies = [
     "safetensors>=0.5",
     "scikit-learn>=1.7",
     "scipy>=1.16",
+    "tabicl>=2.2",
     "torch>=2.11,<2.12",
     "tqdm>=4.67",
 ]
