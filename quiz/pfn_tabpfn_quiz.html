@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PFN과 TabPFN 이해도 점검</title>
+<meta name="description" content="minipfn 노트북으로 공부한 PFN과 TabPFN 논문 내용을 객관식으로 풀어 보고, 문항마다 해설과 참고 위치를 확인합니다.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500&family=Noto+Serif:ital,wght@1,400&family=Noto+Serif+KR:wght@600&family=Vollkorn:wght@600&display=swap">
+<link rel="stylesheet" href="./tokens.css">
+<link rel="stylesheet" href="./base.css">
+<link rel="stylesheet" href="./quiz.css">
+</head>
+<body>
+<header class="bar">
+  <div class="container">
+    <a class="wordmark" href="#" id="home" aria-label="minipfn, 처음 화면으로">minipfn</a>
+    <div class="bar-end">
+      <span class="bar-count" id="bar-count" hidden></span>
+      <button type="button" class="link" id="restart" hidden>범위 다시 고르기</button>
+    </div>
+  </div>
+</header>
+
+<noscript><div class="container screen"><p>이 퀴즈는 브라우저에서 JavaScript가 켜져 있어야 풀 수 있습니다.</p></div></noscript>
+
+<!-- 응시 범위 -->
+<main id="start" class="screen" hidden>
+  <div class="container">
+    <div class="start-grid">
+     <div class="start-copy">
+      <h1>PFN과 TabPFN 이해도 점검</h1>
+      <p class="lead">minipfn 노트북에서 낸 객관식 문항입니다. 답을 고르면 바로 채점하고, 해설과 다시 읽을 위치를 보여 줍니다.</p>
+      <p class="start-rules">보기 순서는 문항마다 새로 섞이니 번호로 외울 수 없습니다. 틀린 문제는 끝의 오답 노트에 모이고, 그것만 골라 다시 풀 수 있습니다.</p>
+     </div>
+     <div class="start-range">
+      <h2>응시 범위</h2>
+      <table class="table" aria-describedby="range-hint">
+        <thead><tr><th scope="col">영역</th><th scope="col" class="path-col">노트북</th><th scope="col" class="num">문항</th></tr></thead>
+        <tbody id="sec-list"></tbody>
+        <tfoot><tr><td>고른 범위</td><td class="path-col"></td><td class="num" id="range-total"></td></tr></tfoot>
+      </table>
+      <p class="empty-note" id="range-hint" hidden>영역을 하나 이상 고르면 시작할 수 있습니다.</p>
+      <div class="start-foot">
+        <label class="toggle"><input type="checkbox" id="shuffle-q"> 문제 순서 섞기</label>
+        <div class="start-actions">
+          <button type="button" class="btn" id="resume-btn" hidden>풀던 문제로 돌아가기</button>
+          <button type="button" class="btn btn--primary" id="start-btn">풀기 시작</button>
+        </div>
+      </div>
+     </div>
+    </div>
+  </div>
+</main>
+
+<!-- 문제 -->
+<main id="quiz" class="screen" hidden>
+  <div class="container">
+    <nav aria-label="답안지">
+      <div class="sheet" id="q-nav"></div>
+    </nav>
+    <div class="work">
+      <article class="question" aria-labelledby="q-text">
+        <h1 class="q-title"><span class="q-no" id="q-no"></span><span class="q-text" id="q-text"></span></h1>
+        <ol class="choices" id="q-options"></ol>
+        <div class="q-controls">
+          <button type="button" class="btn" id="prev-btn">이전 문제</button>
+          <button type="button" class="btn btn--primary" id="next-btn">다음 문제</button>
+        </div>
+        <p class="keys">키보드로 풀 때는 보기 번호의 숫자 키로 답을 고르고, Enter나 오른쪽 화살표 키로 다음 문제, 왼쪽 화살표 키로 이전 문제로 갑니다. 채점은 마지막 문제의 채점하기 버튼으로만 합니다.</p>
+      </article>
+      <aside class="notes" aria-live="polite">
+        <div class="panel" id="q-explain"></div>
+      </aside>
+    </div>
+  </div>
+</main>
+
+<!-- 결과 -->
+<main id="result" class="screen" hidden>
+  <div class="container">
+    <div class="result-head">
+      <div>
+        <h1>채점 결과</h1>
+        <p class="score"><span class="score-n" id="r-score"></span><span class="score-of" id="r-total"></span></p>
+      </div>
+      <p id="r-note"></p>
+    </div>
+    <div class="result-body">
+      <section aria-labelledby="r-areas-title">
+        <h2 id="r-areas-title">영역별로 보면</h2>
+        <table class="table">
+          <thead><tr><th scope="col">영역</th><th scope="col">맞힌 비율</th><th scope="col" class="num">맞힘</th></tr></thead>
+          <tbody id="r-bars"></tbody>
+        </table>
+      </section>
+      <section aria-labelledby="r-missed-title">
+        <h2 id="r-missed-title">오답 노트</h2>
+        <ol class="misses" id="r-missed"></ol>
+        <div id="r-skipped-block" hidden>
+          <h3 class="skipped-title">풀지 않은 문제</h3>
+          <p class="skipped-note">정답은 풀고 나서 보여 줍니다. 번호를 누르면 그 문제로 돌아갑니다.</p>
+          <ol class="skipped" id="r-skipped"></ol>
+        </div>
+        <div class="result-actions">
+          <button type="button" class="btn btn--primary" id="retry-wrong">틀린 문제만 다시 풀기</button>
+          <button type="button" class="btn" id="back-start">범위 다시 고르기</button>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="colophon">
+  <div class="container">
+    <p>문항은 Müller et al., <cite>Transformers Can Do Bayesian Inference</cite>(ICLR 2022)와 Hollmann et al., <cite>TabPFN</cite>(ICLR 2023)을 다룬 이 저장소의 minipfn 노트북에서 만들었습니다.</p>
+  </div>
+</footer>
+
+<script>
+const SECTIONS = [
+  { id: "bayes", name: "베이지안 추론과 PFN", nb: "01_pfn/01, 02" },
+  { id: "pfnimpl", name: "PFN 구현과 GP 재현", nb: "01_pfn/03, 04" },
+  { id: "prior", name: "SCM과 BNN prior", nb: "02_tabpfn/01, 02" },
+  { id: "tabpfn", name: "TabPFN 구조와 추론", nb: "02_tabpfn/03" },
+  { id: "repro", name: "TabPFN 재현", nb: "02_tabpfn/04" },
+];
+
+const M = (s) => `<span class="m">${s}</span>`;
+
+// o: 보기. ok가 정답, w는 그 보기를 골랐을 때 보여 줄 짧은 이유.
+const QUESTIONS = [
+  // ── 베이지안 추론과 PFN ──
+  {
+    s: "bayes",
+    q: "PFN이 학습해서 근사하려는 대상은 무엇인가요?",
+    o: [
+      { t: `사후 예측 분포(PPD) ${M("p(y | x, D)")}`, ok: true },
+      { t: `파라미터의 posterior ${M("p(θ | D)")}`, w: "PFN은 θ(task)를 직접 모델링하지 않습니다. θ는 데이터셋을 만들 때만 쓰이고 적분되어 사라집니다." },
+      { t: `likelihood ${M("p(D | θ)")}`, w: "likelihood는 prior 샘플러가 데이터를 만들 때 쓰는 재료입니다. 모델의 출력이 아닙니다." },
+      { t: "MAP 점추정 (posterior를 최대로 하는 θ 하나)", w: "점추정은 PPD 적분을 점 하나로 바꿔 버린 근사입니다. PFN은 분포를 냅니다." },
+    ],
+    e: `PFN의 출력은 쿼리 ${M("x")}에서 ${M("y")}에 대한 분포 ${M("q<sub>θ</sub>(y | x, D)")}이고, 이것을 ${M("p(y | x, D) = ∫ p(y | x, θ) p(θ | D) dθ")}에 맞춥니다. 우리가 원하는 건 파라미터가 아니라 다음 관측의 예측이기 때문입니다.`,
+    ref: "01_pfn/01 · Posterior Predictive Distribution",
+  },
+  {
+    s: "bayes",
+    q: `앞면 확률 ${M("θ")}에 prior ${M("Beta(1, 1)")}을 두고 동전을 3번 던졌더니 3번 모두 앞면이었습니다. 다음 던지기가 앞면일 PPD는?`,
+    o: [
+      { t: "1.0", w: "MLE(h / n)입니다. 데이터가 적을 때 점추정이 과신하는 전형적인 예입니다." },
+      { t: "0.8", ok: true },
+      { t: "0.75", w: "h / (n + 1)로 계산한 값입니다. 공식은 (a + h) / (a + b + n)입니다." },
+      { t: "0.5", w: "prior 평균입니다. 관측한 3번을 반영하지 않았습니다." },
+    ],
+    e: `동전의 PPD는 posterior 평균입니다: ${M("(a + h) / (a + b + n) = (1 + 3) / (1 + 1 + 3) = 0.8")}. MLE는 1.0이라고 단언하지만, posterior 전체로 평균내면 prior가 값을 조금 끌어당깁니다.`,
+    ref: "01_pfn/01 · 점추정 vs 완전 베이지안, PPD",
+  },
+  {
+    s: "bayes",
+    q: "MCMC·변분추론과 비교했을 때, PFN이 하는 amortized inference(분할상환 추론)의 뜻으로 맞는 것은?",
+    o: [
+      { t: "prior에 대해 한 번만 학습해 두고, 새 데이터셋이 오면 forward pass 한 번으로 PPD를 얻는다", ok: true },
+      { t: "새 데이터셋마다 몇 step만 fine-tuning해서 posterior를 빠르게 맞춘다", w: "추론 때 가중치는 바뀌지 않습니다. 학습셋 D는 입력 시퀀스로 들어갈 뿐입니다(in-context learning)." },
+      { t: "posterior에서 θ 샘플을 MCMC보다 빠르게 뽑는다", w: "PFN은 θ 샘플을 만들지 않고 예측분포를 바로 냅니다." },
+      { t: "여러 실제 데이터셋으로 미리 학습해 둔다", w: "학습 데이터는 전부 prior에서 뽑은 합성 데이터셋입니다." },
+    ],
+    e: "MCMC·VI는 데이터셋 D가 바뀔 때마다 추론을 처음부터 다시 합니다. PFN은 PPD가 (x, D)의 함수라는 점을 이용해 그 함수를 한 번 학습해 두고, 같은 prior에서 나올 법한 모든 데이터셋에 재사용합니다.",
+    ref: "01_pfn/02 · 1절",
+  },
+  {
+    s: "bayes",
+    q: `PFN 손실 ${M("E[−log q<sub>θ</sub>(y | x, D)]")}를 최소화하면 ${M("q<sub>θ</sub>")}가 진짜 PPD로 가는 이유로 가장 정확한 것은?`,
+    o: [
+      { t: `고정된 (x, D)에서 기대 NLL = ${M("H(p) + KL(p ‖ q<sub>θ</sub>)")}이고, ${M("H(p)")}는 θ와 무관하므로 NLL 최소화가 곧 KL 최소화이다`, ok: true },
+      { t: `기대 NLL이 ${M("KL(q<sub>θ</sub> ‖ p)")}와 같기 때문이다`, w: "KL의 방향이 반대입니다. y가 진짜 PPD p에서 뽑히므로 교차 엔트로피를 분해하면 KL(p ‖ q)가 나옵니다." },
+      { t: "NLL은 MSE와 같아서, 평균을 맞추면 분포 전체가 맞춰진다", w: "MSE는 평균만 맞춥니다. NLL은 퍼짐과 다봉 모양까지 포함한 분포 전체를 맞추게 합니다." },
+      { t: "학습이 prior의 엔트로피를 최대화하기 때문이다", w: "H(p)는 θ와 무관한 상수라서 학습이 바꿀 수 없습니다." },
+    ],
+    e: "y가 진짜 PPD를 따를 때 기대 NLL은 교차 엔트로피이고, 이것은 PPD의 엔트로피(상수)와 KL(p ‖ q)의 합입니다. KL은 q = p일 때 0이므로, 용량과 데이터가 충분하면 NLL로 학습한 PFN은 진짜 PPD로 수렴합니다.",
+    ref: "01_pfn/02 · 3절",
+  },
+  {
+    s: "bayes",
+    q: "GP prior로 PFN을 학습할 때, 논문이 말하는 task t 하나에 해당하는 것은?",
+    o: [
+      { t: "GP에서 뽑은 함수 f 하나", ok: true },
+      { t: "RBF 커널의 lengthscale 값", w: "이 재현에서는 0.6으로 고정한 하이퍼파라미터입니다. task는 그 커널 아래에서 뽑힌 함수입니다." },
+      { t: "(x, y) 점 하나", w: "점은 task가 만든 관측입니다. task 하나에서 N = n + m개 점을 뽑습니다." },
+      { t: "context 크기 n", w: "n은 데이터셋을 context와 query로 나누는 방식이지, 데이터를 만드는 메커니즘이 아닙니다." },
+    ],
+    e: "task는 데이터를 만들어 내는 가설·메커니즘 하나입니다. 동전 예에서는 편향 θ를 가진 동전 하나, BNN prior에서는 가중치가 정해진 신경망 하나입니다. PFN은 p(t)를 명시적으로 쓰지 않고, 데이터셋 prior p(D)에서 샘플을 뽑을 수만 있으면 됩니다.",
+    ref: "01_pfn/02 · 2절",
+  },
+  {
+    s: "bayes",
+    q: "'Prior-Data Fitted Network'라는 이름과 가장 잘 맞는 설명은?",
+    o: [
+      { t: "실제 데이터는 학습에 쓰지 않고 prior에서 뽑은 합성 데이터셋만으로 학습하므로, prior에서 나올 법하지 않은 데이터에는 약하다", ok: true },
+      { t: "실제 데이터로 사전학습한 뒤, prior를 정규화 항으로 더해 fine-tuning한다", w: "학습 루프 어디에도 실제 데이터는 들어가지 않습니다." },
+      { t: "학습하면서 prior의 모수를 데이터에 맞춰 fit한다", w: "prior는 고정된 생성 과정입니다. fit하는 것은 신경망 가중치입니다." },
+      { t: "추론할 때 prior를 입력 시퀀스에 함께 넣는다", w: "추론 때 넣는 것은 실제 학습셋 D입니다. prior는 학습을 거쳐 가중치에 녹아 있습니다." },
+    ],
+    e: "Algorithm 1은 매 스텝 prior에서 데이터셋을 하나 뽑아 query 라벨의 NLL로 gradient step을 밟는 것뿐입니다. prior가 곧 학습 분포이므로 prior의 질이 성능을 정합니다.",
+    ref: "01_pfn/02 · 5절",
+  },
+  {
+    s: "bayes",
+    q: "PFN 학습(Algorithm 1)에서 context 크기 n을 매 스텝 무작위로 고르는 이유는?",
+    o: [
+      { t: "모델 하나가 데이터가 거의 없을 때부터 많을 때까지, 여러 크기의 D에 대해 PPD를 내도록 하려고", ok: true },
+      { t: "GPU 메모리를 아끼려고", w: "메모리가 목적이라면 n을 작게 고정하면 됩니다. 목적은 다양한 크기의 D에 대응하는 것입니다." },
+      { t: "query 수를 줄여 과적합을 막으려고", w: "query는 오히려 한 데이터셋에서 여러 개를 동시에 학습에 씁니다." },
+      { t: "attention mask를 매번 바꿔 dropout처럼 정규화하려고", w: "mask 규칙(query는 context에만 attend)은 n과 상관없이 같습니다." },
+    ],
+    e: "추론 때 들어올 학습셋 크기는 미리 알 수 없습니다. n을 매 스텝 바꾸면 같은 가중치가 작은 D와 큰 D 모두에서 그 크기에 맞는 PPD(데이터가 적으면 넓게, 많으면 좁게)를 내도록 학습됩니다.",
+    ref: "01_pfn/02 · 2절 Algorithm 1",
+  },
+
+  // ── PFN 구현과 GP 재현 ──
+  {
+    s: "pfnimpl",
+    q: `bar distribution에서 bucket ${M("[0, 0.5)")}에 확률 ${M("p<sub>k</sub> = 0.2")}가 배정됐습니다. 이 bucket 안의 y에서 예측 밀도 ${M("q(y)")}는?`,
+    o: [
+      { t: "0.2", w: "확률과 밀도를 혼동했습니다. 확률을 bucket 너비로 나눠야 밀도가 됩니다." },
+      { t: "0.1", w: "확률에 너비를 곱했습니다. 나눠야 합니다." },
+      { t: "0.4", ok: true },
+      { t: "0.5", w: "bucket 너비 자체입니다." },
+    ],
+    e: `${M("q(y) = p<sub>k</sub> / (b<sub>k</sub> − b<sub>k−1</sub>) = 0.2 / 0.5 = 0.4")}. bucket 안에서는 밀도가 균일하다고 보므로 예측 밀도는 계단 모양입니다. 학습 때 NLL은 ${M("−log 0.4 ≈ 0.92")}가 됩니다.`,
+    ref: "01_pfn/03 · 6절",
+  },
+  {
+    s: "pfnimpl",
+    q: "PFN이 회귀 출력을 평균·분산 두 값(가우시안 하나)으로 내지 않고 bar distribution으로 내는 가장 중요한 이유는?",
+    o: [
+      { t: "PPD가 비대칭이거나 봉우리가 여러 개일 수 있어서, 임의 모양의 분포를 담으려고", ok: true },
+      { t: "회귀를 분류로 바꾸면 항상 정확도가 높아져서", w: "핵심은 정확도가 아니라 분포 모양을 표현하는 능력입니다." },
+      { t: "가우시안 NLL은 미분할 수 없어서", w: "가우시안 NLL도 미분 가능합니다." },
+      { t: "bucket 수만큼 모델 파라미터가 줄어서", w: "출력 head가 bucket 수만큼 logit을 내므로 오히려 늘어납니다." },
+    ],
+    e: "여러 그럴듯한 함수가 공존하면 PPD가 다봉이 됩니다. 단일 가우시안은 이를 담지 못합니다. 출력 범위를 bucket으로 잘라 softmax를 내면, bucket이 촘촘할수록 임의 모양을 근사할 수 있습니다. 재현에서 쓴 FullSupportBarDistribution은 양 끝 bucket을 half-normal 꼬리로 바꿔 범위 밖 y에도 유한한 NLL을 줍니다.",
+    ref: "01_pfn/03 · 6절, 01_pfn/04 · 3절",
+  },
+  {
+    s: "pfnimpl",
+    q: "PFN이 GPT 같은 decoder 대신 positional encoding이 없는 Transformer encoder를 써서 얻는 성질은?",
+    o: [
+      { t: "context 예제의 순서를 바꿔도 예측이 같다 (permutation invariance)", ok: true },
+      { t: "다음 토큰을 순서대로 생성할 수 있다", w: "인과 마스킹 decoder의 성질입니다. PFN의 입력은 순서가 없는 집합입니다." },
+      { t: "긴 context를 선형 비용으로 처리할 수 있다", w: "attention 비용은 여전히 행 수의 제곱입니다(TabPFN 한계 1)." },
+      { t: "query끼리 정보를 주고받아 더 정확해진다", w: "query끼리는 mask로 막습니다." },
+    ],
+    e: "학습셋 D는 집합이므로 순서가 의미 없어야 합니다. 인과 마스킹과 위치 인코딩을 모두 빼면 context 토큰을 어떤 순서로 넣어도 같은 결과가 나옵니다. TabPFN 노트북 2.3절에서 무작위 가중치 모델로 이 성질을 직접 확인했습니다.",
+    ref: "01_pfn/03 · 7절, 02_tabpfn/03 · 2.3절",
+  },
+  {
+    s: "pfnimpl",
+    q: "한 번의 forward에 query를 여러 개 넣을 때, query 토큰이 다른 query 토큰에 attend하지 못하게 막는 이유는?",
+    o: [
+      { t: `각 query의 예측이 다른 query의 x에 영향받지 않게 해서, query를 몇 개 넣든 각각 ${M("q(y | x, D)")}가 되게 하려고`, ok: true },
+      { t: "다른 query 토큰에 있는 정답 y가 새어 나가지 않게 하려고", w: "query 토큰에는 애초에 y가 없습니다(mask 토큰). 문제는 정답 노출이 아니라, 예측이 D에 없는 다른 query의 x에 의존하게 되는 것입니다." },
+      { t: "attention 계산량을 줄이려고", w: "원 PFN은 모든 쌍을 계산한 뒤 mask로 막으므로 계산량은 그대로입니다. 계산을 줄인 건 TabPFN의 변경입니다." },
+      { t: "context 토큰과 query 토큰의 임베딩 차원이 달라서", w: "두 토큰은 같은 차원입니다." },
+    ],
+    e: "query가 서로를 보면 x₄의 예측이 x₅에 따라 달라집니다. 그러면 출력이 q(y | x₄, D)가 아니라 q(y | x₄, D, x₅)가 되어 버립니다. 막아 두면 query를 1개 넣든 100개 넣든 각 query의 예측이 같습니다.",
+    ref: "01_pfn/03 · 7절, 01_pfn/04 · 4절",
+  },
+  {
+    s: "pfnimpl",
+    q: "PFN 재현 대상으로 GP prior 1D 회귀를 고른 이유는?",
+    o: [
+      { t: "GP posterior는 닫힌형으로 정확히 계산되므로, PFN 예측을 '정답'과 직접 겹쳐 비교할 수 있어서", ok: true },
+      { t: "GP prior가 샘플링이 가장 빨라서", w: "속도가 아니라, 비교할 정답이 있다는 점이 이유입니다." },
+      { t: "PFN으로 근사할 수 있는 prior가 GP뿐이어서", w: "샘플링만 되면 어떤 prior든 됩니다. TabPFN은 SCM·BNN prior를 씁니다." },
+      { t: "1D 회귀에서는 bar distribution이 필요 없어서", w: "재현에서도 bar distribution을 출력으로 씁니다." },
+    ],
+    e: `GP는 관측이 주어지면 posterior 평균 ${M("μ<sub>*</sub>")}과 공분산 ${M("Σ<sub>*</sub>")}이 닫힌형입니다. 학습한 PFN의 평균과 ±2σ 밴드가 이 analytic posterior에 겹치면 재현에 성공한 것으로 판단합니다.`,
+    ref: "01_pfn/03 · 8절, 01_pfn/04 · 6절",
+  },
+  {
+    s: "pfnimpl",
+    q: "GP prior(variance 1.0, 노이즈 매우 작음)로 학습한 PFN에 context를 하나도 주지 않고 x = 2.0에서 예측하면, 기대하는 출력은?",
+    o: [
+      { t: "평균 ≈ 0, 표준편차 ≈ 1 (GP prior 그대로)", ok: true },
+      { t: "평균 ≈ 0, 표준편차 ≈ 0", w: "데이터가 없으면 불확실성이 가장 큽니다. prior의 퍼짐이 그대로 나와야 합니다." },
+      { t: "학습 때 가장 자주 본 함수의 x = 2.0 값", w: "PFN은 특정 함수를 외우지 않습니다. 매 스텝 새 함수를 뽑아 학습합니다." },
+      { t: "정의되지 않는다 (D가 비면 PPD가 없다)", w: "D가 비면 PPD는 prior predictive가 되고, 잘 정의됩니다." },
+    ],
+    e: "관측이 없으면 posterior = prior이므로 PPD는 zero-mean GP의 주변분포, 즉 평균 0, 표준편차 √(variance + noise²) ≈ 1입니다. 이 값이 나오면 PFN이 특정 데이터를 외운 게 아니라 prior 자체를 학습했다는 증거입니다.",
+    ref: "01_pfn/04 · 7절",
+  },
+
+  // ── SCM과 BNN prior ──
+  {
+    s: "prior",
+    q: "A와 C는 서로 독립인데, B를 고정(조건부)하면 A와 C 사이에 상관이 생기는 구조는?",
+    o: [
+      { t: "chain  A → B → C", w: "chain에서는 A와 C가 원래 상관이 있고, B를 고정하면 사라집니다." },
+      { t: "fork  A ← B → C", w: "fork도 원래 상관이 있고(공통 원인 B), B를 고정하면 사라집니다." },
+      { t: "collider  A → B ← C", ok: true },
+      { t: "어느 구조에서도 생기지 않는다", w: "collider에서 생깁니다." },
+    ],
+    e: "collider에서는 A와 C가 독립이지만, B 값을 알면 'A가 크면 C는 작아야 B가 이 값이 된다'는 관계가 생깁니다. 노트북에서 B가 큰 샘플만 골랐을 때 A와 C에 음의 상관이 나타난 것이 이것입니다.",
+    ref: "02_tabpfn/01 · 4절",
+  },
+  {
+    s: "prior",
+    q: "기온이 아이스크림·선크림 판매의 공통 원인인 SCM이 있습니다(평소 아이스크림 판매량은 약 60). 두 값을 비교하면?",
+    ctx: "(가) 관측 데이터에서 아이스크림이 40쯤 팔린 날만 골라 낸 선크림 평균<br>(나) E[선크림 | do(아이스크림 = 40)]",
+    o: [
+      { t: "(가)는 평소보다 낮고, (나)는 평소와 같다", ok: true },
+      { t: "둘 다 평소보다 낮다", w: "개입은 아이스크림 식만 상수로 바꿉니다. 기온은 평소대로 뽑히므로 선크림도 평소와 같습니다." },
+      { t: "둘 다 같다. 관측 분포가 같으면 개입 결과도 같다", w: "관측 분포가 같아도 SCM이 다르면 개입 결과가 다릅니다. 이 점이 SCM을 '인과' 모델로 만듭니다." },
+      { t: "(가)는 평소와 같고, (나)는 평소보다 낮다", w: "반대입니다. 관측에서 아이스크림이 적게 팔린 날은 대개 추운 날입니다." },
+    ],
+    e: "(가)에서 아이스크림이 40쯤 팔린 날은 대개 추운 날이라 선크림도 적게 팔렸습니다. (나)는 기온과 상관없이 아이스크림을 40으로 강제한 것이라 기온, 따라서 선크림은 그대로입니다. 보는 것(see)과 바꾸는 것(do)의 차이입니다.",
+    ref: "02_tabpfn/01 · 5절",
+  },
+  {
+    s: "prior",
+    q: "TabPFN 논문이 자신을 Pearl의 인과 사다리 'rung 1.5'라고 부르는 의미는?",
+    o: [
+      { t: "인과 그래프나 개입 효과를 추정하지는 않지만, 현실 데이터가 SCM 같은 과정에서 나왔다고 가정해 그 가정을 prior에 넣고 관측 데이터로 예측한다", ok: true },
+      { t: "개입 do(·)로 만든 데이터를 절반 섞어 학습한다", w: "TabPFN은 개입을 쓰지 않습니다." },
+      { t: "데이터에서 DAG를 추정한 뒤 그 DAG로 예측한다", w: "그래프를 추정하지 않습니다. prior 안에서 무작위로 뽑을 뿐입니다." },
+      { t: "반사실(counterfactual) 질문 일부에 답할 수 있다", w: "반사실은 rung 3입니다. TabPFN은 예측만 합니다." },
+    ],
+    e: "SCM을 쓰는 이유는 인과 효과를 추정하려는 게 아니라, 현실의 표 데이터가 이런 인과 과정에서 만들어진다고 보고 그 과정을 흉내 내 학습 데이터를 만들기 위해서입니다.",
+    ref: "02_tabpfn/01 · 5절, 02_tabpfn/03 · 3.2절",
+  },
+  {
+    s: "prior",
+    q: "다음 중 BNN prior로 만든 데이터셋에서는 생길 수 없고, SCM prior에서만 생기는 것은?",
+    o: [
+      { t: "feature가 target의 결과(effect) 쪽 노드인 경우", ok: true },
+      { t: "target이 feature의 비선형 함수인 경우", w: "BNN도 tanh·ELU 같은 비선형 활성화를 씁니다." },
+      { t: "클래스 크기가 불균형한 경우", w: "두 prior 모두 4.5절의 무작위 경계로 클래스를 만들어 불균형이 생깁니다." },
+      { t: "target에 노이즈가 섞인 경우", w: "BNN도 은닉층과 출력층에 노이즈를 더합니다." },
+    ],
+    e: "BNN prior는 항상 입력층이 feature, 출력층이 target이므로 feature는 늘 원인 쪽이고, 표에 없는 원인도 없고, feature끼리 독립입니다. SCM prior는 그래프의 아무 노드에서나 feature와 target을 고르므로 feature가 target의 결과일 수도, 버린 노드가 target에 영향을 줄 수도, feature끼리 상관될 수도 있습니다.",
+    ref: "02_tabpfn/02 · 5절",
+  },
+  {
+    s: "prior",
+    q: "TabPFN에 실제 표를 넣을 때, 이 표가 SCM 같은지 BNN 같은지, 어떤 하이퍼파라미터(층 수·활성화 함수)에 가까운지는 어떻게 처리되나요?",
+    o: [
+      { t: "따로 알려 주지 않는다. 모델이 학습 행만 보고 암묵적으로 따지며, PFN이 근사하는 PPD 자체가 prior 종류와 하이퍼파라미터까지 적분한 것이다", ok: true },
+      { t: "사용자가 is_causal 같은 플래그로 알려 준다", w: "is_causal은 prior 샘플러 내부의 하이퍼파라미터입니다. 추론 입력이 아닙니다." },
+      { t: "추론 전에 작은 검증셋으로 하이퍼파라미터를 고른다", w: "TabPFN은 데이터셋마다 튜닝하지 않습니다." },
+      { t: "앙상블 32개가 각각 다른 prior를 맡는다", w: "앙상블은 feature 열·클래스 번호 회전과 power transform 유무로 만듭니다." },
+    ],
+    e: "TabPFN은 데이터셋마다 하이퍼파라미터부터 새로 뽑고, SCM/BNN도 동전 던지기로 고릅니다. 모델은 지금 받은 표가 어디서 왔는지 듣지 못하므로, 가중치·구조·하이퍼파라미터·prior 종류를 모두 적분한 PPD를 근사하게 됩니다. 논문 4.1절의 '하이퍼파라미터에 대해서도 완전히 베이지안'이라는 말이 이 뜻입니다.",
+    ref: "02_tabpfn/02 · 3절, 6절",
+  },
+  {
+    s: "prior",
+    q: "부록 B.4 prior ablation(평균 ROC AUC: BNN만 0.865, SCM만 0.881, SCM + BNN 0.883)과 맞는 해석은?",
+    o: [
+      { t: "SCM만 써도 섞은 것과 거의 같고 BNN만 쓰면 눈에 띄게 나쁘다. feature 간 상관과 보이지 않는 원인이 있는 SCM 데이터가 현실 표에 더 가깝다", ok: true },
+      { t: "둘을 섞으면 큰 시너지가 난다", w: "SCM만 쓴 것과의 차이는 0.002이고, 논문도 '큰 차이가 없어 보인다'고 적었습니다." },
+      { t: "BNN prior가 현실 데이터에 더 가깝다", w: "수치가 반대입니다." },
+      { t: "prior 종류는 성능에 거의 영향이 없다", w: "BNN만 쓴 것과 SCM만 쓴 것은 0.016 차이로, 이 표에서 가장 큰 차이입니다." },
+    ],
+    e: "PFN은 prior의 PPD를 근사할 뿐이라 성능을 prior가 정합니다. 현실 표 데이터는 feature끼리 상관되고 표에 없는 요인이 target에 영향을 주는 경우가 많아서 SCM prior가 더 맞습니다.",
+    ref: "02_tabpfn/02 · 5절, 02_tabpfn/03 · 3.3절",
+  },
+
+  // ── TabPFN 구조와 추론 ──
+  {
+    s: "tabpfn",
+    q: "TabPFN prior가 층·노드가 적은 작은 그래프를 훨씬 자주 뽑되 큰 그래프도 가끔 나오게(긴 꼬리) 분포를 잡은 결과, 학습된 모델에 기대하는 행동은?",
+    o: [
+      { t: "학습 행이 적으면 단순한 설명을 선호하고, 학습 행이 많아지면 더 복잡한 함수도 맞춘다", ok: true },
+      { t: "항상 선형에 가까운 결정 경계만 낸다", w: "꼬리가 길어서 복잡한 그래프도 prior에 들어 있습니다." },
+      { t: "학습 행 수와 상관없이 같은 복잡도의 함수를 낸다", w: "데이터가 늘면 posterior가 복잡한 설명 쪽으로 옮겨 갈 수 있습니다." },
+      { t: "복잡한 데이터셋에서는 예측을 거부한다", w: "그런 동작은 없습니다." },
+    ],
+    e: "4.2절의 단순성(Occam's razor)은 하이퍼파라미터 분포의 모양으로 들어갑니다. prior가 단순한 설명에 무게를 더 두면, posterior도 데이터가 적을 때는 단순한 쪽을 고르고 데이터가 뒷받침할 때만 복잡한 쪽으로 갑니다(부록 B.3.1, Figure 8).",
+    ref: "02_tabpfn/03 · 3.1절",
+  },
+  {
+    s: "tabpfn",
+    q: `연속 target ${M("ŷ")}를 클래스로 바꾸는 규칙 ${M("y = Σ<sub>j</sub> [B<sub>j</sub> &lt; ŷ]")}에서 경계가 ${M("B = {−0.1, 0.5}")}일 때, ${M("ŷ = 0.5")}인 행의 클래스(번호 섞기 전)는?`,
+    o: [
+      { t: "0", w: "−0.1 < 0.5는 참이므로 최소 1입니다." },
+      { t: "1", ok: true },
+      { t: "2", w: "0.5 < 0.5는 거짓입니다. 경계와 같은 값은 아래 구간에 들어갑니다." },
+      { t: "경계값이라 정할 수 없다", w: "부등호가 엄격(<)해서 경계와 같은 값도 클래스가 정해집니다." },
+    ],
+    e: "−0.1 < 0.5 (참) + 0.5 < 0.5 (거짓) = 1. 노트북의 ŷ = −0.1인 행이 클래스 0에 들어간 것과 같은 원리입니다. 경계를 ŷ 값 가운데서 무작위로 고르므로 클래스 크기가 제각각이 되고, 마지막에 클래스 번호를 섞어 번호와 값의 크기 순서를 끊습니다.",
+    ref: "02_tabpfn/03 · 3.4절",
+  },
+  {
+    s: "tabpfn",
+    q: "학습 행 n = 3, 테스트 행 m = 2일 때, attention 점수 개수는 원 PFN 방식(모든 행 쌍 계산 후 mask)과 TabPFN 방식(self-attention + cross-attention으로 나눠 계산)에서 각각 몇 개인가요?",
+    o: [
+      { t: "25 → 15", ok: true },
+      { t: "25 → 13", w: "n² + m²로 계산했습니다. 테스트 행끼리는 attend하지 않고, 테스트 행 → 학습 행(n·m)이 들어갑니다." },
+      { t: "25 → 9", w: "학습 행끼리(n²)만 셌습니다. 테스트 행이 학습 행을 보는 n·m = 6개가 빠졌습니다." },
+      { t: "9 → 6", w: "원 PFN은 mask로 막더라도 (n + m)² = 25개를 모두 계산합니다." },
+    ],
+    e: `원 PFN: ${M("(n + m)² = 5² = 25")}. TabPFN은 모든 행이 학습 행 열만 보므로 ${M("n² + n·m = 9 + 6 = 15")}. 비율은 ${M("n / (n + m)")}이라 테스트 행이 많을수록 더 많이 줄어듭니다. 두 attention은 같은 가중치를 씁니다.`,
+    ref: "02_tabpfn/03 · 2.2절",
+  },
+  {
+    s: "tabpfn",
+    q: "TabPFN에서는 테스트 행이 자기 자신에게도 attend하지 않습니다(논문 식 4). 그래도 테스트 행 자신의 feature 정보가 예측에 반영되는 이유는?",
+    o: [
+      { t: "residual 연결로 테스트 행 자신의 표현이 층마다 그대로 이어지기 때문", ok: true },
+      { t: "학습 행의 y 임베딩에 테스트 행 정보가 섞여 들어가기 때문", w: "y 임베딩은 학습 행의 정답으로만 만듭니다." },
+      { t: "마지막 층에서만 self-attention을 허용하기 때문", w: "모든 층이 같은 규칙입니다." },
+      { t: "반영되지 않는다. 학습 행 분포만으로 예측한다", w: "그렇다면 모든 테스트 행의 예측이 똑같아집니다." },
+    ],
+    e: "attention은 '학습 행에서 무엇을 가져올지'를 정하고, 그 질의(query)가 바로 테스트 행 자신의 표현입니다. 자신의 정보는 residual 경로로 층마다 계속 전달되므로 자기 자신에 attend할 필요가 없습니다.",
+    ref: "02_tabpfn/03 · 2.2절",
+  },
+  {
+    s: "tabpfn",
+    q: "feature가 5개인 데이터셋을 TabPFN(입력 100열 고정)에 넣을 때 하는 변환은?",
+    o: [
+      { t: "나머지 95열을 0으로 채우고, 쓴 5열을 20배(100/k) 한다", ok: true },
+      { t: "나머지 95열을 0으로 채우기만 한다", w: "그러면 feature가 적을수록 입력 전체의 크기가 작아져, feature 수에 따라 입력 분포가 달라집니다." },
+      { t: "5열을 20번 복제해서 100열을 만든다", w: "복제하지 않습니다. 0으로 채우고 크기만 맞춥니다." },
+      { t: "x_encoder를 입력 5짜리 Linear로 바꾼다", w: "x_encoder는 입력 크기 100으로 고정입니다. 그래서 feature 100개가 상한입니다." },
+    ],
+    e: "100/k배 하면 feature 수와 상관없이 100열 전체의 평균 크기가 같아집니다. 학습 때 prior 데이터에도, 추론 때 실제 데이터에도 같은 변환을 합니다.",
+    ref: "02_tabpfn/03 · 2.4절",
+  },
+  {
+    s: "tabpfn",
+    q: "feature 4개, 클래스 3개인 데이터셋에서 TabPFN 앙상블(feature 열 회전 × 클래스 번호 회전 × power transform 유무, 상한 32)의 멤버 수는?",
+    o: [
+      { t: "12", w: "power transform 적용 여부(×2)를 빠뜨렸습니다." },
+      { t: "24", ok: true },
+      { t: "32", w: "가능한 조합이 32보다 적으면 그 조합만 씁니다." },
+      { t: "8", w: "클래스 번호 회전(×3)을 빠뜨렸습니다. power transform 유무와 feature 회전만 곱한 2 × 4입니다." },
+    ],
+    e: `가능한 조합은 ${M("2·k·j = 2 × 4 × 3 = 24")}개이고 32보다 적으므로 24개만 씁니다. 학습 때도 열과 클래스 번호를 돌리지만 모델이 이 회전에 완전히 무관하지는 않아서 앙상블이 도움이 됩니다. 클래스를 돌린 멤버의 출력은 원래 번호로 되돌린 뒤 logit을 평균합니다.`,
+    ref: "02_tabpfn/03 · 2.5절",
+  },
+  {
+    s: "tabpfn",
+    q: "추론 때 실제 데이터에 power transform(Yeo-Johnson)을 적용하는 이유는?",
+    o: [
+      { t: "prior 데이터(신경망 출력을 표준화한 값)에는 긴 꼬리가 드물어서, 꼬리가 긴 실제 feature를 prior 데이터와 비슷한 모양으로 바꾸려고", ok: true },
+      { t: "범주형 feature를 one-hot으로 바꾸려고", w: "power transform은 수치형 분포의 모양을 바꾸는 변환입니다." },
+      { t: "결측값을 채우려고", w: "결측값은 0으로 바꿉니다(nan_to_num)." },
+      { t: "테스트 행 통계가 학습에 새지 않게 하려고", w: "전처리가 학습 행 통계만 쓰는 것은 맞지만, 그게 power transform을 쓰는 이유는 아닙니다." },
+    ],
+    e: "PFN은 prior에서 나올 법한 데이터에서만 잘합니다. 집값·소득처럼 오른쪽 꼬리가 긴 feature는 prior에서 드물기 때문에, 추론 때 실제 데이터를 prior 쪽으로 옮겨 줍니다(부록 C.2.1).",
+    ref: "02_tabpfn/03 · 2.5절",
+  },
+  {
+    s: "tabpfn",
+    q: "다음 중 TabPFN(v1) 논문이 밝힌 한계가 아닌 것은?",
+    o: [
+      { t: "새 데이터셋마다 몇 분씩 fine-tuning해야 한다", ok: true, w: "맞습니다. 이건 한계가 아닙니다. TabPFN은 데이터셋마다 학습하지 않고 forward pass 한 번으로 예측합니다." },
+      { t: "비용이 학습 행 수의 제곱으로 늘어난다", w: "논문이 밝힌 한계입니다. attention 점수가 n² + n·m개입니다." },
+      { t: "feature 100개, 클래스 10개가 상한이다", w: "논문이 밝힌 한계입니다. x_encoder 입력과 출력 logit 수가 고정입니다." },
+      { t: "정보 없는 feature가 많아지면 성능이 떨어진다", w: "논문이 밝힌 한계입니다(B.3.2). prior에 그런 데이터셋이 드뭅니다." },
+    ],
+    e: "논문의 한계 다섯 가지: (1) 학습 행 수의 제곱 비용 (2) feature 100·클래스 10 상한 (3) 범주형 feature와 결측값에 약함 (4) 무의미한 feature에 약함 (5) 학습이 끝난 baseline과 예측 시간만 비교하면 앙상블 TabPFN이 더 느릴 수 있음.",
+    ref: "02_tabpfn/03 · 5절",
+  },
+
+  // ── TabPFN 재현 ──
+  {
+    s: "repro",
+    q: "재현에서 학습 행 수를 v1처럼 0부터가 아니라 1부터 뽑도록 바꾼 이유는?",
+    o: [
+      { t: "학습 행이 0개면 그 데이터셋은 무시되어 gradient가 0이고, 그 GPU에서만 attention 가중치가 쓰이지 않아 GPU 간 gradient 동기화가 어긋나서", ok: true },
+      { t: "학습 행이 0개면 bf16에서 NaN이 나서", w: "NaN 문제는 따로입니다. bf16에는 GradScaler가 없어서 non-finite step 건너뛰기를 직접 넣었습니다." },
+      { t: "학습 행이 0개면 cuDNN이 실행 그래프를 새로 만들어 느려져서", w: "그건 학습 행 수가 매번 바뀌는 것 자체 때문이고, cuDNN attention을 꺼서 해결했습니다." },
+      { t: "논문 본문에 1부터라고 적혀 있어서", w: "논문을 따른 것이 아니라 8×H100 학습에서 생긴 문제를 고친 것입니다. 학습 신호는 바꾸지 않습니다." },
+    ],
+    e: "세 가지 수정(bf16 + non-finite step 건너뛰기, 학습 행 1부터, cuDNN attention 끄기)은 모두 엔지니어링 문제였습니다. GP PFN에서 context 0개가 'prior 회복' 확인용으로 의미 있던 것과 달리, TabPFN v1 학습에서 학습 행 0개인 데이터셋은 손실에 기여하지 않습니다.",
+    ref: "02_tabpfn/04 · 1절",
+  },
+  {
+    s: "repro",
+    q: "재현 결과(평균 ROC AUC 0.932, 논문 0.934)의 해석으로 가장 정확한 것은?",
+    o: [
+      { t: "차이 0.002는 논문 Table 1의 ± 범위(약 0.009) 안이라 재현으로 볼 수 있지만, 이 실험으로 그보다 작은 차이를 구별하기는 어렵다", ok: true },
+      { t: "같은 split에서 1시간 튜닝한 AutoGluon(0.930)을 이겼다", w: "AutoGluon 값은 논문 수치를 인용한 것이고 같은 split에서 다시 돌리지 않았습니다. 직접 돌린 건 sklearn 기본값 baseline입니다." },
+      { t: "공식 v1 체크포인트와 같은 split에서 같은 점수를 냈다", w: "공식 가중치는 외부 pickle이라 열지 않았고, 논문 평균값과만 비교했습니다." },
+      { t: "범주형·결측값이 있는 30개 데이터셋(Table 2)에서도 재현했다", w: "Table 2는 재현하지 않았습니다. 결측값 주입도 끄고 학습했습니다." },
+    ],
+    e: "재현 기준(0.01 이내)은 통과했고, 앙상블 없는 모델도 0.928로 논문 0.932와 0.004 차이입니다. 다만 18개 데이터셋 × split 5개라는 실험 규모와, 무엇을 직접 돌렸고 무엇을 인용했는지를 구분해서 읽어야 합니다.",
+    ref: "02_tabpfn/04 · 5절, 7절",
+  },
+  {
+    s: "repro",
+    q: "학습 예산을 1/10(medium)에서 논문 규모(paper)로 늘렸을 때, 앙상블 없는 모델(0.913 → 0.928)이 앙상블 모델(0.924 → 0.932)보다 더 크게 오른 이유로 노트북이 든 설명은?",
+    o: [
+      { t: "클래스 번호를 돌려 평균하는 앙상블이 덜 학습된 모델의 약점을 어느 정도 가려 주는데, 충분히 학습하면 앙상블 없이도 클래스가 많은 문제를 잘 맞히게 되어서", ok: true },
+      { t: "앙상블 모델은 이미 1.0에 가까워 더 오를 여지가 없어서", w: "0.924는 오를 여지가 충분합니다. 차이는 특히 10클래스 mfeat 데이터셋에서 났습니다." },
+      { t: "paper 모델에서는 앙상블을 꺼서", w: "두 run 모두 앙상블 32개와 앙상블 없음을 같은 방식으로 평가했습니다." },
+      { t: "medium 모델은 feature를 50개까지만 받아서", w: "두 모델 모두 입력 100열입니다. 차이는 학습 step 수입니다." },
+    ],
+    e: "앙상블 없는 모델에서 10클래스 mfeat 데이터셋 네 개가 크게 올랐습니다(0.909~0.955 → 0.961~0.992). 덜 학습된 모델은 클래스 번호에 덜 무관해서 회전 앙상블의 덕을 크게 봤고, 학습을 더 하면 그 덕이 줄어듭니다.",
+    ref: "02_tabpfn/04 · 5절",
+  },
+];
+// 영역 번호 Ⅰ…Ⅻ와 보기 번호 ①…⑳. 그보다 많으면 아라비아 숫자로 쓴다
+const ROMAN = SECTIONS.map((_, i) => (i < 12 ? String.fromCharCode(0x2160 + i) : String(i + 1)));
+const CIRCLED = Array.from({ length: Math.max(...QUESTIONS.map((q) => q.o.length)) }, (_, i) => (i < 20 ? String.fromCharCode(0x2460 + i) : `(${i + 1})`));
+
+// ── 상태 ──
+let order = [];          // 이번 회차에 풀 문제 인덱스
+let cur = 0;
+let answers = {};        // 문제 인덱스 → 고른 보기 원래 인덱스
+let perms = {};          // 문제 인덱스 → 보기 순서
+let shuffled = false;
+let graded = false;      // 채점 결과를 본 회차인가
+const $ = (id) => document.getElementById(id);
+const secIndex = (q) => SECTIONS.findIndex((s) => s.id === q.s);
+// 참고 위치 "01_pfn/02 · 3절, 02_tabpfn/03 · 2.3절"을 "notebooks/01_pfn/02의 3절, 02_tabpfn/03의 2.3절"로 읽는다
+const readRef = (ref) => `notebooks/${ref.replaceAll(" · ", "의 ")}`;
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function show(id) {
+  for (const s of ["start", "quiz", "result"]) $(s).hidden = s !== id;
+  $("restart").hidden = id === "start";
+  // 풀던 회차가 있으면 시작 화면에서 그 회차로 돌아갈 수 있다
+  $("resume-btn").hidden = !(id === "start" && order.length);
+  $("resume-btn").textContent = graded ? "채점 결과로 돌아가기" : "풀던 문제로 돌아가기";
+  $("bar-count").hidden = id !== "quiz";
+  window.scrollTo(0, 0);
+}
+
+function pickedIndices() {
+  const picked = [...document.querySelectorAll("#sec-list input:checked")].map((el) => el.value);
+  return QUESTIONS.map((q, i) => (picked.includes(q.s) ? i : -1)).filter((i) => i >= 0);
+}
+
+function updateTotal() {
+  const n = pickedIndices().length;
+  $("range-total").textContent = `${n}문항`;
+  $("start-btn").disabled = n === 0;
+  $("range-hint").hidden = n !== 0;
+}
+
+function buildStart() {
+  $("sec-list").innerHTML = SECTIONS.map((s, i) => {
+    const n = QUESTIONS.filter((q) => q.s === s.id).length;
+    return `<tr><td><label class="pick"><input type="checkbox" value="${s.id}" checked>
+      <span class="area-no">${ROMAN[i]}</span><span>${s.name}</span></label></td>
+      <td class="path-col"><span class="path">${s.nb}</span></td><td class="num">${n}</td></tr>`;
+  }).join("");
+  updateTotal();
+}
+
+function begin(indices) {
+  graded = false;
+  shuffled = $("shuffle-q").checked;
+  order = shuffled ? shuffle(indices) : indices;
+  cur = 0;
+  answers = {};
+  perms = {};
+  for (const i of order) perms[i] = shuffle(QUESTIONS[i].o.map((_, k) => k));
+  show("quiz");
+  render();
+}
+
+function isCorrect(i) {
+  return i in answers && QUESTIONS[i].o[answers[i]].ok;
+}
+
+function cellHTML(i, k) {
+  const a = i in answers;
+  const c = isCorrect(i);
+  const cls = ["cell", a ? (c ? "is-right" : "is-wrong") : ""].join(" ");
+  const label = `${k + 1}번${a ? (c ? ", 맞힘" : ", 틀림") : ", 안 풂"}`;
+  return `<li><button type="button" class="${cls}" data-k="${k}" aria-label="${label}"${k === cur ? ' aria-current="step"' : ""}>${k + 1}</button></li>`;
+}
+
+function renderSheet() {
+  // 순서대로 풀 때는 영역마다 띠를 끊고, 섞어 풀 때는 한 줄로 둔다
+  const groups = [];
+  order.forEach((i, k) => {
+    const si = shuffled ? -1 : secIndex(QUESTIONS[i]);
+    const last = groups[groups.length - 1];
+    if (last && last.si === si) last.items.push([i, k]);
+    else groups.push({ si, items: [[i, k]] });
+  });
+  $("q-nav").innerHTML = groups.map((g) => `
+    <div class="sheet-group" style="flex: ${g.items.length} 1 0; --n: ${g.items.length}">
+      <ol class="sheet-cells">${g.items.map(([i, k]) => cellHTML(i, k)).join("")}</ol>
+      ${g.si >= 0 ? `<p class="sheet-label"><span class="sheet-roman">${ROMAN[g.si]}</span> <span class="sheet-name">${SECTIONS[g.si].name}</span></p>` : ""}
+    </div>`).join("");
+  const done = Object.keys(answers).length;
+  const right = order.filter(isCorrect).length;
+  $("bar-count").textContent = `${order.length}문항 중 ${done}문항 풂, 맞힘 ${right}`;
+}
+
+function render() {
+  const qi = order[cur];
+  const q = QUESTIONS[qi];
+  const si = secIndex(q);
+  const answered = qi in answers;
+  const ok = isCorrect(qi);
+
+  renderSheet();
+  $("q-no").textContent = cur + 1;
+  $("q-text").innerHTML = q.q + (q.ctx ? `<span class="q-ctx">${q.ctx}</span>` : "");
+
+  $("q-options").innerHTML = perms[qi].map((oi, pos) => {
+    const o = q.o[oi];
+    let cls = "choice";
+    let tag = "";
+    let why = "";
+    if (answered) {
+      const chosen = oi === answers[qi];
+      if (o.ok) { cls += " is-right"; tag = chosen ? "정답, 고른 답" : "정답"; }
+      else if (chosen) { cls += " is-wrong"; tag = "고른 답"; }
+      else cls += " is-other";
+      if (chosen && o.w) why = `<span class="choice-why">${o.w}</span>`;
+    }
+    return `<li><button type="button" class="${cls}" data-oi="${oi}" ${answered ? "disabled" : ""}>
+      <span class="choice-no">${CIRCLED[pos]}</span><span class="choice-text"><span class="choice-label">${o.t}</span>${why}</span>
+      ${tag ? `<span class="choice-tag">${tag}</span>` : ""}</button></li>`;
+  }).join("");
+
+  const facts = `<dl class="facts"><dt>영역</dt><dd>${ROMAN[si]} ${SECTIONS[si].name}</dd>
+    ${answered ? `<dt>다시 읽을 곳</dt><dd>${readRef(q.ref)}</dd>` : ""}</dl>`;
+  if (answered) {
+    const right = CIRCLED[perms[qi].findIndex((oi) => q.o[oi].ok)];
+    const chosen = CIRCLED[perms[qi].indexOf(answers[qi])];
+    const verdict = ok ? `맞혔습니다. 정답은 ${right}입니다.` : `고른 답은 ${chosen}, 정답은 ${right}입니다.`;
+    $("q-explain").innerHTML = `<h2>해설</h2><p class="verdict">${verdict}</p><p>${q.e}</p>${facts}`;
+  } else {
+    $("q-explain").innerHTML = `<h2>해설</h2><p class="panel-wait">보기를 고르면 정답과 해설이 여기에 나옵니다.</p>${facts}`;
+  }
+
+  $("prev-btn").disabled = cur === 0;
+  $("next-btn").textContent = cur === order.length - 1 ? "채점하기" : "다음 문제";
+}
+
+function choose(oi) {
+  const qi = order[cur];
+  if (qi in answers) return;
+  answers[qi] = oi;
+  render();
+  // 다시 그린 뒤 포커스가 사라지지 않도록 다음 문제 버튼으로 옮긴다
+  $("next-btn").focus({ preventScroll: true });
+}
+
+function go(k) {
+  // 다시 그리면 답안지 칸이 새 노드로 바뀌므로, 답안지에서 왔으면 같은 칸으로 포커스를 돌려준다
+  const fromSheet = !!(document.activeElement && document.activeElement.closest("#q-nav"));
+  cur = k;
+  render();
+  if (fromSheet) document.querySelector(`#q-nav [data-k="${k}"]`).focus({ preventScroll: true });
+  else if (document.activeElement === document.body || document.activeElement.disabled) $("next-btn").focus({ preventScroll: true });
+  window.scrollTo(0, 0);
+}
+
+function next() {
+  if (cur < order.length - 1) go(cur + 1);
+  else finish();
+}
+
+function prev() {
+  if (cur > 0) go(cur - 1);
+}
+
+function finish() {
+  graded = true;
+  const right = order.filter(isCorrect).length;
+  const unanswered = order.filter((i) => !(i in answers)).length;
+  $("r-score").textContent = right;
+  $("r-total").textContent = `${order.length}문항 중 맞힌 수`;
+
+  const areas = SECTIONS.map((s, si) => {
+    const qs = order.filter((i) => QUESTIONS[i].s === s.id);
+    const done = qs.filter((i) => i in answers);
+    return { s, si, n: qs.length, d: done.length, r: qs.filter(isCorrect).length };
+  }).filter((a) => a.n);
+  // 표의 막대와 같은 기준: 푼 문항 가운데 틀린 비율, 같으면 틀린 개수가 많은 쪽
+  const wrongRate = (a) => (a.d - a.r) / a.d;
+  const tried = areas.filter((a) => a.d && a.r < a.d);
+  const weakest = tried.length
+    ? tried.reduce((w, a) => (wrongRate(a) > wrongRate(w) || (wrongRate(a) === wrongRate(w) && a.d - a.r > w.d - w.r) ? a : w))
+    : null;
+
+  let note;
+  if (!Object.keys(answers).length) note = "아직 푼 문항이 없습니다.";
+  else if (!weakest) note = "푼 문항은 전부 맞혔습니다.";
+  else note = `푼 문항 기준으로 틀린 비율이 가장 높은 영역은 ${ROMAN[weakest.si]} ${weakest.s.name}입니다(푼 ${weakest.d}문항 중 ${weakest.d - weakest.r}문항 틀림). 오답 노트의 참고 위치부터 다시 읽어 보세요.`;
+  if (unanswered) note += ` 풀지 않은 ${unanswered}문항은 점수에서 틀린 것으로 셌습니다.`;
+  $("r-note").textContent = note;
+
+  $("r-bars").innerHTML = areas.map((a) => {
+    const weak = a === weakest;
+    const bar = a.d
+      ? `<div class="meter" role="img" aria-label="푼 ${a.d}문항 중 ${a.r}문항 맞힘"><span style="width:${(a.r / a.d) * 100}%"></span></div>`
+      : `<span class="untried">풀지 않음</span>`;
+    const count = a.d ? `${a.r} / ${a.d}` : "";
+    const left = a.d < a.n ? `<span class="weak-tag">${a.n}문항 중 ${a.d}문항 풂</span>` : "";
+    return `<tr class="${weak ? "is-weak" : ""}">
+      <td><span class="area-no">${ROMAN[a.si]}</span> ${a.s.name}${weak ? '<span class="weak-tag">틀린 비율이 가장 높은 영역</span>' : ""}</td>
+      <td>${bar}</td><td class="num">${count}${left}</td></tr>`;
+  }).join("");
+
+  // 오답 노트에는 풀고 틀린 문제만. 풀지 않은 문제에 정답을 보여 주면 돌아가 고쳐 풀 수 있다
+  const missed = order.filter((i) => i in answers && !isCorrect(i));
+  const skipped = order.filter((i) => !(i in answers));
+  $("retry-wrong").hidden = !missed.length;
+  $("r-skipped-block").hidden = !skipped.length;
+  $("r-skipped").innerHTML = skipped.map((i) => {
+    const k = order.indexOf(i);
+    return `<li><button type="button" class="cell" data-k="${k}" aria-label="${k + 1}번, 안 풂">${k + 1}</button></li>`;
+  }).join("");
+  $("r-missed").innerHTML = missed.length ? missed.map((i) => {
+    const q = QUESTIONS[i];
+    const k = order.indexOf(i);
+    return `<li><button type="button" class="miss" data-k="${k}">
+      <span class="miss-no">${k + 1}</span>
+      <span><span class="miss-q">${q.q}</span>
+      <span class="miss-a">정답: ${q.o.find((o) => o.ok).t}</span>
+      <span class="miss-ref">${readRef(q.ref)}</span></span></button></li>`;
+  }).join("") : `<li class="all-right">${Object.keys(answers).length ? "푼 문제 가운데 틀린 문제가 없습니다." : "아직 푼 문제가 없습니다."}</li>`;
+  show("result");
+}
+
+// ── 이벤트 ──
+$("sec-list").addEventListener("change", updateTotal);
+$("start-btn").addEventListener("click", () => {
+  const idx = pickedIndices();
+  if (!idx.length) return;
+  // 채점하지 않은 풀이 기록이 있으면 지우기 전에 묻는다
+  const done = Object.keys(answers).length;
+  if (done && !graded && !confirm(`풀던 ${done}문항의 기록이 지워집니다. 새로 시작할까요?`)) return;
+  begin(idx);
+});
+$("resume-btn").addEventListener("click", () => {
+  if (graded) finish();
+  else { show("quiz"); render(); }
+});
+$("q-options").addEventListener("click", (e) => {
+  const b = e.target.closest(".choice");
+  if (b && !b.disabled) choose(Number(b.dataset.oi));
+});
+$("q-nav").addEventListener("click", (e) => {
+  const b = e.target.closest(".cell");
+  if (b) go(Number(b.dataset.k));
+});
+$("next-btn").addEventListener("click", next);
+$("prev-btn").addEventListener("click", prev);
+for (const id of ["r-missed", "r-skipped"]) $(id).addEventListener("click", (e) => {
+  const b = e.target.closest("[data-k]");
+  if (b) { show("quiz"); go(Number(b.dataset.k)); }
+});
+$("retry-wrong").addEventListener("click", () => begin(order.filter((i) => i in answers && !isCorrect(i))));
+for (const id of ["restart", "back-start"]) $(id).addEventListener("click", () => show("start"));
+$("home").addEventListener("click", (e) => { e.preventDefault(); show("start"); });
+document.addEventListener("keydown", (e) => {
+  if ($("quiz").hidden || e.metaKey || e.ctrlKey || e.altKey) return;
+  const qi = order[cur];
+  const step = e.key === "ArrowRight" || e.key === "ArrowLeft" || e.key === "Enter";
+  // 키를 누르고 있으면 반복 입력이 문제를 줄줄이 넘기므로 무시한다
+  if (step && e.repeat) return;
+  const last = cur === order.length - 1;
+  if (/^[1-9]$/.test(e.key) && !(qi in answers)) {
+    const p = perms[qi][Number(e.key) - 1];
+    if (p !== undefined) choose(p);
+  } else if (e.key === "ArrowRight" && qi in answers && !last) {
+    next();
+  } else if (e.key === "Enter" && qi in answers && !last && !e.target.closest("button, a, input")) {
+    next();
+  } else if (e.key === "ArrowLeft") {
+    prev();
+  }
+});
+
+buildStart();
+show("start");
+</script>
+</body>
+</html>
