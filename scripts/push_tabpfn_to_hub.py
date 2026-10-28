@@ -8,8 +8,9 @@
     --repo-id <owner/name> --dry-run
 
 MLflow run의 `model/tabpfn_final.pt`를 `model.safetensors` + `config.json`으로 바꾸고, 모델
-카드와 저장소 루트의 `NOTICE`를 붙여 올린다. 모델 카드는 `--model-card`로 주거나, 주지 않으면
-repo 이름으로 `hub/<name>/README.md`를 찾는다. `--dry-run`이면 폴더만 만들고 올리지 않는다.
+카드(옆에 `images/`가 있으면 함께)와 저장소 루트의 `NOTICE`를 붙여 올린다. 모델 카드는
+`--model-card`로 주거나, 주지 않으면 repo 이름으로 `hub/<name>/README.md`를 찾는다.
+`--dry-run`이면 폴더만 만들고 올리지 않는다.
 
 공개 repo를 실수로 덮어쓰지 않도록 `--repo-id`는 기본값 없이 받는다. 모델 카드는 paper run
 결과를 적고 있어서, paper 크기가 아닌 모델은 `--allow-non-paper`를 줄 때만 올린다.
@@ -89,6 +90,9 @@ def main(argv: list[str] | None = None) -> None:
     upload_dir = save_pretrained(model, config, out_dir / "upload")
     shutil.copy(model_card, upload_dir / "README.md")
     shutil.copy(NOTICE, upload_dir / "NOTICE")
+    # 카드가 쓰는 그림은 카드 옆 images/에 둔다.
+    if (model_card.parent / "images").is_dir():
+        shutil.copytree(model_card.parent / "images", upload_dir / "images", dirs_exist_ok=True)
 
     # 올리기 전에 변환한 파일만으로 같은 가중치가 다시 만들어지는지 확인한다.
     reloaded, _ = from_pretrained(upload_dir)
