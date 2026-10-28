@@ -22,6 +22,12 @@ This is not the official TabPFN checkpoint. For the official models see [PriorLa
 - Prior: v1 prior bag (SCM and BNN with differentiable hyperparameters, GP) ported to PyTorch
 - Training: 18,000 steps, batch 512 datasets, 8×H100 (about 2 hours)
 
+## Training
+
+Figures and numbers on this card come from MLflow run `977614dce2104e44915f81b02705a178`. Train CE is the mean loss over each 25-step window, every step on a freshly sampled prior batch; val CE and accuracy are on 64 fixed prior datasets, logged every 500 steps. Final val CE 0.493, val accuracy 0.770.
+
+![Training curves](images/training_curves.png)
+
 ## Results (paper Table 1)
 
 Mean ROC AUC over the 18 OpenML-CC18 datasets in Table 1 (5 splits each).
@@ -33,6 +39,10 @@ Mean ROC AUC over the 18 OpenML-CC18 datasets in Table 1 (5 splits each).
 | LogisticRegression (sklearn default) | 0.918 | – |
 | HistGradientBoosting (sklearn default) | 0.908 | – |
 | RandomForest (sklearn default) | 0.906 | – |
+
+Per dataset, against the best of the three sklearn defaults:
+
+![Table 1 ROC AUC per dataset](images/table1_roc_auc.png)
 
 ## Usage
 
@@ -59,6 +69,7 @@ uv run python scripts/eval_tabpfn.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
 - `model.safetensors`: weights
 - `config.json`: `TabPFNConfig` used for training (model size, prior and optimizer settings)
 - `NOTICE`: attribution notices required by Apache-2.0
+- `images/`: figures used in this card
 
 ## License
 
