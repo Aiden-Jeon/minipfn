@@ -62,11 +62,21 @@ def _graph_scm_classes():
     return GraphSCM, PriorConfig
 
 
-def sample_table_size(rng: np.random.Generator) -> tuple[int, int]:
-    """(학습 행 수, feature 수). 셀 수 제한은 검증 행까지 포함해 적용한다."""
-    n_train = int(rng.integers(1, MAX_TRAIN_ROWS + 1))
+def sample_table_size(
+    rng: np.random.Generator,
+    max_train_rows: int = MAX_TRAIN_ROWS,
+    n_eval_rows: int = N_EVAL_ROWS,
+    max_features: int = MAX_FEATURES,
+) -> tuple[int, int]:
+    """(학습 행 수, feature 수). 셀 수 제한은 실제로 쓰는 feature 수와 검증 행까지 포함해 적용한다.
+
+    논문 설정(기본값)에서는 feature 수를 자를 일이 없다. 작은 설정에서 feature 상한을 낮추면
+    잘린 feature 수로 셀 수를 센다.
+    """
+    n_train = int(rng.integers(1, max_train_rows + 1))
     n_features = 1 + int(round(rng.beta(*FEATURE_BETA) * (MAX_FEATURES - 1)))
-    max_train = (MAX_CELLS - 1) // n_features - N_EVAL_ROWS
+    n_features = min(n_features, max_features)
+    max_train = max(1, (MAX_CELLS - 1) // n_features - n_eval_rows)
     return min(n_train, max_train), n_features
 
 
@@ -115,9 +125,10 @@ class TabPFNv2Prior:
         self._config = prior_config()
 
     def sample_size(self) -> tuple[int, int]:
-        n_train, n_features = sample_table_size(self.rng)
-        n_train = int(np.clip(n_train, self.min_train_rows, self.max_train_rows))
-        return n_train, min(n_features, self.max_features)
+        n_train, n_features = sample_table_size(
+            self.rng, self.max_train_rows, self.n_eval_rows, self.max_features
+        )
+        return max(n_train, self.min_train_rows), n_features
 
     def _one_dataset(self, n_train: int, n_features: int) -> tuple[torch.Tensor, torch.Tensor]:
         n_rows = n_train + self.n_eval_rows

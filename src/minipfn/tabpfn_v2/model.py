@@ -106,6 +106,7 @@ class TabPFNv2(nn.Module):
             TabPFNv2Layer(e, config.nhead, nhid) for _ in range(config.nlayers)
         )
         self.decoder = nn.Sequential(nn.Linear(e, nhid), nn.GELU(), nn.Linear(nhid, config.n_out))
+        self._column_noise: dict[tuple, torch.Tensor] = {}  # state_dict에 넣지 않는 캐시
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -157,10 +158,14 @@ class TabPFNv2(nn.Module):
         return self.target_embedder(torch.stack([y, indicator], dim=-1))
 
     def column_embeddings(self, n_groups: int, like: torch.Tensor) -> torch.Tensor:
-        # 열마다 고정된 무작위 벡터. CPU에서 뽑아 장치와 상관없이 같은 값을 쓴다
-        generator = torch.Generator().manual_seed(self.config.column_embedding_seed)
-        noise = torch.randn(n_groups, self.config.emsize // 4, generator=generator)
-        return self.column_embedder(noise.to(device=like.device, dtype=like.dtype))
+        # 열마다 고정된 무작위 벡터. CPU에서 뽑아 장치와 상관없이 같은 값을 쓴다.
+        # 묶음 수마다 한 번만 뽑아 입력과 같은 장치·dtype으로 캐시해 둔다
+        key = (n_groups, like.device, like.dtype)
+        if key not in self._column_noise:
+            generator = torch.Generator().manual_seed(self.config.column_embedding_seed)
+            noise = torch.randn(n_groups, self.config.emsize // 4, generator=generator)
+            self._column_noise[key] = noise.to(device=like.device, dtype=like.dtype)
+        return self.column_embedder(self._column_noise[key])
 
     def forward(self, x: torch.Tensor, y_train: torch.Tensor) -> torch.Tensor:
         """테스트 행의 logit (B, R - n_train, n_out).

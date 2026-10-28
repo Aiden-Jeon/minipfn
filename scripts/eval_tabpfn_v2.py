@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import mlflow
+import numpy as np
 import pandas as pd
 import torch
 
@@ -50,6 +51,12 @@ def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
         for task_id in bm.task_names(suite):
             if chosen is None or task_id in chosen:
                 out.append((suite, task_id))
+    if chosen is not None:
+        unknown = sorted(chosen - {task_id for _, task_id in out})
+        if unknown:
+            raise SystemExit(f"--suite {args.suite}에 없는 task id: {unknown}")
+    if not out:
+        raise SystemExit("평가할 task가 없다.")
     return out
 
 
@@ -58,7 +65,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     if path is None:
         flag = "--classifier-path" if suite == "classification" else "--regressor-path"
         raise SystemExit(f"{suite} 평가에는 {flag}가 필요하다.")
-    model, borders = load_checkpoint(path, map_location=args.device)
+    model, borders = load_checkpoint(path)  # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
 
     def make(task: bm.OpenMLTask):
         kw = {"categorical_features_indices": task.categorical_indices, "device": args.device}
@@ -102,7 +109,7 @@ def main(argv: list[str] | None = None) -> None:
         for row in task_rows:
             row["suite"] = suite
         rows.extend(task_rows)
-        mean = sum(r["score"] for r in task_rows) / len(task_rows)
+        mean = float(np.nanmean([r["score"] for r in task_rows]))
         paper = bm.paper_scores(suite)[task_id]
         print(
             f"[{i}/{len(tasks)}] {suite:14s} {task.name:40s} {task.X.shape} "

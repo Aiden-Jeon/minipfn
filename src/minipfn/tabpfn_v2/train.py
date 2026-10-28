@@ -19,10 +19,9 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -42,6 +41,7 @@ from minipfn.tabpfn_v2.prior import (
     TabPFNv2Prior,
     regression_borders,
 )
+from minipfn.utils import DistContext, lr_factor, setup_distributed
 
 N_BUCKETS = 5000
 
@@ -163,14 +163,6 @@ class PriorBatches(IterableDataset):
             yield batch.x, batch.y, batch.n_train
 
 
-def lr_factor(step: int, warmup_steps: int, total_steps: int) -> float:
-    """0에서 선형으로 올린 뒤 cosine으로 0까지."""
-    if step < warmup_steps:
-        return step / max(1, warmup_steps)
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-
 def prior_loss(
     logits: torch.Tensor,
     y_eval: torch.Tensor,
@@ -184,31 +176,9 @@ def prior_loss(
     return bar(logits, y_eval.float()).mean()
 
 
-@dataclass
-class _Dist:
-    rank: int = 0
-    world_size: int = 1
-    local_rank: int = 0
-
-    @property
-    def is_main(self) -> bool:
-        return self.rank == 0
-
-
-def _setup_distributed() -> tuple[_Dist, torch.device]:
-    """torchrun 환경변수가 있으면 NCCL 프로세스 그룹을 연다."""
-    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
-        d = _Dist(
-            int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_RANK"])
-        )
-        torch.cuda.set_device(d.local_rank)
-        dist.init_process_group("nccl")
-        return d, torch.device("cuda", d.local_rank)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return _Dist(), device
-
-
-def _borders(config: TabPFNv2TrainConfig, d: _Dist, device: torch.device) -> torch.Tensor | None:
+def _borders(
+    config: TabPFNv2TrainConfig, d: DistContext, device: torch.device
+) -> torch.Tensor | None:
     """회귀면 rank 0에서 구간 경계를 계산해 모든 GPU에 나눠 준다."""
     if config.task != "regression":
         return None
@@ -268,7 +238,7 @@ def train_tabpfn_v2(
     `MLFLOW_RUN_ID`로 run을 넘겨준다). `checkpoint_every` step마다 학습 상태 전체를
     `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다.
     """
-    d, device = _setup_distributed()
+    d, device = setup_distributed()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     accumulation = config.grad_accumulation(d.world_size)
@@ -445,7 +415,7 @@ def train_tabpfn_v2(
     if d.is_main:
         save_checkpoint(final_path, model, None if borders is None else borders.cpu())
         (out_dir / "history.json").write_text(json.dumps(history))
-        (out_dir / "train_config.json").write_text(json.dumps(asdict(replace(config))))
+        (out_dir / "train_config.json").write_text(json.dumps(asdict(config)))
         if mlf is not None:
             mlf.log_artifact(str(final_path), "model")
             mlf.log_artifact(str(out_dir / "history.json"))

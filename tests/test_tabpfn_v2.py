@@ -111,3 +111,24 @@ def test_nearly_constant_training_column_does_not_blow_up():
     out.sum().backward()
     assert torch.isfinite(out).all()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
+def test_outlier_clip_leaves_categorical_codes_alone():
+    from minipfn.tabpfn_v2.inference import _Member, _MemberPreprocessor
+
+    x = np.zeros((1000, 2))
+    x[:3, 0] = 50.0  # 드문 범주 번호 50
+    x[:, 1] = np.random.default_rng(0).normal(size=1000)
+    member = _Member(kind="quantile", class_permutation=None, target_power=False, seed=0)
+    prep = _MemberPreprocessor(member, cat_ix=[0]).fit(x)
+    assert prep.upper[0] == np.inf and len(prep.cat_maps[0]) == 51
+    codes = prep._base(prep._clip(x))[:, 0]
+    assert len(np.unique(codes[:3])) == 1 and codes[0] != codes[3]  # 50은 다른 범주와 섞이지 않는다
+
+
+def test_predict_is_repeatable_and_regressor_keeps_borders_on_cpu():
+    x, y = load_breast_cancer(return_X_y=True)
+    clf = TabPFNv2Classifier(_tiny_model()).fit(x[:60], y[:60])
+    assert np.array_equal(clf.predict_proba(x[60:70]), clf.predict_proba(x[60:70]))
+    reg = TabPFNv2Regressor(_tiny_model(n_out=32), torch.linspace(-4, 4, 33).double())
+    assert reg.borders.device.type == "cpu" and reg.borders.dtype == torch.float32

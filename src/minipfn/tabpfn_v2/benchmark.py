@@ -764,6 +764,11 @@ def score_fold(
     """분류: ROC AUC (이진은 양성 클래스 확률, 다중은 one-vs-rest 평균). 회귀: negative RMSE."""
     if task_type == "regression":
         return -float(mean_squared_error(y_true, prediction) ** 0.5)
+    # 학습 fold에 없던 클래스의 테스트 행은 모델이 예측할 수 없으므로 뺀다
+    seen = np.isin(y_true, classes)
+    y_true, prediction = y_true[seen], prediction[seen]
+    if len(np.unique(y_true)) < 2:
+        return float("nan")  # 클래스가 하나뿐이면 ROC AUC를 정의할 수 없다
     if prediction.shape[1] == 2:
         return float(roc_auc_score(y_true == classes[1], prediction[:, 1]))
     # 테스트 fold에 없는 클래스는 빼고 확률을 다시 정규화한다

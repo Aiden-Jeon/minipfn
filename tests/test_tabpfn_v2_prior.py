@@ -56,3 +56,11 @@ def test_classification_with_very_few_training_rows_does_not_hang():
         for y in batch.y:
             train = set(y[: batch.n_train].tolist())
             assert len(train) >= 2 and set(y[batch.n_train :].tolist()) <= train
+
+
+def test_cell_budget_uses_the_capped_feature_count():
+    rng = np.random.default_rng(0)
+    sizes = np.array([P.sample_table_size(rng, 64, 16, 8) for _ in range(2000)])
+    assert sizes[:, 1].max() <= 8 and sizes[:, 0].max() <= 64
+    # feature 8개면 셀 제한(75,000)에 걸리지 않으므로 학습 행이 64개까지 고르게 나온다
+    assert (sizes[:, 0] > 48).mean() > 0.2

@@ -10,7 +10,7 @@
 - 멤버마다: feature 순서 섞기, (분류) 클래스 번호 섞기, 표준정규 난수로 된 샘플 식별자 열
 - 전처리 두 가지를 번갈아: (1) 분위수 변환한 열을 원래 열 옆에 붙이고 SVD 성분을 덧붙임,
   범주형 열은 번호를 섞음 (2) Yeo-Johnson power transform
-- 평균에서 표준편차 12배 밖의 값은 그 경계로 자른다
+- 수치형 열에서 평균으로부터 표준편차 12배 밖의 값은 그 경계로 자른다
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
@@ -83,16 +83,17 @@ class _MemberPreprocessor:
         rng = np.random.default_rng(self.member.seed)
         mean, std = np.nanmean(X, axis=0), np.nanstd(X, axis=0)
         self.lower, self.upper = mean - OUTLIER_SIGMA * std, mean + OUTLIER_SIGMA * std
+        # 범주형 열은 자르지 않는다 (번호를 자르면 드문 범주가 다른 범주와 합쳐진다)
+        self.lower[self.cat_ix], self.upper[self.cat_ix] = -np.inf, np.inf
         X = self._clip(X)
         num_ix = [i for i in range(X.shape[1]) if i not in self.cat_ix]
         self.num_ix = num_ix
-        # 범주형 열: 번호를 섞는다 (분위수 멤버만)
         self.cat_maps = {}
         if self.member.kind == "quantile":
+            # 범주형 열: 번호를 섞는다 (분위수 멤버만)
             for i in self.cat_ix:
                 n = int(np.nanmax(X[:, i])) + 1 if np.isfinite(X[:, i]).any() else 1
                 self.cat_maps[i] = rng.permutation(n)
-        if self.member.kind == "quantile":
             n_quantiles = max(min(X.shape[0] // 10, 1000), 2)
             self.transformer = QuantileTransformer(
                 n_quantiles=n_quantiles, random_state=self.member.seed
@@ -162,18 +163,25 @@ class _Base:
     def _fit_members(self, X: Any, members: list[_Member]) -> None:
         X_num, self.cat_ix_, self.encoder_ = _to_numeric(X, self.categorical_features_indices)
         self.preprocessors_ = [_MemberPreprocessor(m, self.cat_ix_).fit(X_num) for m in members]
-        self.X_train_ = X_num
+        # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
+        self.X_trains_ = [
+            prep.transform(X_num, np.random.default_rng(prep.member.seed + 2))
+            for prep in self.preprocessors_
+        ]
 
     def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
         X_test = _apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
         model = self.model.to(self.device).eval()
-        autocast = self.device.type == "cuda"
+        autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
         for i, (prep, y_train) in enumerate(zip(self.preprocessors_, y_trains, strict=True)):
-            rng = np.random.default_rng(prep.member.seed + 2)
-            x = np.concatenate([prep.transform(self.X_train_, rng), prep.transform(X_test, rng)])
+            x_test = prep.transform(X_test, np.random.default_rng(prep.member.seed + 3))
+            x = np.concatenate([self.X_trains_[i], x_test])
             x = torch.as_tensor(x, dtype=torch.float32, device=self.device).unsqueeze(0)
             y = torch.as_tensor(y_train, dtype=torch.float32, device=self.device).unsqueeze(0)
-            with torch.autocast(self.device.type, enabled=autocast), torch.inference_mode():
+            with (
+                torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
+                torch.inference_mode(),
+            ):
                 yield i, model(x, y)[0].float()
 
 
@@ -236,7 +244,7 @@ class TabPFNv2Regressor(_Base):
         self, model: TabPFNv2, borders: torch.Tensor, *, n_estimators: int = 8, **kwargs: Any
     ) -> None:
         super().__init__(model, n_estimators=n_estimators, **kwargs)
-        self.borders = borders.float()
+        self.borders = borders.float().cpu()  # 계산할 때만 장치로 옮기고, 결과는 CPU로 돌려준다
 
     def fit(self, X: Any, y: Any) -> TabPFNv2Regressor:
         rng = np.random.default_rng(self.random_state)
