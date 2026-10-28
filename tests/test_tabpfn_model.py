@@ -50,6 +50,26 @@ def test_test_rows_are_independent():
     assert torch.allclose(full[:, 2:3], single, atol=1e-5)
 
 
+def test_kv_cache_matches_forward():
+    model = _tiny_model()
+    xtr, ytr, xte = (
+        torch.randn(3, 12, 6),
+        torch.randint(0, 4, (3, 12)).float(),
+        torch.randn(3, 5, 6),
+    )
+    xte[0, 1, 2] = float("nan")  # 결측값도 forward처럼 0으로 바꾼다
+    cache = model.build_kv_cache(xtr, ytr)
+    assert len(cache) == len(model.layers) and cache[0][0].shape == (3, 2, 12, 8)
+    assert torch.allclose(model.forward_cached(cache, xte), model(xtr, ytr, xte), atol=1e-5)
+
+
+def test_kv_cache_with_zero_train_rows_matches_forward():
+    model = _tiny_model()
+    xtr, ytr, xte = torch.randn(2, 0, 6), torch.zeros(2, 0), torch.randn(2, 4, 6)
+    cached = model.forward_cached(model.build_kv_cache(xtr, ytr), xte)
+    assert torch.allclose(cached, model(xtr, ytr, xte), atol=1e-6)
+
+
 def test_zero_train_rows_runs():
     model = _tiny_model()
     out = model(torch.randn(2, 0, 6), torch.zeros(2, 0), torch.randn(2, 4, 6))

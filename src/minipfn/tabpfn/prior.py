@@ -226,23 +226,39 @@ def _masked_mean_std(x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor,
     return mean, var.sqrt()
 
 
+def normalization_stats(ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """normalize_data가 쓰는 열별 평균·표준편차 (결측값 제외)."""
+    return _masked_mean_std(ref, ~torch.isnan(ref))
+
+
+def apply_normalization(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    return torch.clip((x - mean) / (std + 1e-6), -100, 100)
+
+
 def normalize_data(x: torch.Tensor, n_rows: int = -1) -> torch.Tensor:
     """행 방향(dim 0)으로 표준화하고 ±100으로 자른다. n_rows > 0이면 앞 n_rows행의 통계를 쓴다."""
     ref = x[:n_rows] if n_rows > 0 else x
+    return apply_normalization(x, *normalization_stats(ref))
+
+
+def outlier_bounds(ref: torch.Tensor, n_sigma: float = 4) -> tuple[torch.Tensor, torch.Tensor]:
+    """remove_outliers의 경계: 평균 ± nσ 안의 값만으로 평균·표준편차를 다시 구한 ± nσ."""
     mean, std = _masked_mean_std(ref, ~torch.isnan(ref))
-    return torch.clip((x - mean) / (std + 1e-6), -100, 100)
+    lower, upper = mean - n_sigma * std, mean + n_sigma * std
+    mask = (ref <= upper) & (ref >= lower) & ~torch.isnan(ref)
+    mean, std = _masked_mean_std(ref, mask)
+    return mean - n_sigma * std, mean + n_sigma * std
+
+
+def squash_outliers(x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
+    x = torch.maximum(-torch.log(1 + torch.abs(x)) + lower, x)
+    return torch.minimum(torch.log(1 + torch.abs(x)) + upper, x)
 
 
 def remove_outliers(x: torch.Tensor, n_sigma: float = 4, n_rows: int = -1) -> torch.Tensor:
     """평균 ± 4σ 밖의 값을 log로 눌러 준다 (v1 remove_outliers)."""
     ref = x[:n_rows] if n_rows > 0 else x
-    mean, std = _masked_mean_std(ref, ~torch.isnan(ref))
-    lower, upper = mean - n_sigma * std, mean + n_sigma * std
-    mask = (ref <= upper) & (ref >= lower) & ~torch.isnan(ref)
-    mean, std = _masked_mean_std(ref, mask)
-    lower, upper = mean - n_sigma * std, mean + n_sigma * std
-    x = torch.maximum(-torch.log(1 + torch.abs(x)) + lower, x)
-    return torch.minimum(torch.log(1 + torch.abs(x)) + upper, x)
+    return squash_outliers(x, *outlier_bounds(ref, n_sigma))
 
 
 def _randomize_classes(d: torch.Tensor, n_classes: int, gen: torch.Generator) -> torch.Tensor:

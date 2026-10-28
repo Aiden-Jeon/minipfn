@@ -19,23 +19,31 @@ uv run jupyter lab  # 노트북 실행
 
 ## 2. 학습한 TabPFN으로 바로 예측하기
 
-TabPFN은 학습 데이터를 "fit"하지 않고, 학습 행과 테스트 행을 함께 넣어 forward pass 한 번으로 테스트 행의 클래스 확률을 냅니다.
+TabPFN은 가중치를 학습하지 않습니다. 학습 행을 context로 넣고 forward pass 한 번으로 테스트 행의 클래스 확률을 냅니다. 그래서 `fit`은 학습 행을 준비만 하고, 계산은 `predict`에서 일어납니다.
 
 ```python
 from sklearn.datasets import load_breast_cancer
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from minipfn.tabpfn.evaluate import tabpfn_predict_proba
 from minipfn.tabpfn.hub import from_pretrained
+from minipfn.tabpfn.inference import TabPFNClassifier
 
 x, y = load_breast_cancer(return_X_y=True)
 x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.5, random_state=0)
 
 model, config = from_pretrained("aiden-jeon/minipfn-tabpfn-v1")
-proba = tabpfn_predict_proba(model, x_train, y_train, x_test)  # (테스트 행 수, 클래스 수)
+clf = TabPFNClassifier(model).fit(x_train, y_train)
+proba = clf.predict_proba(x_test)  # (테스트 행 수, 클래스 수)
 print("ROC AUC:", roc_auc_score(y_test, proba[:, 1]))  # 0.997
 ```
+
+`fit_mode`는 `fit`에서 어디까지 준비해 둘지 정합니다. 두 모드의 결과는 같고 비용만 다릅니다.
+
+- `"fit_preprocessors"`(기본): 전처리만 캐시합니다. 테스트 행을 한꺼번에 많이 예측하는 batch 작업에 맞습니다.
+- `"fit_with_cache"`: 층별 학습 행 key·value까지 캐시합니다. 학습 행을 고정하고 한 행씩 예측하는 서빙에 맞습니다. 메모리를 많이 씁니다(학습 1,000행 기준 약 1.6GB).
+
+요청마다 학습 행이 다르면 함수 `minipfn.tabpfn.inference.tabpfn_predict_proba(model, x_train, y_train, x_test)`를 씁니다.
 
 같은 모델로 논문 Table 1(OpenML-CC18 18개 데이터셋 × 5 split)을 측정할 수 있습니다.
 
