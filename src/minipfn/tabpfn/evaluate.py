@@ -20,9 +20,7 @@ import torch
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 from minipfn.tabpfn import spec
-from minipfn.tabpfn.inference import tabpfn_predict_proba
-
-__all__ = ["tabpfn_predict_proba"]  # 예전 경로(evaluate.tabpfn_predict_proba)도 그대로 쓴다
+from minipfn.tabpfn.inference import tabpfn_predict_proba as tabpfn_predict_proba  # 예전 경로
 
 
 @dataclass

@@ -29,7 +29,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from sklearn.preprocessing import LabelEncoder, PowerTransformer
+from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 
 from minipfn.tabpfn import spec
 from minipfn.tabpfn.model import TabPFNTransformer
@@ -62,7 +62,9 @@ class _Preprocessor:
         x = apply_normalization(x, *self.norm_stats_)[:, 0]
         self.keep_ = [len(torch.unique(x[:, c])) > 1 for c in range(x.shape[1])]
         x = x[:, self.keep_]
-        self.power_: dict[int, PowerTransformer] = {}
+        # PowerTransformer(standardize=True)와 같은 계산을 Yeo-Johnson과 표준화 두 단계로 나눠 둔다.
+        # 테스트 행에서 넘친 값을 두 단계 사이에서 처리하기 위해서다(transform_rows).
+        self.power_: dict[int, tuple[PowerTransformer, StandardScaler]] = {}
         if self.transform == "power_all":
             x = x.numpy().copy()
             for c in range(x.shape[1]):
@@ -70,9 +72,11 @@ class _Preprocessor:
                 with warnings.catch_warnings():
                     warnings.simplefilter("error")
                     try:
-                        pt = PowerTransformer(standardize=True).fit(x[:, c : c + 1])
-                        x[:, c : c + 1] = pt.transform(x[:, c : c + 1])
-                        self.power_[c] = pt
+                        pt = PowerTransformer(standardize=False).fit(x[:, c : c + 1])
+                        t = pt.transform(x[:, c : c + 1])
+                        scaler = StandardScaler().fit(t)
+                        x[:, c : c + 1] = scaler.transform(t)
+                        self.power_[c] = (pt, scaler)
                     except Exception:
                         pass
             x = torch.tensor(x).float()
@@ -84,8 +88,13 @@ class _Preprocessor:
         x = apply_normalization(x.unsqueeze(1), *self.norm_stats_)[:, 0][:, self.keep_]
         if self.power_:
             x = x.numpy().copy()
-            for c, pt in self.power_.items():
-                x[:, c : c + 1] = pt.transform(x[:, c : c + 1])
+            for c, (pt, scaler) in self.power_.items():
+                # 학습 범위 밖의 값은 Yeo-Johnson에서 inf로 넘칠 수 있다. 그대로 두면 표준화가
+                # 에러를 내고, 지나가도 이상치 누르기 뒤에 inf로 남는다. float32 최댓값으로 바꾸면
+                # 이상치 누르기가 log로 눌러 준다.
+                with np.errstate(over="ignore"):
+                    t = _finite(pt.transform(x[:, c : c + 1]))
+                    x[:, c : c + 1] = _finite(scaler.transform(t))
             x = torch.tensor(x).float()
         return self._finish(x)
 
@@ -105,7 +114,7 @@ class TabPFNClassifier:
         fit_mode: FitMode = "fit_preprocessors",
         seed: int = 0,
         batch_size: int = 16,
-        device: torch.device | str = "cpu",
+        device: torch.device | str | None = None,
     ) -> None:
         if fit_mode not in ("fit_preprocessors", "fit_with_cache"):
             raise ValueError(f"fit_mode는 'fit_preprocessors' 또는 'fit_with_cache': {fit_mode!r}")
@@ -114,11 +123,12 @@ class TabPFNClassifier:
         self.fit_mode = fit_mode
         self.seed = seed
         self.batch_size = batch_size  # 한 forward에 넣는 앙상블 멤버 수
-        self.device = torch.device(device)
+        self.device = device  # None이면 모델이 있는 장치를 쓴다. 주면 fit에서 모델을 그리로 옮긴다.
 
     @torch.no_grad()
     def fit(self, X: Any, y: Any) -> TabPFNClassifier:
-        x = torch.tensor(np.asarray(X, dtype=np.float32))
+        x = _as_rows(X)
+        self.n_features_in_ = x.shape[1]
         self.label_encoder_ = LabelEncoder()
         y = self.label_encoder_.fit_transform(np.asarray(y))
         self.classes_ = self.label_encoder_.classes_
@@ -129,7 +139,12 @@ class TabPFNClassifier:
             raise ValueError(
                 f"feature {x.shape[1]}개는 모델 입력({self.model.num_features}개)보다 많다."
             )
-        self.model.to(self.device).eval()
+        if self.device is None:
+            self.device_ = next(self.model.parameters()).device
+        else:
+            self.device_ = torch.device(self.device)
+            self.model.to(self.device_)
+        self.model.eval()
 
         # 앙상블 멤버 = (클래스 회전, feature 회전) × 전처리 2가지, 앞에서부터 n_ensemble개 (v1)
         gen = torch.Generator().manual_seed(self.seed)
@@ -146,35 +161,40 @@ class TabPFNClassifier:
                 prep = _Preprocessor(transform, self.model.num_features)
                 x_trains[transform] = prep.fit_transform(x)
                 self.preprocessors_[transform] = prep
-        self.x_train_ = self._member_inputs(x_trains)  # (N, n, F)
+        # predict마다 다시 옮기지 않도록 학습 행을 장치에 올려 둔다.
+        x_train = self._member_inputs(x_trains).to(self.device_)  # (N, n, F)
         y = torch.tensor(y, dtype=torch.float32)
-        self.y_train_ = torch.stack([(y + cs) % n_classes for (cs, _), _ in self.members_])
+        y_train = torch.stack([(y + cs) % n_classes for (cs, _), _ in self.members_])
+        y_train = y_train.to(self.device_)
 
-        self.kv_caches_ = None
         if self.fit_mode == "fit_with_cache":
+            # 캐시만 있으면 되므로 학습 행은 들고 있지 않는다.
+            self.x_train_ = self.y_train_ = None
             self.kv_caches_ = [
-                self.model.build_kv_cache(xb.to(self.device), yb.to(self.device))
-                for xb, yb in zip(
-                    self._batches(self.x_train_), self._batches(self.y_train_), strict=True
-                )
+                self.model.build_kv_cache(xb, yb)
+                for xb, yb in zip(self._batches(x_train), self._batches(y_train), strict=True)
             ]
+        else:
+            self.x_train_, self.y_train_, self.kv_caches_ = x_train, y_train, None
         return self
 
     @torch.no_grad()
     def predict_proba(self, X: Any) -> np.ndarray:
         """(m, F) -> 클래스 확률 (m, C). 열 순서는 classes_."""
-        x = torch.tensor(np.asarray(X, dtype=np.float32))
+        x = _as_rows(X)
+        if x.shape[1] != self.n_features_in_:
+            raise ValueError(f"feature {x.shape[1]}개: fit 때는 {self.n_features_in_}개였다.")
         x_test = self._member_inputs(
             {t: prep.transform_rows(x) for t, prep in self.preprocessors_.items()}
         )
         n_classes = len(self.classes_)
         logits = []
         for i, xb in enumerate(self._batches(x_test)):
-            xb = xb.to(self.device)
+            xb = xb.to(self.device_)
             if self.kv_caches_ is None:
                 j = i * self.batch_size
-                x_tr = self.x_train_[j : j + self.batch_size].to(self.device)
-                y_tr = self.y_train_[j : j + self.batch_size].to(self.device)
+                x_tr = self.x_train_[j : j + self.batch_size]
+                y_tr = self.y_train_[j : j + self.batch_size]
                 out = self.model(x_tr, y_tr, xb)
             else:
                 out = torch.cat(
@@ -211,6 +231,19 @@ class TabPFNClassifier:
         return t.split(self.batch_size)
 
 
+def _finite(a: np.ndarray) -> np.ndarray:
+    """±inf를 float32 최댓값으로 바꾼다. 결측값(nan)은 그대로 둔다."""
+    big = np.finfo(np.float32).max
+    return np.nan_to_num(a, nan=np.nan, posinf=big, neginf=-big)
+
+
+def _as_rows(X: Any) -> torch.Tensor:
+    x = np.asarray(X, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"X는 (행 수, feature 수) 2차원이어야 한다: shape {x.shape}")
+    return torch.tensor(x)
+
+
 def tabpfn_predict_proba(
     model: TabPFNTransformer,
     x_train: np.ndarray,
@@ -219,11 +252,12 @@ def tabpfn_predict_proba(
     n_ensemble: int = spec.N_ENSEMBLE,
     seed: int = 0,
     batch_size: int = 16,
-    device: torch.device | str = "cpu",
+    device: torch.device | str | None = None,
 ) -> np.ndarray:
     """테스트 행의 클래스 확률 (m, C). context(학습 행)가 호출마다 바뀔 때 쓰는 stateless 버전.
 
-    v1 TabPFNClassifier.predict_proba와 같은 앙상블. 열 순서는 정렬한 레이블 순서다."""
+    v1 TabPFNClassifier.predict_proba와 같은 앙상블. 열 순서는 정렬한 레이블 순서다.
+    device를 주지 않으면 모델이 있는 장치에서 돌리고 모델을 옮기지 않는다."""
     clf = TabPFNClassifier(
         model, n_ensemble=n_ensemble, seed=seed, batch_size=batch_size, device=device
     )

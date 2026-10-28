@@ -82,3 +82,37 @@ def test_rejects_unknown_fit_mode_and_too_many_classes():
     x_tr, _, _ = _toy()
     with pytest.raises(ValueError, match="클래스"):
         TabPFNClassifier(model).fit(x_tr, np.arange(len(x_tr)) % 5)
+
+
+def test_power_transform_overflow_on_test_rows_stays_finite():
+    # v1은 학습·테스트 행을 함께 변환하다 넘치면 그 열을 변환하지 않았다. 이제는 학습 행으로만
+    # 판단하므로, 테스트 행에서 넘친 값이 NaN 확률로 번지지 않아야 한다.
+    model = _tiny_model()
+    x_tr, y_tr, x_te = _toy()
+    clf = TabPFNClassifier(model, n_ensemble=4).fit(x_tr, y_tr)
+    for pt, _ in clf.preprocessors_["power_all"].power_.values():
+        pt.lambdas_[:] = 30.0  # 101**30은 float32에서 넘친다
+    x_te[0] = 1e4
+    rows = clf.preprocessors_["power_all"].transform_rows(torch.tensor(x_te))
+    assert torch.isfinite(rows).all()
+    assert np.isfinite(clf.predict_proba(x_te)).all()
+
+
+def test_rejects_feature_count_different_from_fit():
+    model = _tiny_model()
+    x_tr, y_tr, x_te = _toy()
+    clf = TabPFNClassifier(model, n_ensemble=2).fit(x_tr, y_tr)
+    with pytest.raises(ValueError, match="feature"):
+        clf.predict_proba(x_te[:, :1])
+    with pytest.raises(ValueError, match="2차원"):
+        clf.predict_proba(x_te[0])
+
+
+def test_uses_model_device_by_default_and_drops_rows_with_cache():
+    model = _tiny_model()
+    x_tr, y_tr, _ = _toy()
+    clf = TabPFNClassifier(model, n_ensemble=2).fit(x_tr, y_tr)
+    assert clf.device_ == next(model.parameters()).device
+    assert clf.x_train_.device == clf.device_
+    cached = TabPFNClassifier(model, n_ensemble=2, fit_mode="fit_with_cache").fit(x_tr, y_tr)
+    assert cached.x_train_ is None and cached.y_train_ is None
