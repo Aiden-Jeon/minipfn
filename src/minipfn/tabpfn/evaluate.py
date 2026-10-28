@@ -6,24 +6,23 @@ v1 코드의 평가 절차를 따른다(github.com/automl/TabPFN `tabpfn_v1`, Ap
   split 5개, 학습·테스트 행이 같은 클래스 집합을 갖는 구간을 고른다
 - 예측(`scripts/transformer_prediction_interface.py` transformer_predict): 학습 행 기준 표준화,
   상수 feature 제거, power transform 유무, 이상치 누르기, feature 수 보정,
-  클래스·feature 회전 앙상블, logits / 0.8을 평균한 뒤 softmax
+  클래스·feature 회전 앙상블, logits / 0.8을 평균한 뒤 softmax. 구현은 `inference` 모듈에 있다.
 - 지표(`scripts/tabular_metrics.py`): 다중 클래스 ROC AUC는 OVO
 """
 
 from __future__ import annotations
 
-import itertools
 import random
-import warnings
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.preprocessing import PowerTransformer
 
 from minipfn.tabpfn import spec
-from minipfn.tabpfn.prior import normalize_data, remove_outliers
+from minipfn.tabpfn.inference import tabpfn_predict_proba
+
+__all__ = ["tabpfn_predict_proba"]  # 예전 경로(evaluate.tabpfn_predict_proba)도 그대로 쓴다
 
 
 @dataclass
@@ -92,83 +91,6 @@ def generate_split(
             _, yw = np.unique(yw, return_inverse=True)  # 0..C-1로 다시 매긴다
             return xw[:eval_pos], yw[:eval_pos], xw[eval_pos:], yw[eval_pos:]
     return None
-
-
-def _preprocess(
-    x_all: torch.Tensor, n_train: int, transform: str, max_features: int
-) -> torch.Tensor:
-    """v1 transformer_predict.preprocess_input. x_all: (S, F) → (S, F')."""
-    x = normalize_data(x_all.unsqueeze(1), n_rows=n_train)[:, 0]
-    keep = [len(torch.unique(x[:n_train, c])) > 1 for c in range(x.shape[1])]
-    x = x[:, keep]
-    if transform == "power_all":
-        x = x.numpy().copy()
-        for c in range(x.shape[1]):
-            # v1은 경고도 예외로 바꿔서, 변환이 매끄럽지 않은 열은 그대로 둔다.
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")
-                try:
-                    pt = PowerTransformer(standardize=True).fit(x[:n_train, c : c + 1])
-                    x[:, c : c + 1] = pt.transform(x[:, c : c + 1])
-                except Exception:
-                    pass
-        x = torch.tensor(x).float()
-    x = remove_outliers(x.unsqueeze(1), n_rows=n_train)[:, 0]
-    return x / (x.shape[-1] / max_features)
-
-
-@torch.no_grad()
-def tabpfn_predict_proba(
-    model: torch.nn.Module,
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_test: np.ndarray,
-    n_ensemble: int = spec.N_ENSEMBLE,
-    seed: int = 0,
-    batch_size: int = 16,
-    device: torch.device | str = "cpu",
-) -> np.ndarray:
-    """테스트 행의 클래스 확률 (m, C). v1 TabPFNClassifier.predict_proba와 같은 앙상블."""
-    model.eval()
-    n_train = len(x_train)
-    num_classes = int(y_train.max()) + 1
-    max_features = model.num_features
-    x_all = torch.tensor(np.concatenate([x_train, x_test]), dtype=torch.float32)
-    y_tr = torch.tensor(y_train, dtype=torch.float32)
-
-    torch.manual_seed(seed)
-    feature_shifts = torch.randperm(x_all.shape[1]).tolist()
-    class_shifts = torch.randperm(len(np.unique(y_train))).tolist()
-    configs = list(itertools.product(class_shifts, feature_shifts))
-    random.Random(seed).shuffle(configs)
-    configs = list(itertools.product(configs, ["none", "power_all"]))[:n_ensemble]
-
-    cache: dict[str, torch.Tensor] = {}
-    xs, ys = [], []
-    for (class_shift, feature_shift), transform in configs:
-        if transform not in cache:
-            cache[transform] = _preprocess(x_all, n_train, transform, max_features)
-        x = cache[transform]
-        x = torch.cat([x[:, feature_shift:], x[:, :feature_shift]], dim=1)
-        x = torch.cat([x, torch.zeros(len(x), max_features - x.shape[1])], dim=1)
-        xs.append(x)
-        ys.append((y_tr + class_shift) % num_classes)
-    xs, ys = torch.stack(xs), torch.stack(ys)
-
-    logits = []
-    for i in range(0, len(xs), batch_size):
-        xb, yb = xs[i : i + batch_size].to(device), ys[i : i + batch_size].to(device)
-        out = model(xb[:, :n_train], yb, xb[:, n_train:])[..., :num_classes]
-        logits.append(out.float().cpu() / spec.SOFTMAX_TEMPERATURE)
-    logits = torch.cat(logits)  # (N, m, C)
-
-    total = torch.zeros(logits.shape[1:])
-    for i, ((class_shift, _), _) in enumerate(configs):
-        out = logits[i]
-        total += torch.cat(
-            [out[:, class_shift:], out[:, :class_shift]], dim=1
-        )  # 클래스 회전 되돌리기
-    return torch.softmax(total / len(configs), dim=-1).numpy()
 
 
 def roc_auc(y_true: np.ndarray, proba: np.ndarray) -> float:

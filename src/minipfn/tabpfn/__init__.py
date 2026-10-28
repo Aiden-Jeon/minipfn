@@ -4,5 +4,6 @@
 - `prior`: v1 prior(SCM·BNN·GP)를 torch로 옮긴 데이터셋 생성기
 - `model`: v1 구조의 Transformer (25.82M 파라미터)
 - `train`: 다중 GPU prior-fitting 학습 루프
+- `inference`: sklearn 스타일 `TabPFNClassifier`(fit_mode로 KV 캐시 선택)와 stateless 예측 함수
 - `evaluate`: OpenML-CC18(논문 Table 1) 평가
 """
