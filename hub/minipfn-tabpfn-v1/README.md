@@ -24,7 +24,7 @@ This is not the official TabPFN checkpoint. For the official models see [PriorLa
 
 ## Training
 
-Train CE is the loss on each step's freshly sampled prior batch; val CE and accuracy are on 64 fixed prior datasets, logged every 500 steps. Final val CE 0.493, val accuracy 0.770.
+Figures and numbers on this card come from MLflow run `977614dce2104e44915f81b02705a178`. Train CE is the mean loss over each 25-step window, every step on a freshly sampled prior batch; val CE and accuracy are on 64 fixed prior datasets, logged every 500 steps. Final val CE 0.493, val accuracy 0.770.
 
 ![Training curves](images/training_curves.png)
 
