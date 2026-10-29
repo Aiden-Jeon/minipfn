@@ -5,7 +5,12 @@ from dataclasses import replace
 import torch
 
 from minipfn.tabpfn_v2.model import load_checkpoint
-from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig, lr_factor, train_tabpfn_v2
+from minipfn.tabpfn_v2.train import (
+    TabPFNv2TrainConfig,
+    _make_val_batches,
+    lr_factor,
+    train_tabpfn_v2,
+)
 
 
 def test_lr_schedule_warms_up_then_decays_to_zero():
@@ -56,6 +61,16 @@ def test_chunked_training_continues_the_full_schedule(tmp_path):
     assert second["history"]["step"] == list(range(1, 11))
 
 
+def test_val_batches_do_not_depend_on_micro_batch():
+    config = TabPFNv2TrainConfig.smoke("classification")
+    a = _make_val_batches(replace(config, micro_batch=4), n_batches=2)
+    b = _make_val_batches(replace(config, micro_batch=1), n_batches=2)
+    for batch_a, batch_b in zip(a, b, strict=True):
+        assert batch_a.x.shape[0] == config.val_batch
+        assert torch.equal(batch_a.x.nan_to_num(), batch_b.x.nan_to_num())
+        assert torch.equal(batch_a.y, batch_b.y)
+
+
 def test_deadline_in_the_past_stops_at_the_next_log_step(tmp_path):
     config = replace(
         TabPFNv2TrainConfig.smoke("classification"), steps=10, log_every=2, deadline=0.0
@@ -63,3 +78,12 @@ def test_deadline_in_the_past_stops_at_the_next_log_step(tmp_path):
     result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
     assert result["history"]["step"][-1] == 2
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 2
+
+
+def test_micro_batch_shrinks_when_gpus_exceed_the_batch():
+    config = TabPFNv2TrainConfig.paper("classification")  # batch 64, micro 8
+    for world_size, micro, accumulation in [(1, 8, 8), (8, 8, 1), (16, 4, 1), (32, 2, 1)]:
+        scaled = config.for_world_size(world_size)
+        assert scaled.batch_size == 64
+        assert scaled.micro_batch == micro
+        assert scaled.grad_accumulation(world_size) == accumulation
