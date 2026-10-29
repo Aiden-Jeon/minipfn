@@ -1,8 +1,10 @@
+import math
 import os
 import random
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -63,3 +65,39 @@ def log_run_source(script: str | Path, env_prefix: str, artifact_path: str = "co
         tags["git_commit"] = commit
         tags["git_dirty"] = str(bool(_git("status", "--porcelain", cwd=script.parent)))
     mlflow.set_tags(tags)
+
+
+def lr_factor(step: int, warmup_steps: int, schedule_steps: int) -> float:
+    """학습률 배율: 0에서 선형으로 올린 뒤(warmup) cosine으로 0까지 (v1 cosine 스케줄)."""
+    if step < warmup_steps:
+        return step / max(1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, schedule_steps - warmup_steps)
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
+@dataclass
+class DistContext:
+    """torchrun 프로세스 하나의 위치."""
+
+    rank: int = 0
+    world_size: int = 1
+    local_rank: int = 0
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
+def setup_distributed() -> tuple[DistContext, torch.device]:
+    """torchrun 환경변수가 있으면 NCCL 프로세스 그룹을 연다. 없으면 GPU 하나 또는 CPU."""
+    import torch.distributed as dist
+
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        d = DistContext(
+            int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_RANK"])
+        )
+        torch.cuda.set_device(d.local_rank)
+        dist.init_process_group("nccl")
+        return d, torch.device("cuda", d.local_rank)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return DistContext(), device

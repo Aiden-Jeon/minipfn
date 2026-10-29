@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
-import os
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -33,6 +31,7 @@ from minipfn.tabpfn.model import (
     configure_attention_backends,
 )
 from minipfn.tabpfn.prior import TabPFNPrior, TabPFNPriorDataset
+from minipfn.utils import lr_factor, setup_distributed
 
 
 @dataclass
@@ -127,14 +126,6 @@ def build_tabpfn_model(config: TabPFNConfig) -> TabPFNTransformer:
     )
 
 
-def lr_factor(step: int, warmup_steps: int, schedule_steps: int) -> float:
-    """v1 get_cosine_schedule_with_warmup: 0에서 선형으로 올린 뒤 cosine으로 0까지."""
-    if step < warmup_steps:
-        return step / max(1, warmup_steps)
-    progress = (step - warmup_steps) / max(1, schedule_steps - warmup_steps)
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-
 def save_tabpfn(model: torch.nn.Module, config: TabPFNConfig, path: str | Path) -> None:
     """가중치와 config만 저장한다 (`weights_only=True`로 다시 읽을 수 있는 형식)."""
     torch.save({"state_dict": model.state_dict(), "config": asdict(config)}, path)
@@ -155,30 +146,6 @@ def load_tabpfn(
 ) -> tuple[TabPFNTransformer, TabPFNConfig]:
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
     return tabpfn_from_state(ckpt["config"], ckpt["state_dict"], map_location)
-
-
-@dataclass
-class _Dist:
-    rank: int = 0
-    world_size: int = 1
-    local_rank: int = 0
-
-    @property
-    def is_main(self) -> bool:
-        return self.rank == 0
-
-
-def _setup_distributed() -> tuple[_Dist, torch.device]:
-    """torchrun 환경변수가 있으면 NCCL 프로세스 그룹을 연다."""
-    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
-        d = _Dist(
-            int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_RANK"])
-        )
-        torch.cuda.set_device(d.local_rank)
-        dist.init_process_group("nccl")
-        return d, torch.device("cuda", d.local_rank)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return _Dist(), device
 
 
 def _make_val_batch(config: TabPFNConfig, n_groups: int = 8):
@@ -228,7 +195,7 @@ def train_tabpfn(
     `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다. `resume_from`에
     그 파일을 주면 이어서 학습한다.
     """
-    d, device = _setup_distributed()
+    d, device = setup_distributed()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     accumulation = config.grad_accumulation(d.world_size)

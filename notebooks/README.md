@@ -23,3 +23,14 @@
 | 04 | [논문 규모 재현](02_tabpfn/04_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
 실행 파일: `scripts/train_tabpfn.py`, `scripts/eval_tabpfn.py`, `scripts/push_tabpfn_to_hub.py`(+ 모델 카드 `hub/minipfn-tabpfn-v1/README.md`), `runs/train_tabpfn.yaml`
+
+## `03_tabpfn_v2/` — Hollmann et al., *Accurate predictions on small data with a tabular foundation model* (Nature 2025)
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [셀 단위 표현과 2방향 attention](03_tabpfn_v2/01_two_way_attention_primer.ipynb) | 표의 셀을 토큰으로 쓰고 행·열 방향으로 번갈아 attend하면 무엇이 달라지는가? |
+| 02 | [v2 prior](03_tabpfn_v2/02_prior_primer.ipynb) | 무작위 계산 그래프로 범주형 feature, 결측값, 계단 모양 관계가 있는 표를 어떻게 만드는가? |
+| 03 | [논문 walkthrough](03_tabpfn_v2/03_tabpfn_v2_paper_walkthrough.ipynb) | v2는 v1의 무엇을 바꿔 행 10,000개·feature 500개의 분류와 회귀를 forward pass 한 번으로 하는가? |
+| 04 | [학습 데이터: TabICL prior](03_tabpfn_v2/04_tabicl_prior.ipynb) | 논문 prior 대신 쓰는 TabICL prior는 무엇이 같고 다르며, 학습에 쓸 만큼 빨리 만들어지는가? |
+
+재현(이 prior로 학습하고 논문 benchmark 숫자와 비교)은 진행 중입니다.

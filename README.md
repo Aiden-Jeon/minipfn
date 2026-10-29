@@ -100,11 +100,12 @@ uv run python scripts/push_tabpfn_to_hub.py --run-id <학습 run_id> --repo-id <
 
 - [`notebooks/01_pfn/`](notebooks/01_pfn) — Müller et al., *[Transformers Can Do Bayesian Inference](https://arxiv.org/pdf/2112.10510)*, ICLR 2022
 - [`notebooks/02_tabpfn/`](notebooks/02_tabpfn) — Hollmann et al., *[TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second](https://arxiv.org/pdf/2207.01848)*, ICLR 2023
+- [`notebooks/03_tabpfn_v2/`](notebooks/03_tabpfn_v2) — Hollmann et al., *[Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6)*, Nature 2025 (재현 진행 중)
 
-공식 구현은 [automl/PFNs](https://github.com/automl/PFNs), [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)입니다. 후속작 TabPFN v2(Hollmann et al., *Accurate predictions on small data with a tabular foundation model*, Nature 2025)는 아직 다루지 않습니다.
+공식 구현은 [automl/PFNs](https://github.com/automl/PFNs), [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)입니다.
 
 ## 5. 라이선스
 
 코드와 Hugging Face Hub의 가중치는 [Apache-2.0](LICENSE)입니다. `src/minipfn/tabpfn/`은 공식 TabPFN v1 코드([automl/TabPFN](https://github.com/automl/TabPFN) `tabpfn_v1`, Apache-2.0)를 옮긴 부분이 있어 원 저작권 표기를 [NOTICE](NOTICE)에 함께 둡니다.
 
-`notebooks/*/images/`의 논문 그림(`pfn_fig1a.png`, `tabpfn_fig1.png`, `tabpfn_fig2.png`, `tabpfn_fig4.png`)은 각 논문 저자에게 저작권이 있으며 Apache-2.0 대상이 아닙니다. 설명을 위해 출처(Müller et al. 2022, Hollmann et al. 2023)를 밝혀 인용했습니다. 직접 그린 `pfn_encoder_arch.svg`는 Apache-2.0입니다.
+`notebooks/*/images/`의 논문 그림(`pfn_fig1a.png`, `tabpfn_fig1.png`, `tabpfn_fig2.png`, `tabpfn_fig4.png`)은 각 논문 저자에게 저작권이 있으며 Apache-2.0 대상이 아닙니다. 설명을 위해 출처(Müller et al. 2022, Hollmann et al. 2023)를 밝혀 인용했습니다. `notebooks/03_tabpfn_v2/images/`의 그림(`tabpfn_v2_fig1.png`~`tabpfn_v2_fig4.png`)은 Hollmann et al. 2025([Nature 637:319](https://doi.org/10.1038/s41586-024-08328-6))의 Fig. 1~4를 줄인 것으로, 원 논문의 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 라이선스를 따릅니다. 직접 그린 `pfn_encoder_arch.svg`는 Apache-2.0입니다.

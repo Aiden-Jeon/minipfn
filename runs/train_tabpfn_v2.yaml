@@ -1,0 +1,43 @@
+# TabPFN v2 prior-fitting (Nature 2025 재현, TabICL prior):
+#   databricks air run -f runs/train_tabpfn_v2.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 기본은 8×H100에서 논문 크기 모델·batch 64로 300 step 실측(분류). 규모는 override로 바꾼다:
+#   회귀:        --override env_variables.TABPFN_V2_TASK=regression
+#   논문 규모:   --override env_variables.TABPFN_V2_CONFIG_NAME=paper --override env_variables.TABPFN_V2_STEPS=2000000 \
+#                --override mlflow_run_name=tabpfn-v2-<task>-paper --override timeout_minutes=<추정 시간>
+#   이어서 학습: --override env_variables.TABPFN_V2_RESUME_RUN_ID=<run_id>
+experiment_name: tabpfn-v2-reproduction
+mlflow_run_name: tabpfn-v2-timing-300steps-8gpu
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+  # 기본 환경에 없는 패키지 (학습 데이터를 만드는 TabICL prior)
+  dependencies:
+    - tabicl>=2.2
+compute:
+  accelerator_type: GPU_8xH100
+  num_accelerators: 8
+code_source:
+  type: snapshot
+  snapshot:
+    # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
+    root_path: ..
+    include_paths:
+      - src
+      - scripts/train_tabpfn_v2.py
+env_variables:
+  TABPFN_V2_TASK: classification
+  TABPFN_V2_CONFIG_NAME: medium
+  TABPFN_V2_STEPS: "300"
+  # GPU당 prior 생성 worker 수. 노드의 CPU 수에 맞춰 조정한다.
+  TABPFN_V2_NUM_WORKERS: "8"
+max_retries: 0
+timeout_minutes: 45
+# torchrun이 GPU마다 프로세스를 하나씩 띄운다 (batch 64 = micro batch 8 × GPU 8).
+# 표 크기가 batch마다 바뀌어 메모리가 조각나므로 expandable_segments를 켠다.
+# TabICL prior는 같은 시드여도 PYTHONHASHSEED에 따라 두 가지 데이터 중 하나를 만든다. 고정해서
+# 이어서 학습하는 chunk마다 검증 세트가 같도록 한다(1은 논문 규모 chunk0~3이 쓴 검증 세트를 만든다).
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONHASHSEED=1
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  torchrun --standalone --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/train_tabpfn_v2.py
