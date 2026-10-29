@@ -61,6 +61,22 @@ def test_chunked_training_continues_the_full_schedule(tmp_path):
     assert second["history"]["step"] == list(range(1, 11))
 
 
+def test_kept_checkpoints_are_not_overwritten(tmp_path):
+    config = replace(
+        TabPFNv2TrainConfig.smoke("classification"), steps=6, checkpoint_every=2, keep_every=4
+    )
+    train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    assert sorted(p.name for p in tmp_path.glob("step_*.pt")) == ["step_0000004.pt"]
+    assert torch.load(tmp_path / "step_0000004.pt", weights_only=True)["step"] == 4
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 6
+
+    # 남긴 step에서 이어 가면 그 step부터 다시 학습한다
+    resumed = train_tabpfn_v2(
+        config, tmp_path / "b", resume_from=tmp_path / "step_0000004.pt", mlflow_log=False
+    )
+    assert resumed["history"]["step"][-1] == 6
+
+
 def test_val_batches_do_not_depend_on_micro_batch():
     config = TabPFNv2TrainConfig.smoke("classification")
     a = _make_val_batches(replace(config, micro_batch=4), n_batches=2)
