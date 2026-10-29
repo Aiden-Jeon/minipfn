@@ -5,6 +5,8 @@
 #   논문 규모:   --override env_variables.TABPFN_V2_CONFIG_NAME=paper --override env_variables.TABPFN_V2_STEPS=2000000 \
 #                --override mlflow_run_name=tabpfn-v2-<task>-paper --override timeout_minutes=<추정 시간>
 #   이어서 학습: --override env_variables.TABPFN_V2_RESUME_RUN_ID=<run_id>
+#   노드 2대:    --override compute.num_accelerators=16 --override env_variables.TABPFN_V2_MICRO_BATCH=4
+#                (batch 64 = micro batch × GPU 수. 4대면 32와 2)
 experiment_name: tabpfn-v2-reproduction
 mlflow_run_name: tabpfn-v2-timing-300steps-8gpu
 environment:
@@ -33,6 +35,8 @@ env_variables:
 max_retries: 0
 timeout_minutes: 45
 # torchrun이 GPU마다 프로세스를 하나씩 띄운다 (batch 64 = micro batch 8 × GPU 8).
+# AI Runtime은 command를 노드마다 실행하고 NUM_NODES·NODE_RANK·MASTER_ADDR·MASTER_PORT를 넣어 준다.
+# 변수가 없으면(노드 한 대) 기본값으로 혼자 돈다.
 # 표 크기가 batch마다 바뀌어 메모리가 조각나므로 expandable_segments를 켠다.
 # TabICL prior는 같은 시드여도 PYTHONHASHSEED에 따라 두 가지 데이터 중 하나를 만든다. 고정해서
 # 이어서 학습하는 chunk마다 검증 세트가 같도록 한다(1은 논문 규모 chunk0~3이 쓴 검증 세트를 만든다).
@@ -40,4 +44,6 @@ command: >-
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   PYTHONHASHSEED=1
   PYTHONPATH=$CODE_SOURCE_PATH/src
-  torchrun --standalone --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/train_tabpfn_v2.py
+  torchrun --nnodes=${NUM_NODES:-1} --node_rank=${NODE_RANK:-0}
+  --master_addr=${MASTER_ADDR:-127.0.0.1} --master_port=${MASTER_PORT:-29500}
+  --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/train_tabpfn_v2.py

@@ -75,6 +75,7 @@ class TabPFNv2TrainConfig:
     num_workers: int = 8
     log_every: int = 100
     val_every: int = 5_000
+    val_batch: int = 8  # 검증 batch의 데이터셋 수. micro_batch와 따로 둬서 검증 세트가 늘 같다
     checkpoint_every: int = 5_000
 
     @property
@@ -201,9 +202,9 @@ def _borders(
 
 
 def _make_val_batches(config: TabPFNv2TrainConfig, n_batches: int = 8):
-    """학습과 겹치지 않는 시드로 검증용 prior batch를 고정해 둔다."""
+    """학습과 겹치지 않는 시드로 검증용 prior batch를 고정해 둔다 (val_batch × n_batches개)."""
     prior = config.make_prior(10_000_000 + config.seed)
-    return [prior.sample_batch(config.micro_batch) for _ in range(n_batches)]
+    return [prior.sample_batch(config.val_batch) for _ in range(n_batches)]
 
 
 @torch.no_grad()

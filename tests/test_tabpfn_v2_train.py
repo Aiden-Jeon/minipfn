@@ -5,7 +5,12 @@ from dataclasses import replace
 import torch
 
 from minipfn.tabpfn_v2.model import load_checkpoint
-from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig, lr_factor, train_tabpfn_v2
+from minipfn.tabpfn_v2.train import (
+    TabPFNv2TrainConfig,
+    _make_val_batches,
+    lr_factor,
+    train_tabpfn_v2,
+)
 
 
 def test_lr_schedule_warms_up_then_decays_to_zero():
@@ -54,6 +59,16 @@ def test_chunked_training_continues_the_full_schedule(tmp_path):
         config, tmp_path / "b", resume_from=tmp_path / "a" / "latest.pt", mlflow_log=False
     )
     assert second["history"]["step"] == list(range(1, 11))
+
+
+def test_val_batches_do_not_depend_on_micro_batch():
+    config = TabPFNv2TrainConfig.smoke("classification")
+    a = _make_val_batches(replace(config, micro_batch=4), n_batches=2)
+    b = _make_val_batches(replace(config, micro_batch=1), n_batches=2)
+    for batch_a, batch_b in zip(a, b, strict=True):
+        assert batch_a.x.shape[0] == config.val_batch
+        assert torch.equal(batch_a.x.nan_to_num(), batch_b.x.nan_to_num())
+        assert torch.equal(batch_a.y, batch_b.y)
 
 
 def test_deadline_in_the_past_stops_at_the_next_log_step(tmp_path):
