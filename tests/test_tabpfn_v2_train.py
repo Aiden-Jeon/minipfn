@@ -78,3 +78,12 @@ def test_deadline_in_the_past_stops_at_the_next_log_step(tmp_path):
     result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
     assert result["history"]["step"][-1] == 2
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 2
+
+
+def test_micro_batch_shrinks_when_gpus_exceed_the_batch():
+    config = TabPFNv2TrainConfig.paper("classification")  # batch 64, micro 8
+    for world_size, micro, accumulation in [(1, 8, 8), (8, 8, 1), (16, 4, 1), (32, 2, 1)]:
+        scaled = config.for_world_size(world_size)
+        assert scaled.batch_size == 64
+        assert scaled.micro_batch == micro
+        assert scaled.grad_accumulation(world_size) == accumulation

@@ -6,8 +6,9 @@
 
     batch_size = micro_batch × grad_accumulation × world_size
 
-이고 grad_accumulation은 나머지 값으로 자동 계산한다. 학습률은 linear warmup 뒤 cosine으로
-줄인다(논문: Adam, warmup + cosine, lr ∈ [1e-4, 5e-4]).
+이고 grad_accumulation은 나머지 값으로 자동 계산한다. GPU가 많아 micro_batch × world_size가
+batch_size를 넘으면 GPU당 micro batch를 batch_size / world_size로 줄인다. 학습률은 linear
+warmup 뒤 cosine으로 줄인다(논문: Adam, warmup + cosine, lr ∈ [1e-4, 5e-4]).
 
 v1 재현에서 GPU로 학습하며 고친 세 가지를 그대로 둔다.
 - bf16에는 GradScaler가 없으므로 gradient가 inf/nan이면 그 step을 건너뛴다
@@ -21,7 +22,7 @@ import contextlib
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -125,6 +126,12 @@ class TabPFNv2TrainConfig:
         return TabPFNv2Config(
             emsize=self.emsize, nlayers=self.nlayers, nhead=self.nhead, n_out=self.n_out
         )
+
+    def for_world_size(self, world_size: int) -> TabPFNv2TrainConfig:
+        """GPU가 많아 micro_batch × world_size가 batch를 넘으면 GPU당 micro batch를 줄인다."""
+        if self.micro_batch * world_size <= self.batch_size:
+            return self
+        return replace(self, micro_batch=self.batch_size // world_size)
 
     def grad_accumulation(self, world_size: int) -> int:
         per_forward = self.micro_batch * world_size
@@ -240,6 +247,7 @@ def train_tabpfn_v2(
     `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다.
     """
     d, device = setup_distributed()
+    config = config.for_world_size(d.world_size)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     accumulation = config.grad_accumulation(d.world_size)
