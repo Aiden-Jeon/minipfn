@@ -8,6 +8,7 @@ from minipfn.tabpfn_v2.model import load_checkpoint
 from minipfn.tabpfn_v2.train import (
     TabPFNv2TrainConfig,
     _make_val_batches,
+    dequantize_targets,
     lr_factor,
     train_tabpfn_v2,
 )
@@ -83,6 +84,39 @@ def test_kept_checkpoints_are_not_overwritten(tmp_path):
         "step_0000003.pt",
         "step_0000006.pt",
     ]
+
+
+def test_dequantize_moves_only_repeated_interior_targets():
+    from minipfn.bar_distribution import FullSupportBarDistribution
+
+    bar = FullSupportBarDistribution(torch.linspace(-4.0, 4.0, 101))  # 구간 100개, 폭 0.08
+    n_train = 4
+    # 데이터셋 0: 1.0이 반복(이산), 데이터셋 1: 모두 다른 값(연속), 꼬리 값 9.0도 반복
+    y = torch.tensor(
+        [
+            [1.0, 1.0, 2.0, 9.0, 1.0, 1.0, 9.0, 0.5],
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, float("nan")],
+        ]
+    )
+    torch.manual_seed(0)
+    out = dequantize_targets(y, n_train, bar, n_buckets=10)
+    assert out.shape == (2, 4)
+    moved = out[0, :2]
+    assert not torch.equal(moved, y[0, 4:6])  # 반복된 1.0은 흩어진다
+    assert ((moved - 1.0).abs() <= 5 * 0.08 + 1e-6).all()  # 이웃 구간 10개(±5) 안
+    assert out[0, 2] == 9.0  # 꼬리 구간 값은 그대로
+    assert out[0, 3] == 0.5  # 한 번만 나온 값은 그대로
+    assert torch.equal(out[1, :3], y[1, 4:7]) and torch.isnan(
+        out[1, 3]
+    )  # 연속 target·결측은 그대로
+
+
+def test_regression_training_with_dequantize(tmp_path):
+    config = replace(
+        TabPFNv2TrainConfig.smoke("regression"), steps=2, border_datasets=10, dequantize_buckets=10
+    )
+    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    assert torch.isfinite(torch.tensor(result["history"]["train_loss"])).all()
 
 
 def test_val_batches_do_not_depend_on_micro_batch():
