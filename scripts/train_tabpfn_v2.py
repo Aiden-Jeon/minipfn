@@ -13,7 +13,9 @@ AI Runtime(`databricks air run -f runs/train_tabpfn_v2.yaml`)과 로컬에서 �
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
 `--resume-run-id`(또는 `TABPFN_V2_RESUME_RUN_ID`)를 주면 그 run의 `checkpoints/latest.pt`에서
-이어서 학습한다. 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
+이어서 학습한다. `--resume-step`(또는 `TABPFN_V2_RESUME_STEP`)을 같이 주면 그 step에 남긴
+`checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).
+실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
 from __future__ import annotations
@@ -63,9 +65,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-every", type=int, default=_env("TABPFN_V2_CHECKPOINT_EVERY", int)
     )
+    parser.add_argument("--keep-every", type=int, default=_env("TABPFN_V2_KEEP_EVERY", int))
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
+    parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.resume_step is not None and not args.resume_run_id:
+        parser.error("--resume-step은 --resume-run-id와 같이 줘야 한다")
+    return args
 
 
 def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
@@ -77,6 +84,7 @@ def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
         "lr": args.lr,
         "stop_step": args.stop_step,
         "checkpoint_every": args.checkpoint_every,
+        "keep_every": args.keep_every,
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
     return replace(config, **{k: v for k, v in overrides.items() if v is not None})
@@ -104,17 +112,21 @@ def main(argv: list[str] | None = None) -> None:
 
     resume_path = None
     if args.resume_run_id:
+        name = "latest.pt" if args.resume_step is None else f"step_{args.resume_step:07d}.pt"
         resume_path = mlflow.artifacts.download_artifacts(
             run_id=args.resume_run_id,
-            artifact_path="checkpoints/latest.pt",
+            artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
 
     if is_main:
         print("config_name:", args.config_name)
         print(config)
-        # air가 넘겨준 run이 있으면 거기에, 이어서 학습하면 그 run에, 아니면 새 run에 기록한다
-        run_id = os.environ.get("MLFLOW_RUN_ID") or args.resume_run_id
+        # air가 넘겨준 run이 있으면 거기에, 이어서 학습하면 그 run에, 아니면 새 run에 기록한다.
+        # 남긴 step으로 되돌아가면 원래 run의 latest.pt와 뒤쪽 step_*.pt를 덮어쓰지 않도록
+        # 새 run에 쓴다
+        resume_into = args.resume_run_id if args.resume_step is None else None
+        run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
         run_name = None if run_id else f"tabpfn-v2-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)

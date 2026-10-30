@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -78,6 +79,8 @@ class TabPFNv2TrainConfig:
     val_every: int = 5_000
     val_batch: int = 8  # 검증 batch의 데이터셋 수. micro_batch와 따로 둬서 검증 세트가 늘 같다
     checkpoint_every: int = 5_000
+    # latest.pt는 덮어써지므로 이 step마다 `step_XXXXXXX.pt`로 따로 남긴다(되돌아갈 지점)
+    keep_every: int | None = 25_000
 
     @property
     def n_out(self) -> int:
@@ -96,6 +99,7 @@ class TabPFNv2TrainConfig:
             warmup_steps=1_000,
             val_every=1_000,
             checkpoint_every=1_000,
+            keep_every=5_000,
             border_datasets=5_000,
         )
 
@@ -120,6 +124,7 @@ class TabPFNv2TrainConfig:
             log_every=5,
             val_every=10,
             checkpoint_every=10,
+            keep_every=10,
         )
 
     def model_config(self) -> TabPFNv2Config:
@@ -244,7 +249,8 @@ def train_tabpfn_v2(
 
     rank 0만 MLflow에 기록한다. 활성 run이 있으면 거기에 이어서 쓴다(AI Runtime은
     `MLFLOW_RUN_ID`로 run을 넘겨준다). `checkpoint_every` step마다 학습 상태 전체를
-    `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다.
+    `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다. `keep_every`
+    step마다는 덮어쓰지 않는 `step_XXXXXXX.pt`로도 남긴다.
     """
     d, device = setup_distributed()
     config = config.for_world_size(d.world_size)
@@ -403,7 +409,8 @@ def train_tabpfn_v2(
             if mlf is not None:
                 mlf.log_metrics(val, step=done)
 
-        if d.is_main and (done % config.checkpoint_every == 0 or last):
+        keep = bool(config.keep_every) and done % config.keep_every == 0
+        if d.is_main and (done % config.checkpoint_every == 0 or keep or last):
             state = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
@@ -414,8 +421,14 @@ def train_tabpfn_v2(
                 "borders": borders,
             }
             torch.save(state, out_dir / "latest.pt")
+            kept = None
+            if keep:
+                kept = out_dir / f"step_{done:07d}.pt"
+                shutil.copyfile(out_dir / "latest.pt", kept)
             if mlf is not None:
                 mlf.log_artifact(str(out_dir / "latest.pt"), "checkpoints")
+                if kept is not None:
+                    mlf.log_artifact(str(kept), "checkpoints")
                 mlf.log_metric("checkpoint_step", done, step=done)
         if last:
             break
