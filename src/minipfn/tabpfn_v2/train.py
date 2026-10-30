@@ -72,8 +72,9 @@ class TabPFNv2TrainConfig:
     warmup_steps: int = 10_000
     lr: float = 2e-4
     grad_clip: float = 1.0
-    # 회귀에서 반복되는 target 값의 정답을 이웃 구간 몇 개에 흩을지 (0이면 끔, dequantize_targets)
-    dequantize_buckets: float = 0.0
+    # 회귀에서 반복되는 target 값의 정답을 이웃 구간 몇 개에 흩을지 (0이면 끔, dequantize_targets).
+    # 25k step 비교에서 100이어야 grad norm 증가가 멈췄다(10은 거의 효과 없음)
+    dequantize_buckets: float = 100.0
     # 실행
     seed: int = 0
     num_workers: int = 8
