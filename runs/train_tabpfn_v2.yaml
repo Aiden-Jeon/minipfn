@@ -5,6 +5,7 @@
 #   논문 규모:   --override env_variables.TABPFN_V2_CONFIG_NAME=paper --override env_variables.TABPFN_V2_STEPS=2000000 \
 #                --override mlflow_run_name=tabpfn-v2-<task>-paper --override timeout_minutes=<추정 시간>
 #   이어서 학습: --override env_variables.TABPFN_V2_RESUME_RUN_ID=<run_id>
+#                (남긴 step에서: --override env_variables.TABPFN_V2_RESUME_STEP=<step> 를 더한다)
 #   노드 2대:    --override compute.num_accelerators=16 --override mlflow_run_name=<이름>-16gpu
 #                (batch 64는 그대로, GPU당 micro batch가 8에서 4로 자동으로 줄어든다. 4대면 2)
 experiment_name: tabpfn-v2-reproduction

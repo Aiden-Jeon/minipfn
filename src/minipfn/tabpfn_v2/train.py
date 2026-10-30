@@ -409,7 +409,8 @@ def train_tabpfn_v2(
             if mlf is not None:
                 mlf.log_metrics(val, step=done)
 
-        if d.is_main and (done % config.checkpoint_every == 0 or last):
+        keep = bool(config.keep_every) and done % config.keep_every == 0
+        if d.is_main and (done % config.checkpoint_every == 0 or keep or last):
             state = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
@@ -421,7 +422,7 @@ def train_tabpfn_v2(
             }
             torch.save(state, out_dir / "latest.pt")
             kept = None
-            if config.keep_every and done % config.keep_every == 0:
+            if keep:
                 kept = out_dir / f"step_{done:07d}.pt"
                 shutil.copyfile(out_dir / "latest.pt", kept)
             if mlf is not None:

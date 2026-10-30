@@ -69,7 +69,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.resume_step is not None and not args.resume_run_id:
+        parser.error("--resume-step은 --resume-run-id와 같이 줘야 한다")
+    return args
 
 
 def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
@@ -119,8 +122,11 @@ def main(argv: list[str] | None = None) -> None:
     if is_main:
         print("config_name:", args.config_name)
         print(config)
-        # air가 넘겨준 run이 있으면 거기에, 이어서 학습하면 그 run에, 아니면 새 run에 기록한다
-        run_id = os.environ.get("MLFLOW_RUN_ID") or args.resume_run_id
+        # air가 넘겨준 run이 있으면 거기에, 이어서 학습하면 그 run에, 아니면 새 run에 기록한다.
+        # 남긴 step으로 되돌아가면 원래 run의 latest.pt와 뒤쪽 step_*.pt를 덮어쓰지 않도록
+        # 새 run에 쓴다
+        resume_into = args.resume_run_id if args.resume_step is None else None
+        run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
         run_name = None if run_id else f"tabpfn-v2-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)

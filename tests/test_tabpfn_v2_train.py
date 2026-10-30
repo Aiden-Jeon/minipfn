@@ -76,6 +76,14 @@ def test_kept_checkpoints_are_not_overwritten(tmp_path):
     )
     assert resumed["history"]["step"][-1] == 6
 
+    # keep_every가 checkpoint_every의 배수가 아니어도 그 step에 남긴다
+    odd = replace(config, checkpoint_every=4, keep_every=3)
+    train_tabpfn_v2(odd, tmp_path / "c", mlflow_log=False)
+    assert sorted(p.name for p in (tmp_path / "c").glob("step_*.pt")) == [
+        "step_0000003.pt",
+        "step_0000006.pt",
+    ]
+
 
 def test_val_batches_do_not_depend_on_micro_batch():
     config = TabPFNv2TrainConfig.smoke("classification")
