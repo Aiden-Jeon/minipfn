@@ -2,6 +2,7 @@
 #   databricks air run -f runs/train_tabpfn_v2.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
 # 기본은 8×H100에서 논문 크기 모델·batch 64로 300 step 실측(분류). 규모는 override로 바꾼다:
 #   회귀:        --override env_variables.TABPFN_V2_TASK=regression
+#                (반복되는 target을 이웃 구간 10개에 흩기: --override env_variables.TABPFN_V2_DEQUANTIZE_BUCKETS=10)
 #   논문 규모:   --override env_variables.TABPFN_V2_CONFIG_NAME=paper --override env_variables.TABPFN_V2_STEPS=2000000 \
 #                --override mlflow_run_name=tabpfn-v2-<task>-paper --override timeout_minutes=<추정 시간>
 #   이어서 학습: --override env_variables.TABPFN_V2_RESUME_RUN_ID=<run_id>

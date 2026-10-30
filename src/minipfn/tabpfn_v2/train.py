@@ -72,6 +72,8 @@ class TabPFNv2TrainConfig:
     warmup_steps: int = 10_000
     lr: float = 2e-4
     grad_clip: float = 1.0
+    # 회귀에서 반복되는 target 값의 정답을 이웃 구간 몇 개에 흩을지 (0이면 끔, dequantize_targets)
+    dequantize_buckets: float = 0.0
     # 실행
     seed: int = 0
     num_workers: int = 8
@@ -187,6 +189,33 @@ def prior_loss(
     if task == "classification":
         return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y_eval.reshape(-1).long())
     return bar(logits, y_eval.float()).mean()
+
+
+def dequantize_targets(
+    y: torch.Tensor, n_train: int, bar: FullSupportBarDistribution, n_buckets: float
+) -> torch.Tensor:
+    """데이터셋 안에서 반복되는 target 값의 검증 행 정답을 이웃 구간 `n_buckets`개에 흩는다.
+
+    같은 값이 반복되는 이산 target은 늘 같은 구간에 떨어지므로, 그 구간에 확률을 몰수록 NLL이
+    끝없이 낮아진다(최적 logit이 무한대). 그러면 출력층이 계속 커지고 gradient가 연속 target의
+    수백 배가 되어 학습이 무너진다(논문 규모 회귀 run에서 겪음). 구간 번호 좌표에서 균일 noise를
+    더해 정답을 이웃 구간에 퍼뜨리면 최적이 유한해진다. 연속 target, 양 끝 꼬리 구간의 값, 결측은
+    그대로 둔다(여기서 정함). 반환은 검증 행 정답 `(batch, n_eval)`이다.
+    """
+    y_eval = y[:, n_train:]
+    repeated = torch.zeros_like(y_eval, dtype=torch.bool)
+    for i in range(y.shape[0]):
+        _, inverse, counts = torch.unique(y[i], return_inverse=True, return_counts=True)
+        repeated[i] = counts[inverse[n_train:]] > 1
+    borders, widths, last = bar.borders, bar.widths, bar.num_buckets - 1
+    idx = bar._bucket_index(y_eval.contiguous())
+    interior = (idx >= 1) & (idx <= last - 1) & ~torch.isnan(y_eval)
+    coord = idx + (y_eval - borders[idx]) / widths[idx]  # 구간 번호 좌표 (k ~ k+1이 구간 k)
+    noise = (torch.rand_like(y_eval) - 0.5) * n_buckets
+    moved = (coord + noise).clamp(1.0, last - 1e-4)  # 꼬리 구간으로는 보내지 않는다
+    j = moved.floor().long()
+    shifted = borders[j] + (moved - j) * widths[j]
+    return torch.where(repeated & interior, shifted, y_eval)
 
 
 def _borders(
@@ -335,7 +364,10 @@ def train_tabpfn_v2(
             with ctx:
                 with autocast():
                     logits = ddp_model(x, y[:, :n_train])
-                loss = prior_loss(logits, y[:, n_train:], config.task, bar) / accumulation
+                y_eval = y[:, n_train:]
+                if bar is not None and config.dequantize_buckets:
+                    y_eval = dequantize_targets(y, n_train, bar, config.dequantize_buckets)
+                loss = prior_loss(logits, y_eval, config.task, bar) / accumulation
                 loss.backward()
             step_loss += loss.detach()
             micro_info.append((loss.detach(), x, y, n_train))
@@ -381,6 +413,8 @@ def train_tabpfn_v2(
                 "train_loss": window_loss / max(1, window_finite),
                 "lr": sched.get_last_lr()[0],
                 "grad_norm": float(grad_norm),
+                # 출력층 가중치 크기. 계속 커지면 출력이 날카로워지며 학습이 불안정해진다
+                "decoder_norm": model.decoder[-1].weight.norm().item(),
                 "skipped_steps": skipped_steps,
                 "sec_per_step": elapsed / n,
                 "data_wait_frac": window_wait / max(elapsed, 1e-9),
