@@ -296,9 +296,9 @@ def _rescale_lr(opt, sched, config: TabPFNv2TrainConfig, step: int, verbose: boo
     기준 lr(base_lrs, initial_lr)과 지금 lr을 함께 고친다. warmup·cosine 모양은 그대로다.
     """
     old = sched.base_lrs[0]
-    if abs(old - config.lr) <= 1e-12 * max(old, config.lr):
+    if math.isclose(old, config.lr, rel_tol=1e-12):
         return
-    factor = lr_factor(step, config.warmup_steps, config.steps)
+    factor = sched.lr_lambdas[0](step)  # scheduler가 쓰는 스케줄 그대로
     sched.base_lrs = [config.lr] * len(opt.param_groups)
     for group in opt.param_groups:
         group["initial_lr"] = config.lr
@@ -306,6 +306,12 @@ def _rescale_lr(opt, sched, config: TabPFNv2TrainConfig, step: int, verbose: boo
     sched._last_lr = [group["lr"] for group in opt.param_groups]
     if verbose:
         print(f"lr: 기준 {old:.2e} → {config.lr:.2e} (step {step}부터 {config.lr * factor:.3e})")
+
+
+def checkpoint_lr(path: str | Path) -> float:
+    """checkpoint가 쓰던 기준 lr. 이어서 학습할 때 lr을 따로 주지 않으면 이 값을 이어 간다."""
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    return float(state["scheduler"]["base_lrs"][0])
 
 
 def _to_cpu(obj):

@@ -10,6 +10,7 @@ from minipfn.tabpfn_v2.train import (
     CollapseGuard,
     TabPFNv2TrainConfig,
     _make_val_batches,
+    checkpoint_lr,
     dequantize_targets,
     lr_factor,
     train_tabpfn_v2,
@@ -226,6 +227,7 @@ def test_collapse_guard_counts_windows_without_finite_loss():
 def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
     config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=10, log_every=1)
     train_tabpfn_v2(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
+    assert checkpoint_lr(tmp_path / "a" / "latest.pt") == config.lr  # lr을 안 주면 이 값을 쓴다
     lower = replace(config, lr=config.lr / 2)
     train_tabpfn_v2(
         replace(lower, stop_step=6),
