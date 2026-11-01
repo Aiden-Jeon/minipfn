@@ -19,6 +19,7 @@ v1 재현에서 GPU로 학습하며 고친 세 가지를 그대로 둔다.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import shutil
@@ -84,6 +85,14 @@ class TabPFNv2TrainConfig:
     checkpoint_every: int = 5_000
     # latest.pt는 덮어써지므로 이 step마다 `step_XXXXXXX.pt`로 따로 남긴다(되돌아갈 지점)
     keep_every: int | None = 25_000
+    # 붕괴 감지 (CollapseGuard): log_every마다 낸 train loss 평균이 최근 건강한 평균보다
+    # collapse_threshold 넘게 높은 채로 collapse_patience번 이어지면, 메모리에 둔 건강한 상태로
+    # 되돌리고 데이터 시드를 바꿔 다시 간다. None이면 끈다. 값은 여기서 정함(논문 규모 run에서
+    # 붕괴는 분류 0.8 → 2.0, 회귀 −1.0 → +1.1로 뛰었고, 평소 흔들림은 0.1 안팎이었다)
+    collapse_threshold: float | None = 0.5
+    collapse_patience: int = 3
+    snapshot_every: int = 2_000  # 이 step마다 건강하면 상태를 메모리에 남긴다 (최근 2개)
+    max_rewinds: int = 10  # 한 번 실행에서 이보다 많이 되돌려야 하면 멈춘다
 
     @property
     def n_out(self) -> int:
@@ -279,6 +288,49 @@ def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, floa
     return out
 
 
+def _to_cpu(obj):
+    """state_dict 안의 텐서를 CPU로 복사한다 (메모리에 남겨 둘 사본)."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    return obj
+
+
+class CollapseGuard:
+    """train loss가 갑자기 뛰어 돌아오지 않는 붕괴를 알아챈다.
+
+    논문 규모 run에서 분류·회귀 모두 grad spike 없이도 수백 step 안에 상수 출력으로 무너진 적이
+    있다. 같은 시드로 다시 돌리면 무너지지 않아서(GPU 비결정성), 막기보다 알아채고 되돌린다.
+    log_every마다 window 평균 loss를 받아, 최근 건강한 window들의 중앙값보다 `threshold` 넘게
+    높은 window가 `patience`번 이어지면 붕괴로 본다. 모든 GPU가 같은 평균(all-reduce 뒤)을 보므로
+    판단도 같다.
+    """
+
+    def __init__(self, threshold: float, patience: int, n_windows: int = 20, min_windows: int = 5):
+        self.threshold, self.patience, self.min_windows = threshold, patience, min_windows
+        self.healthy: list[float] = []  # 최근 건강한 window 평균
+        self.n_windows = n_windows
+        self.bad = 0  # 이어진 나쁜 window 수
+
+    def update(self, window_mean: float) -> bool:
+        """window 평균을 넣고, 붕괴로 판단하면 True."""
+        if len(self.healthy) >= self.min_windows:
+            ref = sorted(self.healthy)[len(self.healthy) // 2]
+            if window_mean > ref + self.threshold:
+                self.bad += 1
+                return self.bad >= self.patience
+        self.bad = 0
+        self.healthy = (self.healthy + [window_mean])[-self.n_windows :]
+        return False
+
+    @property
+    def suspect(self) -> bool:
+        return self.bad > 0
+
+
 def train_tabpfn_v2(
     config: TabPFNv2TrainConfig,
     out_dir: str | Path,
@@ -290,7 +342,9 @@ def train_tabpfn_v2(
     rank 0만 MLflow에 기록한다. 활성 run이 있으면 거기에 이어서 쓴다(AI Runtime은
     `MLFLOW_RUN_ID`로 run을 넘겨준다). `checkpoint_every` step마다 학습 상태 전체를
     `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다. `keep_every`
-    step마다는 덮어쓰지 않는 `step_XXXXXXX.pt`로도 남긴다.
+    step마다는 덮어쓰지 않는 `step_XXXXXXX.pt`로도 남긴다. `CollapseGuard`가 붕괴를 알아채면
+    `snapshot_every`마다 메모리에 남긴 건강한 상태로 되돌리고 데이터 시드를 바꿔 다시 간다
+    (MLflow `rewinds`). 붕괴 중일 수 있는 상태는 checkpoint로 남기지 않는다.
     """
     d, device = setup_distributed()
     config = config.for_world_size(d.world_size)
@@ -330,12 +384,17 @@ def train_tabpfn_v2(
             return torch.autocast("cuda", dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
-    # 이어서 학습할 때 같은 데이터를 다시 보지 않도록 시드에 시작 step을 섞는다
-    dataset = PriorBatches(config, seed=(config.seed, start_step, d.rank))
     loader_kwargs = {"num_workers": config.num_workers, "pin_memory": use_cuda}
     if config.num_workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
-    batches = iter(DataLoader(dataset, batch_size=None, **loader_kwargs))
+
+    def make_batches(from_step: int, rewinds: int):
+        # 이어서 학습할 때 같은 데이터를 다시 보지 않도록 시드에 시작 step을 섞는다.
+        # 붕괴로 되돌아가면 되돌린 횟수도 섞어 다른 데이터로 다시 간다
+        seed = (config.seed, from_step, d.rank) + ((rewinds,) if rewinds else ())
+        return iter(DataLoader(PriorBatches(config, seed=seed), batch_size=None, **loader_kwargs))
+
+    batches = make_batches(start_step, 0)
 
     mlf, val_batches = None, None
     if d.is_main:
@@ -358,11 +417,35 @@ def train_tabpfn_v2(
                     }
                 )
 
+    guard = None
+    if config.collapse_threshold is not None:
+        guard = CollapseGuard(config.collapse_threshold, config.collapse_patience)
+    guard_sum, guard_n, rewinds = 0.0, 0, 0
+    snapshots: list[dict] = []  # 메모리에 둔 건강한 상태 (최근 2개, 되돌릴 때는 오래된 쪽)
+
+    def snapshot(at_step: int) -> None:
+        snapshots.append(
+            {
+                "model": _to_cpu(model.state_dict()),
+                "optimizer": _to_cpu(opt.state_dict()),
+                "scheduler": copy.deepcopy(sched.state_dict()),
+                "step": at_step,
+                "history": copy.deepcopy(history),
+                "skipped_steps": skipped_steps,
+                "healthy": list(guard.healthy),
+            }
+        )
+        del snapshots[:-2]
+
     ddp_model.train()
     window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
     last_log_step, skip_reports = start_step, 0
     stop_step = min(config.stop_step or config.steps, config.steps)
-    for step in range(start_step, stop_step):
+    if guard is not None:
+        snapshot(start_step)
+    step = start_step - 1
+    while step + 1 < stop_step:
+        step += 1
         step_loss = torch.zeros((), device=device)
         micro_info = []
         for micro in range(accumulation):
@@ -407,6 +490,7 @@ def train_tabpfn_v2(
         if torch.isfinite(step_loss):
             window_loss += step_loss.item()
             window_finite += 1
+            guard_sum, guard_n = guard_sum + step_loss.item(), guard_n + 1
 
         done = step + 1
         # 시각을 넘겼는지는 log_every마다 보고, 모든 GPU가 같은 step에서 멈추도록 판단을 맞춘다
@@ -417,7 +501,41 @@ def train_tabpfn_v2(
             if late.item() > 0:
                 stop_step = done
         last = done == stop_step
-        if d.is_main and (done % config.log_every == 0 or last):
+
+        rewound_at_end = False
+        if guard is not None:
+            collapsed = False
+            if done % config.log_every == 0 and guard_n:
+                collapsed = guard.update(guard_sum / guard_n)
+                guard_sum, guard_n = 0.0, 0
+            # 무너졌거나, 의심스러운 채로 끝나면 마지막 건강한 상태로 되돌린다
+            if collapsed or (last and guard.suspect):
+                rewinds += 1
+                if rewinds > config.max_rewinds:
+                    raise RuntimeError(f"step {done}: 붕괴로 {config.max_rewinds}번 넘게 되돌렸다")
+                snap = snapshots[0]
+                model.load_state_dict(snap["model"])
+                opt.load_state_dict(snap["optimizer"])
+                sched.load_state_dict(snap["scheduler"])
+                history = copy.deepcopy(snap["history"])
+                skipped_steps = snap["skipped_steps"]
+                guard.healthy, guard.bad = list(snap["healthy"]), 0
+                del snapshots[1:]
+                if d.is_main:
+                    print(
+                        f"step {done}: train loss 붕괴 → step {snap['step']}로 되돌림", flush=True
+                    )
+                    if mlf is not None:
+                        mlf.log_metric("rewinds", rewinds, step=done)
+                del batches
+                batches = make_batches(snap["step"], rewinds)
+                window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
+                last_log_step = snap["step"]
+                if not last:
+                    step = snap["step"] - 1
+                    continue
+                done, rewound_at_end = snap["step"], True  # 되돌린 상태를 남기고 멈춘다
+        if d.is_main and (done % config.log_every == 0 or last) and not rewound_at_end:
             n = done - last_log_step
             elapsed = time.time() - window_start
             metrics = {
@@ -446,7 +564,7 @@ def train_tabpfn_v2(
             window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
             last_log_step = done
 
-        if d.is_main and (done % config.val_every == 0 or last):
+        if d.is_main and (done % config.val_every == 0 or last) and not rewound_at_end:
             val = _validate(model, val_batches, device, autocast, config.task, bar)
             history["val_step"].append(done)
             history["val_loss"].append(val["val_loss"])
@@ -455,7 +573,8 @@ def train_tabpfn_v2(
                 mlf.log_metrics(val, step=done)
 
         keep = bool(config.keep_every) and done % config.keep_every == 0
-        if d.is_main and (done % config.checkpoint_every == 0 or keep or last):
+        suspect = guard is not None and guard.suspect  # 무너지는 중일 수 있는 상태는 남기지 않는다
+        if d.is_main and (done % config.checkpoint_every == 0 or keep or last) and not suspect:
             state = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
@@ -477,6 +596,8 @@ def train_tabpfn_v2(
                 mlf.log_metric("checkpoint_step", done, step=done)
         if last:
             break
+        if guard is not None and done % config.snapshot_every == 0 and not guard.suspect:
+            snapshot(done)
 
     final_path = out_dir / "tabpfn_v2_final.pt"
     if d.is_main:

@@ -2,10 +2,12 @@
 
 from dataclasses import replace
 
+import pytest
 import torch
 
 from minipfn.tabpfn_v2.model import load_checkpoint
 from minipfn.tabpfn_v2.train import (
+    CollapseGuard,
     TabPFNv2TrainConfig,
     _make_val_batches,
     dequantize_targets,
@@ -145,3 +147,48 @@ def test_micro_batch_shrinks_when_gpus_exceed_the_batch():
         assert scaled.batch_size == 64
         assert scaled.micro_batch == micro
         assert scaled.grad_accumulation(world_size) == accumulation
+
+
+def test_collapse_guard_needs_a_sustained_jump():
+    guard = CollapseGuard(threshold=0.5, patience=3)
+    for v in [0.82, 0.80, 0.81, 0.79, 0.83, 0.80]:
+        assert not guard.update(v)
+    assert not guard.update(1.5)  # 한 번 튄 건 붕괴가 아니다
+    assert not guard.update(0.81) and not guard.suspect
+    assert not guard.update(2.0) and not guard.update(2.0)
+    assert guard.update(2.0)  # 3번 이어지면 붕괴
+
+
+def test_training_rewinds_after_a_collapse(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    original = CollapseGuard.update
+
+    def fake_update(self, window_mean):
+        calls["n"] += 1
+        if calls["n"] == 7:  # 7번째 window에서 한 번 붕괴했다고 본다
+            return True
+        return original(self, window_mean)
+
+    monkeypatch.setattr(CollapseGuard, "update", fake_update)
+    config = replace(
+        TabPFNv2TrainConfig.smoke("classification"), steps=50, log_every=5, snapshot_every=10
+    )
+    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    steps = result["history"]["step"]
+    assert steps[-1] == 50
+    assert steps == sorted(set(steps))  # 되돌린 구간의 기록은 지우고 다시 쓴다
+    # 35 step에서 붕괴 → 최근 두 snapshot(20, 30) 중 오래된 20으로 되돌아가 다시 50까지
+    assert calls["n"] == 7 + (50 - 20) // 5
+
+
+def test_training_stops_after_too_many_rewinds(tmp_path):
+    config = replace(
+        TabPFNv2TrainConfig.smoke("classification"),
+        steps=200,
+        log_every=5,
+        snapshot_every=10,
+        collapse_threshold=-10.0,  # 건강한 기록이 쌓인 뒤로는 모든 window가 나쁘다
+        max_rewinds=2,
+    )
+    with pytest.raises(RuntimeError, match="되돌렸다"):
+        train_tabpfn_v2(config, tmp_path, mlflow_log=False)
