@@ -15,6 +15,7 @@ train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔).
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
+이어서 학습할 때 `TABPFN_V2_LR`을 checkpoint와 다르게 주면 남은 스케줄을 그 lr 기준으로 바꾼다.
 `--resume-run-id`(또는 `TABPFN_V2_RESUME_RUN_ID`)를 주면 그 run의 `checkpoints/latest.pt`에서
 이어서 학습한다. `--resume-step`(또는 `TABPFN_V2_RESUME_STEP`)을 같이 주면 그 step에 남긴
 `checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).

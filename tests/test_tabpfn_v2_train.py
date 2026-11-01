@@ -221,3 +221,20 @@ def test_collapse_guard_counts_windows_without_finite_loss():
     guard = CollapseGuard(threshold=0.5, patience=2)
     assert not guard.update(float("inf")) and guard.suspect  # 건강한 기록이 없어도 나쁘다
     assert guard.update(float("inf"))
+
+
+def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
+    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=10, log_every=1)
+    train_tabpfn_v2(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
+    lower = replace(config, lr=config.lr / 2)
+    train_tabpfn_v2(
+        replace(lower, stop_step=6),
+        tmp_path / "b",
+        resume_from=tmp_path / "a" / "latest.pt",
+        mlflow_log=False,
+    )
+    state = torch.load(tmp_path / "b" / "latest.pt", weights_only=True)
+    assert abs(state["scheduler"]["base_lrs"][0] - lower.lr) < 1e-15
+    expected = lower.lr * lr_factor(6, config.warmup_steps, config.steps)
+    assert abs(state["scheduler"]["_last_lr"][0] - expected) < 1e-12
+    assert abs(state["optimizer"]["param_groups"][0]["lr"] - expected) < 1e-12
