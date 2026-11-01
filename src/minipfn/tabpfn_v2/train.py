@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
+import math
 import os
 import shutil
 import time
@@ -316,12 +317,17 @@ class CollapseGuard:
         self.bad = 0  # 이어진 나쁜 window 수
 
     def update(self, window_mean: float) -> bool:
-        """window 평균을 넣고, 붕괴로 판단하면 True."""
-        if len(self.healthy) >= self.min_windows:
+        """window 평균을 넣고, 붕괴로 판단하면 True.
+
+        유한한 loss가 하나도 없던 window(inf)는 나쁜 window로 센다.
+        """
+        bad = not math.isfinite(window_mean)
+        if not bad and len(self.healthy) >= self.min_windows:
             ref = sorted(self.healthy)[len(self.healthy) // 2]
-            if window_mean > ref + self.threshold:
-                self.bad += 1
-                return self.bad >= self.patience
+            bad = window_mean > ref + self.threshold
+        if bad:
+            self.bad += 1
+            return self.bad >= self.patience
         self.bad = 0
         self.healthy = (self.healthy + [window_mean])[-self.n_windows :]
         return False
@@ -361,7 +367,7 @@ def train_tabpfn_v2(
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: lr_factor(s, config.warmup_steps, config.steps)
     )
-    start_step, skipped_steps, borders = 0, 0, None
+    start_step, skipped_steps, borders, rewinds = 0, 0, None, 0
     history: dict[str, list] = {"step": [], "train_loss": [], "val_step": [], "val_loss": []}
     if resume_from is not None:
         state = torch.load(resume_from, map_location=device, weights_only=True)
@@ -371,6 +377,9 @@ def train_tabpfn_v2(
         start_step = int(state["step"])
         history = state["history"]
         skipped_steps = int(state["skipped_steps"])
+        rewinds = int(
+            state.get("rewinds", 0)
+        )  # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록
         borders = state["borders"]
     if borders is None:
         borders = _borders(config, d, device)
@@ -394,7 +403,7 @@ def train_tabpfn_v2(
         seed = (config.seed, from_step, d.rank) + ((rewinds,) if rewinds else ())
         return iter(DataLoader(PriorBatches(config, seed=seed), batch_size=None, **loader_kwargs))
 
-    batches = make_batches(start_step, 0)
+    batches = make_batches(start_step, rewinds)
 
     mlf, val_batches = None, None
     if d.is_main:
@@ -420,8 +429,8 @@ def train_tabpfn_v2(
     guard = None
     if config.collapse_threshold is not None:
         guard = CollapseGuard(config.collapse_threshold, config.collapse_patience)
-    guard_sum, guard_n, rewinds = 0.0, 0, 0
-    snapshots: list[dict] = []  # 메모리에 둔 건강한 상태 (최근 2개, 되돌릴 때는 오래된 쪽)
+    rewinds_here = 0  # 이번 실행에서 되돌린 횟수 (rewinds는 이전 chunk까지 포함한 누계)
+    snapshots: list[dict] = []  # 메모리에 둔 건강한 상태 (최근 2개)
 
     def snapshot(at_step: int) -> None:
         snapshots.append(
@@ -490,7 +499,6 @@ def train_tabpfn_v2(
         if torch.isfinite(step_loss):
             window_loss += step_loss.item()
             window_finite += 1
-            guard_sum, guard_n = guard_sum + step_loss.item(), guard_n + 1
 
         done = step + 1
         # 시각을 넘겼는지는 log_every마다 보고, 모든 GPU가 같은 step에서 멈추도록 판단을 맞춘다
@@ -505,22 +513,24 @@ def train_tabpfn_v2(
         rewound_at_end = False
         if guard is not None:
             collapsed = False
-            if done % config.log_every == 0 and guard_n:
-                collapsed = guard.update(guard_sum / guard_n)
-                guard_sum, guard_n = 0.0, 0
+            if done % config.log_every == 0:
+                # window_loss는 all-reduce 뒤 값이라 모든 GPU에서 같다
+                collapsed = guard.update(window_loss / window_finite if window_finite else math.inf)
             # 무너졌거나, 의심스러운 채로 끝나면 마지막 건강한 상태로 되돌린다
             if collapsed or (last and guard.suspect):
-                rewinds += 1
-                if rewinds > config.max_rewinds:
+                rewinds, rewinds_here = rewinds + 1, rewinds_here + 1
+                if rewinds_here > config.max_rewinds:
                     raise RuntimeError(f"step {done}: 붕괴로 {config.max_rewinds}번 넘게 되돌렸다")
-                snap = snapshots[0]
+                # 붕괴면 무너지기 시작한 지점보다 앞서도록 오래된 쪽으로, 의심스러운 채로 끝나는
+                # 것뿐이면(한 번 튄 것일 수 있다) 가장 최근 건강한 상태로 되돌린다
+                snap = snapshots[0] if collapsed else snapshots[-1]
                 model.load_state_dict(snap["model"])
                 opt.load_state_dict(snap["optimizer"])
                 sched.load_state_dict(snap["scheduler"])
                 history = copy.deepcopy(snap["history"])
                 skipped_steps = snap["skipped_steps"]
                 guard.healthy, guard.bad = list(snap["healthy"]), 0
-                del snapshots[1:]
+                snapshots[:] = [snap]
                 if d.is_main:
                     print(
                         f"step {done}: train loss 붕괴 → step {snap['step']}로 되돌림", flush=True
@@ -561,6 +571,7 @@ def train_tabpfn_v2(
             )
             if mlf is not None:
                 mlf.log_metrics(metrics, step=done)
+        if done % config.log_every == 0 or last:
             window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
             last_log_step = done
 
@@ -583,6 +594,7 @@ def train_tabpfn_v2(
                 "history": history,
                 "skipped_steps": skipped_steps,
                 "borders": borders,
+                "rewinds": rewinds,
             }
             torch.save(state, out_dir / "latest.pt")
             kept = None

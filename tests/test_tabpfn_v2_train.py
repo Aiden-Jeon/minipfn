@@ -179,6 +179,29 @@ def test_training_rewinds_after_a_collapse(tmp_path, monkeypatch):
     assert steps == sorted(set(steps))  # 되돌린 구간의 기록은 지우고 다시 쓴다
     # 35 step에서 붕괴 → 최근 두 snapshot(20, 30) 중 오래된 20으로 되돌아가 다시 50까지
     assert calls["n"] == 7 + (50 - 20) // 5
+    # 되돌린 횟수는 checkpoint에 남아 다음 chunk의 데이터 시드에도 섞인다
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["rewinds"] == 1
+
+
+def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    original = CollapseGuard.update
+
+    def fake_update(self, window_mean):
+        calls["n"] += 1
+        if calls["n"] == 10:  # 마지막 window(50 step)만 한 번 튄다
+            self.bad += 1
+            return False
+        return original(self, window_mean)
+
+    monkeypatch.setattr(CollapseGuard, "update", fake_update)
+    config = replace(
+        TabPFNv2TrainConfig.smoke("classification"), steps=50, log_every=5, snapshot_every=10
+    )
+    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    state = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert state["step"] == 40  # 오래된 30이 아니라 가장 최근 건강한 40
+    assert result["history"]["step"][-1] == 40
 
 
 def test_training_stops_after_too_many_rewinds(tmp_path):
@@ -192,3 +215,9 @@ def test_training_stops_after_too_many_rewinds(tmp_path):
     )
     with pytest.raises(RuntimeError, match="되돌렸다"):
         train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+
+
+def test_collapse_guard_counts_windows_without_finite_loss():
+    guard = CollapseGuard(threshold=0.5, patience=2)
+    assert not guard.update(float("inf")) and guard.suspect  # 건강한 기록이 없어도 나쁘다
+    assert guard.update(float("inf"))

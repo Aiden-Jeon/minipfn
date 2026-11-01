@@ -12,7 +12,7 @@ AI Runtime(`databricks air run -f runs/train_tabpfn_v2.yaml`)과 로컬에서 �
 `TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
-(붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5).
+(붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔).
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
 `--resume-run-id`(또는 `TABPFN_V2_RESUME_RUN_ID`)를 주면 그 run의 `checkpoints/latest.pt`에서
@@ -73,7 +73,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-every", type=int, default=_env("TABPFN_V2_KEEP_EVERY", int))
     parser.add_argument(
-        "--collapse-threshold", type=float, default=_env("TABPFN_V2_COLLAPSE_THRESHOLD", float)
+        "--collapse-threshold", default=os.environ.get("TABPFN_V2_COLLAPSE_THRESHOLD") or None
     )
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
@@ -95,10 +95,13 @@ def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
         "stop_step": args.stop_step,
         "checkpoint_every": args.checkpoint_every,
         "keep_every": args.keep_every,
-        "collapse_threshold": args.collapse_threshold,
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
-    return replace(config, **{k: v for k, v in overrides.items() if v is not None})
+    config = replace(config, **{k: v for k, v in overrides.items() if v is not None})
+    if args.collapse_threshold is not None:  # `off`면 CollapseGuard를 끈다
+        off = args.collapse_threshold.lower() in ("off", "none")
+        config = replace(config, collapse_threshold=None if off else float(args.collapse_threshold))
+    return config
 
 
 def plot_history(history: dict, task: str) -> plt.Figure:
