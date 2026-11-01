@@ -15,6 +15,8 @@ train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔).
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
+이어서 학습할 때 `TABPFN_V2_LR`을 checkpoint와 다르게 주면 남은 스케줄을 그 lr 기준으로 바꾸고,
+주지 않으면 checkpoint가 쓰던 lr을 이어 간다.
 `--resume-run-id`(또는 `TABPFN_V2_RESUME_RUN_ID`)를 주면 그 run의 `checkpoints/latest.pt`에서
 이어서 학습한다. `--resume-step`(또는 `TABPFN_V2_RESUME_STEP`)을 같이 주면 그 step에 남긴
 `checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).
@@ -36,7 +38,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
-from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig, train_tabpfn_v2  # noqa: E402
+from minipfn.tabpfn_v2.train import (  # noqa: E402
+    TabPFNv2TrainConfig,
+    checkpoint_lr,
+    train_tabpfn_v2,
+)
 from minipfn.utils import log_run_source  # noqa: E402
 
 CONFIG_NAMES = ("smoke", "medium", "paper")
@@ -132,6 +138,9 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
+        if args.lr is None:
+            # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
+            config = replace(config, lr=checkpoint_lr(resume_path))
 
     if is_main:
         print("config_name:", args.config_name)

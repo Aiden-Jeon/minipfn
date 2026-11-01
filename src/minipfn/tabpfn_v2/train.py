@@ -289,6 +289,31 @@ def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, floa
     return out
 
 
+def _rescale_lr(opt, sched, config: TabPFNv2TrainConfig, step: int, verbose: bool) -> None:
+    """이어서 학습할 때 config.lr이 checkpoint의 기준 lr과 다르면 남은 스케줄을 그 비율로 바꾼다.
+
+    optimizer와 scheduler 상태를 불러오면 lr도 checkpoint 값으로 돌아가므로, lr을 바꿔 이어 가려면
+    기준 lr(base_lrs, initial_lr)과 지금 lr을 함께 고친다. warmup·cosine 모양은 그대로다.
+    """
+    old = sched.base_lrs[0]
+    if math.isclose(old, config.lr, rel_tol=1e-12):
+        return
+    factor = sched.lr_lambdas[0](step)  # scheduler가 쓰는 스케줄 그대로
+    sched.base_lrs = [config.lr] * len(opt.param_groups)
+    for group in opt.param_groups:
+        group["initial_lr"] = config.lr
+        group["lr"] = config.lr * factor
+    sched._last_lr = [group["lr"] for group in opt.param_groups]
+    if verbose:
+        print(f"lr: 기준 {old:.2e} → {config.lr:.2e} (step {step}부터 {config.lr * factor:.3e})")
+
+
+def checkpoint_lr(path: str | Path) -> float:
+    """checkpoint가 쓰던 기준 lr. 이어서 학습할 때 lr을 따로 주지 않으면 이 값을 이어 간다."""
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    return float(state["scheduler"]["base_lrs"][0])
+
+
 def _to_cpu(obj):
     """state_dict 안의 텐서를 CPU로 복사한다 (메모리에 남겨 둘 사본)."""
     if isinstance(obj, torch.Tensor):
@@ -377,9 +402,9 @@ def train_tabpfn_v2(
         start_step = int(state["step"])
         history = state["history"]
         skipped_steps = int(state["skipped_steps"])
-        rewinds = int(
-            state.get("rewinds", 0)
-        )  # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록
+        # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록 되돌린 횟수를 이어받는다
+        rewinds = int(state.get("rewinds", 0))
+        _rescale_lr(opt, sched, config, start_step, d.is_main)
         borders = state["borders"]
     if borders is None:
         borders = _borders(config, d, device)
