@@ -72,6 +72,9 @@ class TabPFNv2TrainConfig:
     stop_step: int | None = None  # 이번 실행을 멈출 step (None이면 steps까지). 나눠 학습할 때 쓴다
     deadline: float | None = None  # 이 시각(Unix time)을 넘기면 checkpoint를 남기고 멈춘다
     warmup_steps: int = 10_000
+    # 분류는 2e-4로 끝까지 간다. 회귀는 2e-4로 200k를 넘기면 grad가 폭발해 붕괴가 반복돼서 이어 갈
+    # 때 TABPFN_V2_LR로 낮췄다(225k부터 1e-4, 275k부터 5e-5). 275k에서 35k step 비교: 1e-4는
+    # weight decay(0.01, 0.1)를 더해도 3번씩 되돌렸고 5e-5만 한 번도 무너지지 않았다
     lr: float = 2e-4
     grad_clip: float = 1.0
     # 회귀에서 반복되는 target 값의 정답을 이웃 구간 몇 개에 흩을지 (0이면 끔, dequantize_targets).
