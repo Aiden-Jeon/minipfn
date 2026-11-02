@@ -72,6 +72,7 @@ class TabPFNv2TrainConfig:
     stop_step: int | None = None  # 이번 실행을 멈출 step (None이면 steps까지). 나눠 학습할 때 쓴다
     deadline: float | None = None  # 이 시각(Unix time)을 넘기면 checkpoint를 남기고 멈춘다
     warmup_steps: int = 10_000
+    # 회귀는 200k 언저리부터 이 lr에서 붕괴가 되풀이됐다. 낮추는 건 rewind_lr_factor 규칙이 맡는다
     lr: float = 2e-4
     grad_clip: float = 1.0
     # 회귀에서 반복되는 target 값의 정답을 이웃 구간 몇 개에 흩을지 (0이면 끔, dequantize_targets).
@@ -94,6 +95,18 @@ class TabPFNv2TrainConfig:
     collapse_patience: int = 3
     snapshot_every: int = 2_000  # 이 step마다 건강하면 상태를 메모리에 남긴다 (최근 2개)
     max_rewinds: int = 10  # 한 번 실행에서 이보다 많이 되돌려야 하면 멈춘다
+    # 붕괴로 되돌릴 때마다 기준 lr에 곱하는 값 (1이면 lr 그대로). 되돌려도 같은 lr이면 붕괴가
+    # 되풀이됐고(회귀 run에서 rewind 8~10번), 같은 checkpoint에서 lr만 낮추면 멈췄다(275k에서
+    # 35k step 비교: 1e-4는 weight decay를 더해도 3번씩, 5e-5는 0번). 사람이 중간에 lr을 고치는 대신
+    # 미리 정한 규칙으로 낮춘다. warmup·cosine 모양은 그대로이고 다음 chunk에도 이어진다
+    rewind_lr_factor: float = 1.0
+    # 규칙으로는 기준 lr을 이보다 낮추지 않는다(그 뒤로는 되돌리기만 한다). 2e-4에서 세 번 절반,
+    # 5e-5가 안정했던 것의 절반까지. 이어서 학습할 때 TABPFN_V2_LR로 준 lr은 이 값과 상관없다
+    rewind_min_lr: float = 2.5e-5
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.rewind_lr_factor <= 1.0:
+            raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
 
     @property
     def n_out(self) -> int:
@@ -101,7 +114,8 @@ class TabPFNv2TrainConfig:
 
     @classmethod
     def paper(cls, task: str = "classification") -> TabPFNv2TrainConfig:
-        return cls(task=task)
+        # 분류는 2e-4에서 붕괴가 드물어(300k까지 rewind 1번) lr을 그대로 둔다
+        return cls(task=task, rewind_lr_factor=0.5 if task == "regression" else 1.0)
 
     @classmethod
     def medium(cls, task: str = "classification") -> TabPFNv2TrainConfig:
@@ -289,23 +303,22 @@ def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, floa
     return out
 
 
-def _rescale_lr(opt, sched, config: TabPFNv2TrainConfig, step: int, verbose: bool) -> None:
-    """이어서 학습할 때 config.lr이 checkpoint의 기준 lr과 다르면 남은 스케줄을 그 비율로 바꾼다.
+def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
+    """기준 lr(base_lrs, initial_lr)을 바꾸고 지금 lr을 그 기준의 `step` 값으로 맞춘다.
 
-    optimizer와 scheduler 상태를 불러오면 lr도 checkpoint 값으로 돌아가므로, lr을 바꿔 이어 가려면
-    기준 lr(base_lrs, initial_lr)과 지금 lr을 함께 고친다. warmup·cosine 모양은 그대로다.
+    optimizer와 scheduler 상태를 불러오면 lr도 그 상태의 값으로 돌아가므로, 이어서 학습할 때 lr을
+    바꾸거나 붕괴로 되돌린 뒤 lr을 낮추려면 기준 lr과 지금 lr을 함께 고친다. warmup·cosine 모양은
+    그대로다. 같은 lr이면 아무것도 바뀌지 않는다.
     """
     old = sched.base_lrs[0]
-    if math.isclose(old, config.lr, rel_tol=1e-12):
-        return
     factor = sched.lr_lambdas[0](step)  # scheduler가 쓰는 스케줄 그대로
-    sched.base_lrs = [config.lr] * len(opt.param_groups)
+    sched.base_lrs = [lr] * len(opt.param_groups)
     for group in opt.param_groups:
-        group["initial_lr"] = config.lr
-        group["lr"] = config.lr * factor
+        group["initial_lr"] = lr
+        group["lr"] = lr * factor
     sched._last_lr = [group["lr"] for group in opt.param_groups]
-    if verbose:
-        print(f"lr: 기준 {old:.2e} → {config.lr:.2e} (step {step}부터 {config.lr * factor:.3e})")
+    if verbose and not math.isclose(old, lr, rel_tol=1e-12):
+        print(f"lr: 기준 {old:.2e} → {lr:.2e} (step {step}부터 {lr * factor:.3e})", flush=True)
 
 
 def checkpoint_lr(path: str | Path) -> float:
@@ -404,7 +417,7 @@ def train_tabpfn_v2(
         skipped_steps = int(state["skipped_steps"])
         # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록 되돌린 횟수를 이어받는다
         rewinds = int(state.get("rewinds", 0))
-        _rescale_lr(opt, sched, config, start_step, d.is_main)
+        _set_base_lr(opt, sched, config.lr, start_step, d.is_main)
         borders = state["borders"]
     if borders is None:
         borders = _borders(config, d, device)
@@ -450,6 +463,11 @@ def train_tabpfn_v2(
                         "cpu_count": os.cpu_count(),
                     }
                 )
+            else:
+                # 이어서 쓰는 run은 param을 바꿀 수 없으니, 그 뒤에 생긴 설정만 더한다
+                new = {k: v for k, v in asdict(config).items() if k not in run_params}
+                if new:
+                    mlf.log_params(new)
 
     guard = None
     if config.collapse_threshold is not None:
@@ -549,9 +567,18 @@ def train_tabpfn_v2(
                 # 붕괴면 무너지기 시작한 지점보다 앞서도록 오래된 쪽으로, 의심스러운 채로 끝나는
                 # 것뿐이면(한 번 튄 것일 수 있다) 가장 최근 건강한 상태로 되돌린다
                 snap = snapshots[0] if collapsed else snapshots[-1]
+                # snapshot이 이전 lr 인하보다 앞설 수 있으니 되돌리기 전의 lr을 기준으로 낮춘다
+                lr_now = sched.base_lrs[0]
                 model.load_state_dict(snap["model"])
                 opt.load_state_dict(snap["optimizer"])
                 sched.load_state_dict(snap["scheduler"])
+                # 한 번 튄 채로 끝난 것뿐이면 붕괴가 아니므로 lr은 그대로 둔다
+                lr_next = lr_now
+                if collapsed:  # 하한까지만 낮춘다 (이미 하한보다 낮으면 그대로)
+                    lr_next = min(
+                        lr_now, max(lr_now * config.rewind_lr_factor, config.rewind_min_lr)
+                    )
+                _set_base_lr(opt, sched, lr_next, snap["step"], d.is_main)
                 history = copy.deepcopy(snap["history"])
                 skipped_steps = snap["skipped_steps"]
                 guard.healthy, guard.bad = list(snap["healthy"]), 0
@@ -576,6 +603,8 @@ def train_tabpfn_v2(
             metrics = {
                 "train_loss": window_loss / max(1, window_finite),
                 "lr": sched.get_last_lr()[0],
+                # 스케줄의 기준 lr. 이어 갈 때 바꾸거나 붕괴 규칙으로 낮추면 config.lr과 달라진다
+                "base_lr": sched.base_lrs[0],
                 "grad_norm": float(grad_norm),
                 # 출력층 가중치 크기. 계속 커지면 출력이 날카로워지며 학습이 불안정해진다
                 "decoder_norm": model.decoder[-1].weight.norm().item(),
