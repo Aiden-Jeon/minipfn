@@ -184,6 +184,39 @@ def test_training_rewinds_after_a_collapse(tmp_path, monkeypatch):
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["rewinds"] == 1
 
 
+def test_each_collapse_lowers_the_lr_by_the_rewind_factor(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    original = CollapseGuard.update
+
+    def fake_update(self, window_mean):
+        calls["n"] += 1
+        if calls["n"] in (7, 9):  # 35 step에서 붕괴, 되돌아간 20부터 다시 가다 30 step에서 또 붕괴
+            return True
+        return original(self, window_mean)
+
+    monkeypatch.setattr(CollapseGuard, "update", fake_update)
+    config = replace(
+        TabPFNv2TrainConfig.smoke("classification"),
+        steps=50,
+        log_every=5,
+        snapshot_every=10,
+        rewind_lr_factor=0.5,
+    )
+    train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    state = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert state["rewinds"] == 2
+    # 두 번째로 되돌아간 snapshot(20 step)은 첫 인하 전 상태지만 lr은 두 번 모두 반영된다
+    assert abs(state["scheduler"]["base_lrs"][0] - config.lr / 4) < 1e-15
+    expected = config.lr / 4 * lr_factor(50, config.warmup_steps, config.steps)
+    assert abs(state["optimizer"]["param_groups"][0]["lr"] - expected) < 1e-12
+    assert checkpoint_lr(tmp_path / "latest.pt") == config.lr / 4  # 다음 chunk가 이어 간다
+
+
+def test_paper_preset_lowers_the_lr_on_collapse_only_for_regression():
+    assert TabPFNv2TrainConfig.paper("regression").rewind_lr_factor == 0.5
+    assert TabPFNv2TrainConfig.paper("classification").rewind_lr_factor == 1.0
+
+
 def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, monkeypatch):
     calls = {"n": 0}
     original = CollapseGuard.update
@@ -197,11 +230,16 @@ def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, mon
 
     monkeypatch.setattr(CollapseGuard, "update", fake_update)
     config = replace(
-        TabPFNv2TrainConfig.smoke("classification"), steps=50, log_every=5, snapshot_every=10
+        TabPFNv2TrainConfig.smoke("classification"),
+        steps=50,
+        log_every=5,
+        snapshot_every=10,
+        rewind_lr_factor=0.5,
     )
     result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
     state = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert state["step"] == 40  # 오래된 30이 아니라 가장 최근 건강한 40
+    assert state["scheduler"]["base_lrs"][0] == config.lr  # 붕괴가 아니니 lr은 그대로
     assert result["history"]["step"][-1] == 40
 
 
