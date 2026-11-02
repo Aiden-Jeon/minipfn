@@ -43,6 +43,7 @@ import mlflow  # noqa: E402
 from minipfn.tabpfn_v2.train import (  # noqa: E402
     TabPFNv2TrainConfig,
     checkpoint_lr,
+    checkpoint_qk_norm,
     train_tabpfn_v2,
 )
 from minipfn.utils import log_run_source  # noqa: E402
@@ -159,6 +160,15 @@ def main(argv: list[str] | None = None) -> None:
                 f"주의: checkpoint의 기준 lr {saved_lr:.2e}보다 높은 {args.lr:.2e}로 이어 간다. "
                 "붕괴 규칙으로 낮춘 lr이었다면 그 인하가 사라진다",
                 flush=True,
+            )
+        saved_qk_norm = checkpoint_qk_norm(resume_path)
+        if args.qk_norm is None:
+            # 모델 구조는 checkpoint를 따른다 (다르면 가중치를 불러올 수 없다)
+            config = replace(config, qk_norm=saved_qk_norm)
+        elif args.qk_norm != saved_qk_norm:
+            raise SystemExit(
+                f"TABPFN_V2_QK_NORM={int(args.qk_norm)}이지만 checkpoint 모델은 "
+                f"qk_norm={saved_qk_norm}이라 이어서 학습할 수 없다"
             )
 
     if is_main:

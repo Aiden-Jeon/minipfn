@@ -1,16 +1,20 @@
 """TabPFN v2 학습 루프 테스트 (smoke 크기, CPU)."""
 
+import contextlib
 from dataclasses import replace
 
 import pytest
 import torch
 
+from minipfn.bar_distribution import FullSupportBarDistribution
 from minipfn.tabpfn_v2.model import load_checkpoint
 from minipfn.tabpfn_v2.train import (
     CollapseGuard,
     TabPFNv2TrainConfig,
     _make_val_batches,
+    _validate,
     checkpoint_lr,
+    checkpoint_qk_norm,
     dequantize_targets,
     lr_factor,
     train_tabpfn_v2,
@@ -123,17 +127,20 @@ def test_regression_training_with_qk_norm_records_attention_stats(tmp_path):
     assert model.config.qk_norm
     assert torch.isfinite(torch.tensor(result["history"]["train_loss"])).all()
 
-    val = _validate_stats(model, config)
+    assert checkpoint_qk_norm(tmp_path / "latest.pt")  # 이어서 학습할 때 구조를 여기서 읽는다
+    assert not checkpoint_qk_norm(_plain_checkpoint(tmp_path / "plain"))
+
+    bar = FullSupportBarDistribution(torch.load(tmp_path / "latest.pt")["borders"])
+    batches = _make_val_batches(config, n_batches=2)
+    val = _validate(model, batches, torch.device("cpu"), contextlib.nullcontext, "regression", bar)
     assert val["attn_logit_max"] > 0 and 0 < val["attn_entropy_min"] <= 1 + 1e-6
+    assert model.training  # 검증 뒤 학습 모드로 돌아온다
 
 
-def _validate_stats(model, config):
-    import contextlib
-
-    from minipfn.tabpfn_v2.train import _attention_stats
-
-    batch = _make_val_batches(config, n_batches=1)[0]
-    return _attention_stats(model, batch, torch.device("cpu"), contextlib.nullcontext)
+def _plain_checkpoint(out_dir):
+    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=1)
+    train_tabpfn_v2(config, out_dir, mlflow_log=False)
+    return out_dir / "latest.pt"
 
 
 def test_regression_training_with_dequantize(tmp_path):

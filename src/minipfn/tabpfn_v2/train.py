@@ -36,7 +36,12 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from minipfn.bar_distribution import FullSupportBarDistribution
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, save_checkpoint
+from minipfn.tabpfn_v2.model import (
+    TabPFNv2,
+    TabPFNv2Config,
+    record_sample_attention,
+    save_checkpoint,
+)
 from minipfn.tabpfn_v2.prior import (
     MAX_CLASSES,
     MAX_FEATURES,
@@ -290,46 +295,30 @@ def _make_val_batches(config: TabPFNv2TrainConfig, n_batches: int = 8):
 
 @torch.no_grad()
 def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, float]:
+    """검증 loss와, 첫 검증 batch에서 본 sample attention의 logit 크기·entropy(모든 층 중 가장
+    나쁜 값). 논문 규모 회귀 학습이 무너질 무렵 이 logit이 10^5를 넘고 entropy가 0 쪽으로 떨어졌다.
+    """
     model.eval()
-    total, correct, count = 0.0, 0, 0
-    for batch in val_batches:
-        x, y = batch.x.to(device), batch.y.to(device)
-        with autocast():
-            logits = model(x, y[:, : batch.n_train])
-        y_eval = y[:, batch.n_train :]
-        total += prior_loss(logits, y_eval, task, bar).item()
-        if task == "classification":
-            correct += (logits.argmax(-1) == y_eval.long()).sum().item()
-            count += y_eval.numel()
+    total, correct, count, stats = 0.0, 0, 0, []
+    try:
+        for i, batch in enumerate(val_batches):
+            x, y = batch.x.to(device), batch.y.to(device)
+            record = record_sample_attention(model, stats) if i == 0 else contextlib.nullcontext()
+            with record, autocast():
+                logits = model(x, y[:, : batch.n_train])
+            y_eval = y[:, batch.n_train :]
+            total += prior_loss(logits, y_eval, task, bar).item()
+            if task == "classification":
+                correct += (logits.argmax(-1) == y_eval.long()).sum().item()
+                count += y_eval.numel()
+    finally:
+        model.train()
     out = {"val_loss": total / len(val_batches)}
     if task == "classification":
         out["val_acc"] = correct / max(1, count)
-    out.update(_attention_stats(model, val_batches[0], device, autocast))
-    model.train()
+    out["attn_logit_max"] = max(s[0] for s in stats)
+    out["attn_entropy_min"] = min(s[1] for s in stats)
     return out
-
-
-@torch.no_grad()
-def _attention_stats(model, batch, device, autocast) -> dict[str, float]:
-    """검증 batch 하나에서 sample attention의 logit 크기와 entropy (모든 층 중 가장 나쁜 값).
-
-    논문 규모 회귀 학습이 무너질 무렵 이 logit이 10^5를 넘고 entropy가 0 쪽으로 떨어졌다.
-    데이터셋 하나만 넣어 메모리를 아낀다.
-    """
-    attentions = [layer.sample_attention for layer in model.layers]
-    for attention in attentions:
-        attention.record = []
-    try:
-        with autocast():
-            model(batch.x[:1].to(device), batch.y[:1, : batch.n_train].to(device))
-        stats = [s for attention in attentions for s in attention.record]
-    finally:
-        for attention in attentions:
-            attention.record = None
-    return {
-        "attn_logit_max": max(s[0] for s in stats),
-        "attn_entropy_min": min(s[1] for s in stats),
-    }
 
 
 def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
@@ -354,6 +343,12 @@ def checkpoint_lr(path: str | Path) -> float:
     """checkpoint가 쓰던 기준 lr. 이어서 학습할 때 lr을 따로 주지 않으면 이 값을 이어 간다."""
     state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     return float(state["scheduler"]["base_lrs"][0])
+
+
+def checkpoint_qk_norm(path: str | Path) -> bool:
+    """checkpoint 모델이 QK-norm을 쓰는지 (가중치 이름으로 본다). 구조가 다르면 불러올 수 없다."""
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    return any(".q_norm." in name for name in state["model"])
 
 
 def _to_cpu(obj):

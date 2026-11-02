@@ -6,7 +6,14 @@ import torch
 from sklearn.datasets import load_breast_cancer, load_diabetes
 
 from minipfn.tabpfn_v2.inference import TabPFNv2Classifier, TabPFNv2Regressor, _probs_on_borders
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, load_checkpoint, save_checkpoint
+from minipfn.tabpfn_v2.model import (
+    TabPFNv2,
+    TabPFNv2Config,
+    _logit_stats,
+    load_checkpoint,
+    record_sample_attention,
+    save_checkpoint,
+)
 
 
 def _tiny_model(n_out: int = 10) -> TabPFNv2:
@@ -19,14 +26,10 @@ def _tiny_model(n_out: int = 10) -> TabPFNv2:
 
 
 def _attention_logit_max(model: TabPFNv2, x: torch.Tensor, y: torch.Tensor) -> float:
-    attentions = [layer.sample_attention for layer in model.layers]
-    for attention in attentions:
-        attention.record = []
-    with torch.no_grad():
+    stats = []
+    with record_sample_attention(model, stats), torch.no_grad():
         model(x, y)
-    stats = [s for attention in attentions for s in attention.record]
-    for attention in attentions:
-        attention.record = None
+    assert all(layer.sample_attention.record is None for layer in model.layers)  # 끝나면 끈다
     return max(s[0] for s in stats)
 
 
@@ -48,6 +51,13 @@ def test_qk_norm_bounds_attention_logits_when_weights_grow():
             assert abs(after - before) < 1e-3
         else:
             assert after > 1000 * before
+
+
+def test_logit_stats_entropy_is_one_for_uniform_or_single_key():
+    q = torch.zeros(1, 1, 5, 4)
+    assert _logit_stats(q, q, 5) == (0.0, 1.0)  # logit이 모두 같으면 균일 → 1
+    _, entropy = _logit_stats(torch.randn(1, 1, 3, 4), torch.randn(1, 1, 3, 4), 1)
+    assert entropy == 1.0  # key가 하나면 붕괴가 아니다
 
 
 def test_qk_norm_checkpoint_roundtrip(tmp_path):

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -86,11 +87,28 @@ def _logit_stats(q: torch.Tensor, k: torch.Tensor, n_context: int) -> tuple[floa
     시퀀스(N) 몇 개만 본다. 행 2,048개 × 시퀀스 수백 개의 logit을 다 만들면 메모리가 모자란다.
     """
     pick = torch.linspace(0, q.shape[0] - 1, min(4, q.shape[0]), device=q.device).long()
-    q, k = q[pick, :, :n_context].float(), k[pick, :, :n_context].float()
-    logits = q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5
-    p = logits.softmax(-1)
-    entropy = -(p * p.clamp_min(1e-30).log()).sum(-1).mean()
-    return logits.abs().amax().item(), (entropy / max(math.log(n_context), 1e-9)).item()
+    # logit이 10^5까지 커지면 bf16으로는 수백씩 틀리므로 autocast를 끄고 fp32로 계산한다
+    with torch.autocast(q.device.type, enabled=False):
+        q, k = q[pick, :, :n_context].float(), k[pick, :, :n_context].float()
+        logits = q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5
+        if n_context <= 1:  # key가 하나면 attention은 늘 그 하나 (붕괴가 아니다)
+            return logits.abs().amax().item(), 1.0
+        log_p = logits.log_softmax(-1)
+        entropy = -(log_p.exp() * log_p).sum(-1).mean()
+    return logits.abs().amax().item(), (entropy / math.log(n_context)).item()
+
+
+@contextlib.contextmanager
+def record_sample_attention(model: TabPFNv2, stats: list[tuple[float, float]]):
+    """이 안에서 forward하면 층마다 sample attention의 `_logit_stats`를 `stats`에 모은다."""
+    attentions = [layer.sample_attention for layer in model.layers]
+    for attention in attentions:
+        attention.record = stats
+    try:
+        yield stats
+    finally:
+        for attention in attentions:
+            attention.record = None
 
 
 class TabPFNv2Layer(nn.Module):
