@@ -184,7 +184,10 @@ def test_training_rewinds_after_a_collapse(tmp_path, monkeypatch):
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["rewinds"] == 1
 
 
-def test_each_collapse_lowers_the_lr_by_the_rewind_factor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("min_scale, expected_scale", [(0.0, 0.25), (0.75, 0.75)])
+def test_each_collapse_lowers_the_lr_by_the_rewind_factor(
+    tmp_path, monkeypatch, min_scale, expected_scale
+):
     calls = {"n": 0}
     original = CollapseGuard.update
 
@@ -202,19 +205,25 @@ def test_each_collapse_lowers_the_lr_by_the_rewind_factor(tmp_path, monkeypatch)
         snapshot_every=10,
         rewind_lr_factor=0.5,
     )
+    config = replace(config, rewind_min_lr=config.lr * min_scale)
     train_tabpfn_v2(config, tmp_path, mlflow_log=False)
     state = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert state["rewinds"] == 2
-    # 두 번째로 되돌아간 snapshot(20 step)은 첫 인하 전 상태지만 lr은 두 번 모두 반영된다
-    assert abs(state["scheduler"]["base_lrs"][0] - config.lr / 4) < 1e-15
-    expected = config.lr / 4 * lr_factor(50, config.warmup_steps, config.steps)
+    # 두 번째로 되돌아간 snapshot(20 step)은 첫 인하 전 상태지만 lr은 두 번 모두 반영된다.
+    # 하한이 있으면 거기서 멈춘다
+    base = config.lr * expected_scale
+    assert abs(state["scheduler"]["base_lrs"][0] - base) < 1e-15
+    expected = base * lr_factor(50, config.warmup_steps, config.steps)
     assert abs(state["optimizer"]["param_groups"][0]["lr"] - expected) < 1e-12
-    assert checkpoint_lr(tmp_path / "latest.pt") == config.lr / 4  # 다음 chunk가 이어 간다
+    assert abs(checkpoint_lr(tmp_path / "latest.pt") - base) < 1e-15  # 다음 chunk가 이어 간다
 
 
 def test_paper_preset_lowers_the_lr_on_collapse_only_for_regression():
     assert TabPFNv2TrainConfig.paper("regression").rewind_lr_factor == 0.5
     assert TabPFNv2TrainConfig.paper("classification").rewind_lr_factor == 1.0
+    for bad in (0.0, -0.5, 5.0):
+        with pytest.raises(ValueError, match="rewind_lr_factor"):
+            TabPFNv2TrainConfig(rewind_lr_factor=bad)
 
 
 def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, monkeypatch):

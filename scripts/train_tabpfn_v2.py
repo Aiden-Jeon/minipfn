@@ -143,9 +143,16 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
+        saved_lr = checkpoint_lr(resume_path)
         if args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
-            config = replace(config, lr=checkpoint_lr(resume_path))
+            config = replace(config, lr=saved_lr)
+        elif args.lr > saved_lr and config.rewind_lr_factor < 1 and rank == 0:
+            print(
+                f"주의: checkpoint의 기준 lr {saved_lr:.2e}보다 높은 {args.lr:.2e}로 이어 간다. "
+                "붕괴 규칙으로 낮춘 lr이었다면 그 인하가 사라진다",
+                flush=True,
+            )
 
     if is_main:
         print("config_name:", args.config_name)
