@@ -14,6 +14,7 @@ AI Runtime(`databricks air run -f runs/train_tabpfn_v2.yaml`)과 로컬에서 �
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
 `TABPFN_V2_REWIND_LR_FACTOR`를 곱한다(paper 회귀는 0.5, 그 밖에는 1 = 그대로).
+`TABPFN_V2_QK_NORM=1`이면 attention의 q·k를 정규화한 모델로 학습한다(이어서 학습할 때도 같게 준다).
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
 이어서 학습할 때 `TABPFN_V2_LR`을 checkpoint와 다르게 주면 남은 스케줄을 그 lr 기준으로 바꾸고,
@@ -85,6 +86,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rewind-lr-factor", type=float, default=_env("TABPFN_V2_REWIND_LR_FACTOR", float)
     )
+    parser.add_argument(
+        "--qk-norm",
+        action=argparse.BooleanOptionalAction,
+        default=_env("TABPFN_V2_QK_NORM", lambda v: v.lower() in ("1", "true", "yes", "on")),
+    )
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
@@ -106,6 +112,7 @@ def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
         "checkpoint_every": args.checkpoint_every,
         "keep_every": args.keep_every,
         "rewind_lr_factor": args.rewind_lr_factor,
+        "qk_norm": args.qk_norm,
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
     config = replace(config, **{k: v for k, v in overrides.items() if v is not None})

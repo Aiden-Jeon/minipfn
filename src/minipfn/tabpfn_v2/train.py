@@ -59,6 +59,7 @@ class TabPFNv2TrainConfig:
     emsize: int = 192
     nlayers: int = 12
     nhead: int = 6
+    qk_norm: bool = False  # attention의 q·k를 정규화한다 (TabPFNv2Config.qk_norm)
     # prior / 데이터셋 크기 (논문 Methods)
     max_train_rows: int = MAX_TRAIN_ROWS
     n_eval_rows: int = N_EVAL_ROWS
@@ -156,7 +157,11 @@ class TabPFNv2TrainConfig:
 
     def model_config(self) -> TabPFNv2Config:
         return TabPFNv2Config(
-            emsize=self.emsize, nlayers=self.nlayers, nhead=self.nhead, n_out=self.n_out
+            emsize=self.emsize,
+            nlayers=self.nlayers,
+            nhead=self.nhead,
+            n_out=self.n_out,
+            qk_norm=self.qk_norm,
         )
 
     def for_world_size(self, world_size: int) -> TabPFNv2TrainConfig:
@@ -296,11 +301,35 @@ def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, floa
         if task == "classification":
             correct += (logits.argmax(-1) == y_eval.long()).sum().item()
             count += y_eval.numel()
-    model.train()
     out = {"val_loss": total / len(val_batches)}
     if task == "classification":
         out["val_acc"] = correct / max(1, count)
+    out.update(_attention_stats(model, val_batches[0], device, autocast))
+    model.train()
     return out
+
+
+@torch.no_grad()
+def _attention_stats(model, batch, device, autocast) -> dict[str, float]:
+    """검증 batch 하나에서 sample attention의 logit 크기와 entropy (모든 층 중 가장 나쁜 값).
+
+    논문 규모 회귀 학습이 무너질 무렵 이 logit이 10^5를 넘고 entropy가 0 쪽으로 떨어졌다.
+    데이터셋 하나만 넣어 메모리를 아낀다.
+    """
+    attentions = [layer.sample_attention for layer in model.layers]
+    for attention in attentions:
+        attention.record = []
+    try:
+        with autocast():
+            model(batch.x[:1].to(device), batch.y[:1, : batch.n_train].to(device))
+        stats = [s for attention in attentions for s in attention.record]
+    finally:
+        for attention in attentions:
+            attention.record = None
+    return {
+        "attn_logit_max": max(s[0] for s in stats),
+        "attn_entropy_min": min(s[1] for s in stats),
+    }
 
 
 def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:

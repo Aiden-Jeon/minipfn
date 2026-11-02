@@ -114,6 +114,28 @@ def test_dequantize_moves_only_repeated_interior_targets():
     )  # 연속 target·결측은 그대로
 
 
+def test_regression_training_with_qk_norm_records_attention_stats(tmp_path):
+    config = replace(
+        TabPFNv2TrainConfig.smoke("regression"), steps=2, border_datasets=10, qk_norm=True
+    )
+    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    model, _ = load_checkpoint(result["final_path"])
+    assert model.config.qk_norm
+    assert torch.isfinite(torch.tensor(result["history"]["train_loss"])).all()
+
+    val = _validate_stats(model, config)
+    assert val["attn_logit_max"] > 0 and 0 < val["attn_entropy_min"] <= 1 + 1e-6
+
+
+def _validate_stats(model, config):
+    import contextlib
+
+    from minipfn.tabpfn_v2.train import _attention_stats
+
+    batch = _make_val_batches(config, n_batches=1)[0]
+    return _attention_stats(model, batch, torch.device("cpu"), contextlib.nullcontext)
+
+
 def test_regression_training_with_dequantize(tmp_path):
     config = replace(
         TabPFNv2TrainConfig.smoke("regression"), steps=2, border_datasets=10, dequantize_buckets=10

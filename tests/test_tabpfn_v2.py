@@ -18,6 +18,46 @@ def _tiny_model(n_out: int = 10) -> TabPFNv2:
     return model.eval()
 
 
+def _attention_logit_max(model: TabPFNv2, x: torch.Tensor, y: torch.Tensor) -> float:
+    attentions = [layer.sample_attention for layer in model.layers]
+    for attention in attentions:
+        attention.record = []
+    with torch.no_grad():
+        model(x, y)
+    stats = [s for attention in attentions for s in attention.record]
+    for attention in attentions:
+        attention.record = None
+    return max(s[0] for s in stats)
+
+
+def test_qk_norm_bounds_attention_logits_when_weights_grow():
+    torch.manual_seed(0)
+    x, y = torch.randn(1, 30, 5), torch.randn(1, 20)
+    head_dim = 16 // 2
+    for qk_norm in (False, True):
+        model = TabPFNv2(TabPFNv2Config(emsize=16, nlayers=2, nhead=2, n_out=10, qk_norm=qk_norm))
+        model.eval()
+        before = _attention_logit_max(model, x, y)
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.sample_attention.qkv.weight.mul_(100.0)  # 논문 규모 회귀에서처럼 q·k가 커진다
+        after = _attention_logit_max(model, x, y)
+        if qk_norm:
+            # 정규화한 q, k는 크기가 √d이므로 logit은 gain(처음 1)이 그대로면 √d를 넘지 못한다
+            assert after <= head_dim**0.5 + 1e-4
+            assert abs(after - before) < 1e-3
+        else:
+            assert after > 1000 * before
+
+
+def test_qk_norm_checkpoint_roundtrip(tmp_path):
+    model = TabPFNv2(TabPFNv2Config(emsize=16, nlayers=2, nhead=2, n_out=10, qk_norm=True))
+    save_checkpoint(tmp_path / "m.pt", model)
+    loaded, _ = load_checkpoint(tmp_path / "m.pt")
+    assert loaded.config.qk_norm
+    assert "layers.0.sample_attention.q_norm.weight" in loaded.state_dict()
+
+
 def test_default_size_is_paper_model():
     model = TabPFNv2()
     assert model.config.emsize == 192 and model.config.nlayers == 12

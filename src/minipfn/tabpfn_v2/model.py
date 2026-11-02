@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -35,24 +36,37 @@ class TabPFNv2Config:
     features_per_group: int = 2
     n_out: int = 10  # 분류: 최대 클래스 수, 회귀: bar distribution 구간 수
     column_embedding_seed: int = 42
+    # q와 k를 head마다 LayerNorm(학습하는 gain)한 뒤 곱한다(QK-norm, 논문에 없음, 여기서 정함).
+    # 없으면 논문 규모 학습에서 sample attention의 q·k가 층마다 갑자기 수천 배로 커져 logit이
+    # 10^5를 넘고(정상 ~10) attention이 거의 one-hot이 되며, 그 무렵 학습이 무너졌다
+    qk_norm: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class Attention(nn.Module):
-    def __init__(self, emsize: int, nhead: int) -> None:
+    def __init__(self, emsize: int, nhead: int, qk_norm: bool = False) -> None:
         super().__init__()
         self.nhead = nhead
         self.qkv = nn.Linear(emsize, 3 * emsize, bias=False)
         self.out = nn.Linear(emsize, emsize, bias=False)
         nn.init.zeros_(self.out.weight)  # 처음에는 attention이 잔차에 아무것도 더하지 않는다
+        d = emsize // nhead
+        self.q_norm = nn.LayerNorm(d, bias=False) if qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(d, bias=False) if qk_norm else nn.Identity()
+        # list를 넣으면 forward마다 (logit 절댓값 최대, 정규화한 entropy)를 남긴다 (진단용)
+        self.record: list[tuple[float, float]] | None = None
 
     def forward(self, x: torch.Tensor, n_context: int | None = None) -> torch.Tensor:
         """x: (N, L, E). n_context를 주면 앞의 n_context개(학습 행)만 key·value가 된다."""
         n, length, e = x.shape
         q, k, v = self.qkv(x).view(n, length, 3, self.nhead, e // self.nhead).unbind(2)
+        # autocast에서 LayerNorm은 fp32를 내므로 attention 입력 dtype(v와 같게)으로 되돌린다
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (N, H, L, D)
+        if self.record is not None:
+            self.record.append(_logit_stats(q, k, n_context or length))
         if n_context is None:
             out = F.scaled_dot_product_attention(q, k, v)
         else:
@@ -65,11 +79,25 @@ class Attention(nn.Module):
         return self.out(out.transpose(1, 2).reshape(n, length, e))
 
 
+@torch.no_grad()
+def _logit_stats(q: torch.Tensor, k: torch.Tensor, n_context: int) -> tuple[float, float]:
+    """학습 행끼리의 attention logit 절댓값 최대와 평균 entropy / log(key 수) (균일하면 1).
+
+    시퀀스(N) 몇 개만 본다. 행 2,048개 × 시퀀스 수백 개의 logit을 다 만들면 메모리가 모자란다.
+    """
+    pick = torch.linspace(0, q.shape[0] - 1, min(4, q.shape[0]), device=q.device).long()
+    q, k = q[pick, :, :n_context].float(), k[pick, :, :n_context].float()
+    logits = q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5
+    p = logits.softmax(-1)
+    entropy = -(p * p.clamp_min(1e-30).log()).sum(-1).mean()
+    return logits.abs().amax().item(), (entropy / max(math.log(n_context), 1e-9)).item()
+
+
 class TabPFNv2Layer(nn.Module):
-    def __init__(self, emsize: int, nhead: int, nhid: int) -> None:
+    def __init__(self, emsize: int, nhead: int, nhid: int, qk_norm: bool = False) -> None:
         super().__init__()
-        self.feature_attention = Attention(emsize, nhead)
-        self.sample_attention = Attention(emsize, nhead)
+        self.feature_attention = Attention(emsize, nhead, qk_norm)
+        self.sample_attention = Attention(emsize, nhead, qk_norm)
         self.mlp = nn.Sequential(
             nn.Linear(emsize, nhid, bias=False), nn.GELU(), nn.Linear(nhid, emsize, bias=False)
         )
@@ -103,7 +131,7 @@ class TabPFNv2(nn.Module):
         self.column_embedder = nn.Linear(e // 4, e)
         nhid = e * config.nhid_factor
         self.layers = nn.ModuleList(
-            TabPFNv2Layer(e, config.nhead, nhid) for _ in range(config.nlayers)
+            TabPFNv2Layer(e, config.nhead, nhid, config.qk_norm) for _ in range(config.nlayers)
         )
         self.decoder = nn.Sequential(nn.Linear(e, nhid), nn.GELU(), nn.Linear(nhid, config.n_out))
         self._column_noise: dict[tuple, torch.Tensor] = {}  # state_dict에 넣지 않는 캐시
