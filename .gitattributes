@@ -5,6 +5,7 @@
 # walkthrough 노트북은 그림/출력을 커밋에 남긴다 (stripout 제외, diff는 유지).
 notebooks/01_pfn/01_bayesian_primer.ipynb !filter
 notebooks/01_pfn/02_pfn_paper_walkthrough.ipynb !filter
+notebooks/01_pfn/04_pfn_gp_reproduction.ipynb !filter
 notebooks/02_tabpfn/01_scm_primer.ipynb !filter
 notebooks/02_tabpfn/02_bnn_primer.ipynb !filter
 notebooks/02_tabpfn/03_tabpfn_paper_walkthrough.ipynb !filter
