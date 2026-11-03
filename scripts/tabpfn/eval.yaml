@@ -1,6 +1,6 @@
 # TabPFN 평가 (논문 Table 1: OpenML-CC18 18개 × 5 split, sklearn 기본값 baseline과 비교).
 # 모델은 TABPFN_EXTRA_ARGS로 넘긴다. 학습 run이 남긴 모델·checkpoint는 runs:/ URI로 준다:
-#   databricks air run -f runs/eval_tabpfn.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#   databricks air run -f scripts/tabpfn/eval.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
 #     --override "env_variables.TABPFN_EXTRA_ARGS=--model-path runs:/<run_id>/model/tabpfn_final.pt"
 #   학습 중 checkpoint:  --model-path runs:/<run_id>/checkpoints/step_0003000.pt
 #   Hub 모델:           --hub-repo aiden-jeon/minipfn-tabpfn-v1
@@ -20,7 +20,7 @@ code_source:
   type: snapshot
   snapshot:
     # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
-    root_path: ..
+    root_path: ../..
     include_paths:
       - src
       - scripts/tabpfn/eval.py

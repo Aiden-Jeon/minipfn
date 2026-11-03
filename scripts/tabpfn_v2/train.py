@@ -1,6 +1,6 @@
 """TabPFN v2를 TabICL prior로 학습하고 MLflow에 기록한다 (Nature 2025 재현).
 
-AI Runtime(`databricks air run -f runs/train_tabpfn_v2.yaml`)과 로컬에서 같은 스크립트를 쓴다.
+AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서 같은 스크립트를 쓴다.
 - GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/tabpfn_v2/train.py`
 - 노드 여러 대: 노드마다 `torchrun --nnodes=<노드 수> --node_rank=<번호> --master_addr=<주소>
   --master_port=<포트> --nproc_per_node=8 scripts/tabpfn_v2/train.py`. batch는 그대로이고

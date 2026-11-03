@@ -1,5 +1,5 @@
 # TabPFN v2 prior-fitting (Nature 2025 재현, TabICL prior):
-#   databricks air run -f runs/train_tabpfn_v2.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+#   databricks air run -f scripts/tabpfn_v2/train.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
 # 기본은 8×H100에서 논문 크기 모델·batch 64로 300 step 실측(분류). 규모는 override로 바꾼다:
 #   회귀:        --override env_variables.TABPFN_V2_TASK=regression
 #                (반복되는 target은 기본으로 이웃 구간 100개에 흩는다. 끄려면 TABPFN_V2_DEQUANTIZE_BUCKETS=0)
@@ -27,7 +27,7 @@ code_source:
   type: snapshot
   snapshot:
     # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
-    root_path: ..
+    root_path: ../..
     include_paths:
       - src
       - scripts/tabpfn_v2/train.py

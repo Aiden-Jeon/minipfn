@@ -1,4 +1,4 @@
-# 환경 점검: databricks air run -f runs/setup_check.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 환경 점검: databricks air run -f scripts/setup_check.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
 experiment_name: pfn-setup-check
 environment:
   # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)

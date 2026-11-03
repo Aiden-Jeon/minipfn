@@ -12,7 +12,7 @@ Hugging Face Hub의 모델이다.
   uv run python $EVAL --hub-repo aiden-jeon/minipfn-tabpfn-v1 --hub-revision <commit>
   uv run python $EVAL --baselines-only                      # sklearn baseline만
 
-AI Runtime(`runs/eval_tabpfn.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에 기록한다.
+AI Runtime(`scripts/tabpfn/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에 기록한다.
 로컬에서 `--mlflow`를 주면 `TABPFN_EXPERIMENT`(기본 tabpfn-reproduction) experiment에 새 run을
 만든다. 결과(평균 ROC AUC와 데이터셋별 표)는 그 run의 `eval/`에 남는다.
 """
