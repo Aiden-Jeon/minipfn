@@ -153,7 +153,11 @@ def load_tabpfn(
     return tabpfn_from_state(ckpt["config"], ckpt["state_dict"], map_location)
 
 
-def _make_val_batch(config: TabPFNConfig, n_groups: int = 8):
+# 검증용 prior group 수. 검증 데이터셋은 VAL_GROUPS × group_size개다 (plot_card.py도 쓴다).
+VAL_GROUPS = 8
+
+
+def _make_val_batch(config: TabPFNConfig, n_groups: int = VAL_GROUPS):
     """학습과 겹치지 않는 seed로 검증용 prior 데이터셋을 고정해 둔다.
 
     학습 행 수는 max_eval_pos의 절반으로 둔다.
