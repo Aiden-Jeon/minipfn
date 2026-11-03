@@ -1,7 +1,7 @@
 """학습한 TabPFN v2 가중치를 Hugging Face Hub에 올린다.
 
 예) 저장소 루트에서 (.env.local을 불러온 셸)
-  MLFLOW_TRACKING_URI=databricks uv run python scripts/push_tabpfn_v2_to_hub.py \
+  MLFLOW_TRACKING_URI=databricks uv run python scripts/tabpfn_v2/push_to_hub.py \
     --checkpoint runs:/<학습 run_id>/checkpoints/step_0500000.pt --task classification \
     --repo-id aiden-jeon/minipfn-tabpfn-v2-classifier --dry-run
 
@@ -13,7 +13,7 @@ Hub의 `images/`에서 카드가 더는 쓰지 않는 파일은 지운다. `--dr
 
 공개 repo를 실수로 덮어쓰지 않도록 `--repo-id`는 기본값 없이 받는다. 카드의 그림과 수치가 다른
 체크포인트의 것이 되지 않도록, 카드에 `--checkpoint` 문자열이 그대로 적혀 있어야 올린다(그림은
-`plot_tabpfn_v2_card.py`로 다시 만든다).
+`plot_card.py`로 다시 만든다).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from huggingface_hub import HfApi
 
 from minipfn.tabpfn_v2.hub import from_pretrained, load_model, save_pretrained
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_DIR = REPO_ROOT / "hub"
 IMAGE_LINK = re.compile(r"\]\((images/[^)\s]+)\)")
 
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.checkpoint not in model_card.read_text():
         raise SystemExit(
             f"모델 카드에 {args.checkpoint}가 없습니다. 카드는 다른 체크포인트의 결과를 적고"
-            " 있을 수 있으니 plot_tabpfn_v2_card.py로 그림을 다시 만들고 카드의 수치와"
+            " 있을 수 있으니 plot_card.py로 그림을 다시 만들고 카드의 수치와"
             " 체크포인트를 고쳐 주세요."
         )
     out_dir = Path(args.out_dir)

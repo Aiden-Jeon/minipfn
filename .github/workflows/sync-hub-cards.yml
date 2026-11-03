@@ -1,5 +1,5 @@
 # hub/<name>/의 모델 카드(README와 카드가 링크한 그림)가 main에 바뀌어 들어오면 Hugging Face Hub의
-# <HF_OWNER>/<name> repo에 올린다. 가중치는 올리지 않는다(새로 학습했을 때 push_tabpfn*_to_hub.py로
+# <HF_OWNER>/<name> repo에 올린다. 가중치는 올리지 않는다(새로 학습했을 때 scripts/<논문>/push_to_hub.py로
 # 직접 올린다). 저장소 secret HF_TOKEN(쓰기 권한)이 필요하다.
 # 손으로 돌리면(workflow_dispatch) hub/ 아래 카드를 모두 올린다.
 name: Sync model cards to the Hub

@@ -94,7 +94,7 @@ proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes
 `fit` does not train weights. It fits each ensemble member's preprocessing on the training rows, which then serve as context at prediction time. To reproduce the benchmark (downloads the OpenML tasks):
 
 ```bash
-uv run python scripts/eval_tabpfn_v2.py --suite classification \
+uv run python scripts/tabpfn_v2/eval.py --suite classification \
   --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier
 ```
 

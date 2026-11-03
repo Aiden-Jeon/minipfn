@@ -1,11 +1,11 @@
 """학습 체크포인트와 benchmark 평가 run으로 TabPFN v2 Hub 모델 카드의 그림을 만든다.
 
 예) 저장소 루트에서 (.env.local을 불러온 셸)
-  MLFLOW_TRACKING_URI=databricks uv run python scripts/plot_tabpfn_v2_card.py \
+  MLFLOW_TRACKING_URI=databricks uv run python scripts/tabpfn_v2/plot_card.py \
     --checkpoint runs:/<학습 run_id>/checkpoints/step_0500000.pt \
     --eval-runs 100000=<평가 run_id>,200000=<평가 run_id>,...
 
-체크포인트의 `history`(이어서 학습한 chunk까지 step 0부터 이어진 기록)와 `eval_tabpfn_v2.py`가 남긴
+체크포인트의 `history`(이어서 학습한 chunk까지 step 0부터 이어진 기록)와 `eval.py`가 남긴
 `eval/eval_per_dataset.csv`를 읽어 `--out-dir`(기본 `hub/minipfn-tabpfn-v2-classifier/images/`)에
 세 그림을 쓴다. 데이터셋별 그림은 step이 가장 큰 평가 run으로 그린다.
 
@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 # v1 카드와 같은 색. 논문 값은 범주가 아니라 기준선이라 회색으로 둔다
 BLUE, GRAY = "#2a78d6", "#8a8984"
 INK, MUTED, GRID, SURFACE = "#1f1f1e", "#5f5e58", "#e6e5e0", "#fcfcfb"
