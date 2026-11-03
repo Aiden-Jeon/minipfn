@@ -101,5 +101,13 @@ def test_train_script_logs_to_mlflow(tmp_path):
             assert torch.equal(a, b)  # 마지막 step의 checkpoint = 최종 모델
         with pytest.raises(SystemExit, match="runs:/"):
             eval_script.load_model(str(tmp_path / "out" / "step_0000002.pt"), tmp_path / "e3")
+
+        # 모델 설정 param이 없는 run(이어서 학습한 run 등)이면 무엇이 없는지 알리고 멈춘다
+        with mlflow.start_run() as bare:
+            mlflow.log_artifact(str(tmp_path / "out" / "step_0000002.pt"), "checkpoints")
+        with pytest.raises(SystemExit, match="emsize"):
+            eval_script.load_model(
+                f"runs:/{bare.info.run_id}/checkpoints/step_0000002.pt", tmp_path / "e4"
+            )
     finally:
         mlflow.set_tracking_uri(prev_uri)
