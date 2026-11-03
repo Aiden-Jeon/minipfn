@@ -23,7 +23,6 @@ runs/
 # scripts/의 기본 출력 폴더 (저장소 루트에서 실행할 때)
 tabpfn_run/
 tabpfn_eval/
-tabpfn_hub/
 tabpfn_v2_run/
 tabpfn_v2_eval/
 tabpfn_v2_hub/
