@@ -80,10 +80,11 @@ uv run python scripts/tabpfn/eval.py --baselines-only                          #
 
 ### checkpoint에서 이어서 학습하기
 
-TabPFN 학습은 `checkpoint_every` step마다(paper 1,000 · medium 300 · smoke 10) 학습 상태 전체를 MLflow run의 `checkpoints/latest.pt`에 올립니다. 학습이 끊기면 그 run id를 `--resume-run-id`로 주고, 처음과 같은 config와 step 수로 다시 실행합니다.
+TabPFN 학습은 `checkpoint_every` step마다(paper 1,000 · medium 300 · smoke 10) 학습 상태 전체를 MLflow run의 `checkpoints/latest.pt`에 덮어쓰고, `keep_every` step마다(paper 3,000 · medium 600 · smoke 10) `checkpoints/step_XXXXXXX.pt`로도 남깁니다. 학습이 끊기면 그 run id를 `--resume-run-id`로 주고, 처음과 같은 config와 step 수로 다시 실행합니다. `--resume-step`을 같이 주면 그 step의 checkpoint에서 새 run으로 이어 갑니다.
 
 ```bash
 uv run python scripts/tabpfn/train.py --config-name smoke --resume-run-id <run_id>
+uv run python scripts/tabpfn/train.py --config-name smoke --resume-run-id <run_id> --resume-step 10
 ```
 
 Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다. PFN 학습(`scripts/pfn/train.py`)에는 아직 checkpoint 재개 기능이 없습니다.

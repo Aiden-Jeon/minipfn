@@ -55,12 +55,8 @@ def test_train_script_logs_to_mlflow(tmp_path):
     uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("MLFLOW_", "TABPFN_"))}
     env["MLFLOW_TRACKING_URI"] = uri
-    subprocess.run(
-        [sys.executable, str(SCRIPT), "--config-name", "smoke", "--steps", "4", "--out-dir", "out"],
-        env=env,
-        cwd=tmp_path,
-        check=True,
-    )
+    args = ["--config-name", "smoke", "--steps", "4", "--keep-every", "2", "--out-dir", "out"]
+    subprocess.run([sys.executable, str(SCRIPT), *args], env=env, cwd=tmp_path, check=True)
     prev_uri = mlflow.get_tracking_uri()
     mlflow.set_tracking_uri(uri)
     try:
@@ -71,13 +67,20 @@ def test_train_script_logs_to_mlflow(tmp_path):
         run_id = runs["run_id"].iloc[0]
         artifacts = {a.path for a in client.list_artifacts(run_id)}
         assert {"loss_curve.png", "model", "checkpoints", "code"} <= artifacts
+        # latest.pt는 덮어쓰고, keep_every step마다 따로 남긴다
+        checkpoints = {a.path for a in client.list_artifacts(run_id, "checkpoints")}
+        assert checkpoints == {
+            "checkpoints/latest.pt",
+            "checkpoints/step_0000002.pt",
+            "checkpoints/step_0000004.pt",
+        }
         # 실제로 돈 스크립트와 src가 run에 남는다
         code = {a.path for a in client.list_artifacts(run_id, "code")}
         assert {"code/train.py", "code/minipfn"} <= code
         tabpfn_code = {a.path for a in client.list_artifacts(run_id, "code/minipfn/tabpfn")}
         assert "code/minipfn/tabpfn/train.py" in tabpfn_code
         tags = runs.iloc[0]
-        assert tags["tags.command"] == "train.py --config-name smoke --steps 4 --out-dir out"
+        assert tags["tags.command"] == "train.py " + " ".join(args)
         assert tags["tags.git_commit"]
     finally:
         mlflow.set_tracking_uri(prev_uri)
