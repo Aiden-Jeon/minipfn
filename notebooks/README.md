@@ -11,7 +11,7 @@
 | 03 | [구현 디테일](01_pfn/03_pfn_implementation_details.ipynb) | bar distribution, Transformer encoder, GP prior의 정답 posterior는 어떻게 생겼나? |
 | 04 | [GP prior 1D 회귀 재현](01_pfn/04_pfn_gp_reproduction.ipynb) | 논문 크기로 학습한 PFN(H100)이 정확한 GP posterior와 얼마나 비슷한가? |
 
-실행 파일: `scripts/pfn/train.py`, `runs/train_pfn.yaml`
+실행 파일: 없음. 학습은 04 노트북의 8절에서 직접 돌립니다.
 
 ## `02_tabpfn/` — Hollmann et al., *TabPFN* (ICLR 2023)
 

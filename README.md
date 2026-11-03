@@ -53,14 +53,11 @@ uv run python scripts/tabpfn/eval.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
 
 ## 3. 바닥부터 학습하기
 
-규모는 `--config-name`과 `--steps`로 정합니다. 학습·평가 기록은 MLflow run에 남습니다.
+규모는 `--config-name`과 `--steps`로 정합니다. 학습·평가 기록은 MLflow run에 남습니다. PFN(GP prior 1D 회귀)은 학습 스크립트 없이 [`notebooks/01_pfn/04_pfn_gp_reproduction.ipynb`](notebooks/01_pfn/04_pfn_gp_reproduction.ipynb)에서 직접 학습합니다.
 
 ### 학습
 
 ```bash
-# PFN GP prior 1D 회귀 (config: small / large / paper)
-uv run python scripts/pfn/train.py --config-name small --steps 50
-
 # TabPFN (config: smoke / medium / paper). 마지막 가중치는 tabpfn_run/tabpfn_final.pt
 uv run python scripts/tabpfn/train.py --config-name smoke
 
@@ -88,7 +85,7 @@ uv run python scripts/tabpfn/train.py --config-name smoke --resume-run-id <run_i
 uv run python scripts/tabpfn/train.py --config-name smoke --resume-run-id <run_id> --resume-step 10
 ```
 
-Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다. PFN 학습(`scripts/pfn/train.py`)에는 아직 checkpoint 재개 기능이 없습니다.
+Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다.
 
 ## 4. Step by step
 
