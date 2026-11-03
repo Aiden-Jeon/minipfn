@@ -220,6 +220,11 @@ def test_each_collapse_lowers_the_lr_by_the_rewind_factor(
     assert abs(checkpoint_lr(tmp_path / "latest.pt") - base) < 1e-15  # 다음 chunk가 이어 간다
 
 
+def test_paper_preset_clips_qk_only_for_regression():
+    assert TabPFNv2TrainConfig.paper("regression").qk_clip == 250.0
+    assert TabPFNv2TrainConfig.paper("classification").qk_clip is None
+
+
 def test_paper_preset_lowers_the_lr_on_collapse_only_for_regression():
     assert TabPFNv2TrainConfig.paper("regression").rewind_lr_factor == 0.5
     assert TabPFNv2TrainConfig.paper("classification").rewind_lr_factor == 1.0

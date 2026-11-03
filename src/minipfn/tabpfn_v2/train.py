@@ -128,8 +128,12 @@ class TabPFNv2TrainConfig:
 
     @classmethod
     def paper(cls, task: str = "classification") -> TabPFNv2TrainConfig:
-        # 분류는 2e-4에서 붕괴가 드물어(300k까지 rewind 1번) lr을 그대로 둔다
-        return cls(task=task, rewind_lr_factor=0.5 if task == "regression" else 1.0)
+        # 분류는 2e-4에서 붕괴가 드물어(300k까지 rewind 1번) lr을 그대로 둔다.
+        # 회귀의 QK-clip 250: 50k scratch 비교에서 250·500 모두 상한을 지켰고 val NLL도 비슷했다
+        # (−1.08·−1.07, 끈 것 −1.04). 그중 logit을 더 낮게 묶는 쪽. 100은 10k부터 잘라 학습이 늦었다
+        if task == "regression":
+            return cls(task=task, rewind_lr_factor=0.5, qk_clip=250.0)
+        return cls(task=task)
 
     @classmethod
     def medium(cls, task: str = "classification") -> TabPFNv2TrainConfig:
