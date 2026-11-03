@@ -88,14 +88,6 @@ uv run python scripts/train_tabpfn.py --config-name smoke --resume-run-id <run_i
 
 Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다. PFN 학습(`train_pfn.py`)에는 아직 checkpoint 재개 기능이 없습니다.
 
-### Hugging Face Hub에 올리기
-
-MLflow run의 `tabpfn_final.pt`를 `model.safetensors`와 `config.json`으로 바꾸고, `hub/<repo 이름>/README.md` 모델 카드를 붙여 올립니다. 다른 카드는 `--model-card`로 주고, paper 크기가 아닌 run은 `--allow-non-paper`를 함께 줍니다.
-
-```bash
-uv run python scripts/push_tabpfn_to_hub.py --run-id <학습 run_id> --repo-id <owner/name>
-```
-
 ## 4. Step by step
 
 - [`notebooks/01_pfn/`](notebooks/01_pfn) — Müller et al., *[Transformers Can Do Bayesian Inference](https://arxiv.org/pdf/2112.10510)*, ICLR 2022
