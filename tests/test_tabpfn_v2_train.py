@@ -303,7 +303,8 @@ def test_qk_logit_bounds_match_the_spectral_norm():
     for head in range(h):
         q, k = w[head * d : (head + 1) * d], w[e + head * d : e + (head + 1) * d]
         sigma = torch.linalg.matrix_norm(q.T @ k, ord=2).item()
-        assert abs(bounds[3, head].item() - sigma * e / d**0.5) < 1e-3 * sigma * e / d**0.5
+        # 행 순서: 0 = 첫 층 sample, 1 = 둘째 층 feature, 2 = 둘째 층 sample (첫 층 feature는 뺀다)
+        assert abs(bounds[2, head].item() - sigma * e / d**0.5) < 1e-3 * sigma * e / d**0.5
 
 
 def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
@@ -314,12 +315,12 @@ def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
         attention.qkv.weight[:16].mul_(20.0)  # head 0의 q만 크게 → 그 head만 상한을 넘는다
     before = qk_logit_bounds(model)
     v_before = attention.qkv.weight[2 * 32 :].clone()
-    tau = float(before[1, 1:].max()) * 1.5  # head 0만 넘도록
+    tau = float(before[0, 1:].max()) * 1.5  # head 0만 넘도록
     clipped, worst = apply_qk_clip(model, tau)
     after = qk_logit_bounds(model)
-    assert clipped >= 1 and abs(worst - before.max().item()) < 1e-3 * worst
+    assert clipped.item() >= 1 and abs(worst.item() - before.max().item()) < 1e-3 * worst.item()
     assert after.max() <= tau * (1 + 1e-4)
-    assert torch.allclose(after[1, 1:], before[1, 1:])  # 상한 안쪽 head는 그대로
+    assert torch.allclose(after[0, 1:], before[0, 1:])  # 상한 안쪽 head는 그대로
     assert torch.equal(attention.qkv.weight[2 * 32 :], v_before)  # v는 건드리지 않는다
 
 
@@ -332,3 +333,28 @@ def test_training_with_qk_clip_keeps_bounds_under_tau(tmp_path):
     assert qk_logit_bounds(model).max() <= 5.0 * (1 + 1e-4)
     with pytest.raises(ValueError, match="qk_clip"):
         TabPFNv2TrainConfig(qk_clip=0.0)
+
+
+def test_resuming_with_qk_clip_clips_before_the_first_snapshot(tmp_path, monkeypatch):
+    config = replace(
+        TabPFNv2TrainConfig.smoke("regression"), steps=10, log_every=1, border_datasets=10
+    )
+    train_tabpfn_v2(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
+    tau = 1.0  # clip 없이 학습한 checkpoint의 상한보다 훨씬 작다
+    state = torch.load(tmp_path / "a" / "latest.pt", weights_only=True)
+    plain = TabPFNv2(config.model_config())
+    plain.load_state_dict(state["model"])
+    assert qk_logit_bounds(plain).max() > tau
+
+    # 마지막 step에서 무너졌다고 보면 첫 snapshot(이어 받은 상태)으로 되돌린 채 끝난다
+    monkeypatch.setattr(CollapseGuard, "update", lambda self, window_mean: True)
+    train_tabpfn_v2(
+        replace(config, stop_step=5, qk_clip=tau),
+        tmp_path / "b",
+        resume_from=tmp_path / "a" / "latest.pt",
+        mlflow_log=False,
+    )
+    resumed = torch.load(tmp_path / "b" / "latest.pt", weights_only=True)
+    assert resumed["step"] == 4
+    plain.load_state_dict(resumed["model"])
+    assert qk_logit_bounds(plain).max() <= tau * (1 + 1e-4)

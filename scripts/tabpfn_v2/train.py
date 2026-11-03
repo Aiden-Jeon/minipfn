@@ -112,13 +112,16 @@ def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
     config = replace(config, **{k: v for k, v in overrides.items() if v is not None})
-    if args.collapse_threshold is not None:  # `off`면 CollapseGuard를 끈다
-        off = args.collapse_threshold.lower() in ("off", "none")
-        config = replace(config, collapse_threshold=None if off else float(args.collapse_threshold))
-    if args.qk_clip is not None:  # `off`면 QK-clip을 끈다
-        off = args.qk_clip.lower() in ("off", "none")
-        config = replace(config, qk_clip=None if off else float(args.qk_clip))
+    # `off`면 끈다 (CollapseGuard, QK-clip)
+    if args.collapse_threshold is not None:
+        config = replace(config, collapse_threshold=_optional_float(args.collapse_threshold))
+    if args.qk_clip is not None:
+        config = replace(config, qk_clip=_optional_float(args.qk_clip))
     return config
+
+
+def _optional_float(value: str) -> float | None:
+    return None if value.lower() in ("off", "none") else float(value)
 
 
 def plot_history(history: dict, task: str) -> plt.Figure:

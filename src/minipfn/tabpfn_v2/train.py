@@ -330,11 +330,13 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
 
 
 def _qk_weights(model) -> list[tuple[str, torch.Tensor]]:
-    # (이름, qkv weight) — 층마다 feature attention, sample attention
+    # (종류, qkv weight). 입력이 LayerNorm 뒤인 attention만: 첫 층 feature attention은 입력이
+    # 임베딩 그대로라 아래 상한이 성립하지 않아 뺀다(그 attention은 폭주한 적도 없다)
     return [
-        (f"{kind}.{i}", getattr(layer, kind).qkv.weight)
+        (kind, getattr(layer, kind).qkv.weight)
         for i, layer in enumerate(model.layers)
         for kind in ("feature_attention", "sample_attention")
+        if i > 0 or kind == "sample_attention"
     ]
 
 
@@ -342,10 +344,10 @@ def _qk_weights(model) -> list[tuple[str, torch.Tensor]]:
 def qk_logit_bounds(model) -> torch.Tensor:
     """attention마다 head별 logit 상한 σ_max(Wq_hᵀ Wk_h) · E / √d. 모양 (attention 수, head 수).
 
-    층 입력은 affine 없는 LayerNorm 뒤라 토큰 크기가 √E로 같으므로(첫 층 feature attention만 예외)
-    |q·k| / √d ≤ σ_max · E / √d이다. 논문 규모 회귀 checkpoint에서 이 값은 실제 최대 logit과 거의
-    같았다(678k vs 676k). σ_max²는 d×d 행렬 (Wq_h Wq_hᵀ)(Wk_h Wk_hᵀ)의 가장 큰 고유값이라 E×E 대신
-    d×d에서 계산한다.
+    attention 순서는 `_qk_weights`와 같다. 층 입력은 affine 없는 LayerNorm 뒤라 토큰 크기가 √E로
+    같으므로 |q·k| / √d ≤ σ_max · E / √d이다. 논문 규모 회귀 checkpoint에서 이 값은 실제 최대
+    logit과 거의 같았다(678k vs 676k). Wq_hᵀ = Q_q R_q, Wk_hᵀ = Q_k R_k로 QR 분해하면
+    σ_max(Wq_hᵀ Wk_h) = σ_max(R_q R_kᵀ)라 E×E 대신 d×d에서 계산한다.
     """
     weights = _qk_weights(model)
     nhead = model.config.nhead
@@ -354,20 +356,27 @@ def qk_logit_bounds(model) -> torch.Tensor:
     w = torch.stack([w for _, w in weights]).double()  # (A, 3E, E)
     q = w[:, :e].reshape(len(weights), nhead, d, e)
     k = w[:, e : 2 * e].reshape(len(weights), nhead, d, e)
-    gram = (q @ q.transpose(-1, -2)) @ (k @ k.transpose(-1, -2))  # (A, H, d, d)
-    sigma_sq = torch.linalg.eigvals(gram).real.amax(-1).clamp_min(0)
-    return (sigma_sq.sqrt() * e / math.sqrt(d)).float()
+    r_q = torch.linalg.qr(q.transpose(-1, -2)).R  # (A, H, d, d)
+    r_k = torch.linalg.qr(k.transpose(-1, -2)).R
+    sigma = torch.linalg.matrix_norm(r_q @ r_k.transpose(-1, -2), ord=2)
+    return (sigma * e / math.sqrt(d)).float()
+
+
+def _sample_rows(model) -> list[int]:
+    # qk_logit_bounds의 행 가운데 sample attention인 것
+    return [i for i, (kind, _) in enumerate(_qk_weights(model)) if kind == "sample_attention"]
 
 
 @torch.no_grad()
-def apply_qk_clip(model, tau: float, world_size: int = 1) -> tuple[int, float]:
+def apply_qk_clip(model, tau: float, world_size: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """logit 상한이 tau를 넘는 head의 Wq_h·Wk_h를 각각 √(tau / 상한)배로 줄인다.
 
-    반환: (줄인 head 수, 줄이기 전 가장 큰 상한). GPU마다 고유값 계산이 아주 조금 다를 수 있어
-    배율은 모든 GPU의 최솟값으로 맞춘다(가중치가 GPU마다 같게 남도록).
+    반환: (줄인 head 수, 줄이기 전 가장 큰 상한). 매 step 부르므로 GPU에 둔 채 돌려준다(값을 읽는
+    것은 기록할 때만). GPU마다 계산이 아주 조금 다를 수 있어 배율은 모든 GPU의 최솟값으로
+    맞춘다(가중치가 GPU마다 같게 남도록).
     """
     bounds = qk_logit_bounds(model)
-    scale = (tau / bounds).clamp(max=1.0).sqrt().to(bounds.device)
+    scale = (tau / bounds).clamp(max=1.0).sqrt()
     if world_size > 1:
         dist.all_reduce(scale, op=dist.ReduceOp.MIN)
     nhead = model.config.nhead
@@ -376,7 +385,7 @@ def apply_qk_clip(model, tau: float, world_size: int = 1) -> tuple[int, float]:
         head = s.to(w.dtype).repeat_interleave(e // nhead)[:, None]  # (E, 1): 행마다 그 head의 배율
         w[:e].mul_(head)
         w[e : 2 * e].mul_(head)
-    return int((scale < 1).sum().item()), bounds.max().item()
+    return (scale < 1).sum(), bounds.max()
 
 
 def checkpoint_lr(path: str | Path) -> float:
@@ -552,6 +561,11 @@ def train_tabpfn_v2(
     window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
     last_log_step, skip_reports = start_step, 0
     stop_step = min(config.stop_step or config.steps, config.steps)
+    if config.qk_clip is not None:
+        # 이어서 학습하는 checkpoint가 clip 없이 학습됐을 수 있어, 첫 snapshot 전에 한 번 맞춘다
+        apply_qk_clip(model, config.qk_clip, d.world_size)
+        if mlf is not None:  # 이어 쓰는 run은 param을 못 바꾸므로 chunk마다 쓴 값을 지표로 남긴다
+            mlf.log_metric("qk_clip", config.qk_clip, step=start_step)
     if guard is not None:
         snapshot(start_step)
     step = start_step - 1
@@ -582,8 +596,10 @@ def train_tabpfn_v2(
             opt.step()
             if config.qk_clip is not None:
                 clipped, bound = apply_qk_clip(model, config.qk_clip, d.world_size)
-                window_clipped += clipped
-                window_bound = max(window_bound, bound)
+                window_clipped = window_clipped + clipped  # GPU에 둔 채 더한다 (읽는 건 기록할 때)
+                window_bound = torch.maximum(
+                    torch.as_tensor(window_bound, device=bound.device), bound
+                )
         else:
             skipped_steps += 1
             if skip_reports < 5:  # 원인을 찾도록 처음 몇 번은 rank마다 batch 정보를 남긴다
@@ -682,10 +698,12 @@ def train_tabpfn_v2(
             # attention logit 상한 중 가장 큰 값 (sample attention이 폭주하면 수만 이상으로 커진다)
             bounds = qk_logit_bounds(model)
             metrics["qk_bound_max"] = bounds.max().item()
-            metrics["qk_bound_sample_max"] = bounds[1::2].max().item()
+            metrics["qk_bound_sample_max"] = bounds[_sample_rows(model)].max().item()
             if config.qk_clip is not None:
-                metrics["qk_clipped_heads"] = window_clipped  # 이 window에서 줄인 (step, head) 수
-                metrics["qk_bound_before_clip"] = window_bound
+                metrics["qk_clipped_heads"] = float(
+                    window_clipped
+                )  # 이 window에서 줄인 (step, head)
+                metrics["qk_bound_before_clip"] = float(window_bound)
             history["step"].append(done)
             history["train_loss"].append(metrics["train_loss"])
             print(
