@@ -20,12 +20,13 @@
 - 양 끝 꼬리 구간의 값: prior에서 만든 경계는 맨 바깥 구간이 아주 넓어서(z 폭 24~28)
   half-normal 꼬리의 평균이 z ±34 근처가 된다. 학습 target이 안쪽 경계를 넘는 데이터(치우친 y)에서
   꼬리에 놓인 1~2% 확률이 그 먼 값으로 계산돼 예측이 크게 밀리므로, 꼬리 구간의 값은 학습 target
-  범위의 끝(안쪽 경계보다 바깥일 때만)으로 본다.
+  범위의 끝(안쪽 경계보다 바깥일 때만, 맨 바깥 경계 안으로)으로 본다.
 - 평균은 공통 경계로 옮기지 않고 멤버마다 자기 공간에서 낸다. target power 멤버는 자기 구간 값을
   역변환한다. 공통 경계로 옮기면 구간 안을 균일하다고 보므로, 값이 몰린 곳이 공통 경계 가까이에
   있으면(cpu_activity의 y=0, 안쪽 경계 바로 위) 확률 일부가 꼬리 구간으로 넘어간다.
-- Yeo-Johnson 역변환은 λ에 따라 한쪽 끝에서 정의가 끝난다(NaN). 학습 target 범위 밖은 끝 기울기로
-  직선 연장한다.
+- Yeo-Johnson 역변환은 λ에 따라 한쪽 끝에서 정의가 끝나고(NaN) 그 가까이에서 끝없이 가파르다.
+  학습 target 범위 밖은 그 끝값으로 둔다. 그래서 target power 멤버의 구간 값은 학습 target 범위
+  안에 있다.
 """
 
 from __future__ import annotations
@@ -252,33 +253,31 @@ def _probs_on_borders(probs: torch.Tensor, frm: torch.Tensor, to: torch.Tensor) 
     return (at_to[:, 1:] - at_to[:, :-1]).clamp_min(0)
 
 
-def _safe_inverse(transform: PowerTransformer, u_train: np.ndarray):
-    """power transform의 역변환. 학습 target 범위 [lo, hi] 밖은 끝 기울기로 직선 연장한다."""
+def _clipped_inverse(transform: PowerTransformer, u_train: np.ndarray):
+    """power transform의 역변환. 학습 target 범위 [lo, hi] 밖은 그 끝값으로 둔다.
+
+    역변환은 λ < 0이면 오른쪽, λ > 2이면 왼쪽 끝에서 정의가 끝나고 그 가까이에서 끝없이 가팔라서,
+    범위 밖으로 연장하면 (끝 기울기로 직선 연장해도) z가 수천까지 커진다.
+    """
     lo, hi = float(u_train.min()), float(u_train.max())
-    eps = 1e-3 * (hi - lo) if hi > lo else 1e-3
-
-    def inverse(u: np.ndarray) -> np.ndarray:
-        with np.errstate(all="ignore"):
-            return transform.inverse_transform(np.reshape(u, (-1, 1))).ravel()
-
-    z_lo, z_lo_in, z_hi_in, z_hi = inverse(np.array([lo, lo + eps, hi - eps, hi]))
-    slope_lo, slope_hi = (z_lo_in - z_lo) / eps, (z_hi - z_hi_in) / eps
 
     def g(u: np.ndarray) -> np.ndarray:
-        u = np.asarray(u, dtype=np.float64)
-        z = inverse(np.clip(u, lo, hi))
-        z = np.where(u < lo, z_lo + slope_lo * (u - lo), z)
-        return np.where(u > hi, z_hi + slope_hi * (u - hi), z)
+        u = np.clip(np.asarray(u, dtype=np.float64).reshape(-1, 1), lo, hi)
+        with np.errstate(all="ignore"):
+            return transform.inverse_transform(u).ravel()
 
     return g
 
 
 def _bucket_values(borders: torch.Tensor, u_train: np.ndarray) -> np.ndarray:
-    """평균에 쓸 구간마다의 값: 안쪽 구간은 가운데, 양 끝 꼬리 구간은 학습 target 범위의 끝."""
+    """평균에 쓸 구간마다의 값: 안쪽 구간은 가운데, 양 끝 꼬리 구간은 학습 target 범위의 끝.
+
+    꼬리 구간의 값은 맨 바깥 경계 안으로 자른다 (극단값 행 하나가 꼬리 값을 정하지 않도록).
+    """
     b = borders.double().numpy()
     values = (b[1:] + b[:-1]) / 2
-    values[0] = min(b[1], float(u_train.min()))
-    values[-1] = max(b[-2], float(u_train.max()))
+    values[0] = max(b[0], min(b[1], float(u_train.min())))
+    values[-1] = min(b[-1], max(b[-2], float(u_train.max())))
     return values
 
 
@@ -304,33 +303,36 @@ class TabPFNv2Regressor(_Base):
             for i in range(self.n_estimators)
         ]
         self._fit_members(X, members)
-        self.inverses_, self.y_trains_, self.bucket_values_ = [], [], []
+        b = self.borders.double().numpy()
+        self.y_trains_, self.bucket_values_, self.border_maps_ = [], [], []
         for m in members:
-            inverse, u = None, z
+            u, values, border_map = z, _bucket_values(self.borders, z), None
             if m.target_power:
                 transform = PowerTransformer(method="yeo-johnson", standardize=True)
                 u = transform.fit_transform(z.reshape(-1, 1)).ravel()
-                inverse = _safe_inverse(transform, u)
-            values = _bucket_values(self.borders, u)
-            if inverse is not None:
-                values = inverse(values)  # 멤버 공간의 구간 값을 z 공간으로
-            self.inverses_.append(inverse)
+                inverse = _clipped_inverse(transform, u)
+                # 멤버 공간의 구간 값과 경계를 z 공간으로 (경계는 predict_distribution에서 쓴다)
+                values = np.clip(inverse(_bucket_values(self.borders, u)), b[0], b[-1])
+                back = np.clip(np.maximum.accumulate(inverse(b)), b[0], b[-1])
+                border_map = torch.as_tensor(back, dtype=torch.float32)
             self.y_trains_.append(u)
             self.bucket_values_.append(torch.as_tensor(values, dtype=torch.float32))
+            self.border_maps_.append(border_map)
         return self
 
     def predict_distribution(self, X: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """(구간 log 확률 (n, 구간 수), 원래 단위의 경계)."""
+        """(구간 log 확률 (n, 구간 수), 원래 단위의 경계).
+
+        멤버를 공통 경계로 옮겨 섞은 분포다. 꼬리는 공통 경계의 half-normal 그대로라, 이 분포로 낸
+        평균은 `predict`와 다르다 (평균은 `predict`를 쓴다).
+        """
         borders = self.borders.to(self.device)
         probs = []
         for i, logits in self._iter_logits(X, self.y_trains_):
             p = torch.softmax(logits / SOFTMAX_TEMPERATURE, dim=-1)
-            inverse = self.inverses_[i]
-            if inverse is not None:
-                # power transform한 공간의 경계를 z 공간으로 되돌려 확률을 옮긴다
-                back = np.maximum.accumulate(inverse(self.borders.numpy()))
-                frm = torch.as_tensor(back, dtype=torch.float32, device=self.device)
-                p = _probs_on_borders(p, frm.clamp(borders[0], borders[-1]), borders)
+            if self.border_maps_[i] is not None:
+                # power transform한 공간의 경계를 z 공간으로 되돌린 것 위에서 확률을 옮긴다
+                p = _probs_on_borders(p, self.border_maps_[i].to(self.device), borders)
             probs.append(p)
         log_probs = torch.stack(probs).mean(0).clamp_min(1e-12).log().cpu()
         return log_probs, (self.borders * self.y_std_ + self.y_mean_)
