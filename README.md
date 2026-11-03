@@ -70,12 +70,13 @@ uv run torchrun --standalone --nproc_per_node=8 scripts/tabpfn/train.py --config
 
 ### 평가
 
-논문 Table 1의 OpenML-CC18 18개 데이터셋 × 5 split에서 ROC AUC를 재고, sklearn 기본값 baseline과 비교합니다. `--run-id`를 주면 결과를 그 학습 run에 함께 기록합니다.
+논문 Table 1의 OpenML-CC18 18개 데이터셋 × 5 split에서 ROC AUC를 재고, sklearn 기본값 baseline과 비교합니다. 학습 run이 남긴 모델과 checkpoint는 `runs:/` URI로 줍니다. `--mlflow`를 주면 평가용 run을 따로 만들어 결과를 그 run의 `eval/`에 남깁니다(AI Runtime에서는 `runs/eval_tabpfn.yaml`).
 
 ```bash
-uv run python scripts/tabpfn/eval.py --model-path tabpfn_run/tabpfn_final.pt   # 로컬 가중치
-uv run python scripts/tabpfn/eval.py --run-id <학습 run_id>                    # MLflow run의 가중치
-uv run python scripts/tabpfn/eval.py --baselines-only                          # baseline만
+uv run python scripts/tabpfn/eval.py --model-path tabpfn_run/tabpfn_final.pt                      # 로컬 가중치
+uv run python scripts/tabpfn/eval.py --model-path runs:/<run_id>/model/tabpfn_final.pt --mlflow   # 학습 run의 최종 모델
+uv run python scripts/tabpfn/eval.py --model-path runs:/<run_id>/checkpoints/step_0003000.pt      # 학습 중 checkpoint
+uv run python scripts/tabpfn/eval.py --baselines-only                                             # baseline만
 ```
 
 ### checkpoint에서 이어서 학습하기
