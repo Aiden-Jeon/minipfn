@@ -5,14 +5,16 @@ from dataclasses import replace
 import pytest
 import torch
 
-from minipfn.tabpfn_v2.model import load_checkpoint
+from minipfn.tabpfn_v2.model import TabPFNv2, load_checkpoint
 from minipfn.tabpfn_v2.train import (
     CollapseGuard,
     TabPFNv2TrainConfig,
     _make_val_batches,
+    apply_qk_clip,
     checkpoint_lr,
     dequantize_targets,
     lr_factor,
+    qk_logit_bounds,
     train_tabpfn_v2,
 )
 
@@ -287,3 +289,46 @@ def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
     expected = lower.lr * lr_factor(6, config.warmup_steps, config.steps)
     assert abs(state["scheduler"]["_last_lr"][0] - expected) < 1e-12
     assert abs(state["optimizer"]["param_groups"][0]["lr"] - expected) < 1e-12
+
+
+def test_qk_logit_bounds_match_the_spectral_norm():
+    model = TabPFNv2(TabPFNv2TrainConfig.smoke("regression").model_config())
+    torch.manual_seed(0)
+    for layer in model.layers:
+        torch.nn.init.normal_(layer.sample_attention.qkv.weight, std=0.5)
+    bounds = qk_logit_bounds(model)
+    e, h = model.config.emsize, model.config.nhead
+    d = e // h
+    w = model.layers[1].sample_attention.qkv.weight.double()
+    for head in range(h):
+        q, k = w[head * d : (head + 1) * d], w[e + head * d : e + (head + 1) * d]
+        sigma = torch.linalg.matrix_norm(q.T @ k, ord=2).item()
+        assert abs(bounds[3, head].item() - sigma * e / d**0.5) < 1e-3 * sigma * e / d**0.5
+
+
+def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
+    model = TabPFNv2(TabPFNv2TrainConfig.smoke("regression").model_config())
+    attention = model.layers[0].sample_attention
+    with torch.no_grad():
+        attention.qkv.weight.normal_(std=0.5)
+        attention.qkv.weight[:16].mul_(20.0)  # head 0의 q만 크게 → 그 head만 상한을 넘는다
+    before = qk_logit_bounds(model)
+    v_before = attention.qkv.weight[2 * 32 :].clone()
+    tau = float(before[1, 1:].max()) * 1.5  # head 0만 넘도록
+    clipped, worst = apply_qk_clip(model, tau)
+    after = qk_logit_bounds(model)
+    assert clipped >= 1 and abs(worst - before.max().item()) < 1e-3 * worst
+    assert after.max() <= tau * (1 + 1e-4)
+    assert torch.allclose(after[1, 1:], before[1, 1:])  # 상한 안쪽 head는 그대로
+    assert torch.equal(attention.qkv.weight[2 * 32 :], v_before)  # v는 건드리지 않는다
+
+
+def test_training_with_qk_clip_keeps_bounds_under_tau(tmp_path):
+    config = replace(
+        TabPFNv2TrainConfig.smoke("regression"), steps=4, border_datasets=10, qk_clip=5.0
+    )
+    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    model, _ = load_checkpoint(result["final_path"])
+    assert qk_logit_bounds(model).max() <= 5.0 * (1 + 1e-4)
+    with pytest.raises(ValueError, match="qk_clip"):
+        TabPFNv2TrainConfig(qk_clip=0.0)
