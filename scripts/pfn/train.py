@@ -4,7 +4,7 @@ AI Runtime(`databricks air run -f runs/train_pfn.yaml`)과 로컬에서 같은 �
 쓴다.
 - AI Runtime: 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에 이어서 기록한다.
 - 로컬: 새 run을 연다.
-  예) `uv run python scripts/train_pfn.py --config-name small --steps 50`
+  예) `uv run python scripts/pfn/train.py --config-name small --steps 50`
 
 규모는 인자 또는 환경변수(`PFN_CONFIG_NAME`, `PFN_STEPS`)로 정한다. air에서는
 `--override env_variables.PFN_STEPS=...`로 yaml을 고치지 않고 바꿀 수 있다.

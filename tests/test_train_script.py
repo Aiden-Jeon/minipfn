@@ -5,7 +5,7 @@ from pathlib import Path
 
 import mlflow
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "train_pfn.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "pfn" / "train.py"
 
 
 def test_train_script_logs_run_with_eval_metrics(tmp_path):

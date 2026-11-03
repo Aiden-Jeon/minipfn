@@ -2,8 +2,8 @@
 
 AI Runtime(`databricks air run -f runs/train_tabpfn.yaml`)과 로컬에서 같은
 스크립트를 쓴다.
-- GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/train_tabpfn.py`
-- 로컬: `uv run python scripts/train_tabpfn.py --config-name smoke`
+- GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/tabpfn/train.py`
+- 로컬: `uv run python scripts/tabpfn/train.py --config-name smoke`
 
 규모는 인자 또는 환경변수(`TABPFN_CONFIG_NAME`, `TABPFN_STEPS`, `TABPFN_NUM_WORKERS`,
 `TABPFN_GROUPS_PER_BATCH`, `TABPFN_BATCH_SIZE`, `TABPFN_PROFILE_STEPS`)로 정한다.
