@@ -5,7 +5,7 @@ benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마�
 학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`), Hub repo id
 (`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
 
-예) 저장소 루트에서 `EVAL=scripts/eval_tabpfn_v2.py`라고 두면
+예) 저장소 루트에서 `EVAL=scripts/tabpfn_v2/eval.py`라고 두면
   uv run python $EVAL --classifier-path clf.pt --regressor-path reg.pt            # 57개 × 10 fold
   uv run python $EVAL --suite classification --classifier-path clf.pt --tasks 359955 --folds 2
   uv run python $EVAL --suite classification --classifier-path runs:/<run_id>/checkpoints/latest.pt

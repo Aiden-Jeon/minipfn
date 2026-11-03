@@ -25,7 +25,7 @@ def test_single_class_fold_scores_nan():
 
 
 def _eval_script():
-    path = Path(__file__).parents[1] / "scripts" / "eval_tabpfn_v2.py"
+    path = Path(__file__).parents[1] / "scripts" / "tabpfn_v2" / "eval.py"
     spec = importlib.util.spec_from_file_location("eval_tabpfn_v2", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

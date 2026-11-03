@@ -48,7 +48,7 @@ print("ROC AUC:", roc_auc_score(y_test, proba[:, 1]))  # 0.997
 같은 모델로 논문 Table 1(OpenML-CC18 18개 데이터셋 × 5 split)을 측정할 수 있습니다.
 
 ```bash
-uv run python scripts/eval_tabpfn.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
+uv run python scripts/tabpfn/eval.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
 ```
 
 ## 3. 바닥부터 학습하기
@@ -59,13 +59,13 @@ uv run python scripts/eval_tabpfn.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
 
 ```bash
 # PFN GP prior 1D 회귀 (config: small / large / paper)
-uv run python scripts/train_pfn.py --config-name small --steps 50
+uv run python scripts/pfn/train.py --config-name small --steps 50
 
 # TabPFN (config: smoke / medium / paper). 마지막 가중치는 tabpfn_run/tabpfn_final.pt
-uv run python scripts/train_tabpfn.py --config-name smoke
+uv run python scripts/tabpfn/train.py --config-name smoke
 
 # GPU 여러 장이면 torchrun으로 GPU마다 프로세스를 하나씩 띄운다
-uv run torchrun --standalone --nproc_per_node=8 scripts/train_tabpfn.py --config-name paper
+uv run torchrun --standalone --nproc_per_node=8 scripts/tabpfn/train.py --config-name paper
 ```
 
 ### 평가
@@ -73,9 +73,9 @@ uv run torchrun --standalone --nproc_per_node=8 scripts/train_tabpfn.py --config
 논문 Table 1의 OpenML-CC18 18개 데이터셋 × 5 split에서 ROC AUC를 재고, sklearn 기본값 baseline과 비교합니다. `--run-id`를 주면 결과를 그 학습 run에 함께 기록합니다.
 
 ```bash
-uv run python scripts/eval_tabpfn.py --model-path tabpfn_run/tabpfn_final.pt   # 로컬 가중치
-uv run python scripts/eval_tabpfn.py --run-id <학습 run_id>                    # MLflow run의 가중치
-uv run python scripts/eval_tabpfn.py --baselines-only                          # baseline만
+uv run python scripts/tabpfn/eval.py --model-path tabpfn_run/tabpfn_final.pt   # 로컬 가중치
+uv run python scripts/tabpfn/eval.py --run-id <학습 run_id>                    # MLflow run의 가중치
+uv run python scripts/tabpfn/eval.py --baselines-only                          # baseline만
 ```
 
 ### checkpoint에서 이어서 학습하기
@@ -83,10 +83,10 @@ uv run python scripts/eval_tabpfn.py --baselines-only                          #
 TabPFN 학습은 `checkpoint_every` step마다(paper 1,000 · medium 300 · smoke 10) 학습 상태 전체를 MLflow run의 `checkpoints/latest.pt`에 올립니다. 학습이 끊기면 그 run id를 `--resume-run-id`로 주고, 처음과 같은 config와 step 수로 다시 실행합니다.
 
 ```bash
-uv run python scripts/train_tabpfn.py --config-name smoke --resume-run-id <run_id>
+uv run python scripts/tabpfn/train.py --config-name smoke --resume-run-id <run_id>
 ```
 
-Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다. PFN 학습(`train_pfn.py`)에는 아직 checkpoint 재개 기능이 없습니다.
+Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다. PFN 학습(`scripts/pfn/train.py`)에는 아직 checkpoint 재개 기능이 없습니다.
 
 ## 4. Step by step
 

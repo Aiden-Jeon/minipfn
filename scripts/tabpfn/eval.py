@@ -1,6 +1,6 @@
 """학습한 TabPFN을 OpenML-CC18(논문 Table 1)에서 평가하고 논문 수치와 비교한다.
 
-예) 저장소 루트에서 `EVAL=scripts/eval_tabpfn.py`라고 두면
+예) 저장소 루트에서 `EVAL=scripts/tabpfn/eval.py`라고 두면
   uv run python $EVAL --run-id <학습 run_id>                # MLflow run의 모델
   uv run python $EVAL --model-path tabpfn_run/tabpfn_final.pt --datasets 11,37
   uv run python $EVAL --hub-repo aiden-jeon/minipfn-tabpfn-v1   # Hugging Face Hub의 모델

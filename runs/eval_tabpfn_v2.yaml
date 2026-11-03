@@ -22,11 +22,11 @@ code_source:
     root_path: ..
     include_paths:
       - src
-      - scripts/eval_tabpfn_v2.py
+      - scripts/tabpfn_v2/eval.py
 env_variables:
   TABPFN_V2_EXTRA_ARGS: ""
 max_retries: 0
 timeout_minutes: 180
 command: >-
   PYTHONPATH=$CODE_SOURCE_PATH/src
-  python $CODE_SOURCE_PATH/scripts/eval_tabpfn_v2.py --suite all $TABPFN_V2_EXTRA_ARGS
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v2/eval.py --suite all $TABPFN_V2_EXTRA_ARGS

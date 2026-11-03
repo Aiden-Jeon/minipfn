@@ -17,7 +17,7 @@ code_source:
     root_path: ..
     include_paths:
       - src
-      - scripts/train_pfn.py
+      - scripts/pfn/train.py
 env_variables:
   PFN_CONFIG_NAME: large
   PFN_STEPS: "500"
@@ -26,4 +26,4 @@ max_retries: 0
 timeout_minutes: 60
 command: >-
   PYTHONPATH=$CODE_SOURCE_PATH/src
-  python $CODE_SOURCE_PATH/scripts/train_pfn.py
+  python $CODE_SOURCE_PATH/scripts/pfn/train.py

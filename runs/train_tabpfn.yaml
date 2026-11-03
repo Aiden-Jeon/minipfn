@@ -19,7 +19,7 @@ code_source:
     root_path: ..
     include_paths:
       - src
-      - scripts/train_tabpfn.py
+      - scripts/tabpfn/train.py
 env_variables:
   TABPFN_CONFIG_NAME: medium
   TABPFN_STEPS: "50"
@@ -30,4 +30,4 @@ timeout_minutes: 30
 # torchrun이 GPU마다 프로세스를 하나씩 띄운다 (batch 512 = group 8 × 누적 8 × GPU 8).
 command: >-
   PYTHONPATH=$CODE_SOURCE_PATH/src
-  torchrun --standalone --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/train_tabpfn.py
+  torchrun --standalone --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/tabpfn/train.py

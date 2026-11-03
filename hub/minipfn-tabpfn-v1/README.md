@@ -67,7 +67,7 @@ proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes
 If the training rows change with every request, use `minipfn.tabpfn.inference.tabpfn_predict_proba(model, x_train, y_train, x_test)`. To reproduce Table 1:
 
 ```bash
-uv run python scripts/eval_tabpfn.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
+uv run python scripts/tabpfn/eval.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
 ```
 
 ## Files

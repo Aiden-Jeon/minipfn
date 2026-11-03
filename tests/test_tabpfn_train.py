@@ -11,7 +11,7 @@ import torch
 from minipfn.tabpfn import spec
 from minipfn.tabpfn.train import TabPFNConfig, load_tabpfn, lr_factor, train_tabpfn
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "train_tabpfn.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tabpfn" / "train.py"
 
 
 def test_paper_config_matches_spec():
@@ -73,11 +73,11 @@ def test_train_script_logs_to_mlflow(tmp_path):
         assert {"loss_curve.png", "model", "checkpoints", "code"} <= artifacts
         # 실제로 돈 스크립트와 src가 run에 남는다
         code = {a.path for a in client.list_artifacts(run_id, "code")}
-        assert {"code/train_tabpfn.py", "code/minipfn"} <= code
+        assert {"code/train.py", "code/minipfn"} <= code
         tabpfn_code = {a.path for a in client.list_artifacts(run_id, "code/minipfn/tabpfn")}
         assert "code/minipfn/tabpfn/train.py" in tabpfn_code
         tags = runs.iloc[0]
-        assert tags["tags.command"] == "train_tabpfn.py --config-name smoke --steps 4 --out-dir out"
+        assert tags["tags.command"] == "train.py --config-name smoke --steps 4 --out-dir out"
         assert tags["tags.git_commit"]
     finally:
         mlflow.set_tracking_uri(prev_uri)

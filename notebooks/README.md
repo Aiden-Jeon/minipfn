@@ -11,7 +11,7 @@
 | 03 | [구현 디테일](01_pfn/03_pfn_implementation_details.ipynb) | bar distribution, Transformer encoder, GP prior의 정답 posterior는 어떻게 생겼나? |
 | 04 | [GP prior 1D 회귀 재현](01_pfn/04_pfn_gp_reproduction.ipynb) | 논문 크기로 학습한 PFN(H100)이 정확한 GP posterior와 얼마나 비슷한가? |
 
-실행 파일: `scripts/train_pfn.py`, `runs/train_pfn.yaml`
+실행 파일: `scripts/pfn/train.py`, `runs/train_pfn.yaml`
 
 ## `02_tabpfn/` — Hollmann et al., *TabPFN* (ICLR 2023)
 
@@ -22,7 +22,7 @@
 | 03 | [논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthrough.ipynb) | SCM·BNN prior를 섞은 PFN은 어떻게 다양한 표 데이터 분류에 forward pass 한 번으로 적응하는가? |
 | 04 | [논문 규모 재현](02_tabpfn/04_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
-실행 파일: `scripts/train_tabpfn.py`, `scripts/eval_tabpfn.py`, `runs/train_tabpfn.yaml` (Hub 모델 카드: `hub/minipfn-tabpfn-v1/README.md`)
+실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `runs/train_tabpfn.yaml` (Hub 모델 카드: `hub/minipfn-tabpfn-v1/README.md`)
 
 ## `03_tabpfn_v2/` — Hollmann et al., *Accurate predictions on small data with a tabular foundation model* (Nature 2025)
 

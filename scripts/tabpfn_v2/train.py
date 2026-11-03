@@ -1,11 +1,11 @@
 """TabPFN v2를 TabICL prior로 학습하고 MLflow에 기록한다 (Nature 2025 재현).
 
 AI Runtime(`databricks air run -f runs/train_tabpfn_v2.yaml`)과 로컬에서 같은 스크립트를 쓴다.
-- GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/train_tabpfn_v2.py`
+- GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/tabpfn_v2/train.py`
 - 노드 여러 대: 노드마다 `torchrun --nnodes=<노드 수> --node_rank=<번호> --master_addr=<주소>
-  --master_port=<포트> --nproc_per_node=8 scripts/train_tabpfn_v2.py`. batch는 그대로이고 GPU당
-  micro batch는 batch / GPU 수를 넘지 않게 자동으로 줄어든다.
-- 로컬: `uv run python scripts/train_tabpfn_v2.py --config-name smoke --task regression`
+  --master_port=<포트> --nproc_per_node=8 scripts/tabpfn_v2/train.py`. batch는 그대로이고
+  GPU당 micro batch는 batch / GPU 수를 넘지 않게 자동으로 줄어든다.
+- 로컬: `uv run python scripts/tabpfn_v2/train.py --config-name smoke --task regression`
 
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
