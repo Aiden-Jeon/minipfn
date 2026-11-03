@@ -3,7 +3,7 @@
 benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마다 OpenML task의 10-fold 교차검증
 평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `model.save_checkpoint`로 저장한 체크포인트,
 학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`), Hub repo id
-(`hub.save_pretrained`로 올린 것) 가운데 하나다.
+(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
 
 예) 저장소 루트에서 `EVAL=scripts/eval_tabpfn_v2.py`라고 두면
   uv run python $EVAL --classifier-path clf.pt --regressor-path reg.pt            # 57개 × 10 fold
@@ -38,8 +38,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--suite", choices=["classification", "regression", "all"], default="all")
     parser.add_argument("--tasks", help="쉼표로 구분한 OpenML task id (suite 안에서 고른다)")
     parser.add_argument("--folds", type=int, default=10)
-    parser.add_argument("--classifier-path", help="분류 체크포인트 (파일, runs:/ URI, Hub repo id)")
-    parser.add_argument("--regressor-path", help="회귀 체크포인트 (파일, runs:/ URI, Hub repo id)")
+    parser.add_argument(
+        "--classifier-path", help="분류 체크포인트 (파일, 폴더, runs:/ URI, hf://owner/name)"
+    )
+    parser.add_argument(
+        "--regressor-path", help="회귀 체크포인트 (파일, 폴더, runs:/ URI, hf://owner/name)"
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
     parser.add_argument("--mlflow", action="store_true", help="로컬에서도 MLflow에 기록한다")

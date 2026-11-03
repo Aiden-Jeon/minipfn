@@ -95,7 +95,7 @@ proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes
 
 ```bash
 uv run python scripts/eval_tabpfn_v2.py --suite classification \
-  --classifier-path aiden-jeon/minipfn-tabpfn-v2-classifier
+  --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier
 ```
 
 ## Files

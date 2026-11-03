@@ -11,6 +11,11 @@ from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
 from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
 
 
+@pytest.fixture
+def chdir_tmp(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # 상대 경로가 저장소 안의 진짜 폴더와 겹치지 않도록
+
+
 def _model(task="classification"):
     torch.manual_seed(0)
     return TabPFNv2(TabPFNv2TrainConfig.smoke(task).model_config()).eval()
@@ -82,3 +87,29 @@ def test_training_checkpoint_from_run_uses_run_params(tmp_path, monkeypatch):
     _same_weights(model, loaded)
     with pytest.raises(SystemExit, match="regression 모델이 필요"):
         hub.load_model(uri, "regression", tmp_path)
+
+
+def test_hub_needs_the_hf_prefix_and_missing_local_paths_fail(tmp_path, monkeypatch, chdir_tmp):
+    seen = []
+    monkeypatch.setattr(hub, "from_pretrained", lambda spec: seen.append(spec) or (_model(), None))
+    hub.load_model("hf://owner/name", "classification", tmp_path)
+    assert seen == ["owner/name"]
+    with pytest.raises(SystemExit, match="hf://"):
+        hub.load_model("models/clf", "classification", tmp_path)  # 오타 난 로컬 경로
+    assert seen == ["owner/name"]
+
+
+def test_borders_keep_their_dtype(tmp_path):
+    edges = torch.linspace(-3, 3, 5001, dtype=torch.float64)
+    _, borders = hub.from_pretrained(hub.save_pretrained(_model("regression"), edges, tmp_path))
+    assert borders.dtype == torch.float64 and torch.equal(borders, edges)
+
+
+def test_run_uri_to_a_pretrained_folder(tmp_path, monkeypatch):
+    clf = _model()
+    folder = hub.save_pretrained(clf, None, tmp_path / "pretrained")
+    monkeypatch.setattr(
+        hub.mlflow.artifacts, "download_artifacts", lambda artifact_uri, dst_path: str(folder)
+    )
+    loaded, _ = hub.load_model("runs:/abc/model", "classification", tmp_path)
+    _same_weights(clf, loaded)

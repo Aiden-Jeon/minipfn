@@ -7,6 +7,7 @@ Hub에는 pickle 없이 읽을 수 있도록 가중치는 `model.safetensors`, �
     model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier")  # borders: None
 
 `load_model`은 체크포인트를 어디에 두었든 같은 방식으로 읽는다(평가·업로드 스크립트가 쓴다).
+Hub에서 받을 때는 `hf://owner/name`처럼 적는다(오타 난 로컬 경로를 Hub로 보내지 않도록).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 BORDERS_KEY = "borders"
+HUB_PREFIX = "hf://"
 
 
 def save_pretrained(
@@ -36,7 +38,7 @@ def save_pretrained(
     out_dir.mkdir(parents=True, exist_ok=True)
     tensors = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
     if borders is not None:
-        tensors[BORDERS_KEY] = borders.detach().float().cpu().contiguous()
+        tensors[BORDERS_KEY] = borders.detach().cpu().contiguous()
     save_file(tensors, out_dir / WEIGHTS_NAME)
     task = "classification" if borders is None else "regression"
     config = {"task": task, "model": model.config.to_dict(), **extra}
@@ -66,19 +68,23 @@ def from_pretrained(
 def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.Tensor | None]:
     """체크포인트를 CPU로 읽는다. `spec`은 다음 가운데 하나다.
 
-    - `runs:/<run_id>/<경로>`: 학습 run이 MLflow에 남긴 파일 (`dst`로 받는다)
-    - `save_pretrained`로 만든 폴더 또는 Hub repo id (`owner/name`)
-    - `model.save_checkpoint`로 저장한 파일
+    - `runs:/<run_id>/<경로>`: 학습 run이 MLflow에 남긴 파일 또는 폴더 (`dst`로 받는다)
+    - `hf://owner/name`: Hub repo (`save_pretrained`로 올린 것)
+    - `save_pretrained`로 만든 로컬 폴더, `model.save_checkpoint`로 저장한 파일
 
     학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
     그 run에 기록된 param(task·emsize·nlayers·nhead)으로 모델을 만든다.
     """
+    if spec.startswith(HUB_PREFIX):
+        return _check_task(from_pretrained(spec.removeprefix(HUB_PREFIX)), task, spec)
     run_id, path = None, Path(spec)
     if spec.startswith("runs:/"):
         run_id = spec.removeprefix("runs:/").split("/", 1)[0]
         path = Path(mlflow.artifacts.download_artifacts(artifact_uri=spec, dst_path=str(dst)))
-    elif path.is_dir() or not _is_local_path(spec):
-        return _check_task(from_pretrained(spec), task, spec)
+    elif not path.exists():
+        raise SystemExit(f"{spec}가 없다 (Hub repo면 {HUB_PREFIX}owner/name으로 준다).")
+    if path.is_dir():
+        return _check_task(from_pretrained(path), task, spec)
     state = torch.load(path, map_location="cpu", weights_only=True)
     if "config" in state:
         return _check_task(load_checkpoint(path), task, spec)

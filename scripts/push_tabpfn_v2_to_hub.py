@@ -100,7 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         if not torch.equal(a, b):
             raise RuntimeError(f"변환한 가중치가 원본과 다릅니다: {name}")
     if (borders is None) != (reloaded_borders is None) or (
-        borders is not None and not torch.equal(borders.float(), reloaded_borders)
+        borders is not None and not torch.equal(borders.cpu(), reloaded_borders)
     ):
         raise RuntimeError("변환한 회귀 구간 경계가 원본과 다릅니다")
     prepared = sorted(str(p.relative_to(upload_dir)) for p in upload_dir.rglob("*") if p.is_file())
