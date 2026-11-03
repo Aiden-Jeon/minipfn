@@ -95,6 +95,57 @@ def test_regressor_runs():
     assert np.isfinite(pred).all()
 
 
+def test_regressor_tail_bucket_uses_training_target_range():
+    from minipfn.tabpfn_v2.inference import _bucket_values
+
+    # 맨 바깥 구간이 넓은 경계: half-normal 꼬리 평균이면 z 30 근처가 된다
+    borders = torch.tensor([-30.0, -4.0, -1.0, 1.0, 4.0, 30.0])
+    values = _bucket_values(borders, np.array([-1.0, 0.0, 6.0]))
+    assert values[0] == -4.0  # 학습 target이 안쪽 경계 안이면 안쪽 경계
+    assert values[-1] == 6.0  # 안쪽 경계를 넘으면 학습 target 최댓값
+    assert np.allclose(values[1:-1], [-2.5, 0.0, 2.5])
+    assert _bucket_values(borders, np.array([0.0, 60.0]))[-1] == 30.0  # 맨 바깥 경계 안으로
+
+
+def test_clipped_inverse_stays_in_training_range_on_both_sides():
+    from sklearn.preprocessing import PowerTransformer
+
+    from minipfn.tabpfn_v2.inference import _clipped_inverse
+
+    rng = np.random.default_rng(0)
+    # λ > 2: 왼쪽 끝에 몰린 값 + 오른쪽 덩어리 (역변환이 왼쪽에서 끝난다)
+    # λ < 0: 오른쪽으로 긴 꼬리 (역변환이 오른쪽에서 끝난다)
+    for z in [
+        np.concatenate([np.full(50, -4.5), rng.normal(0.5, 0.3, 500)]),
+        rng.lognormal(0, 1.5, 2000),
+    ]:
+        z = (z - z.mean()) / z.std()
+        transform = PowerTransformer(method="yeo-johnson", standardize=True)
+        u = transform.fit_transform(z.reshape(-1, 1)).ravel()
+        assert transform.lambdas_[0] > 2 or transform.lambdas_[0] < 0
+        g = _clipped_inverse(transform, u)
+        back = g(np.linspace(-30, 30, 601))
+        assert np.isfinite(back).all() and (np.diff(back) >= 0).all()
+        assert back.min() >= z.min() - 1e-6 and back.max() <= z.max() + 1e-6
+        assert np.allclose(g(u), z, atol=1e-6)  # 학습 범위 안에서는 원래 역변환
+
+
+def test_regressor_bucket_values_stay_in_training_target_range():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(300, 3))
+    y = rng.lognormal(0, 1.5, 300)  # 오른쪽으로 치우친 target: power 멤버 λ < 0
+    inner = torch.linspace(-4.7, 4.4, 31)
+    borders = torch.cat([torch.tensor([-29.0]), inner, torch.tensor([32.0])])
+    reg = TabPFNv2Regressor(_tiny_model(n_out=32), borders, n_estimators=4).fit(x, y)
+    z = (y - reg.y_mean_) / reg.y_std_
+    lo, hi = min(float(borders[1]), z.min()), max(float(borders[-2]), z.max())
+    for values in reg.bucket_values_:
+        assert lo - 1e-5 <= float(values.min()) and float(values.max()) <= hi + 1e-5
+    assert np.isfinite(reg.predict(x[:20])).all()
+    log_probs, _ = reg.predict_distribution(x[:20])
+    assert torch.allclose(log_probs.exp().sum(-1), torch.ones(20), atol=1e-4)
+
+
 def test_probs_on_same_borders_are_unchanged():
     borders = torch.linspace(-2, 2, 11)
     probs = torch.softmax(torch.randn(3, 10), dim=-1)
