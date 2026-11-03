@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -65,6 +66,8 @@ class TabPFNConfig:
     log_every: int = 25
     val_every: int = 500
     checkpoint_every: int = 1000
+    # latest.pt는 덮어써지므로 이 step마다 `step_XXXXXXX.pt`로 따로 남긴다(평가·재개할 지점)
+    keep_every: int | None = 3000
     profile_steps: int = 0  # > 0이면 rank 0에서 torch.profiler로 이만큼의 step을 재서 출력한다
 
     @classmethod
@@ -80,6 +83,7 @@ class TabPFNConfig:
             schedule_steps=spec.SCHEDULE_STEPS // 10,
             val_every=200,
             checkpoint_every=300,
+            keep_every=600,
         )
 
     @classmethod
@@ -102,6 +106,7 @@ class TabPFNConfig:
             log_every=5,
             val_every=10,
             checkpoint_every=10,
+            keep_every=10,
         )
 
     def grad_accumulation(self, world_size: int) -> int:
@@ -192,8 +197,9 @@ def train_tabpfn(
 
     rank 0만 MLflow에 기록한다. 이미 활성 run이 있으면 거기에 이어서 쓴다(AI Runtime은
     `MLFLOW_RUN_ID`로 run을 넘겨준다). `checkpoint_every` step마다 학습 상태 전체를
-    `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다. `resume_from`에
-    그 파일을 주면 이어서 학습한다.
+    `out_dir/latest.pt`에 저장하고 MLflow 아티팩트(`checkpoints/`)로 올린다. `keep_every`
+    step마다는 덮어쓰지 않는 `step_XXXXXXX.pt`로도 남긴다. `resume_from`에 그 파일을 주면
+    이어서 학습한다.
     """
     d, device = setup_distributed()
     out_dir = Path(out_dir)
@@ -364,7 +370,8 @@ def train_tabpfn(
             if mlf is not None:
                 mlf.log_metrics(val, step=done)
 
-        if d.is_main and (done % config.checkpoint_every == 0 or done == config.steps):
+        keep = bool(config.keep_every) and done % config.keep_every == 0
+        if d.is_main and (done % config.checkpoint_every == 0 or keep or done == config.steps):
             state = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
@@ -374,8 +381,15 @@ def train_tabpfn(
                 "skipped_steps": skipped_steps,
             }
             torch.save(state, out_dir / "latest.pt")
+            kept = None
+            if keep:
+                kept = out_dir / f"step_{done:07d}.pt"
+                shutil.copyfile(out_dir / "latest.pt", kept)
             if mlf is not None:
                 mlf.log_artifact(str(out_dir / "latest.pt"), "checkpoints")
+                if kept is not None:
+                    mlf.log_artifact(str(kept), "checkpoints")
+                mlf.log_metric("checkpoint_step", done, step=done)
 
     final_path = out_dir / "tabpfn_final.pt"
     if d.is_main:
