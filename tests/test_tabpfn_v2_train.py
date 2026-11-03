@@ -326,7 +326,11 @@ def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
 
 def test_training_with_qk_clip_keeps_bounds_under_tau(tmp_path):
     config = replace(
-        TabPFNv2TrainConfig.smoke("regression"), steps=4, border_datasets=10, qk_clip=5.0
+        TabPFNv2TrainConfig.smoke("regression"),
+        steps=4,
+        border_datasets=10,
+        qk_clip=5.0,
+        qk_clip_every=2,  # 마지막 step(4)에서 clip한다
     )
     result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
     model, _ = load_checkpoint(result["final_path"])

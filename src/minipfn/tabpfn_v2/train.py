@@ -109,12 +109,18 @@ class TabPFNv2TrainConfig:
     # 논문 규모 회귀에서 sample attention의 상한이 수만~수십만으로 커지며(정상 수백 이하) 행 하나에
     # 몰리는 attention sink가 됐고, 그 뒤 학습이 불안정해져 benchmark가 크게 나빠졌다
     qk_clip: float | None = None
+    # 상한 계산(head마다 작은 QR·SVD)은 GPU와 CPU를 맞추느라 step마다 하면 step 시간이 1.7배가 된다.
+    # 그래서 이 step마다만 한다. 폭주할 때도 상한은 수천 step에 걸쳐 커져서 50 step 사이에 넘는 양은
+    # 몇 % 안팎이다
+    qk_clip_every: int = 50
 
     def __post_init__(self) -> None:
         if not 0.0 < self.rewind_lr_factor <= 1.0:
             raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
         if self.qk_clip is not None and self.qk_clip <= 0:
             raise ValueError(f"qk_clip은 0보다 커야 한다: {self.qk_clip}")
+        if self.qk_clip_every < 1:
+            raise ValueError(f"qk_clip_every는 1 이상이어야 한다: {self.qk_clip_every}")
 
     @property
     def n_out(self) -> int:
@@ -594,7 +600,7 @@ def train_tabpfn_v2(
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         if torch.isfinite(grad_norm):
             opt.step()
-            if config.qk_clip is not None:
+            if config.qk_clip is not None and (step + 1) % config.qk_clip_every == 0:
                 clipped, bound = apply_qk_clip(model, config.qk_clip, d.world_size)
                 window_clipped = window_clipped + clipped  # GPU에 둔 채 더한다 (읽는 건 기록할 때)
                 window_bound = torch.maximum(
@@ -700,9 +706,8 @@ def train_tabpfn_v2(
             metrics["qk_bound_max"] = bounds.max().item()
             metrics["qk_bound_sample_max"] = bounds[_sample_rows(model)].max().item()
             if config.qk_clip is not None:
-                metrics["qk_clipped_heads"] = float(
-                    window_clipped
-                )  # 이 window에서 줄인 (step, head)
+                # 이 window에서 clip할 때마다 줄인 head 수의 합
+                metrics["qk_clipped_heads"] = float(window_clipped)
                 metrics["qk_bound_before_clip"] = float(window_bound)
             history["step"].append(done)
             history["train_loss"].append(metrics["train_loss"])

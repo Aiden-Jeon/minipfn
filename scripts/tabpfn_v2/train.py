@@ -15,7 +15,7 @@ train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
 `TABPFN_V2_REWIND_LR_FACTOR`를 곱한다(paper 회귀는 0.5, 그 밖에는 1 = 그대로).
 `TABPFN_V2_QK_CLIP`(예: 500, `off`면 끔)을 주면 head별 attention logit 상한이 그 값을 넘을 때
-Wq·Wk를 줄인다(QK-clip, 학습 절차만 바뀌고 모델 구조·추론은 그대로).
+Wq·Wk를 줄인다(QK-clip, 학습 절차만 바뀌고 모델 구조·추론은 그대로). 50 step마다 한다.
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
 이어서 학습할 때 `TABPFN_V2_LR`을 checkpoint와 다르게 주면 남은 스케줄을 그 lr 기준으로 바꾸고,
