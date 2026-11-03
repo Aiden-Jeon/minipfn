@@ -14,6 +14,8 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
 `TABPFN_V2_REWIND_LR_FACTOR`를 곱한다(paper 회귀는 0.5, 그 밖에는 1 = 그대로).
+`TABPFN_V2_QK_CLIP`(예: 500, `off`면 끔)을 주면 head별 attention logit 상한이 그 값을 넘을 때
+Wq·Wk를 줄인다(QK-clip, 학습 절차만 바뀌고 모델 구조·추론은 그대로). 50 step마다 한다.
 나눠 학습할 때는 `TABPFN_V2_STOP_STEP`(이번에 멈출 step)이나 `TABPFN_V2_DEADLINE`(멈출 시각,
 ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 전체 기준으로 이어진다.
 이어서 학습할 때 `TABPFN_V2_LR`을 checkpoint와 다르게 주면 남은 스케줄을 그 lr 기준으로 바꾸고,
@@ -85,6 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rewind-lr-factor", type=float, default=_env("TABPFN_V2_REWIND_LR_FACTOR", float)
     )
+    parser.add_argument("--qk-clip", default=os.environ.get("TABPFN_V2_QK_CLIP") or None)
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
@@ -109,10 +112,16 @@ def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
     config = replace(config, **{k: v for k, v in overrides.items() if v is not None})
-    if args.collapse_threshold is not None:  # `off`면 CollapseGuard를 끈다
-        off = args.collapse_threshold.lower() in ("off", "none")
-        config = replace(config, collapse_threshold=None if off else float(args.collapse_threshold))
+    # `off`면 끈다 (CollapseGuard, QK-clip)
+    if args.collapse_threshold is not None:
+        config = replace(config, collapse_threshold=_optional_float(args.collapse_threshold))
+    if args.qk_clip is not None:
+        config = replace(config, qk_clip=_optional_float(args.qk_clip))
     return config
+
+
+def _optional_float(value: str) -> float | None:
+    return None if value.lower() in ("off", "none") else float(value)
 
 
 def plot_history(history: dict, task: str) -> plt.Figure:
