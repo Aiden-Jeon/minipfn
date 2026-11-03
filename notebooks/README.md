@@ -22,7 +22,7 @@
 | 03 | [논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthrough.ipynb) | SCM·BNN prior를 섞은 PFN은 어떻게 다양한 표 데이터 분류에 forward pass 한 번으로 적응하는가? |
 | 04 | [논문 규모 재현](02_tabpfn/04_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
-실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `scripts/tabpfn/train.yaml`, `scripts/tabpfn/eval.yaml`
+실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `scripts/tabpfn/plot_card.py`, `scripts/tabpfn/train.yaml`, `scripts/tabpfn/eval.yaml` (Hub: `hub/minipfn-tabpfn-v1/README.md` 카드, `hub/push_to_hub.py`)
 
 ## `03_tabpfn_v2/` — Hollmann et al., *Accurate predictions on small data with a tabular foundation model* (Nature 2025)
 

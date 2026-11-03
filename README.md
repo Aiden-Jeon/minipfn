@@ -87,6 +87,20 @@ uv run python scripts/tabpfn/train.py --config-name smoke --resume-run-id <run_i
 
 Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 쓸 수 없습니다.
 
+### Hugging Face Hub에 올리기
+
+`hub/`에는 Hub repo마다 모델 카드 폴더(`hub/<repo 이름>/README.md`와 `images/`)를 두고, Hub에 올리는 스크립트도 함께 둡니다. `hub/push_to_hub.py`는 v1·v2 체크포인트를 `model.safetensors`와 `config.json`으로 바꾸고 카드를 붙여 올립니다. 카드의 그림과 수치가 다른 체크포인트의 것이 되지 않도록, 카드에 `--checkpoint` 문자열이 적혀 있어야 올립니다. 그림은 논문별 `scripts/<paper>/plot_card.py`로 다시 만듭니다. 다른 카드는 `--model-card`로 줍니다. v1에서 paper 크기가 아닌 run은 `--allow-non-paper`를 함께 줍니다.
+
+```bash
+uv run python scripts/tabpfn/plot_card.py --run-id <학습 run_id> --eval-run-id <평가 run_id>
+uv run python hub/push_to_hub.py --paper tabpfn --repo-id <owner/name> \
+  --checkpoint runs:/<학습 run_id>/model/tabpfn_final.pt
+uv run python hub/push_to_hub.py --paper tabpfn_v2 --task classification --repo-id <owner/name> \
+  --checkpoint runs:/<학습 run_id>/checkpoints/step_0500000.pt
+```
+
+카드만 고쳤을 때는 가중치를 다시 올리지 않아도 됩니다. main에 `hub/<repo 이름>/`의 변경이 들어오면 GitHub Actions가 `hub/sync_hub_card.py`로 카드만 Hub에 올립니다.
+
 ## 4. Step by step
 
 - [`notebooks/01_pfn/`](notebooks/01_pfn) — Müller et al., *[Transformers Can Do Bayesian Inference](https://arxiv.org/pdf/2112.10510)*, ICLR 2022
