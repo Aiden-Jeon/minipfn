@@ -1,8 +1,9 @@
 """TabPFN v2를 논문 benchmark에서 평가하고 논문 수치와 비교한다.
 
 benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마다 OpenML task의 10-fold 교차검증
-평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `model.save_checkpoint`로 저장한 체크포인트
-또는 학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`)다.
+평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `model.save_checkpoint`로 저장한 체크포인트,
+학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`), Hub repo id
+(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
 
 예) 저장소 루트에서 `EVAL=scripts/eval_tabpfn_v2.py`라고 두면
   uv run python $EVAL --classifier-path clf.pt --regressor-path reg.pt            # 57개 × 10 fold
@@ -27,9 +28,8 @@ import pandas as pd
 import torch
 
 from minipfn.tabpfn_v2 import benchmark as bm
+from minipfn.tabpfn_v2.hub import load_model
 from minipfn.tabpfn_v2.inference import TabPFNv2Classifier, TabPFNv2Regressor
-from minipfn.tabpfn_v2.model import TabPFNv2, load_checkpoint
-from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
 from minipfn.utils import log_run_source
 
 
@@ -38,8 +38,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--suite", choices=["classification", "regression", "all"], default="all")
     parser.add_argument("--tasks", help="쉼표로 구분한 OpenML task id (suite 안에서 고른다)")
     parser.add_argument("--folds", type=int, default=10)
-    parser.add_argument("--classifier-path", help="분류 체크포인트 파일 또는 runs:/ URI")
-    parser.add_argument("--regressor-path", help="회귀 체크포인트 파일 또는 runs:/ URI")
+    parser.add_argument(
+        "--classifier-path", help="분류 체크포인트 (파일, 폴더, runs:/ URI, hf://owner/name)"
+    )
+    parser.add_argument(
+        "--regressor-path", help="회귀 체크포인트 (파일, 폴더, runs:/ URI, hf://owner/name)"
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
     parser.add_argument("--mlflow", action="store_true", help="로컬에서도 MLflow에 기록한다")
@@ -63,45 +67,13 @@ def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
     return out
 
 
-def load_model(spec: str, suite: str, out_dir: Path) -> tuple[TabPFNv2, torch.Tensor | None]:
-    """체크포인트를 CPU로 읽는다. `runs:/<run_id>/<경로>`면 MLflow에서 받는다.
-
-    학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
-    그 run에 기록된 param(task·emsize·nlayers·nhead)으로 모델을 만든다.
-    """
-    run_id, path = None, spec
-    if spec.startswith("runs:/"):
-        run_id = spec.removeprefix("runs:/").split("/", 1)[0]
-        path = mlflow.artifacts.download_artifacts(
-            artifact_uri=spec, dst_path=str(out_dir / "checkpoints" / suite)
-        )
-    state = torch.load(path, map_location="cpu", weights_only=True)
-    if "config" in state:
-        return load_checkpoint(path)
-    if run_id is None:
-        raise SystemExit(
-            f"{spec}는 학습 중 checkpoint라 모델 설정이 없다. runs:/<run_id>/...로 준다."
-        )
-    params = mlflow.MlflowClient().get_run(run_id).data.params
-    if params["task"] != suite:
-        raise SystemExit(f"{spec}는 {params['task']} 모델인데 {suite} 평가에 줬다.")
-    config = TabPFNv2TrainConfig(
-        task=params["task"],
-        emsize=int(params["emsize"]),
-        nlayers=int(params["nlayers"]),
-        nhead=int(params["nhead"]),
-    )
-    model = TabPFNv2(config.model_config())
-    model.load_state_dict(state["model"])
-    return model.eval(), state["borders"]
-
-
 def make_estimator_factory(suite: str, args: argparse.Namespace):
     path = args.classifier_path if suite == "classification" else args.regressor_path
     if path is None:
         flag = "--classifier-path" if suite == "classification" else "--regressor-path"
         raise SystemExit(f"{suite} 평가에는 {flag}가 필요하다.")
-    model, borders = load_model(path, suite, Path(args.out_dir))  # 추론할 때 모델만 장치로 옮긴다
+    # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
+    model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
 
     def make(task: bm.OpenMLTask):
         kw = {"categorical_features_indices": task.categorical_indices, "device": args.device}

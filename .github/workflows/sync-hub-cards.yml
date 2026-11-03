@@ -1,0 +1,52 @@
+# hub/<name>/의 모델 카드(README와 카드가 링크한 그림)가 main에 바뀌어 들어오면 Hugging Face Hub의
+# <HF_OWNER>/<name> repo에 올린다. 가중치는 올리지 않는다(새로 학습했을 때 push_tabpfn*_to_hub.py로
+# 직접 올린다). 저장소 secret HF_TOKEN(쓰기 권한)이 필요하다.
+# 손으로 돌리면(workflow_dispatch) hub/ 아래 카드를 모두 올린다.
+name: Sync model cards to the Hub
+
+on:
+  push:
+    branches: [main]
+    paths: ["hub/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-hub-cards
+  cancel-in-progress: false
+
+env:
+  HF_OWNER: aiden-jeon
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      - name: Upload changed cards
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::저장소 secret HF_TOKEN이 없습니다"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = push ] && [ -n "$BEFORE" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            dirs=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- hub | cut -d/ -f1-2 | sort -u)
+          else
+            dirs=$(find hub -mindepth 1 -maxdepth 1 -type d | sort)
+          fi
+          for dir in $dirs; do
+            if [ ! -f "$dir/README.md" ]; then
+              echo "$dir: README.md가 없어 건너뜀 (카드를 지운 경우 Hub는 그대로 둔다)"
+              continue
+            fi
+            uv run --no-project --with "huggingface_hub>=0.34" python scripts/sync_hub_card.py \
+              --card-dir "$dir" --repo-id "$HF_OWNER/$(basename "$dir")"
+          done
