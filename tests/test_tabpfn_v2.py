@@ -95,6 +95,35 @@ def test_regressor_runs():
     assert np.isfinite(pred).all()
 
 
+def test_regressor_tail_bucket_uses_training_target_range():
+    from minipfn.tabpfn_v2.inference import _bucket_values
+
+    # 맨 바깥 구간이 넓은 경계: half-normal 꼬리 평균이면 z 30 근처가 된다
+    borders = torch.tensor([-30.0, -4.0, -1.0, 1.0, 4.0, 30.0])
+    values = _bucket_values(borders, np.array([-1.0, 0.0, 6.0]))
+    assert values[0] == -4.0  # 학습 target이 안쪽 경계 안이면 안쪽 경계
+    assert values[-1] == 6.0  # 안쪽 경계를 넘으면 학습 target 최댓값
+    assert np.allclose(values[1:-1], [-2.5, 0.0, 2.5])
+
+
+def test_safe_inverse_is_finite_and_monotone_outside_training_range():
+    from sklearn.preprocessing import PowerTransformer
+
+    from minipfn.tabpfn_v2.inference import _safe_inverse
+
+    # 왼쪽 끝에 몰린 값 + 오른쪽 덩어리 → λ > 2, 역변환이 왼쪽에서 정의가 끝난다
+    z = np.concatenate([np.full(50, -4.5), np.random.default_rng(0).normal(0.5, 0.3, 500)])
+    transform = PowerTransformer(method="yeo-johnson", standardize=True)
+    u = transform.fit_transform(z.reshape(-1, 1)).ravel()
+    assert transform.lambdas_[0] > 2
+    with np.errstate(all="ignore"):
+        assert np.isnan(transform.inverse_transform([[-30.0]])).all()
+    g = _safe_inverse(transform, u)
+    back = g(np.linspace(-30, 30, 601))
+    assert np.isfinite(back).all() and (np.diff(back) >= 0).all()
+    assert np.allclose(g(u), z, atol=1e-6)  # 학습 범위 안에서는 원래 역변환
+
+
 def test_probs_on_same_borders_are_unchanged():
     borders = torch.linspace(-2, 2, 11)
     probs = torch.softmax(torch.randn(3, 10), dim=-1)
