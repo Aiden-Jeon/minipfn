@@ -105,6 +105,14 @@ def load_model(
             f"{path_or_uri}는 학습 중 checkpoint라 모델 설정이 없다. runs:/<run_id>/...로 준다."
         )
     params = mlflow.MlflowClient().get_run(run_id).data.params
+    missing = [k for k in MODEL_PARAMS if k not in params]
+    if missing:
+        # 같은 run에서 이어서 학습한 run은 config가 학습을 처음 시작한 run에만 기록돼 있다
+        raise SystemExit(
+            f"run {run_id}에 모델 설정 param({', '.join(missing)})이 없다. 설정이 함께 저장된 "
+            f"runs:/{run_id}/model/tabpfn_final.pt를 주거나, "
+            "학습을 처음 시작한 run의 param을 확인한다."
+        )
     config = TabPFNConfig(**{k: cast(params[k]) for k, cast in MODEL_PARAMS.items()})
     model = build_tabpfn_model(config)
     model.load_state_dict(state["model"])
