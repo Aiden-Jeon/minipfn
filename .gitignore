@@ -25,7 +25,7 @@ tabpfn_run/
 tabpfn_eval/
 tabpfn_v2_run/
 tabpfn_v2_eval/
-tabpfn_v2_hub/
+hub_upload/
 *.safetensors
 mlruns/
 mlartifacts/

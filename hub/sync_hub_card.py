@@ -1,11 +1,11 @@
 """모델 카드(README와 카드가 링크한 그림)만 Hugging Face Hub repo에 올린다.
 
 예) 저장소 루트에서
-  uv run --no-project --with huggingface_hub python scripts/sync_hub_card.py \
+  uv run --no-project --with huggingface_hub python hub/sync_hub_card.py \
     --card-dir hub/minipfn-tabpfn-v2-classifier --repo-id aiden-jeon/minipfn-tabpfn-v2-classifier
 
 main에 카드가 바뀌어 들어오면 GitHub Actions(`.github/workflows/sync-hub-cards.yml`)가 돌린다.
-가중치는 올리지 않는다(새로 학습했을 때 `scripts/<논문>/push_to_hub.py`로 올린다). 그래서 repo가
+가중치는 올리지 않는다(새로 학습했을 때 `hub/push_to_hub.py`로 올린다). 그래서 repo가
 아직 없으면 카드만 먼저 올리지 않고 건너뛴다. repo의 `config.json`에 `source`(가중치를 만든
 체크포인트)가 있으면 카드에도 그 문자열이 있어야 올린다 — 카드의 수치가 올라가 있는 가중치와
 다른 체크포인트의 것이 되지 않도록. Hub의 `images/`에서 카드가 더는 쓰지 않는 파일은 지운다.
