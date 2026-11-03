@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import subprocess
 import sys
@@ -12,6 +13,14 @@ from minipfn.tabpfn import spec
 from minipfn.tabpfn.train import TabPFNConfig, load_tabpfn, lr_factor, train_tabpfn
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tabpfn" / "train.py"
+
+
+def _eval_script():
+    path = SCRIPT.with_name("eval.py")
+    module_spec = importlib.util.spec_from_file_location("eval_tabpfn", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
 
 
 def test_paper_config_matches_spec():
@@ -82,5 +91,15 @@ def test_train_script_logs_to_mlflow(tmp_path):
         tags = runs.iloc[0]
         assert tags["tags.command"] == "train.py " + " ".join(args)
         assert tags["tags.git_commit"]
+
+        # 평가 스크립트는 run의 최종 모델과 학습 중 checkpoint를 runs:/ URI로 읽는다
+        eval_script = _eval_script()
+        run_uri = f"runs:/{run_id}"
+        final = eval_script.load_model(f"{run_uri}/model/tabpfn_final.pt", tmp_path / "e1")
+        kept = eval_script.load_model(f"{run_uri}/checkpoints/step_0000004.pt", tmp_path / "e2")
+        for a, b in zip(final.state_dict().values(), kept.state_dict().values(), strict=True):
+            assert torch.equal(a, b)  # 마지막 step의 checkpoint = 최종 모델
+        with pytest.raises(SystemExit, match="runs:/"):
+            eval_script.load_model(str(tmp_path / "out" / "step_0000002.pt"), tmp_path / "e3")
     finally:
         mlflow.set_tracking_uri(prev_uri)
