@@ -1,7 +1,8 @@
 # TabPFN v2 benchmark 평가 (직접 학습한 체크포인트, 논문 Supplementary Tables 1·2와 비교).
-# 체크포인트를 어디서 받을지는 학습 단계에서 정한다. 지금은 TABPFN_V2_EXTRA_ARGS로 경로를 넘긴다:
+# 체크포인트는 TABPFN_V2_EXTRA_ARGS로 넘긴다. 학습 run이 남긴 checkpoint는 runs:/ URI로 준다:
 #   databricks air run -f runs/eval_tabpfn_v2.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
-#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--classifier-path <clf.pt> --regressor-path <reg.pt>"
+#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--suite classification \
+#       --classifier-path runs:/<run_id>/checkpoints/step_0100000.pt"
 experiment_name: tabpfn-v2-reproduction
 mlflow_run_name: tabpfn-v2-eval
 environment:
