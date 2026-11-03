@@ -1,6 +1,6 @@
 """실행 환경 점검: 패키지 버전과 연산 장치를 출력한다 (노트북 00의 스크립트판).
 
-AI Runtime: `databricks air run -f runs/setup_check.yaml --watch`
+AI Runtime: `databricks air run -f scripts/setup_check.yaml --watch`
 로컬: `uv run python scripts/setup_check.py`
 """
 

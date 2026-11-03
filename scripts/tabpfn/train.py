@@ -1,6 +1,6 @@
 """TabPFN을 논문 prior로 학습하고 MLflow에 기록한다 (논문 arXiv:2207.01848 재현).
 
-AI Runtime(`databricks air run -f runs/train_tabpfn.yaml`)과 로컬에서 같은
+AI Runtime(`databricks air run -f scripts/tabpfn/train.yaml`)과 로컬에서 같은
 스크립트를 쓴다.
 - GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/tabpfn/train.py`
 - 로컬: `uv run python scripts/tabpfn/train.py --config-name smoke`

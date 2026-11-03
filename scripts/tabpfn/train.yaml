@@ -1,4 +1,4 @@
-# TabPFN prior-fitting (arXiv:2207.01848 재현): databricks air run -f runs/train_tabpfn.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# TabPFN prior-fitting (arXiv:2207.01848 재현): databricks air run -f scripts/tabpfn/train.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
 # 기본은 8×H100 다중 GPU 경로 점검(논문 크기 모델·batch 512로 50 step). 규모는 override로 바꾼다:
 #   medium(예산 1/10): --override env_variables.TABPFN_STEPS=1800 --override mlflow_run_name=tabpfn-medium
 #   논문 규모:        --override env_variables.TABPFN_CONFIG_NAME=paper --override env_variables.TABPFN_STEPS=18000 \
@@ -16,7 +16,7 @@ code_source:
   type: snapshot
   snapshot:
     # 저장소 루트를 기준으로 src/와 이 스크립트만 올린다 (노트북은 올리지 않는다)
-    root_path: ..
+    root_path: ../..
     include_paths:
       - src
       - scripts/tabpfn/train.py

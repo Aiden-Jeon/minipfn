@@ -10,9 +10,9 @@ benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마�
   uv run python $EVAL --suite classification --classifier-path clf.pt --tasks 359955 --folds 2
   uv run python $EVAL --suite classification --classifier-path runs:/<run_id>/checkpoints/latest.pt
 
-AI Runtime(`runs/eval_tabpfn_v2.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에 기록한다.
-로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction) experiment에 새
-run을 만든다.
+AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
+기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
+experiment에 새 run을 만든다.
 """
 
 from __future__ import annotations

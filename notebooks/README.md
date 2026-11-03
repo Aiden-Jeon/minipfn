@@ -1,6 +1,6 @@
 # 노트북 로드맵
 
-노트북은 논문별 폴더로 나눈 hands-on 가이드입니다. 작은 예제로 개념을 따라가고, GPU에서 학습한 결과는 MLflow run에서 불러와 봅니다. 명령줄에서 돌리는 학습·평가 스크립트는 [`scripts/`](../scripts)에, AI Runtime 설정(yaml)은 [`runs/`](../runs)에 있고, 각 표 아래에 그 논문에서 쓰는 파일을 적었습니다. [`00_setup_check.ipynb`](00_setup_check.ipynb)(환경 점검)는 공통입니다.
+노트북은 논문별 폴더로 나눈 hands-on 가이드입니다. 작은 예제로 개념을 따라가고, GPU에서 학습한 결과는 MLflow run에서 불러와 봅니다. 명령줄에서 돌리는 학습·평가 스크립트와 AI Runtime 설정(yaml)은 [`scripts/`](../scripts)에 논문별로 나란히 있고, 각 표 아래에 그 논문에서 쓰는 파일을 적었습니다. [`00_setup_check.ipynb`](00_setup_check.ipynb)(환경 점검)는 공통입니다.
 
 ## `01_pfn/` — Müller et al., *Transformers Can Do Bayesian Inference* (ICLR 2022)
 
@@ -22,7 +22,7 @@
 | 03 | [논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthrough.ipynb) | SCM·BNN prior를 섞은 PFN은 어떻게 다양한 표 데이터 분류에 forward pass 한 번으로 적응하는가? |
 | 04 | [논문 규모 재현](02_tabpfn/04_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
-실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `runs/train_tabpfn.yaml`, `runs/eval_tabpfn.yaml` (Hub 모델 카드: `hub/minipfn-tabpfn-v1/README.md`)
+실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `scripts/tabpfn/train.yaml`, `scripts/tabpfn/eval.yaml`
 
 ## `03_tabpfn_v2/` — Hollmann et al., *Accurate predictions on small data with a tabular foundation model* (Nature 2025)
 
