@@ -1,3 +1,6 @@
+# Agent files
+.hallmark
+
 # Python-generated files
 __pycache__/
 *.py[oc]
