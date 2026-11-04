@@ -17,9 +17,9 @@
   펼친 뒤 열 수가 `MAX_ONE_HOT_WIDTH`(prior의 최대 feature 수)를 넘으면 범주가 많은 열부터 번호로
   되돌린다. 범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던 범주(번호로 바꿀 때 결측이 된다)는
   NaN. 기본값 `DEFAULT_ONE_HOT`은 분류·회귀 모두 `"all"`이다. 세 모드(off·power·all)를 benchmark에서
-  견줬을 때 분류는 suite 평균 ROC AUC(500k 0.9235 → 0.9238), 회귀는 범주형 열이 있는 12개에서 off
-  대비 RMSE 비율의 기하평균(QK-clip 200k, power 0.968, all 0.962)이 가장 좋았다. 회귀의 neg RMSE
-  단순 평균은 RMSE가 수만인 MIP-2016 하나가 정해서 기준으로 쓰지 않았다
+  견줬을 때 분류는 suite 평균 ROC AUC(500k 0.9235 → 0.9238), 회귀는 one-hot으로 결과가 바뀌는
+  11개에서 off 대비 RMSE 비율의 기하평균(QK-clip 200k, power 0.964, all 0.958)이 가장 좋았다.
+  회귀의 neg RMSE 단순 평균은 RMSE가 수만인 MIP-2016 하나가 정해서 기준으로 쓰지 않았다
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
