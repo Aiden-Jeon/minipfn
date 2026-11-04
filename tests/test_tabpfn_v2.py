@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 from sklearn.datasets import load_breast_cancer, load_diabetes
 
@@ -175,6 +176,67 @@ def test_outlier_clip_leaves_categorical_codes_alone():
     assert prep.upper[0] == np.inf and len(prep.cat_maps[0]) == 51
     codes = prep._base(prep._clip(x))[:, 0]
     assert len(np.unique(codes[:3])) == 1 and codes[0] != codes[3]  # 50은 다른 범주와 섞이지 않는다
+
+
+def test_one_hot_expands_small_categorical_columns_only():
+    from minipfn.tabpfn_v2.inference import _Member, _MemberPreprocessor
+
+    rng = np.random.default_rng(0)
+    x = np.stack(
+        [
+            rng.integers(0, 3, 200),
+            rng.integers(0, 2, 200),
+            rng.integers(0, 30, 200),
+            rng.normal(size=200),
+        ],
+        axis=1,
+    ).astype(float)
+    x[0, 0] = np.nan
+    member = _Member(kind="power", class_permutation=None, target_power=False, seed=0, one_hot=True)
+    prep = _MemberPreprocessor(member, cat_ix=[0, 1, 2]).fit(x)
+    assert prep.one_hot_sizes == {0: 3, 1: 2}  # 범주 30개 열은 번호로 둔다
+    base = prep._base(prep._clip(x))
+    assert base.shape[1] == 2 + 3 + 1  # 번호 열 1개 + 수치 1개, 3범주 → 3열, 2범주 → 1열
+    block = base[:, 2:5]
+    assert np.isnan(block[0]).all()  # 결측은 NaN
+    assert np.array_equal(block[1:].argmax(1), x[1:, 0]) and (block[1:].sum(1) == 1).all()
+    assert np.array_equal(base[:, 5], x[:, 1])
+    out = prep.transform(x, np.random.default_rng(1))
+    assert out.shape == (200, base.shape[1] + 1)  # 샘플 식별자 열
+
+
+def test_one_hot_width_is_capped_by_reverting_the_widest_columns():
+    from minipfn.tabpfn_v2.inference import MAX_ONE_HOT_WIDTH, _one_hot_sizes
+
+    # 범주 20개 열 8개 + 범주 2개 열 10개 + 수치 열 2개: 펼치면 2 + 160 + 10 = 172열
+    n_categories = {i: 20 for i in range(8)} | {i: 2 for i in range(8, 18)}
+    sizes = _one_hot_sizes(n_categories, n_features=20)
+    assert sum(1 if n == 2 else n for n in sizes.values()) + 2 <= MAX_ONE_HOT_WIDTH
+    assert len([n for n in sizes.values() if n == 20]) == 7 and 0 not in sizes  # 하나만 되돌린다
+    assert all(i in sizes for i in range(8, 18))  # 열 수가 늘지 않는 2범주 열은 그대로
+    # 원래 열이 이미 상한보다 많으면 열 수를 늘리는 펼침은 하지 않는다
+    assert _one_hot_sizes({0: 5, 1: 2}, n_features=MAX_ONE_HOT_WIDTH + 1) == {1: 2}
+
+
+def test_one_hot_out_of_range_codes_are_missing():
+    from minipfn.tabpfn_v2.inference import _MemberPreprocessor
+
+    block = _MemberPreprocessor._one_hot(np.array([0.0, 2.0, 3.0, np.nan, -1.0]), 3)
+    assert np.array_equal(block[:2], [[1, 0, 0], [0, 0, 1]])
+    assert np.isnan(block[2:]).all()  # 범위 밖과 결측은 번호 열처럼 결측
+
+
+@pytest.mark.parametrize("one_hot", ["off", "power", "all"])
+def test_estimators_run_with_one_hot(one_hot):
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"a": rng.choice(list("xyz"), 80), "b": rng.normal(size=80)})
+    y = (df["b"] > 0).astype(int).to_numpy()
+    clf = TabPFNv2Classifier(_tiny_model(), one_hot=one_hot).fit(df[:60], y[:60])
+    assert clf.predict_proba(df[60:]).shape == (20, 2)
+    reg = TabPFNv2Regressor(_tiny_model(n_out=32), torch.linspace(-4, 4, 33), one_hot=one_hot)
+    assert reg.fit(df[:60], df["b"][:60]).predict(df[60:]).shape == (20,)
+    with pytest.raises(ValueError, match="one_hot"):
+        TabPFNv2Classifier(_tiny_model(), one_hot="half")
 
 
 def test_predict_is_repeatable_and_regressor_keeps_borders_on_cpu():

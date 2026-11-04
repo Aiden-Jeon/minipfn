@@ -39,3 +39,32 @@ def test_unknown_task_ids_are_reported():
     assert script.selected_tasks(argparse.Namespace(suite="all", tasks="359955")) == [
         ("classification", 359955)
     ]
+
+
+def test_one_hot_modes_are_parsed_and_headline_is_the_default_mode():
+    script = _eval_script()
+    assert script.parse_args([]).one_hot == ["all"]
+    assert script.parse_args(["--one-hot", "all,off,all"]).one_hot == ["all", "off"]
+    with pytest.raises(SystemExit):
+        script.parse_args(["--one-hot", "half"])
+    assert script.headline_mode(["off", "power", "all"]) == "all"  # 고르지 않고 기본값
+    assert script.headline_mode(["power", "off"]) == "power"
+
+
+def test_expands_one_hot_needs_a_small_categorical_column():
+    import types
+
+    import pandas as pd
+
+    script = _eval_script()
+
+    def task(X, cat):
+        return types.SimpleNamespace(X=pd.DataFrame(X), categorical_indices=cat)
+
+    many = [f"c{i}" for i in range(30)]
+    assert not script.expands_one_hot(task({"a": [1.0] * 30}, []))
+    assert script.expands_one_hot(task({"a": [0, 1, 2] * 10}, [0]))
+    assert script.expands_one_hot(task({"a": list("xyz") * 10}, []))  # 문자열 열도 범주형
+    assert not script.expands_one_hot(task({"a": many}, []))  # 범주가 많으면 번호로 둔다
+    wide = {f"c{i}": [0, 1, 2] * 10 for i in range(200)}
+    assert not script.expands_one_hot(task(wide, list(range(200))))  # 폭 상한에 걸려 펼치지 않는다

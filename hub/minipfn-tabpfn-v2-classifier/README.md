@@ -28,7 +28,7 @@ This is not the official TabPFN v2 checkpoint, and it uses no official code or w
   - Beta(0.95, 8.0) features scaled to 1–160
   - fewer than 75,000 cells per table
   - in 30% of the tables, values go missing at random at a rate of 0–30%
-- Inference (paper defaults): an ensemble of 4 members. Each member shuffles features and classes and adds a random row-identifier column. Members alternate between quantile features plus SVD components and a Yeo-Johnson power transform. Softmax temperature is 0.9.
+- Inference (paper defaults): an ensemble of 4 members. Each member shuffles features and classes and adds a random row-identifier column. Members alternate between quantile features plus SVD components and a Yeo-Johnson power transform. Categorical columns with at most 20 categories are one-hot encoded in every member (`one_hot="all"`, the default), as long as the table stays within 160 columns. Softmax temperature is 0.9.
 
 ## Training
 
@@ -44,16 +44,16 @@ Figures and numbers on this card come from checkpoint `runs:/a1df9e34774d49e7869
 
 ## Results
 
-The benchmark is the paper's 29 AMLB classification datasets. Each score is the mean ROC AUC over the 10 OpenML folds. Paper values come from Supplementary Table 1 (TabPFN v2, default settings).
+The benchmark is the paper's 29 AMLB classification datasets. Each score is the mean ROC AUC over the 10 OpenML folds. Paper values come from Supplementary Table 1 (TabPFN v2, default settings). All figures use the default inference settings (`one_hot="all"`). The last column keeps categorical columns as ordinal codes (`one_hot="off"`); only the 9 datasets with categorical columns differ.
 
-| Checkpoint | Mean ROC AUC |
-| --- | --- |
-| 100k steps | 0.9169 |
-| 200k steps | 0.9222 |
-| 300k steps | 0.9203 |
-| 400k steps | 0.9196 |
-| **500k steps (this model)** | **0.9235** |
-| Paper | 0.9323 |
+| Checkpoint | Mean ROC AUC | With `one_hot="off"` |
+| --- | --- | --- |
+| 100k steps | 0.9175 | 0.9169 |
+| 200k steps | 0.9225 | 0.9222 |
+| 300k steps | 0.9208 | 0.9203 |
+| 400k steps | 0.9197 | 0.9196 |
+| **500k steps (this model)** | **0.9238** | 0.9235 |
+| Paper | 0.9323 | |
 
 ![Benchmark ROC AUC by step](images/benchmark_by_step.png)
 
@@ -97,6 +97,8 @@ proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes
 uv run python scripts/tabpfn_v2/eval.py --suite classification \
   --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier
 ```
+
+Add `--one-hot off,power,all` to also score the other one-hot modes. The headline numbers stay those of the default mode.
 
 ## Files
 
