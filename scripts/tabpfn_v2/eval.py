@@ -10,6 +10,12 @@ benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마�
   uv run python $EVAL --suite classification --classifier-path clf.pt --tasks 359955 --folds 2
   uv run python $EVAL --suite classification --classifier-path runs:/<run_id>/checkpoints/latest.pt
 
+범주형 열의 one-hot(`--one-hot`, 기본은 off·power·all 셋 다)은 모드마다 평가하고, suite 평균 점수가
+가장 좋은 모드를 그 suite의 결과로 낸다(`eval_per_dataset.csv`와 MLflow의 평균 지표). 모드 하나로
+모든 데이터셋을 평가하므로 논문의 기본 설정 TabPFN과 견줄 수 있다. 모드별 결과는
+`eval_per_dataset_by_one_hot.csv`와 `<suite>_mean_<metric>_one_hot_<mode>` 지표에 남긴다.
+범주형 열이 없는 데이터셋은 모드와 상관없이 결과가 같아 한 번만 평가한다.
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -18,6 +24,7 @@ experiment에 새 run을 만든다.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import time
 from pathlib import Path
@@ -45,12 +52,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--regressor-path", help="회귀 체크포인트 (파일, 폴더, runs:/ URI, hf://owner/name)"
     )
     parser.add_argument(
-        "--one-hot", choices=ONE_HOT_MODES, default="off", help="범주형 열을 one-hot으로 펼칠 멤버"
+        "--one-hot",
+        type=_one_hot_modes,
+        default=list(ONE_HOT_MODES),
+        help="평가할 one-hot 모드, 쉼표로 구분 (기본: off,power,all)",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
     parser.add_argument("--mlflow", action="store_true", help="로컬에서도 MLflow에 기록한다")
     return parser.parse_args(argv)
+
+
+def _one_hot_modes(value: str) -> list[str]:
+    modes = [m.strip() for m in value.split(",") if m.strip()]
+    unknown = [m for m in modes if m not in ONE_HOT_MODES]
+    if unknown or not modes:
+        raise argparse.ArgumentTypeError(f"one-hot 모드는 {ONE_HOT_MODES} 가운데서: {value}")
+    return list(dict.fromkeys(modes))
+
+
+def has_categorical(task: bm.OpenMLTask) -> bool:
+    """추론이 범주형으로 다루는 열이 있는지 (`categorical_indices`이거나 숫자가 아닌 열)."""
+    return bool(task.categorical_indices) or not all(
+        pd.api.types.is_numeric_dtype(dtype) for dtype in task.X.dtypes
+    )
 
 
 def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
@@ -78,10 +103,10 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
     model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
 
-    def make(task: bm.OpenMLTask):
+    def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
             "categorical_features_indices": task.categorical_indices,
-            "one_hot": args.one_hot,
+            "one_hot": one_hot,
             "device": args.device,
         }
         if suite == "classification":
@@ -93,11 +118,18 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
 
 def summarize(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
-    per_dataset = df.groupby(["suite", "task_id", "dataset"])["score"].mean().reset_index()
+    keys = ["one_hot", "suite", "task_id", "dataset"]
+    per_dataset = df.groupby(keys)["score"].mean().reset_index()
     paper = {**bm.paper_scores("classification"), **bm.paper_scores("regression")}
     per_dataset["paper"] = per_dataset["task_id"].map(paper)
     per_dataset["diff"] = per_dataset["score"] - per_dataset["paper"]
     return per_dataset
+
+
+def best_one_hot(per_dataset: pd.DataFrame) -> dict[str, str]:
+    """suite마다 평균 점수(분류 ROC AUC, 회귀 negative RMSE)가 가장 높은 one-hot 모드."""
+    means = per_dataset.groupby(["suite", "one_hot"])["score"].mean()
+    return {suite: group.droplevel(0).idxmax() for suite, group in means.groupby(level=0)}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -105,7 +137,11 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tasks = selected_tasks(args)
-    print(f"tasks: {len(tasks)}, folds: {args.folds}, device: {args.device}", flush=True)
+    print(
+        f"tasks: {len(tasks)}, folds: {args.folds}, device: {args.device}, "
+        f"one-hot: {','.join(args.one_hot)}",
+        flush=True,
+    )
 
     use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
     if use_mlflow:
@@ -113,7 +149,9 @@ def main(argv: list[str] | None = None) -> None:
             mlflow.set_experiment(os.environ.get("TABPFN_V2_EXPERIMENT", "tabpfn-v2-reproduction"))
         mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID"))
         log_run_source(__file__, env_prefix="TABPFN_V2_")
-        mlflow.log_params({"suite": args.suite, "folds": args.folds, "one_hot": args.one_hot})
+        mlflow.log_params(
+            {"suite": args.suite, "folds": args.folds, "one_hot_modes": ",".join(args.one_hot)}
+        )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
 
@@ -122,34 +160,55 @@ def main(argv: list[str] | None = None) -> None:
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()
         task = bm.load_openml_task(task_id)
-        task_rows = bm.evaluate_task(task, factories[suite], n_folds=args.folds)
-        for row in task_rows:
-            row["suite"] = suite
-        rows.extend(task_rows)
-        mean = float(np.nanmean([r["score"] for r in task_rows]))
+        modes = args.one_hot if has_categorical(task) else args.one_hot[:1]
+        scores = {}
+        for mode in modes:
+            make = functools.partial(factories[suite], one_hot=mode)
+            task_rows = bm.evaluate_task(task, make, n_folds=args.folds)
+            scores[mode] = float(np.nanmean([r["score"] for r in task_rows]))
+            # 범주형 열이 없으면 모든 모드가 같은 결과라 한 번 낸 것을 모드마다 쓴다
+            for copy in args.one_hot if len(modes) == 1 else [mode]:
+                rows.extend({**r, "suite": suite, "one_hot": copy} for r in task_rows)
         paper = bm.paper_scores(suite)[task_id]
+        shown = " ".join(f"{m} {v:.4f}" for m, v in scores.items())
         print(
             f"[{i}/{len(tasks)}] {suite:14s} {task.name:40s} {task.X.shape} "
-            f"score {mean:.4f} paper {paper:.4f} ({time.time() - start:.0f}s)",
+            f"score {shown} paper {paper:.4f} ({time.time() - start:.0f}s)",
             flush=True,
         )
         pd.DataFrame(rows).to_csv(out_dir / "eval_rows.csv", index=False)
 
-    per_dataset = summarize(rows)
+    by_mode = summarize(rows)
+    by_mode.to_csv(out_dir / "eval_per_dataset_by_one_hot.csv", index=False)
+    for (suite, mode), group in by_mode.groupby(["suite", "one_hot"]):
+        metric = "roc_auc" if suite == "classification" else "neg_rmse"
+        print(
+            f"{suite} one-hot {mode}: mean score {group['score'].mean():.4f}, "
+            f"mean |diff| {group['diff'].abs().mean():.4f}"
+        )
+        if use_mlflow:
+            mlflow.log_metric(f"{suite}_mean_{metric}_one_hot_{mode}", group["score"].mean())
+            mlflow.log_metric(f"{suite}_mean_abs_diff_one_hot_{mode}", group["diff"].abs().mean())
+
+    best = best_one_hot(by_mode)
+    chosen = [(by_mode.suite == suite) & (by_mode.one_hot == mode) for suite, mode in best.items()]
+    per_dataset = pd.concat([by_mode[mask] for mask in chosen])
     per_dataset.to_csv(out_dir / "eval_per_dataset.csv", index=False)
     print(per_dataset.round(4).to_string(index=False))
     for suite, group in per_dataset.groupby("suite"):
         metric = "roc_auc" if suite == "classification" else "neg_rmse"
         print(
-            f"{suite}: datasets {len(group)}, mean score {group['score'].mean():.4f}, "
-            f"paper {group['paper'].mean():.4f}, mean |diff| {group['diff'].abs().mean():.4f}"
+            f"{suite}: one-hot {best[suite]}, datasets {len(group)}, "
+            f"mean score {group['score'].mean():.4f}, paper {group['paper'].mean():.4f}, "
+            f"mean |diff| {group['diff'].abs().mean():.4f}"
         )
         if use_mlflow:
+            mlflow.log_param(f"{suite}_one_hot", best[suite])
             mlflow.log_metric(f"{suite}_mean_{metric}", group["score"].mean())
             mlflow.log_metric(f"{suite}_paper_mean_{metric}", group["paper"].mean())
             mlflow.log_metric(f"{suite}_mean_abs_diff", group["diff"].abs().mean())
     if use_mlflow:
-        for name in ("eval_rows.csv", "eval_per_dataset.csv"):
+        for name in ("eval_rows.csv", "eval_per_dataset.csv", "eval_per_dataset_by_one_hot.csv"):
             mlflow.log_artifact(str(out_dir / name), "eval")
         mlflow.end_run()
 

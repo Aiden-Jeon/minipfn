@@ -39,3 +39,21 @@ def test_unknown_task_ids_are_reported():
     assert script.selected_tasks(argparse.Namespace(suite="all", tasks="359955")) == [
         ("classification", 359955)
     ]
+
+
+def test_one_hot_modes_are_parsed_and_best_mode_is_picked_per_suite():
+    import pandas as pd
+
+    script = _eval_script()
+    assert script.parse_args([]).one_hot == ["off", "power", "all"]
+    assert script.parse_args(["--one-hot", "all,off,all"]).one_hot == ["all", "off"]
+    with pytest.raises(SystemExit):
+        script.parse_args(["--one-hot", "half"])
+    by_mode = pd.DataFrame(
+        {
+            "suite": ["classification"] * 2 + ["regression"] * 2,
+            "one_hot": ["off", "all", "off", "power"],
+            "score": [0.90, 0.91, -12.0, -10.0],
+        }
+    )
+    assert script.best_one_hot(by_mode) == {"classification": "all", "regression": "power"}

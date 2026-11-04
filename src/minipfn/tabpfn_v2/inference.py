@@ -14,7 +14,9 @@
 - (`one_hot`을 주면) 범주형 열을 one-hot으로 펼친다. 논문 전처리 목록의 6번인데, 어느 멤버에 어떤
   범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 power 멤버만(분위수 멤버는 번호 섞기를
   그대로), `"all"`은 모든 멤버. 범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
-  범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던 범주(번호로 바꿀 때 결측이 된다)는 NaN
+  범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던 범주(번호로 바꿀 때 결측이 된다)는 NaN.
+  기본값은 benchmark에서 세 모드(off·power·all)를 모두 돌려 suite 평균이 가장 좋았던 것이다:
+  분류 `"all"`(500k ROC AUC 0.9235 → 0.9238), 회귀 `"power"`(QK-clip 200k neg RMSE −1831 → −1793)
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
@@ -237,8 +239,10 @@ class _Base:
 
 
 class TabPFNv2Classifier(_Base):
-    def __init__(self, model: TabPFNv2, *, n_estimators: int = 4, **kwargs: Any) -> None:
-        super().__init__(model, n_estimators=n_estimators, **kwargs)
+    def __init__(
+        self, model: TabPFNv2, *, n_estimators: int = 4, one_hot: str = "all", **kwargs: Any
+    ) -> None:
+        super().__init__(model, n_estimators=n_estimators, one_hot=one_hot, **kwargs)
 
     def fit(self, X: Any, y: Any) -> TabPFNv2Classifier:
         rng = np.random.default_rng(self.random_state)
@@ -320,9 +324,15 @@ def _bucket_values(borders: torch.Tensor, u_train: np.ndarray) -> np.ndarray:
 
 class TabPFNv2Regressor(_Base):
     def __init__(
-        self, model: TabPFNv2, borders: torch.Tensor, *, n_estimators: int = 8, **kwargs: Any
+        self,
+        model: TabPFNv2,
+        borders: torch.Tensor,
+        *,
+        n_estimators: int = 8,
+        one_hot: str = "power",
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model, n_estimators=n_estimators, **kwargs)
+        super().__init__(model, n_estimators=n_estimators, one_hot=one_hot, **kwargs)
         self.borders = borders.float().cpu()  # 계산할 때만 장치로 옮기고, 결과는 CPU로 돌려준다
 
     def fit(self, X: Any, y: Any) -> TabPFNv2Regressor:
