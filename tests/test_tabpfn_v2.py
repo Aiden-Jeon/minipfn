@@ -205,6 +205,27 @@ def test_one_hot_expands_small_categorical_columns_only():
     assert out.shape == (200, base.shape[1] + 1)  # 샘플 식별자 열
 
 
+def test_one_hot_width_is_capped_by_reverting_the_widest_columns():
+    from minipfn.tabpfn_v2.inference import MAX_ONE_HOT_WIDTH, _one_hot_sizes
+
+    # 범주 20개 열 8개 + 범주 2개 열 10개 + 수치 열 2개: 펼치면 2 + 160 + 10 = 172열
+    n_categories = {i: 20 for i in range(8)} | {i: 2 for i in range(8, 18)}
+    sizes = _one_hot_sizes(n_categories, n_features=20)
+    assert sum(1 if n == 2 else n for n in sizes.values()) + 2 <= MAX_ONE_HOT_WIDTH
+    assert len([n for n in sizes.values() if n == 20]) == 7 and 0 not in sizes  # 하나만 되돌린다
+    assert all(i in sizes for i in range(8, 18))  # 열 수가 늘지 않는 2범주 열은 그대로
+    # 원래 열이 이미 상한보다 많으면 열 수를 늘리는 펼침은 하지 않는다
+    assert _one_hot_sizes({0: 5, 1: 2}, n_features=MAX_ONE_HOT_WIDTH + 1) == {1: 2}
+
+
+def test_one_hot_out_of_range_codes_are_missing():
+    from minipfn.tabpfn_v2.inference import _MemberPreprocessor
+
+    block = _MemberPreprocessor._one_hot(np.array([0.0, 2.0, 3.0, np.nan, -1.0]), 3)
+    assert np.array_equal(block[:2], [[1, 0, 0], [0, 0, 1]])
+    assert np.isnan(block[2:]).all()  # 범위 밖과 결측은 번호 열처럼 결측
+
+
 @pytest.mark.parametrize("one_hot", ["off", "power", "all"])
 def test_estimators_run_with_one_hot(one_hot):
     rng = np.random.default_rng(0)

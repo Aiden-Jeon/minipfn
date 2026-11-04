@@ -41,19 +41,28 @@ def test_unknown_task_ids_are_reported():
     ]
 
 
-def test_one_hot_modes_are_parsed_and_best_mode_is_picked_per_suite():
-    import pandas as pd
-
+def test_one_hot_modes_are_parsed_and_headline_is_the_default_mode():
     script = _eval_script()
-    assert script.parse_args([]).one_hot == ["off", "power", "all"]
+    assert script.parse_args([]).one_hot == ["all"]
     assert script.parse_args(["--one-hot", "all,off,all"]).one_hot == ["all", "off"]
     with pytest.raises(SystemExit):
         script.parse_args(["--one-hot", "half"])
-    by_mode = pd.DataFrame(
-        {
-            "suite": ["classification"] * 2 + ["regression"] * 2,
-            "one_hot": ["off", "all", "off", "power"],
-            "score": [0.90, 0.91, -12.0, -10.0],
-        }
-    )
-    assert script.best_one_hot(by_mode) == {"classification": "all", "regression": "power"}
+    assert script.headline_mode(["off", "power", "all"]) == "all"  # 고르지 않고 기본값
+    assert script.headline_mode(["power", "off"]) == "power"
+
+
+def test_expands_one_hot_needs_a_small_categorical_column():
+    import types
+
+    import pandas as pd
+
+    script = _eval_script()
+
+    def task(X, cat):
+        return types.SimpleNamespace(X=pd.DataFrame(X), categorical_indices=cat)
+
+    many = [f"c{i}" for i in range(30)]
+    assert not script.expands_one_hot(task({"a": [1.0] * 30}, []))
+    assert script.expands_one_hot(task({"a": [0, 1, 2] * 10}, [0]))
+    assert script.expands_one_hot(task({"a": list("xyz") * 10}, []))  # 문자열 열도 범주형
+    assert not script.expands_one_hot(task({"a": many}, []))  # 범주가 많으면 번호로 둔다

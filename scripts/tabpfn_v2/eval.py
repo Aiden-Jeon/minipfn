@@ -10,11 +10,14 @@ benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마�
   uv run python $EVAL --suite classification --classifier-path clf.pt --tasks 359955 --folds 2
   uv run python $EVAL --suite classification --classifier-path runs:/<run_id>/checkpoints/latest.pt
 
-범주형 열의 one-hot(`--one-hot`, 기본은 off·power·all 셋 다)은 모드마다 평가하고, suite 평균 점수가
-가장 좋은 모드를 그 suite의 결과로 낸다(`eval_per_dataset.csv`와 MLflow의 평균 지표). 모드 하나로
-모든 데이터셋을 평가하므로 논문의 기본 설정 TabPFN과 견줄 수 있다. 모드별 결과는
-`eval_per_dataset_by_one_hot.csv`와 `<suite>_mean_<metric>_one_hot_<mode>` 지표에 남긴다.
-범주형 열이 없는 데이터셋은 모드와 상관없이 결과가 같아 한 번만 평가한다.
+범주형 열의 one-hot(`--one-hot`)은 기본으로 추론의 기본값(`DEFAULT_ONE_HOT`) 하나만 평가한다.
+쉼표로 여러 모드를 주면(`--one-hot off,power,all`) 모드마다 평가해
+`eval_per_dataset_by_one_hot.csv`와 `<suite>_mean_<metric>_one_hot_<mode>` 지표에 남긴다. 이때도
+`eval_per_dataset.csv`와 MLflow의 평균 지표는 기본값 모드(목록에 없으면 첫 모드)의 결과다.
+test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint마다 모드가 달라지면 step별 곡선을
+견줄 수 없어서다. one-hot으로 펼칠 열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하인 범주형 열)이 없는
+데이터셋은 모드와 상관없이 결과가 같아 한 번만 평가하고, 그 결과를 다른 모드에도 `reused=True`로
+쓴다.
 
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
@@ -36,7 +39,13 @@ import torch
 
 from minipfn.tabpfn_v2 import benchmark as bm
 from minipfn.tabpfn_v2.hub import load_model
-from minipfn.tabpfn_v2.inference import ONE_HOT_MODES, TabPFNv2Classifier, TabPFNv2Regressor
+from minipfn.tabpfn_v2.inference import (
+    DEFAULT_ONE_HOT,
+    MAX_ONE_HOT_CATEGORIES,
+    ONE_HOT_MODES,
+    TabPFNv2Classifier,
+    TabPFNv2Regressor,
+)
 from minipfn.utils import log_run_source
 
 
@@ -54,8 +63,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--one-hot",
         type=_one_hot_modes,
-        default=list(ONE_HOT_MODES),
-        help="평가할 one-hot 모드, 쉼표로 구분 (기본: off,power,all)",
+        default=[DEFAULT_ONE_HOT],
+        help=f"평가할 one-hot 모드, 쉼표로 구분 (기본: {DEFAULT_ONE_HOT}, 비교: off,power,all)",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
@@ -71,11 +80,21 @@ def _one_hot_modes(value: str) -> list[str]:
     return list(dict.fromkeys(modes))
 
 
-def has_categorical(task: bm.OpenMLTask) -> bool:
-    """추론이 범주형으로 다루는 열이 있는지 (`categorical_indices`이거나 숫자가 아닌 열)."""
-    return bool(task.categorical_indices) or not all(
-        pd.api.types.is_numeric_dtype(dtype) for dtype in task.X.dtypes
-    )
+def headline_mode(modes: list[str]) -> str:
+    """`eval_per_dataset.csv`와 평균 지표에 쓸 모드: 추론의 기본값, 목록에 없으면 첫 모드."""
+    return DEFAULT_ONE_HOT if DEFAULT_ONE_HOT in modes else modes[0]
+
+
+def expands_one_hot(task: bm.OpenMLTask) -> bool:
+    """one-hot 모드에 따라 결과가 달라질 수 있는지.
+
+    추론이 범주형으로 다루는 열(`categorical_indices`이거나 숫자가 아닌 열) 가운데 범주가
+    `MAX_ONE_HOT_CATEGORIES`개 이하인 열이 있는지 본다 (전체 행 기준).
+    """
+    X = task.X
+    cat = set(task.categorical_indices)
+    cat |= {i for i, dtype in enumerate(X.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
+    return any(X.iloc[:, i].nunique() <= MAX_ONE_HOT_CATEGORIES for i in cat)
 
 
 def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
@@ -126,20 +145,15 @@ def summarize(rows: list[dict]) -> pd.DataFrame:
     return per_dataset
 
 
-def best_one_hot(per_dataset: pd.DataFrame) -> dict[str, str]:
-    """suite마다 평균 점수(분류 ROC AUC, 회귀 negative RMSE)가 가장 높은 one-hot 모드."""
-    means = per_dataset.groupby(["suite", "one_hot"])["score"].mean()
-    return {suite: group.droplevel(0).idxmax() for suite, group in means.groupby(level=0)}
-
-
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tasks = selected_tasks(args)
+    headline = headline_mode(args.one_hot)
     print(
         f"tasks: {len(tasks)}, folds: {args.folds}, device: {args.device}, "
-        f"one-hot: {','.join(args.one_hot)}",
+        f"one-hot: {','.join(args.one_hot)} (결과: {headline})",
         flush=True,
     )
 
@@ -150,7 +164,12 @@ def main(argv: list[str] | None = None) -> None:
         mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID"))
         log_run_source(__file__, env_prefix="TABPFN_V2_")
         mlflow.log_params(
-            {"suite": args.suite, "folds": args.folds, "one_hot_modes": ",".join(args.one_hot)}
+            {
+                "suite": args.suite,
+                "folds": args.folds,
+                "one_hot": headline,
+                "one_hot_modes": ",".join(args.one_hot),
+            }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
@@ -160,15 +179,20 @@ def main(argv: list[str] | None = None) -> None:
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()
         task = bm.load_openml_task(task_id)
-        modes = args.one_hot if has_categorical(task) else args.one_hot[:1]
+        expands = expands_one_hot(task)
         scores = {}
-        for mode in modes:
+        for mode in args.one_hot if expands else [headline]:
             make = functools.partial(factories[suite], one_hot=mode)
             task_rows = bm.evaluate_task(task, make, n_folds=args.folds)
             scores[mode] = float(np.nanmean([r["score"] for r in task_rows]))
-            # 범주형 열이 없으면 모든 모드가 같은 결과라 한 번 낸 것을 모드마다 쓴다
-            for copy in args.one_hot if len(modes) == 1 else [mode]:
-                rows.extend({**r, "suite": suite, "one_hot": copy} for r in task_rows)
+            rows.extend({**r, "suite": suite, "one_hot": mode, "reused": False} for r in task_rows)
+        if not expands:
+            # 펼칠 열이 없으면 모든 모드가 같은 결과라 한 번 낸 것을 다른 모드에도 쓴다
+            for mode in args.one_hot:
+                if mode != headline:
+                    rows.extend(
+                        {**r, "suite": suite, "one_hot": mode, "reused": True} for r in task_rows
+                    )
         paper = bm.paper_scores(suite)[task_id]
         shown = " ".join(f"{m} {v:.4f}" for m, v in scores.items())
         print(
@@ -186,24 +210,21 @@ def main(argv: list[str] | None = None) -> None:
             f"{suite} one-hot {mode}: mean score {group['score'].mean():.4f}, "
             f"mean |diff| {group['diff'].abs().mean():.4f}"
         )
-        if use_mlflow:
+        if use_mlflow and len(args.one_hot) > 1:
             mlflow.log_metric(f"{suite}_mean_{metric}_one_hot_{mode}", group["score"].mean())
             mlflow.log_metric(f"{suite}_mean_abs_diff_one_hot_{mode}", group["diff"].abs().mean())
 
-    best = best_one_hot(by_mode)
-    chosen = [(by_mode.suite == suite) & (by_mode.one_hot == mode) for suite, mode in best.items()]
-    per_dataset = pd.concat([by_mode[mask] for mask in chosen])
+    per_dataset = by_mode[by_mode.one_hot == headline]
     per_dataset.to_csv(out_dir / "eval_per_dataset.csv", index=False)
     print(per_dataset.round(4).to_string(index=False))
     for suite, group in per_dataset.groupby("suite"):
         metric = "roc_auc" if suite == "classification" else "neg_rmse"
         print(
-            f"{suite}: one-hot {best[suite]}, datasets {len(group)}, "
+            f"{suite}: one-hot {headline}, datasets {len(group)}, "
             f"mean score {group['score'].mean():.4f}, paper {group['paper'].mean():.4f}, "
             f"mean |diff| {group['diff'].abs().mean():.4f}"
         )
         if use_mlflow:
-            mlflow.log_param(f"{suite}_one_hot", best[suite])
             mlflow.log_metric(f"{suite}_mean_{metric}", group["score"].mean())
             mlflow.log_metric(f"{suite}_paper_mean_{metric}", group["paper"].mean())
             mlflow.log_metric(f"{suite}_mean_abs_diff", group["diff"].abs().mean())
