@@ -29,7 +29,7 @@ import torch
 
 from minipfn.tabpfn_v2 import benchmark as bm
 from minipfn.tabpfn_v2.hub import load_model
-from minipfn.tabpfn_v2.inference import TabPFNv2Classifier, TabPFNv2Regressor
+from minipfn.tabpfn_v2.inference import ONE_HOT_MODES, TabPFNv2Classifier, TabPFNv2Regressor
 from minipfn.utils import log_run_source
 
 
@@ -43,6 +43,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--regressor-path", help="회귀 체크포인트 (파일, 폴더, runs:/ URI, hf://owner/name)"
+    )
+    parser.add_argument(
+        "--one-hot", choices=ONE_HOT_MODES, default="off", help="범주형 열을 one-hot으로 펼칠 멤버"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
@@ -76,7 +79,11 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
 
     def make(task: bm.OpenMLTask):
-        kw = {"categorical_features_indices": task.categorical_indices, "device": args.device}
+        kw = {
+            "categorical_features_indices": task.categorical_indices,
+            "one_hot": args.one_hot,
+            "device": args.device,
+        }
         if suite == "classification":
             return TabPFNv2Classifier(model, **kw)
         return TabPFNv2Regressor(model, borders, **kw)
@@ -106,7 +113,7 @@ def main(argv: list[str] | None = None) -> None:
             mlflow.set_experiment(os.environ.get("TABPFN_V2_EXPERIMENT", "tabpfn-v2-reproduction"))
         mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID"))
         log_run_source(__file__, env_prefix="TABPFN_V2_")
-        mlflow.log_params({"suite": args.suite, "folds": args.folds})
+        mlflow.log_params({"suite": args.suite, "folds": args.folds, "one_hot": args.one_hot})
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
 

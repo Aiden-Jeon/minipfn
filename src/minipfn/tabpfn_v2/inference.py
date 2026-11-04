@@ -11,6 +11,10 @@
 - 전처리 두 가지를 번갈아: (1) 분위수 변환한 열을 원래 열 옆에 붙이고 SVD 성분을 덧붙임,
   범주형 열은 번호를 섞음 (2) Yeo-Johnson power transform
 - 수치형 열에서 평균으로부터 표준편차 12배 밖의 값은 그 경계로 자른다
+- (`one_hot`을 주면) 범주형 열을 one-hot으로 펼친다. 논문 전처리 목록의 6번인데, 어느 멤버에 어떤
+  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 power 멤버만(분위수 멤버는 번호 섞기를
+  그대로), `"all"`은 모든 멤버. 범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
+  범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던 범주(번호로 바꿀 때 결측이 된다)는 NaN
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
@@ -48,6 +52,8 @@ from sklearn.preprocessing import (
 from minipfn.tabpfn_v2.model import TabPFNv2
 
 OUTLIER_SIGMA = 12.0
+MAX_ONE_HOT_CATEGORIES = 20  # benchmark의 socmob(17개)은 펼치고 colleges(수천 개)는 번호로 둔다
+ONE_HOT_MODES = ("off", "power", "all")
 SOFTMAX_TEMPERATURE = 0.9
 
 
@@ -82,6 +88,7 @@ class _Member:
     class_permutation: np.ndarray | None
     target_power: bool
     seed: int
+    one_hot: bool = False
 
 
 class _MemberPreprocessor:
@@ -101,9 +108,17 @@ class _MemberPreprocessor:
         num_ix = [i for i in range(X.shape[1]) if i not in self.cat_ix]
         self.num_ix = num_ix
         self.cat_maps = {}
-        if self.member.kind == "quantile":
-            # 범주형 열: 번호를 섞는다 (분위수 멤버만)
+        self.one_hot_sizes = {}
+        if self.member.one_hot:
             for i in self.cat_ix:
+                n = int(np.nanmax(X[:, i])) + 1 if np.isfinite(X[:, i]).any() else 1
+                if n <= MAX_ONE_HOT_CATEGORIES:
+                    self.one_hot_sizes[i] = n
+        if self.member.kind == "quantile":
+            # 범주형 열: 번호를 섞는다 (분위수 멤버만, one-hot으로 펼치는 열은 빼고)
+            for i in self.cat_ix:
+                if i in self.one_hot_sizes:
+                    continue
                 n = int(np.nanmax(X[:, i])) + 1 if np.isfinite(X[:, i]).any() else 1
                 self.cat_maps[i] = rng.permutation(n)
             n_quantiles = max(min(X.shape[0] // 10, 1000), 2)
@@ -144,8 +159,24 @@ class _MemberPreprocessor:
             with np.errstate(all="ignore"):
                 transformed[:, self.num_ix] = self.transformer.transform(X[:, self.num_ix])
         if self.member.kind == "quantile":
-            return np.concatenate([X, transformed[:, self.num_ix]], axis=1)  # 원래 열 + 분위수 열
-        return transformed
+            out = np.concatenate([X, transformed[:, self.num_ix]], axis=1)  # 원래 열 + 분위수 열
+        else:
+            out = transformed
+        if not self.one_hot_sizes:
+            return out
+        # 번호 열을 빼고 one-hot 열을 뒤에 붙인다 (앞 d개 열이 원래 열 순서라 위치가 같다)
+        keep = [j for j in range(out.shape[1]) if j not in self.one_hot_sizes]
+        blocks = [self._one_hot(X[:, i], n) for i, n in self.one_hot_sizes.items()]
+        return np.concatenate([out[:, keep], *blocks], axis=1)
+
+    @staticmethod
+    def _one_hot(codes: np.ndarray, n: int) -> np.ndarray:
+        missing = np.isnan(codes)
+        known = ~missing & (codes < n)
+        block = np.zeros((len(codes), n))
+        block[np.flatnonzero(known), codes[known].astype(int)] = 1.0
+        block[missing] = np.nan
+        return block[:, 1:] if n == 2 else block
 
     def transform(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         base = self._base(self._clip(X))
@@ -163,9 +194,13 @@ class _Base:
         *,
         n_estimators: int,
         categorical_features_indices: list[int] | None = None,
+        one_hot: str = "off",
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
+        if one_hot not in ONE_HOT_MODES:
+            raise ValueError(f"one_hot은 {ONE_HOT_MODES} 가운데 하나여야 한다: {one_hot}")
+        self.one_hot = one_hot
         self.model = model
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -173,6 +208,8 @@ class _Base:
         self.random_state = random_state
 
     def _fit_members(self, X: Any, members: list[_Member]) -> None:
+        for m in members:
+            m.one_hot = self.one_hot == "all" or (self.one_hot == "power" and m.kind == "power")
         X_num, self.cat_ix_, self.encoder_ = _to_numeric(X, self.categorical_features_indices)
         self.preprocessors_ = [_MemberPreprocessor(m, self.cat_ix_).fit(X_num) for m in members]
         # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
