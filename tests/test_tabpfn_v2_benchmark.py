@@ -66,3 +66,5 @@ def test_expands_one_hot_needs_a_small_categorical_column():
     assert script.expands_one_hot(task({"a": [0, 1, 2] * 10}, [0]))
     assert script.expands_one_hot(task({"a": list("xyz") * 10}, []))  # 문자열 열도 범주형
     assert not script.expands_one_hot(task({"a": many}, []))  # 범주가 많으면 번호로 둔다
+    wide = {f"c{i}": [0, 1, 2] * 10 for i in range(200)}
+    assert not script.expands_one_hot(task(wide, list(range(200))))  # 폭 상한에 걸려 펼치지 않는다

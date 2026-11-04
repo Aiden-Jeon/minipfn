@@ -41,10 +41,10 @@ from minipfn.tabpfn_v2 import benchmark as bm
 from minipfn.tabpfn_v2.hub import load_model
 from minipfn.tabpfn_v2.inference import (
     DEFAULT_ONE_HOT,
-    MAX_ONE_HOT_CATEGORIES,
     ONE_HOT_MODES,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
+    _one_hot_sizes,
 )
 from minipfn.utils import log_run_source
 
@@ -88,13 +88,13 @@ def headline_mode(modes: list[str]) -> str:
 def expands_one_hot(task: bm.OpenMLTask) -> bool:
     """one-hot 모드에 따라 결과가 달라질 수 있는지.
 
-    추론이 범주형으로 다루는 열(`categorical_indices`이거나 숫자가 아닌 열) 가운데 범주가
-    `MAX_ONE_HOT_CATEGORIES`개 이하인 열이 있는지 본다 (전체 행 기준).
+    추론이 범주형으로 다루는 열(`categorical_indices`이거나 숫자가 아닌 열) 가운데 추론이 펼칠
+    열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하이고, 펼친 폭이 상한 안)이 있는지 본다 (전체 행 기준).
     """
     X = task.X
     cat = set(task.categorical_indices)
     cat |= {i for i, dtype in enumerate(X.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
-    return any(X.iloc[:, i].nunique() <= MAX_ONE_HOT_CATEGORIES for i in cat)
+    return bool(_one_hot_sizes({i: X.iloc[:, i].nunique() for i in cat}, X.shape[1]))
 
 
 def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
