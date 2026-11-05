@@ -89,8 +89,6 @@ def test_top_level_inference_names_load_lazily():
         "from minipfn.hub import from_pretrained as f\n"
         "from minipfn.recipes import tabpfn_v1 as v1, tabpfn_v2 as v2\n"
         "assert from_pretrained is f and TabPFNv1Classifier is v1.TabPFNv1Classifier\n"
-        "from minipfn.recipes.tabpfn_v1 import TabPFNClassifier as old_name\n"
-        "assert old_name is TabPFNv1Classifier  # 예전 Hub 카드의 이름\n"
         "assert TabPFNv2Classifier is v2.TabPFNv2Classifier\n"
         "assert TabPFNv2Regressor is v2.TabPFNv2Regressor\n"
         "assert set(minipfn.__all__) <= set(dir(minipfn))\n"

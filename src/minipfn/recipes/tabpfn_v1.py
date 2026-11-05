@@ -716,10 +716,6 @@ class TabPFNv1Classifier(RotationEnsembleClassifier):
         )
 
 
-# 예전 이름 (예전 v1 Hub 카드가 썼다)
-TabPFNClassifier = TabPFNv1Classifier
-
-
 def tabpfn_predict_proba(
     model: RowTransformer,
     x_train: Any,
