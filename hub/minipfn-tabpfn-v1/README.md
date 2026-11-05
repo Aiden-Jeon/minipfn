@@ -11,7 +11,7 @@ tags:
 
 # minipfn TabPFN (v1 reproduction)
 
-A from-scratch reproduction of TabPFN (Hollmann et al., [arXiv:2207.01848](https://arxiv.org/abs/2207.01848), ICLR 2023), trained with the paper's prior and budget. Code: [Aiden-Jeon/minipfn](https://github.com/Aiden-Jeon/minipfn) (`src/minipfn/tabpfn/`).
+A from-scratch reproduction of TabPFN (Hollmann et al., [arXiv:2207.01848](https://arxiv.org/abs/2207.01848), ICLR 2023), trained with the paper's prior and budget. Code: [Aiden-Jeon/minipfn](https://github.com/Aiden-Jeon/minipfn) (the `tabpfn_v1` modules under `src/minipfn/`, numbers in `src/minipfn/recipes/tabpfn_v1.py`).
 
 This is not the official TabPFN checkpoint. For the official models see [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN).
 
@@ -51,11 +51,9 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 ```
 
 ```python
-from minipfn.tabpfn.hub import from_pretrained
-from minipfn.tabpfn.inference import TabPFNClassifier
+from minipfn import TabPFNv1Classifier
 
-model, config = from_pretrained("aiden-jeon/minipfn-tabpfn-v1")
-clf = TabPFNClassifier(model).fit(x_train, y_train)
+clf = TabPFNv1Classifier().fit(x_train, y_train)  # downloads aiden-jeon/minipfn-tabpfn-v1
 proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes_ order
 ```
 
@@ -64,7 +62,7 @@ proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes
 - `"fit_preprocessors"` (default): caches the preprocessing. Use it for batch prediction.
 - `"fit_with_cache"`: also caches each layer's training-row keys and values, so predicting one row only computes test-to-train attention. Use it for serving with a fixed training set. The cache takes about 1.6 GB at 1,000 training rows.
 
-If the training rows change with every request, use `minipfn.tabpfn.inference.tabpfn_predict_proba(model, x_train, y_train, x_test)`. To reproduce Table 1:
+If the training rows change with every request, use `minipfn.recipes.tabpfn_v1.tabpfn_predict_proba(model, x_train, y_train, x_test)`. To reproduce Table 1:
 
 ```bash
 uv run python scripts/tabpfn/eval.py --hub-repo aiden-jeon/minipfn-tabpfn-v1

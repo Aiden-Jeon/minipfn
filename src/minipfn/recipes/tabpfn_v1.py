@@ -1,7 +1,22 @@
-"""TabPFN prior-fitting 학습 루프 (논문 3절, v1 `train.py`).
+"""TabPFN v1(arXiv:2207.01848) recipe: 논문 수치와 출처, 그리고 그 수치로 각 축의 부품을 묶은 것.
 
-매 optimizer step: prior에서 데이터셋 `batch_size`개를 GPU들에 나눠 만들고, forward batch마다
-학습 행 / 테스트 행으로 나눠 테스트 행의 cross-entropy를 줄인다. GPU가 여러 장이면
+- prior: `minipfn.priors.prior_bag.PriorBag` + 여기의 `PRIOR` 설정 → `TabPFNPrior`
+- 모델: `minipfn.models.row_transformer.RowTransformer` (논문 크기 `PAPER_MODEL`)
+- 학습: 여기의 `train_tabpfn` (v1 `train.py`의 루프, 설정은 `TabPFNConfig`)
+- 추론: `minipfn.inference.rotation_ensemble` + 논문 앙상블 설정 → `TabPFNv1Classifier`
+- 평가: `minipfn.benchmarks.cc18` (Table 1)
+
+값은 논문 본문·부록과 공식 v1 코드(github.com/automl/TabPFN, `tabpfn_v1` 브랜치, commit bef0cf2,
+Apache 2.0, Copyright 2022 University of Freiburg)에서 가져왔다. 출처 표기:
+- "논문 E.1" 등: 논문 절
+- "v1 PriorFittingCustomPrior": 공개 체크포인트를 학습한 설정이 적힌 노트북 셀
+- "v1 model_configs": `tabpfn/scripts/model_configs.py`의 prior 설정
+- "추정": 직접 확인하지 못해 가장 근거 있는 값을 고른 것
+논문 표와 v1 코드가 다르면 체크포인트를 만든 v1 코드를 따른다(차이는 주석에 남긴다).
+
+학습 루프 (논문 3절, v1 `train.py`): 매 optimizer step마다 prior에서 데이터셋 `batch_size`개를
+GPU들에 나눠 만들고, forward batch마다 학습 행 / 테스트 행으로 나눠 테스트 행의 cross-entropy를
+줄인다. GPU가 여러 장이면
 `torchrun`으로 띄운 DDP로 gradient를 평균한다. 유효 batch는 v1과 같이
 
     batch_size = group_size × groups_per_batch × grad_accumulation × world_size
@@ -18,21 +33,266 @@ import json
 import shutil
 import time
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.model import (
-    TabPFNTransformer,
-    classification_loss,
-    configure_attention_backends,
-)
-from minipfn.tabpfn.prior import TabPFNPrior, TabPFNPriorDataset
+from minipfn.inference import rotation_ensemble
+from minipfn.inference.rotation_ensemble import FitMode, RotationEnsembleClassifier
+from minipfn.models.row_transformer import RowTransformer, configure_attention_backends
+from minipfn.priors.base import IGNORE_INDEX
+from minipfn.priors.prior_bag import PriorBag, PriorBagConfig
+from minipfn.training.data import PriorGroups
+from minipfn.training.losses import classification_loss
 from minipfn.utils import lr_factor, setup_distributed
+
+# ---------------------------------------------------------------------------
+# 모델 (논문 E.1, v1 PriorFittingCustomPrior)
+# ---------------------------------------------------------------------------
+EMSIZE = 512
+NLAYERS = 12
+NHEAD = 4  # emsize // 128
+NHID = 1024  # emsize * nhid_factor(2)
+DROPOUT = 0.0
+MAX_FEATURES = 100  # 부족한 feature는 0으로 채우고 100/k로 스케일 (논문 E.2)
+MAX_CLASSES = 10  # 출력 logit 수
+PAPER_N_PARAMETERS = 25_820_000  # 논문 E.1: 25.82M
+
+# ---------------------------------------------------------------------------
+# 학습 (논문 3절·E.3, v1 PriorFittingCustomPrior + train.py)
+# ---------------------------------------------------------------------------
+SEQ_LEN = 1152  # bptt = 1024 + 128 (v1)
+# single_eval_pos(학습 행 수) ~ Uniform{1, ..., 999}.
+# v1은 0부터 뽑는다 (minipfn.training.data.PriorGroups 참고: 1부터 뽑는 이유도 거기 적혀 있다).
+MAX_EVAL_POS = 1000
+# 한 forward batch의 데이터셋 8개가 prior 하이퍼파라미터를 공유한다 (v1)
+DATASETS_PER_PRIOR_GROUP = 8
+GRAD_ACCUMULATION = 8  # aggregate_k_gradients (v1)
+BATCH_SIZE = 512  # optimizer step당 데이터셋 수 = 8 × 8 × GPU 8장 (논문 3절)
+TOTAL_STEPS = 18_000  # 논문 3절: 18,000 step × batch 512
+STEPS_PER_EPOCH = 128  # num_steps = 1024 // aggregate_k_gradients (v1)
+WARMUP_STEPS = 20 * STEPS_PER_EPOCH  # warmup_epochs = 20 (v1 model_builder)
+SCHEDULE_STEPS = (
+    400 * STEPS_PER_EPOCH
+)  # cosine은 400 epoch 기준. 논문은 약 141 epoch(18,000 step)에서 멈췄다.
+LR = 1.1555e-4  # 추정: v1 노트북 출력의 lr (탐색 범위 log-uniform [1e-4, 1.5e-4])
+WEIGHT_DECAY = 0.0  # AdamW (v1 train.py)
+GRAD_CLIP = 1.0  # v1 train.py
+# v1은 fp16 + GradScaler. H100에서는 bf16 autocast를 쓴다 (차이: 수치 형식만).
+
+# ---------------------------------------------------------------------------
+# Prior (v1 model_configs.get_diff_causal 등, PriorFittingCustomPrior에서 덮어쓴 값 반영)
+# 논문 E.4 표와 다른 점: 활성화 함수 후보가 v1에서는 {Tanh, Identity, ReLU}다
+# (논문 표: Tanh, LeakyReLU, ELU, Identity).
+# ---------------------------------------------------------------------------
+# prior bag: softmax([1, w])로 GP 또는 MLP prior를 고른다. w ~ U(2, 10)이라 대부분 MLP다.
+PRIOR_BAG_MLP_WEIGHT = {"distribution": "uniform", "min": 2.0, "max": 10.0}
+
+# MLP prior: is_causal=True면 SCM prior, False면 BNN prior (논문 4.3·4.4).
+# 둘의 비율은 meta_choice 가중치로 정해진다 (평균 50/50).
+MLP_HYPERPARAMETERS = {
+    "num_layers": {
+        "distribution": "meta_gamma",
+        "max_alpha": 2,
+        "max_scale": 3,
+        "round": True,
+        "lower_bound": 2,
+    },
+    "prior_mlp_hidden_dim": {
+        "distribution": "meta_gamma",
+        "max_alpha": 3,
+        "max_scale": 100,
+        "round": True,
+        "lower_bound": 4,
+    },
+    "prior_mlp_dropout_prob": {"distribution": "meta_beta", "scale": 0.6, "min": 0.1, "max": 5.0},
+    "noise_std": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 0.3,
+        "min_mean": 1e-4,
+        "round": False,
+        "lower_bound": 0.0,
+    },
+    "init_std": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 10.0,
+        "min_mean": 0.01,
+        "round": False,
+        "lower_bound": 0.0,
+    },
+    "num_causes": {
+        "distribution": "meta_gamma",
+        "max_alpha": 3,
+        "max_scale": 7,
+        "round": True,
+        "lower_bound": 2,
+    },
+    "is_causal": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "pre_sample_weights": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "y_is_effect": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "prior_mlp_activations": {
+        "distribution": "meta_choice_mixed",
+        "choice_values": ["tanh", "identity", "relu"],
+    },
+    "block_wise_dropout": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "sort_features": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "in_clique": {"distribution": "meta_choice", "choice_values": [True, False]},
+}
+PRE_SAMPLE_CAUSES = True  # 원인 노드의 평균·표준편차를 데이터셋마다 미리 뽑는다
+PRIOR_MLP_SCALE_WEIGHTS_SQRT = True
+RANDOM_FEATURE_ROTATION = True
+
+# GP prior (prior bag의 나머지)
+GP_HYPERPARAMETERS = {
+    "outputscale": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 10.0,
+        "min_mean": 1e-5,
+        "round": False,
+        "lower_bound": 0.0,
+    },
+    "lengthscale": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 10.0,
+        "min_mean": 1e-5,
+        "round": False,
+        "lower_bound": 0.0,
+    },
+    "noise": {"distribution": "meta_choice", "choice_values": [1e-5, 1e-4, 1e-2]},
+}
+
+# 표 데이터 처리 (v1 flexible_categorical, PriorFittingCustomPrior)
+NUM_FEATURES_USED = (1, MAX_FEATURES)  # round(U(1, 100))
+NUM_CLASSES = (2, MAX_CLASSES)  # 상한 round(U(2, 10)), 그 뒤 50% 확률로 2클래스 (class_sampler_f)
+CATEGORICAL_FEATURE_P = 0.2  # 그룹의 20%에서 일부 열을 범주형으로 바꾼다
+CATEGORICAL_ORDERED_P = 0.3
+NAN_PROB = 0.0  # 공개 체크포인트는 결측값 주입을 끄고 학습했다 (nan_prob_* = 0)
+OUTPUT_MULTICLASS_ORDERED_P = 0.0  # 클래스 번호는 항상 섞는다
+NORMALIZE_BY_USED_FEATURES = True
+CHECK_IS_COMPATIBLE = (
+    True  # 학습/테스트 행의 클래스 집합이 같아야 한다. 아니면 행을 섞고, 10번 실패하면 무시(-100)
+)
+# IGNORE_INDEX(-100, 무시할 target)는 `minipfn.priors.base`의 것을 쓴다
+
+# ---------------------------------------------------------------------------
+# 평가 (논문 5.2절·부록 F, v1 RunFullDatasetAnalyses, tabular_evaluation,
+# transformer_prediction_interface)
+# ---------------------------------------------------------------------------
+# OpenML-CC18에서 샘플 ≤2000, feature ≤100, 클래스 ≤10인 30개 (v1 datasets/__init__.py open_cc_dids)
+OPENML_CC18_TEST_DIDS = [
+    11,
+    14,
+    15,
+    16,
+    18,
+    22,
+    23,
+    29,
+    31,
+    37,
+    50,
+    54,
+    188,
+    458,
+    469,
+    1049,
+    1050,
+    1063,
+    1068,
+    1510,
+    1494,
+    1480,
+    1462,
+    1464,
+    6332,
+    23381,
+    40966,
+    40982,
+    40994,
+    40975,
+]
+# 논문 Table 1은 이 중 수치형 feature만 있고 결측값이 없는 18개다.
+# 평가할 때 OpenML 메타데이터로 걸러낸다.
+TABLE1_N_DATASETS = 18
+EVAL_SEQ_LEN = 2000  # 학습 + 테스트 행
+EVAL_TRAIN_SIZE = 1000  # eval_position
+EVAL_MAX_SAMPLES = 10_000  # 로드 시 seed 13으로 섞은 뒤 자른다
+N_SPLITS = 5
+N_ENSEMBLE = 32  # 논문 5.2절
+SOFTMAX_TEMPERATURE = 0.8  # logits / 0.8 (v1)
+ROC_AUC_MULTI_CLASS = "ovo"  # v1 tabular_metrics.auc_metric
+
+# 논문 Table 1 (18개 데이터셋, 평균 ROC AUC)
+PAPER_TABLE1_ROC_AUC = {
+    "TabPFN": 0.934,
+    "TabPFN (no ensemble)": 0.932,
+    "AutoGluon": 0.930,
+    "Auto-sklearn 2.0": 0.929,
+    "XGBoost": 0.924,
+    "CatBoost": 0.924,
+    "LightGBM": 0.920,
+}
+
+
+# 위 수치를 prior bag 설정으로 (`minipfn.priors.prior_bag`)
+PRIOR = PriorBagConfig(
+    mlp_hyperparameters=MLP_HYPERPARAMETERS,
+    gp_hyperparameters=GP_HYPERPARAMETERS,
+    mlp_weight=PRIOR_BAG_MLP_WEIGHT,
+    min_classes=NUM_CLASSES[0],
+    categorical_feature_p=CATEGORICAL_FEATURE_P,
+    categorical_ordered_p=CATEGORICAL_ORDERED_P,
+    output_multiclass_ordered_p=OUTPUT_MULTICLASS_ORDERED_P,
+    normalize_by_used_features=NORMALIZE_BY_USED_FEATURES,
+    check_is_compatible=CHECK_IS_COMPATIBLE,
+    scale_weights_sqrt=PRIOR_MLP_SCALE_WEIGHTS_SQRT,
+    random_feature_rotation=RANDOM_FEATURE_ROTATION,
+)
+
+# 논문 크기 모델 (`RowTransformer(**PAPER_MODEL)`, 25.82M 파라미터)
+PAPER_MODEL = {
+    "num_features": MAX_FEATURES,
+    "n_out": MAX_CLASSES,
+    "emsize": EMSIZE,
+    "nhead": NHEAD,
+    "nhid": NHID,
+    "nlayers": NLAYERS,
+    "dropout": DROPOUT,
+}
+
+
+class TabPFNPrior(PriorBag):
+    """v1 논문 prior(`PRIOR`)와 데이터셋 크기를 기본값으로 둔 prior bag."""
+
+    def __init__(
+        self,
+        seq_len: int = SEQ_LEN,
+        num_features: int = MAX_FEATURES,
+        max_classes: int = MAX_CLASSES,
+        group_size: int = DATASETS_PER_PRIOR_GROUP,
+        device: torch.device | str = "cpu",
+        seed: int = 0,
+    ) -> None:
+        super().__init__(
+            PRIOR,
+            seq_len=seq_len,
+            num_features=num_features,
+            max_classes=max_classes,
+            group_size=group_size,
+            device=device,
+            seed=seed,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 학습 (논문 3절, v1 train.py)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -40,26 +300,26 @@ class TabPFNConfig:
     """모델·prior·최적화 설정. smoke(로컬 CPU), medium(GPU 1장, 예산 1/10), paper(논문)."""
 
     # 모델
-    emsize: int = spec.EMSIZE
-    nhead: int = spec.NHEAD
-    nhid: int = spec.NHID
-    nlayers: int = spec.NLAYERS
-    dropout: float = spec.DROPOUT
-    num_features: int = spec.MAX_FEATURES
-    n_out: int = spec.MAX_CLASSES
+    emsize: int = EMSIZE
+    nhead: int = NHEAD
+    nhid: int = NHID
+    nlayers: int = NLAYERS
+    dropout: float = DROPOUT
+    num_features: int = MAX_FEATURES
+    n_out: int = MAX_CLASSES
     # prior / 데이터셋 구성
-    seq_len: int = spec.SEQ_LEN
-    max_eval_pos: int = spec.MAX_EVAL_POS
-    group_size: int = spec.DATASETS_PER_PRIOR_GROUP
+    seq_len: int = SEQ_LEN
+    max_eval_pos: int = MAX_EVAL_POS
+    group_size: int = DATASETS_PER_PRIOR_GROUP
     groups_per_batch: int = 1
     # 최적화
-    batch_size: int = spec.BATCH_SIZE
-    steps: int = spec.TOTAL_STEPS
-    warmup_steps: int = spec.WARMUP_STEPS
-    schedule_steps: int = spec.SCHEDULE_STEPS
-    lr: float = spec.LR
-    weight_decay: float = spec.WEIGHT_DECAY
-    grad_clip: float = spec.GRAD_CLIP
+    batch_size: int = BATCH_SIZE
+    steps: int = TOTAL_STEPS
+    warmup_steps: int = WARMUP_STEPS
+    schedule_steps: int = SCHEDULE_STEPS
+    lr: float = LR
+    weight_decay: float = WEIGHT_DECAY
+    grad_clip: float = GRAD_CLIP
     # 실행
     seed: int = 0
     num_workers: int = 8
@@ -78,9 +338,9 @@ class TabPFNConfig:
     def medium(cls) -> TabPFNConfig:
         """논문 모델·prior·batch 그대로, step과 스케줄만 1/10."""
         return cls(
-            steps=spec.TOTAL_STEPS // 10,
-            warmup_steps=spec.WARMUP_STEPS // 10,
-            schedule_steps=spec.SCHEDULE_STEPS // 10,
+            steps=TOTAL_STEPS // 10,
+            warmup_steps=WARMUP_STEPS // 10,
+            schedule_steps=SCHEDULE_STEPS // 10,
             val_every=200,
             checkpoint_every=300,
             keep_every=600,
@@ -119,8 +379,8 @@ class TabPFNConfig:
         return self.batch_size // per_forward
 
 
-def build_tabpfn_model(config: TabPFNConfig) -> TabPFNTransformer:
-    return TabPFNTransformer(
+def build_tabpfn_model(config: TabPFNConfig) -> RowTransformer:
+    return RowTransformer(
         num_features=config.num_features,
         n_out=config.n_out,
         emsize=config.emsize,
@@ -138,7 +398,7 @@ def save_tabpfn(model: torch.nn.Module, config: TabPFNConfig, path: str | Path) 
 
 def tabpfn_from_state(
     config: dict, state_dict: dict[str, torch.Tensor], map_location: str | torch.device = "cpu"
-) -> tuple[TabPFNTransformer, TabPFNConfig]:
+) -> tuple[RowTransformer, TabPFNConfig]:
     """저장된 config(dict)와 가중치로 추론용 모델을 만든다 (`.pt`와 Hub 형식이 함께 쓴다)."""
     config = TabPFNConfig(**config)
     model = build_tabpfn_model(config)
@@ -148,7 +408,7 @@ def tabpfn_from_state(
 
 def load_tabpfn(
     path: str | Path, map_location: str | torch.device = "cpu"
-) -> tuple[TabPFNTransformer, TabPFNConfig]:
+) -> tuple[RowTransformer, TabPFNConfig]:
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
     return tabpfn_from_state(ckpt["config"], ckpt["state_dict"], map_location)
 
@@ -184,7 +444,7 @@ def _validate(model, val_batch, device, autocast) -> dict[str, float]:
             logits = model(x[:, :sep], y[:, :sep], x[:, sep:])
         y_test = y[:, sep:]
         total_loss += classification_loss(logits, y_test).item()
-        valid = y_test != spec.IGNORE_INDEX
+        valid = y_test != IGNORE_INDEX
         correct += (logits.argmax(-1)[valid] == y_test[valid]).sum().item()
         count += valid.sum().item()
     model.train()
@@ -246,12 +506,16 @@ def train_tabpfn(
         return contextlib.nullcontext()
 
     # 이어서 학습할 때 같은 데이터를 다시 보지 않도록 seed에 시작 step을 섞는다.
-    dataset = TabPFNPriorDataset(
+    make_prior = partial(
+        TabPFNPrior,
         seq_len=config.seq_len,
-        max_eval_pos=config.max_eval_pos,
         num_features=config.num_features,
         max_classes=config.n_out,
         group_size=config.group_size,
+    )
+    dataset = PriorGroups(
+        make_prior,
+        max_eval_pos=config.max_eval_pos,
         groups_per_batch=config.groups_per_batch,
         seed=(config.seed, start_step, d.rank),
     )
@@ -406,3 +670,76 @@ def train_tabpfn(
         dist.barrier()
         dist.destroy_process_group()
     return {"final_path": str(final_path), "history": history, "is_main": d.is_main}
+
+
+# ---------------------------------------------------------------------------
+# 추론 (논문 5.2절, v1 transformer_predict)
+# ---------------------------------------------------------------------------
+HUB_REPO = "aiden-jeon/minipfn-tabpfn-v1"  # 공개 가중치 (`TabPFNv1Classifier()`의 기본값)
+
+
+class TabPFNv1Classifier(RotationEnsembleClassifier):
+    """v1 논문 앙상블(멤버 `N_ENSEMBLE`개, 온도 `SOFTMAX_TEMPERATURE`)을 기본값으로 둔
+    `RotationEnsembleClassifier`. `model`을 주지 않으면 공개 가중치(`HUB_REPO`)를 받는다. 다른
+    가중치는 Hub repo id(`owner/name`, `owner/name@branch`), 로컬 폴더, 또는 모델로 준다.
+
+        clf = TabPFNv1Classifier().fit(x_train, y_train)
+        proba = clf.predict_proba(x_test)
+    """
+
+    def __init__(
+        self,
+        model: RowTransformer | str | Path | None = None,
+        *,
+        n_ensemble: int = N_ENSEMBLE,
+        softmax_temperature: float = SOFTMAX_TEMPERATURE,
+        fit_mode: FitMode = "fit_preprocessors",
+        seed: int = 0,
+        batch_size: int = 16,
+        device: torch.device | str | None = None,
+    ) -> None:
+        if not isinstance(model, torch.nn.Module):
+            from minipfn.hub import model_or_pretrained
+
+            spec = model
+            model, _ = model_or_pretrained(model, HUB_REPO, "classification")
+            if not isinstance(model, RowTransformer):
+                raise ValueError(f"{spec or HUB_REPO}는 TabPFN v1 모델이 아니다")
+        super().__init__(
+            model,
+            n_ensemble=n_ensemble,
+            softmax_temperature=softmax_temperature,
+            fit_mode=fit_mode,
+            seed=seed,
+            batch_size=batch_size,
+            device=device,
+        )
+
+
+# 예전 이름 (예전 Hub 카드와 `minipfn.tabpfn.inference`가 썼다)
+TabPFNClassifier = TabPFNv1Classifier
+
+
+def tabpfn_predict_proba(
+    model: RowTransformer,
+    x_train: Any,
+    y_train: Any,
+    x_test: Any,
+    n_ensemble: int = N_ENSEMBLE,
+    seed: int = 0,
+    batch_size: int = 16,
+    device: torch.device | str | None = None,
+) -> np.ndarray:
+    """테스트 행의 클래스 확률 (m, C). context(학습 행)가 호출마다 바뀔 때 쓰는 stateless 버전
+    (`TabPFNv1Classifier.predict_proba`와 같은 앙상블). 열 순서는 정렬한 레이블 순서다."""
+    return rotation_ensemble.predict_proba(
+        model,
+        x_train,
+        y_train,
+        x_test,
+        n_ensemble=n_ensemble,
+        softmax_temperature=SOFTMAX_TEMPERATURE,
+        seed=seed,
+        batch_size=batch_size,
+        device=device,
+    )

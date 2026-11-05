@@ -1,9 +1,5 @@
-"""TabPFN(arXiv:2207.01848) 논문 규모 재현.
-
-- `spec`: 논문·공식 v1 코드에서 가져온 수치와 출처
-- `prior`: v1 prior(SCM·BNN·GP)를 torch로 옮긴 데이터셋 생성기
-- `model`: v1 구조의 Transformer (25.82M 파라미터)
-- `train`: 다중 GPU prior-fitting 학습 루프
-- `inference`: sklearn 스타일 `TabPFNClassifier`(fit_mode로 KV 캐시 선택)와 stateless 예측 함수
-- `evaluate`: OpenML-CC18(논문 Table 1) 평가
+"""옛 경로 (TabPFN v1). 코드는 각 축의 부품과 recipe로 옮겼다: `minipfn.priors.prior_bag`,
+`models.row_transformer`, `inference.rotation_ensemble`, `benchmarks.cc18`, `hub.tabpfn_v1`,
+`recipes.tabpfn_v1`(논문 수치, prior·학습·추론 설정).
+예전 Hub 모델 카드의 예제가 쓰던 `minipfn.tabpfn.hub`·`minipfn.tabpfn.inference`만 남겨 둔다.
 """

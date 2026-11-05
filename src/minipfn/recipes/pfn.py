@@ -1,8 +1,13 @@
-"""Prior-fitting 학습 루프 — 논문 Algorithm 1을 그대로 반복한다.
+"""PFN(Müller et al., arXiv:2112.10510) recipe: GP prior로 1D 회귀 PFN을 학습하고 GP posterior와
+대조한다.
 
-매 스텝: GP prior에서 데이터셋 batch를 뽑고 → context/query로 나눠 → query NLL을 계산하고
-→ Adam 스텝. 실제 데이터는 쓰지 않는다(prior가 곧 학습 분포). 학습된 모델은 forward pass
-한 번으로 새 데이터셋의 예측분포를 낸다(in-context learning).
+- prior: `minipfn.priors.gp.GPPriorSampler` (논문 §5.1의 GP 설정)
+- 모델: `minipfn.models.point_transformer.PointTransformer` + bar distribution
+- 학습: 여기의 `train_pfn` — 논문 Algorithm 1을 그대로 반복한다. 매 스텝: GP prior에서 데이터셋
+  batch를 뽑고 → context/query로 나눠 → query NLL을 계산하고 → Adam 스텝. 실제 데이터는 쓰지
+  않는다(prior가 곧 학습 분포). 학습된 모델은 forward pass 한 번으로 새 데이터셋의 예측분포를
+  낸다(in-context learning).
+- 추론: `pfn_predict`, 평가: `minipfn.benchmarks.gp`
 """
 
 from __future__ import annotations
@@ -17,14 +22,14 @@ from dataclasses import asdict, dataclass
 import torch
 from torch import nn
 
-from minipfn.bar_distribution import FullSupportBarDistribution, get_bucket_borders
-from minipfn.gp_prior import (
+from minipfn.models.bar_distribution import FullSupportBarDistribution, get_bucket_borders
+from minipfn.models.point_transformer import PointTransformer
+from minipfn.priors.gp import (
     DEFAULT_LENGTHSCALE,
     DEFAULT_NOISE,
     DEFAULT_VARIANCE,
     GPPriorSampler,
 )
-from minipfn.model import PFNTransformer
 
 
 @dataclass
@@ -106,8 +111,8 @@ def build_criterion(config: PFNConfig) -> FullSupportBarDistribution:
     return FullSupportBarDistribution(borders)
 
 
-def build_model(config: PFNConfig) -> PFNTransformer:
-    return PFNTransformer(
+def build_model(config: PFNConfig) -> PointTransformer:
+    return PointTransformer(
         x_dim=1,
         emsize=config.emsize,
         nhead=config.nhead,

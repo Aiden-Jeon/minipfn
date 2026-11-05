@@ -1,9 +1,11 @@
 """GP prior: 학습 데이터를 만드는 prior 샘플러와, 재현 타깃인 analytic posterior.
 
-논문(arXiv:2112.10510) §5.1 / 부록 F.1의 GP 설정을 따른다: zero-mean GP, RBF 커널,
-기본 하이퍼파라미터 lengthscale=0.6, variance=1.0, 관측 노이즈 1e-4.
-`rbf_kernel`/`analytic_gp_posterior`는 노트북 03 §8과 동일한 식으로, 재현 결과를
-대조할 "정답"을 계산한다. `GPPriorSampler`는 매 학습 스텝의 데이터셋을 batch로 뽑는다.
+- `GPPriorSampler`: 1D 회귀 데이터셋 batch. 기본값은 PFN 논문(arXiv:2112.10510) §5.1 / 부록 F.1의
+  GP 설정이다: zero-mean GP, RBF 커널, lengthscale=0.6, variance=1.0, 관측 노이즈 1e-4.
+- `rbf_kernel`/`analytic_gp_posterior`: 노트북 03 §8과 동일한 식으로, 재현 결과를 대조할 "정답"을
+  계산한다.
+
+TabPFN v1 prior bag의 k차원 GP 표는 `minipfn.priors.prior_bag.sample_gp_tables`에 있다.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from collections.abc import Callable
 import numpy as np
 import torch
 
-# 논문 GP 실험의 기본 하이퍼파라미터 (노트북 03 §8과 공유하는 상수)
+# PFN 논문 GP 실험의 기본 하이퍼파라미터 (노트북 03 §8과 공유하는 상수)
 DEFAULT_LENGTHSCALE = 0.6
 DEFAULT_VARIANCE = 1.0
 DEFAULT_NOISE = 1e-4

@@ -1,7 +1,8 @@
-"""TabPFN v2 Transformer (Nature 2025, Fig. 1b와 Methods "Details on the neural architecture").
+"""Cell Transformer — 셀 묶음 하나가 토큰이고 층마다 행·열 두 방향으로 attention하는 Transformer
+(TabPFN v2 논문 Nature 2025, Fig. 1b와 Methods "Details on the neural architecture"의 구조).
 
-논문 설명대로 만든 구조다. 각 부분은 `notebooks/03_tabpfn_v2/01_two_way_attention_primer`에서
-작은 예로 따라갔다.
+v2 논문 설명대로 만든 구조다. v2·2.5의 구조 설정은 `minipfn.recipes.tabpfn_v2.ARCHITECTURES`에
+있다. 각 부분은 `notebooks/03_tabpfn_v2/01_two_way_attention_primer`에서 작은 예로 따라갔다.
 
 - 입력: feature마다 학습 행의 평균·표준편차로 z-정규화하고, 결측 칸은 0으로 두고 표시를 따로 넣는다
 - 셀 2개를 묶어 토큰 하나로 만들고(Linear), 마지막 열에 y 토큰을 붙인다: (B, R, G + 1, E)
@@ -10,23 +11,36 @@
 - sample attention: 학습 행은 학습 행끼리 attend하고, 테스트 행은 학습 행에만 attend한다.
   테스트 행은 key·value의 첫 head만 쓴다(논문의 multi-query 변형)
 - 출력: 테스트 행의 y 토큰 → MLP → 분류는 클래스 logit 10개, 회귀는 bar distribution 구간 logit
+
+TabPFN-2.5(arXiv 2511.08667 "Architecture")가 바꾼 것은 설정으로 켠다. 기본값은 v2 그대로다
+(state_dict도 v2와 같아서 v2 checkpoint를 그대로 읽는다).
+
+- `features_per_group`: v2는 2, 2.5는 3
+- `nlayers`: v2는 12, 2.5는 회귀 18·분류 24
+- `n_thinking_rows`: 2.5는 학습되는 "thinking" 행 64개를 입력 표에 붙인다. 논문은 행 수와
+  "pretraining 때 학습된다", "attention sink 역할도 해서 다른 행을 무시하게 돕는다"만 적었다.
+  여기서 정한 것: 행마다 벡터 하나(E)를 그 행의 모든 열(토큰)에 쓰고, 학습 행 앞에 둬서 학습 행과
+  테스트 행 모두 key·value로 본다. 출력은 내지 않는다
+- `encoder`: 2.5 회귀는 v2의 linear encoder를 2층 MLP로 바꿨다. 논문은 어느 encoder인지 적지
+  않았는데, 여기서는 셀 묶음 encoder(`feature_embedder`)로 본다(hidden = E, GELU)
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 NAN_INDICATOR = -2.0  # 결측 칸의 표시 값 (아닌 칸은 0)
+ENCODERS = ("linear", "mlp")
 
 
 @dataclass
-class TabPFNv2Config:
-    """모델 크기. 기본값은 논문 기본 모델의 크기(emsize 192, 12층, head 6, 셀 2개 묶기)."""
+class CellTransformerConfig:
+    """모델 크기. 기본값은 v2 논문 기본 모델의 크기(emsize 192, 12층, head 6, 셀 2개 묶기)."""
 
     emsize: int = 192
     nlayers: int = 12
@@ -35,6 +49,25 @@ class TabPFNv2Config:
     features_per_group: int = 2
     n_out: int = 10  # 분류: 최대 클래스 수, 회귀: bar distribution 구간 수
     column_embedding_seed: int = 42
+    n_thinking_rows: int = 0  # TabPFN-2.5: 64
+    encoder: str = "linear"  # 셀 묶음 encoder. "linear"(v2) 또는 "mlp"(TabPFN-2.5 회귀)
+    # 학습 때 본 feature 수 상한 (`TrainConfig.max_features`). 구조와 상관없고 추론이 읽는다:
+    # one-hot으로 펼친 뒤 열 수를 이보다 늘리지 않는다(`minipfn.inference.ensemble`)
+    max_features: int = 160
+
+    # v2 첫 공개 뒤에 더한 필드. 기본값이면 config.json·checkpoint에 적지 않는다
+    # (`models.config_dict`). 예전 minipfn은 `TabPFNv2Config(**config["model"])`로 읽어서 모르는
+    # 키가 있으면 깨진다
+    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("n_thinking_rows", "encoder", "max_features")
+    # 가중치 모양과 상관없는 필드. checkpoint를 이어 학습할 때 비교하지 않고, 학습 run의 모델 구조
+    # (`minipfn.hub.run_architecture`)에도 넣지 않는다 (긴 표로 이어 학습하면 바뀐다)
+    INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features",)
+
+    def __post_init__(self) -> None:
+        if self.encoder not in ENCODERS:
+            raise ValueError(f"encoder는 {ENCODERS} 가운데 하나여야 한다: {self.encoder}")
+        if self.n_thinking_rows < 0:
+            raise ValueError(f"n_thinking_rows는 0 이상이어야 한다: {self.n_thinking_rows}")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -65,7 +98,7 @@ class Attention(nn.Module):
         return self.out(out.transpose(1, 2).reshape(n, length, e))
 
 
-class TabPFNv2Layer(nn.Module):
+class CellTransformerLayer(nn.Module):
     def __init__(self, emsize: int, nhead: int, nhid: int) -> None:
         super().__init__()
         self.feature_attention = Attention(emsize, nhead)
@@ -77,7 +110,8 @@ class TabPFNv2Layer(nn.Module):
         self.norms = nn.ModuleList(nn.LayerNorm(emsize, elementwise_affine=False) for _ in range(3))
 
     def forward(self, h: torch.Tensor, n_train: int) -> torch.Tensor:
-        # h: (B, R, C, E), C = feature 묶음 수 + 1 (y 토큰)
+        # h: (B, R, C, E), C = feature 묶음 수 + 1 (y 토큰). n_train: 앞에서부터 key·value가 되는
+        # 행 수 (thinking 행이 있으면 그것까지)
         b, r, c, e = h.shape
 
         # 1) feature attention: 행 하나의 토큰 C개끼리
@@ -93,23 +127,47 @@ class TabPFNv2Layer(nn.Module):
         return self.norms[2](h + self.mlp(h))
 
 
-class TabPFNv2(nn.Module):
-    def __init__(self, config: TabPFNv2Config | None = None) -> None:
+class CellTransformer(nn.Module):
+    # 모델 종류 (`minipfn.models.MODEL_TYPES`)
+    model_type = "cell_transformer"
+    config_class = CellTransformerConfig
+
+    def __init__(self, config: CellTransformerConfig | None = None) -> None:
         super().__init__()
-        self.config = config = config or TabPFNv2Config()
+        self.config = config = config or CellTransformerConfig()
         e, g = config.emsize, config.features_per_group
-        self.feature_embedder = nn.Linear(2 * g, e)  # [값 g개, 결측 표시 g개] → 토큰
+        # [값 g개, 결측 표시 g개] → 토큰
+        if config.encoder == "mlp":
+            self.feature_embedder = nn.Sequential(nn.Linear(2 * g, e), nn.GELU(), nn.Linear(e, e))
+        else:
+            self.feature_embedder = nn.Linear(2 * g, e)
         self.target_embedder = nn.Linear(2, e)  # [y, 결측 표시] → 토큰
         self.column_embedder = nn.Linear(e // 4, e)
         nhid = e * config.nhid_factor
         self.layers = nn.ModuleList(
-            TabPFNv2Layer(e, config.nhead, nhid) for _ in range(config.nlayers)
+            CellTransformerLayer(e, config.nhead, nhid) for _ in range(config.nlayers)
         )
         self.decoder = nn.Sequential(nn.Linear(e, nhid), nn.GELU(), nn.Linear(nhid, config.n_out))
+        if config.n_thinking_rows:
+            # 처음 값은 여기서 정함: 작은 무작위 값 (층마다 잔차 뒤 LayerNorm이 크기를 맞춘다)
+            self.thinking_rows = nn.Parameter(0.02 * torch.randn(config.n_thinking_rows, e))
         self._column_noise: dict[tuple, torch.Tensor] = {}  # state_dict에 넣지 않는 캐시
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def qk_clip_weights(self) -> list[tuple[str, torch.Tensor]]:
+        """QK-clip이 보는 (종류, qkv weight). 입력이 LayerNorm 뒤인 attention만: 첫 층 feature
+        attention은 입력이 임베딩 그대로라 logit 상한이 성립하지 않아 뺀다(폭주한 적도 없다)."""
+        return [
+            (kind, getattr(layer, kind).qkv.weight)
+            for i, layer in enumerate(self.layers)
+            for kind in ("feature_attention", "sample_attention")
+            if i > 0 or kind == "sample_attention"
+        ]
+
+    def decoder_weight(self) -> torch.Tensor:
+        return self.decoder[-1].weight
 
     def _embed_features(self, x: torch.Tensor, n_train: int) -> torch.Tensor:
         # x: (B, R, F) → 토큰 (B, R, G, E)
@@ -178,25 +236,13 @@ class TabPFNv2(nn.Module):
         x_tokens = x_tokens + self.column_embeddings(x_tokens.shape[2], x_tokens)
         y_tokens = self._embed_target(y_train.to(x_tokens.dtype), x.shape[1])
         h = torch.cat([x_tokens, y_tokens.unsqueeze(2)], dim=2)  # (B, R, G + 1, E)
+        n_context = n_train
+        if self.config.n_thinking_rows:
+            # thinking 행 T개를 맨 앞에: (B, T + R, G + 1, E). 학습 행처럼 key·value가 된다
+            b, _, c, e = h.shape
+            thinking = self.thinking_rows.to(h.dtype)[None, :, None].expand(b, -1, c, e)
+            h = torch.cat([thinking, h], dim=1)
+            n_context += self.config.n_thinking_rows
         for layer in self.layers:
-            h = layer(h, n_train)
-        return self.decoder(h[:, n_train:, -1])
-
-
-def save_checkpoint(path: str | Path, model: TabPFNv2, borders: torch.Tensor | None = None) -> None:
-    """가중치, 설정, (회귀면) bar distribution 경계를 저장한다."""
-    payload = {
-        "config": model.config.to_dict(),
-        "state_dict": model.state_dict(),
-        "borders": borders,
-    }
-    torch.save(payload, path)
-
-
-def load_checkpoint(
-    path: str | Path, map_location: str | torch.device = "cpu"
-) -> tuple[TabPFNv2, torch.Tensor | None]:
-    checkpoint = torch.load(path, map_location=map_location, weights_only=True)
-    model = TabPFNv2(TabPFNv2Config(**checkpoint["config"]))
-    model.load_state_dict(checkpoint["state_dict"])
-    return model.eval(), checkpoint["borders"]
+            h = layer(h, n_context)
+        return self.decoder(h[:, n_context:, -1])

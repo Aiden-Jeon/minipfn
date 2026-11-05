@@ -1,0 +1,241 @@
+"""TabPFN-2.5 구조 설정(thinking 행, 셀 3개 묶기, MLP encoder)과 robust 전처리 테스트."""
+
+import numpy as np
+import pytest
+import torch
+from sklearn.datasets import load_breast_cancer, load_diabetes
+
+from minipfn.inference.preprocessing import RobustSoftClip
+from minipfn.models.cell_transformer import CellTransformer, CellTransformerConfig
+from minipfn.recipes import tabpfn_v2 as recipe
+from minipfn.recipes.tabpfn_v2 import (
+    ARCHITECTURES,
+    MEMBER_KINDS_V2_5,
+    TabPFNv2Classifier,
+    TabPFNv2Regressor,
+)
+from minipfn.training.config import TrainConfig
+
+
+def _tiny(n_out: int = 10, **kw) -> CellTransformer:
+    torch.manual_seed(0)
+    model = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2, n_out=n_out, **kw))
+    for p in model.parameters():  # 0으로 초기화한 출력층이 있으면 attention이 일을 안 한다
+        torch.nn.init.normal_(p, std=0.3)
+    return model.eval()
+
+
+def test_default_config_keeps_v2_state_dict():
+    # 2.5 설정이 꺼져 있으면 parameter 이름·모양이 v2와 같다 (v2 checkpoint를 그대로 읽는다)
+    keys = {k: v.shape for k, v in CellTransformer().state_dict().items()}
+    assert "thinking_rows" not in keys
+    assert keys["feature_embedder.weight"] == (192, 4)
+
+
+def test_default_forward_is_unchanged_by_new_options():
+    # thinking 행 0개·linear encoder는 이 변경 전 forward와 같은 계산이다: 같은 가중치면 같은 출력
+    torch.manual_seed(0)
+    a = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2))
+    b = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2, n_thinking_rows=0))
+    b.load_state_dict(a.state_dict())
+    x, y = torch.randn(2, 20, 5), torch.randint(0, 2, (2, 12)).float()
+    with torch.no_grad():
+        assert torch.equal(a(x, y), b(x, y))
+
+
+@pytest.mark.parametrize("encoder", ["linear", "mlp"])
+@pytest.mark.parametrize("group", [2, 3])
+def test_thinking_rows_keep_permutation_invariance_and_test_row_independence(encoder, group):
+    model = _tiny(n_thinking_rows=4, encoder=encoder, features_per_group=group)
+    x = torch.randn(1, 30, 7)
+    y = torch.randint(0, 3, (1, 20)).float()
+    with torch.no_grad():
+        base = model(x, y)
+        perm = torch.randperm(20)
+        shuffled = model(torch.cat([x[:, perm], x[:, 20:]], dim=1), y[:, perm])
+        one_by_one = torch.cat(
+            [model(torch.cat([x[:, :20], x[:, j : j + 1]], dim=1), y) for j in range(20, 30)], dim=1
+        )
+    assert base.shape == (1, 10, 10)
+    assert torch.allclose(base, shuffled, atol=1e-5)
+    assert torch.allclose(base, one_by_one, atol=1e-5)
+
+
+def test_thinking_rows_change_output_and_get_gradient():
+    model = _tiny(n_thinking_rows=4)
+    x, y = torch.randn(2, 20, 5), torch.randint(0, 2, (2, 12)).float()
+    out = model(x, y)
+    out.sum().backward()
+    assert model.thinking_rows.grad is not None and model.thinking_rows.grad.abs().sum() > 0
+    with torch.no_grad():
+        model.thinking_rows.zero_()
+        assert not torch.allclose(model(x, y), out)
+
+
+def test_thinking_rows_work_with_a_single_train_row():
+    model = _tiny(n_thinking_rows=4)
+    with torch.no_grad():
+        out = model(torch.randn(1, 5, 3), torch.zeros(1, 1))
+    assert out.shape == (1, 4, 10) and torch.isfinite(out).all()
+
+
+def test_bad_options_raise():
+    with pytest.raises(ValueError):
+        CellTransformerConfig(encoder="conv")
+    with pytest.raises(ValueError):
+        CellTransformerConfig(n_thinking_rows=-1)
+    with pytest.raises(ValueError):
+        recipe.with_architecture(recipe.paper("classification"), "v3")
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_v2_5_paper_architecture(task):
+    config = recipe.with_architecture(recipe.paper(task), "v2.5")
+    expected = ARCHITECTURES["v2.5"][task]
+    for key, value in expected.items():
+        assert getattr(config, key) == value
+    model_config = config.model_config()
+    assert model_config.nlayers == (24 if task == "classification" else 18)
+    assert model_config.features_per_group == 3 and model_config.n_thinking_rows == 64
+    assert model_config.encoder == ("mlp" if task == "regression" else "linear")
+    # 학습 설정은 v2 paper 그대로 (회귀 QK-clip 250 등)
+    assert config.qk_clip == recipe.paper(task).qk_clip
+    assert recipe.with_architecture(recipe.paper(task), "v2") == recipe.paper(task)
+
+
+def test_smoke_v2_5_stays_small():
+    config = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5", keep_size=True)
+    assert config.nlayers == 2 and config.n_thinking_rows == 4
+    assert config.features_per_group == 3 and config.encoder == "mlp"
+    # keep_size를 주지 않으면 층 수와 상관없이 2.5 구조 그대로다
+    full = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5")
+    assert full.nlayers == 18 and full.n_thinking_rows == 64
+
+
+def test_robust_soft_clip():
+    rng = np.random.default_rng(0)
+    X = np.column_stack(
+        [
+            rng.normal(5, 2, 200),
+            np.r_[np.zeros(190), rng.normal(0, 1, 10)],  # 사분위 폭 0 → 최대·최소로
+            np.full(200, 3.0),  # 상수 → 0
+            np.r_[np.full(200, np.nan)],  # 모두 결측
+        ]
+    )
+    X[0, 0] = 1e6  # 극단값
+    t = RobustSoftClip().fit(X[:, :3])
+    out = t.transform(X[:, :3])
+    assert np.isfinite(out).all()
+    assert np.abs(out).max() <= 3.0  # smooth clipping은 ±3을 넘지 않는다
+    assert abs(np.median(out[:, 0])) < 0.05
+    assert np.all(out[:, 2] == 0)
+    assert not np.all(out[:, 1] == 0)
+    with_nan = RobustSoftClip().fit(X).transform(X)
+    assert np.isnan(with_nan[:, 3]).all() and np.isfinite(with_nan[:, :3]).all()
+
+
+def test_estimators_with_v2_5_model_and_robust_members():
+    X, y = load_breast_cancer(return_X_y=True)
+    X[::7, 3] = np.nan
+    model = _tiny(n_thinking_rows=4, features_per_group=3)
+    clf = TabPFNv2Classifier(model, member_kinds=MEMBER_KINDS_V2_5).fit(X[:100], y[:100])
+    assert [p.member.kind for p in clf.preprocessors_] == ["quantile", "robust"] * 2
+    proba = clf.predict_proba(X[100:130])
+    assert proba.shape == (30, 2) and np.allclose(proba.sum(1), 1, atol=1e-5)
+
+    Xr, yr = load_diabetes(return_X_y=True)
+    reg_model = _tiny(n_out=20, n_thinking_rows=4, features_per_group=3, encoder="mlp")
+    reg = TabPFNv2Regressor(reg_model, torch.linspace(-3, 3, 21), member_kinds=MEMBER_KINDS_V2_5)
+    pred = reg.fit(Xr[:100], yr[:100]).predict(Xr[100:120])
+    assert pred.shape == (20,) and np.isfinite(pred).all()
+
+
+def test_default_member_kinds_are_v2():
+    X, y = load_breast_cancer(return_X_y=True)
+    clf = TabPFNv2Classifier(_tiny()).fit(X[:60], y[:60])
+    assert [p.member.kind for p in clf.preprocessors_] == ["quantile", "power"] * 2
+    with pytest.raises(ValueError):
+        TabPFNv2Classifier(_tiny(), member_kinds=("quantile", "box-cox"))
+
+
+def test_member_kinds_default_comes_from_the_model():
+    # 사용자는 weight를 받아 쓰므로 추론 설정은 weight가 정한다 (default_inference)
+    from minipfn.recipes.tabpfn_v2 import MEMBER_KINDS_V2, N_ESTIMATORS, default_inference
+
+    X, y = load_breast_cancer(return_X_y=True)
+    v2, v2_5 = _tiny(), _tiny(n_thinking_rows=4, features_per_group=3)
+    # 1) Hub에 추론 설정이 없으면 구조로: 2.5 구조(층 수를 줄인 것 포함)면 v2.5, 아니면 v2
+    assert default_inference(v2, "classification") == {
+        "n_estimators": N_ESTIMATORS["classification"],
+        "member_kinds": MEMBER_KINDS_V2,
+    }
+    assert default_inference(v2_5, "classification")["member_kinds"] == MEMBER_KINDS_V2_5
+    reg = _tiny(n_out=20, n_thinking_rows=4, features_per_group=3, encoder="mlp")
+    assert default_inference(reg, "regression") == {
+        "n_estimators": N_ESTIMATORS["regression"],
+        "member_kinds": MEMBER_KINDS_V2_5,
+    }
+    # 2.5 구조 일부만 바꾼 모델은 어느 구조도 아니라 v2
+    assert default_inference(_tiny(features_per_group=3), "classification")["member_kinds"] == (
+        MEMBER_KINDS_V2
+    )
+    clf = TabPFNv2Classifier(v2_5).fit(X[:60], y[:60])
+    assert [p.member.kind for p in clf.preprocessors_] == list(MEMBER_KINDS_V2_5) * 2
+    # 2) weight와 함께 온 설정(Hub config.json의 inference)이 구조보다 먼저
+    v2_5.inference_config = {"member_kinds": ["robust"], "n_estimators": 3}
+    clf = TabPFNv2Classifier(v2_5)
+    assert clf.member_kinds == ("robust",) and clf.n_estimators == 3
+    # 3) 인자로 주면 그 값 (실험용)
+    clf = TabPFNv2Classifier(v2_5, member_kinds="v2", n_estimators=2)
+    assert clf.member_kinds == MEMBER_KINDS_V2 and clf.n_estimators == 2
+
+
+def test_member_kinds_parse_names_and_lists():
+    from minipfn.recipes.tabpfn_v2 import resolve_member_kinds
+
+    assert resolve_member_kinds("v2.5") == MEMBER_KINDS_V2_5
+    assert resolve_member_kinds("v2") == ("quantile", "power")
+    assert resolve_member_kinds("robust, power") == ("robust", "power")
+    assert resolve_member_kinds(["quantile"]) == ("quantile",)
+    for bad in ("", "v3", "quantile,box-cox"):
+        with pytest.raises(ValueError, match="member_kinds"):
+            resolve_member_kinds(bad)
+    # 평가 스크립트도 같은 규칙을 쓴다 (모델 클래스와 따로 목록을 두지 않는다)
+    from test_tabpfn_v2_benchmark import _eval_script
+
+    script = _eval_script()
+    assert script.parse_args(["--member-kinds", "v2.5"]).member_kinds == MEMBER_KINDS_V2_5
+
+
+def test_regressor_halves_the_target_power_within_each_member_kind():
+    X, y = load_diabetes(return_X_y=True)
+    model = _tiny(n_out=20)
+
+    def members(kinds, n):
+        reg = TabPFNv2Regressor(
+            model, torch.linspace(-3, 3, 21), n_estimators=n, member_kinds=kinds
+        )
+        reg.fit(X[:60], y[:60])
+        return [(p.member.kind, p.member.target_power) for p in reg.preprocessors_]
+
+    # v2 기본(두 종류)은 예전과 같다: F, F, T, T
+    assert members(("quantile", "power"), 4) == [
+        ("quantile", False),
+        ("power", False),
+        ("quantile", True),
+        ("power", True),
+    ]
+    # 한 종류도 예전과 같다: F, F, T, T (예전 benchmark 숫자를 그대로 다시 낸다)
+    assert [tp for _, tp in members(("quantile",), 4)] == [False, False, True, True]
+    # 세 종류면 종류마다 y power 변환이 한 번씩
+    got = members(("quantile", "power", "robust"), 6)
+    for kind in ("quantile", "power", "robust"):
+        assert sorted(tp for k, tp in got if k == kind) == [False, True]
+
+
+def test_one_hot_kinds_tell_which_members_expand():
+    from minipfn.inference.preprocessing import one_hot_kinds
+
+    assert one_hot_kinds("power", ("quantile", "robust")) == {"robust"}
+    assert one_hot_kinds("all", ("quantile", "robust")) == {"quantile", "robust"}
+    assert one_hot_kinds("power", ("quantile",)) == one_hot_kinds("off", ("quantile",))

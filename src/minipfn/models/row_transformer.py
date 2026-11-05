@@ -1,6 +1,8 @@
-"""TabPFN Transformer (논문 3절·부록 E.1, v1 `transformer.py`·`layer.py` 구조).
+"""Row Transformer — 표의 행 하나가 토큰인 Transformer (TabPFN v1 논문 3절·부록 E.1, v1
+`transformer.py`·`layer.py` 구조). 크기는 인자로 받고, v1 논문 크기는 `minipfn.recipes.tabpfn_v1`
+(`PAPER_MODEL`)에 있다.
 
-GP 재현용 `minipfn.model.PFNTransformer`와 다른 점은 v1을 따른 것이다.
+점 하나가 토큰인 `minipfn.models.point_transformer.PointTransformer`와 다른 점은 v1을 따른 것이다.
 - post-norm 층(잔차 더한 뒤 LayerNorm), GELU, attention 출력과 FFN 두 번째 Linear를 0으로 초기화
 - 테스트 행 토큰은 x 임베딩만 쓴다(마스크 토큰 없음)
 - 출력은 Linear → GELU → Linear decoder, logit 10개(최대 클래스 수)
@@ -16,10 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from minipfn.tabpfn import spec
 
-
-class TabPFNLayer(nn.Module):
+class RowTransformerLayer(nn.Module):
     def __init__(self, emsize: int, nhead: int, nhid: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.self_attn = nn.MultiheadAttention(emsize, nhead, dropout=dropout, batch_first=True)
@@ -67,18 +67,21 @@ class TabPFNLayer(nn.Module):
         return self._finish(h, self.self_attn.out_proj(out))
 
 
-class TabPFNTransformer(nn.Module):
-    """forward(x_train, y_train, x_test) -> 테스트 행별 클래스 logits (B, n_test, n_out)."""
+class RowTransformer(nn.Module):
+    """forward(x_train, y_train, x_test) -> 테스트 행별 클래스 logits (B, n_test, n_out).
+
+    입력 feature는 `num_features`개로 0을 채워 넣는다(그보다 적은 표는 앞쪽 열만 쓴다)."""
 
     def __init__(
         self,
-        num_features: int = spec.MAX_FEATURES,
-        n_out: int = spec.MAX_CLASSES,
-        emsize: int = spec.EMSIZE,
-        nhead: int = spec.NHEAD,
-        nhid: int = spec.NHID,
-        nlayers: int = spec.NLAYERS,
-        dropout: float = spec.DROPOUT,
+        *,
+        num_features: int,
+        n_out: int,
+        emsize: int,
+        nhead: int,
+        nhid: int,
+        nlayers: int,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_features = num_features
@@ -86,7 +89,7 @@ class TabPFNTransformer(nn.Module):
         self.x_encoder = nn.Linear(num_features, emsize)
         self.y_encoder = nn.Linear(1, emsize)  # 클래스 번호를 실수 하나로 넣는다 (v1)
         self.layers = nn.ModuleList(
-            TabPFNLayer(emsize, nhead, nhid, dropout) for _ in range(nlayers)
+            RowTransformerLayer(emsize, nhead, nhid, dropout) for _ in range(nlayers)
         )
         self.decoder = nn.Sequential(nn.Linear(emsize, nhid), nn.GELU(), nn.Linear(nhid, n_out))
         for layer in self.layers:  # v1 init_weights
@@ -146,14 +149,3 @@ def configure_attention_backends() -> None:
     """
     if torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(False)
-
-
-def classification_loss(logits: torch.Tensor, y_test: torch.Tensor) -> torch.Tensor:
-    """테스트 행 cross-entropy. 무시할 행(-100)은 0으로 세고 전체 평균을 낸다 (v1과 같은 가중)."""
-    losses = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]).float(),
-        y_test.reshape(-1).long(),
-        ignore_index=spec.IGNORE_INDEX,
-        reduction="none",
-    )
-    return losses.mean()

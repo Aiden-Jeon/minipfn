@@ -11,7 +11,7 @@ tags:
 
 # minipfn TabPFN v2 regressor (reproduction)
 
-A from-scratch reimplementation of the TabPFN v2 regressor (Hollmann et al., [Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6), Nature 637, 2025). The model and inference follow the paper's Methods, and the training data come from the open TabICL prior. Code: [Aiden-Jeon/minipfn](https://github.com/Aiden-Jeon/minipfn) (`src/minipfn/tabpfn_v2/`).
+A from-scratch reimplementation of the TabPFN v2 regressor (Hollmann et al., [Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6), Nature 637, 2025). The model and inference follow the paper's Methods, and the training data come from the open TabICL prior. Code: [Aiden-Jeon/minipfn](https://github.com/Aiden-Jeon/minipfn) (model `src/minipfn/models/cell_transformer.py`, training settings `src/minipfn/recipes/tabpfn_v2.py`).
 
 This is not the official TabPFN v2 checkpoint, and it uses no official code or weights. For the official models see [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN). The classifier is a separate model: [aiden-jeon/minipfn-tabpfn-v2-classifier](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-classifier).
 
@@ -87,12 +87,11 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 ```
 
 ```python
-from minipfn.tabpfn_v2.hub import from_pretrained
-from minipfn.tabpfn_v2.inference import TabPFNv2Regressor
+from minipfn import TabPFNv2Regressor
 
-model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-regressor")
+# downloads aiden-jeon/minipfn-tabpfn-v2-regressor (weights and bucket borders)
 # x_train can be a pandas DataFrame with categorical columns
-reg = TabPFNv2Regressor(model, borders).fit(x_train, y_train)
+reg = TabPFNv2Regressor().fit(x_train, y_train)
 pred = reg.predict(x_test)  # (n_test,), mean of the predicted distribution
 ```
 
@@ -118,7 +117,7 @@ The checkpoints from the Results table are kept as branches of this repo. Each b
 | `main` (500k) | `runs:/0b8800ff3ff741f59996c6265e2d8771/checkpoints/step_0500000.pt` | 1.118 |
 
 ```python
-model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-regressor", revision="step-100k")
+reg = TabPFNv2Regressor("aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k")
 ```
 
 In the benchmark script, write the branch after `@`: `--regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k`.
@@ -126,7 +125,7 @@ In the benchmark script, write the branch after `@`: `--regressor-path hf://aide
 ## Files
 
 - `model.safetensors`: weights and the 5,001 bucket borders (`borders`)
-- `config.json`: model size (`TabPFNv2Config`), task, and the training checkpoint the weights came from
+- `config.json`: model size (`CellTransformerConfig` fields), task, and the training checkpoint the weights came from
 - `images/`: figures used in this card
 
 ## License

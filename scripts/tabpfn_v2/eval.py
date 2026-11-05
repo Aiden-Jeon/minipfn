@@ -1,9 +1,9 @@
 """TabPFN v2를 논문 benchmark에서 평가하고 논문 수치와 비교한다.
 
 benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마다 OpenML task의 10-fold 교차검증
-평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `model.save_checkpoint`로 저장한 체크포인트,
-학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`), Hub repo id
-(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
+평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `minipfn.models.save_checkpoint`로 저장한
+체크포인트, 학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`),
+Hub repo id(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
 
 예) 저장소 루트에서 `EVAL=scripts/tabpfn_v2/eval.py`라고 두면
   uv run python $EVAL --classifier-path clf.pt --regressor-path reg.pt            # 57개 × 10 fold
@@ -17,7 +17,14 @@ benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마�
 test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint마다 모드가 달라지면 step별 곡선을
 견줄 수 없어서다. one-hot으로 펼칠 열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하인 범주형 열)이 없는
 데이터셋은 모드와 상관없이 결과가 같아 한 번만 평가하고, 그 결과를 다른 모드에도 `reused=True`로
-쓴다.
+쓴다. 펼칠 열이 있는지는 fold마다 그 fold의 학습 행으로 본다
+(추론이 멤버 전처리를 학습 행으로 맞추므로).
+
+앙상블 멤버의 전처리는 기본으로 모델이 정한다(`recipes.tabpfn_v2.default_inference`: Hub
+config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2). `--member-kinds`로 주면 그
+값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust scaling + soft clipping을 쓰는
+quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
+`TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
@@ -37,14 +44,21 @@ import numpy as np
 import pandas as pd
 import torch
 
-from minipfn.tabpfn_v2 import benchmark as bm
-from minipfn.tabpfn_v2.hub import load_model
-from minipfn.tabpfn_v2.inference import (
-    DEFAULT_ONE_HOT,
+from minipfn.benchmarks import amlb as bm
+from minipfn.hub import load_model
+from minipfn.inference.ensemble import DEFAULT_ONE_HOT, max_features_of
+from minipfn.inference.preprocessing import (
     ONE_HOT_MODES,
+    one_hot_kinds,
+    one_hot_sizes,
+    to_numeric,
+)
+from minipfn.priors.table_size import MAX_FEATURES
+from minipfn.recipes.tabpfn_v2 import (
     TabPFNv2Classifier,
     TabPFNv2Regressor,
-    _one_hot_sizes,
+    default_inference,
+    resolve_member_kinds,
 )
 from minipfn.utils import log_run_source
 
@@ -66,6 +80,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[DEFAULT_ONE_HOT],
         help=f"평가할 one-hot 모드, 쉼표로 구분 (기본: {DEFAULT_ONE_HOT}, 비교: off,power,all)",
     )
+    parser.add_argument(
+        "--member-kinds",
+        type=_member_kinds,
+        default=None,
+        help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
+        " v2 = quantile,power, v2.5 = quantile,robust)",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
     parser.add_argument("--mlflow", action="store_true", help="로컬에서도 MLflow에 기록한다")
@@ -80,21 +101,55 @@ def _one_hot_modes(value: str) -> list[str]:
     return list(dict.fromkeys(modes))
 
 
+def _member_kinds(value: str) -> tuple[str, ...]:
+    try:
+        return resolve_member_kinds(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def headline_mode(modes: list[str]) -> str:
     """`eval_per_dataset.csv`와 평균 지표에 쓸 모드: 추론의 기본값, 목록에 없으면 첫 모드."""
     return DEFAULT_ONE_HOT if DEFAULT_ONE_HOT in modes else modes[0]
 
 
-def expands_one_hot(task: bm.OpenMLTask) -> bool:
-    """one-hot 모드에 따라 결과가 달라질 수 있는지.
+def fold_expands_one_hot(X: pd.DataFrame, categorical_indices: list[int], max_width: int) -> bool:
+    """학습 행 하나에서 추론이 범주형 열을 펼칠 열이 있는지.
+    `MemberPreprocessor.fit`과 같은 규칙이다: `to_numeric`으로 번호를 매긴 뒤
+    (범주 수는 학습 행의 범주만 센다) `one_hot_sizes`가 고른 열이 하나라도 있으면 펼친다."""
+    X_num, cat_ix, _ = to_numeric(X, categorical_indices)
+    n_categories = {
+        i: int(np.nanmax(X_num[:, i])) + 1 if np.isfinite(X_num[:, i]).any() else 1 for i in cat_ix
+    }
+    return bool(one_hot_sizes(n_categories, X_num.shape[1], max_width))
 
-    추론이 범주형으로 다루는 열(`categorical_indices`이거나 숫자가 아닌 열) 가운데 추론이 펼칠
-    열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하이고, 펼친 폭이 상한 안)이 있는지 본다 (전체 행 기준).
+
+def expands_one_hot(task: bm.OpenMLTask, max_width: int = MAX_FEATURES, n_folds: int = 10) -> bool:
+    """one-hot 모드에 따라 결과가 달라질 수 있는지: 어느 fold의 학습 행에서든 펼칠 열이 있으면 True.
+
+    전체 행으로 보면 안 된다. 범주가 전체로는 `MAX_ONE_HOT_CATEGORIES`개를 넘어도
+    fold의 학습 행에서는 그 이하일 수 있고, 멤버 전처리는 fold마다 학습 행으로 맞춘다.
+    `n_folds`는 평가에 쓰는 fold 수와 같아야 한다. 상한 `max_width`는 모델이 학습 때 본
+    feature 수다 (`max_features_of`).
     """
-    X = task.X
-    cat = set(task.categorical_indices)
-    cat |= {i for i, dtype in enumerate(X.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
-    return bool(_one_hot_sizes({i: X.iloc[:, i].nunique() for i in cat}, X.shape[1]))
+    return any(
+        fold_expands_one_hot(task.X.iloc[train_ix], task.categorical_indices, max_width)
+        for _, train_ix, _ in task.folds(n_folds)
+    )
+
+
+def same_result_modes(
+    modes: list[str], member_kinds: tuple[str, ...], expands: bool
+) -> list[list[str]]:
+    """결과가 같은 one-hot 모드끼리 묶는다. 묶음마다 headline 모드(`headline_mode`)가 있으면 그것이
+    맨 앞이다. 펼칠 열이 없으면(`expands_one_hot`) 모두 한 묶음이고, 있으면 범주형 열을 펼치는 멤버
+    종류(`one_hot_kinds`)가 같은 모드끼리 묶인다(예: 분위수 멤버만 쓰면 off와 power가 같다)."""
+    headline = headline_mode(modes)
+    groups: dict[frozenset, list[str]] = {}
+    for mode in sorted(modes, key=lambda m: m != headline):  # headline을 먼저
+        key = one_hot_kinds(mode, member_kinds) if expands else frozenset()
+        groups.setdefault(key, []).append(mode)
+    return list(groups.values())
 
 
 def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
@@ -121,17 +176,22 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         raise SystemExit(f"{suite} 평가에는 {flag}가 필요하다.")
     # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
     model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
+    # 주지 않으면 모델의 추론 설정 (Hub config.json의 inference, 없으면 모델 구조로)
+    member_kinds = args.member_kinds or default_inference(model, suite)["member_kinds"]
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
             "categorical_features_indices": task.categorical_indices,
             "one_hot": one_hot,
+            "member_kinds": member_kinds,
             "device": args.device,
         }
         if suite == "classification":
             return TabPFNv2Classifier(model, **kw)
         return TabPFNv2Regressor(model, borders, **kw)
 
+    make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
+    make.member_kinds = member_kinds
     return make
 
 
@@ -175,24 +235,30 @@ def main(argv: list[str] | None = None) -> None:
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
 
     factories = {suite: make_estimator_factory(suite, args) for suite in {s for s, _ in tasks}}
+    kinds = {suite: ",".join(make.member_kinds) for suite, make in sorted(factories.items())}
+    print("member kinds:", kinds, flush=True)
+    if use_mlflow:
+        # suite마다 모델이 정하므로 다를 수 있다. 같으면 예전처럼 member_kinds 하나로 남긴다
+        if len(set(kinds.values())) == 1:
+            mlflow.log_param("member_kinds", next(iter(kinds.values())))
+        else:
+            mlflow.log_params({f"member_kinds_{suite}": v for suite, v in kinds.items()})
     rows = []
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()
         task = bm.load_openml_task(task_id)
-        expands = expands_one_hot(task)
         scores = {}
-        for mode in args.one_hot if expands else [headline]:
-            make = functools.partial(factories[suite], one_hot=mode)
+        expands = expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
+        for group in same_result_modes(args.one_hot, factories[suite].member_kinds, expands):
+            # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
+            make = functools.partial(factories[suite], one_hot=group[0])
             task_rows = bm.evaluate_task(task, make, n_folds=args.folds)
-            scores[mode] = float(np.nanmean([r["score"] for r in task_rows]))
-            rows.extend({**r, "suite": suite, "one_hot": mode, "reused": False} for r in task_rows)
-        if not expands:
-            # 펼칠 열이 없으면 모든 모드가 같은 결과라 한 번 낸 것을 다른 모드에도 쓴다
-            for mode in args.one_hot:
-                if mode != headline:
-                    rows.extend(
-                        {**r, "suite": suite, "one_hot": mode, "reused": True} for r in task_rows
-                    )
+            scores[group[0]] = float(np.nanmean([r["score"] for r in task_rows]))
+            for mode in group:
+                rows.extend(
+                    {**r, "suite": suite, "one_hot": mode, "reused": mode != group[0]}
+                    for r in task_rows
+                )
         paper = bm.paper_scores(suite)[task_id]
         shown = " ".join(f"{m} {v:.4f}" for m, v in scores.items())
         print(

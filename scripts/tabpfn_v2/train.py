@@ -7,6 +7,10 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
   GPU당 micro batch는 batch / GPU 수를 넘지 않게 자동으로 줄어든다.
 - 로컬: `uv run python scripts/tabpfn_v2/train.py --config-name smoke --task regression`
 
+모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
+(arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
+회귀 MLP encoder)이다. 이어서 학습하거나 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를
+주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
 `TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
@@ -23,6 +27,8 @@ ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 
 `--resume-run-id`(또는 `TABPFN_V2_RESUME_RUN_ID`)를 주면 그 run의 `checkpoints/latest.pt`에서
 이어서 학습한다. `--resume-step`(또는 `TABPFN_V2_RESUME_STEP`)을 같이 주면 그 step에 남긴
 `checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).
+`--init-run-id`(또는 `TABPFN_V2_INIT_RUN_ID`, 남긴 step은 `TABPFN_V2_INIT_STEP`)는 그 run의
+checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--config-name long_tables`로 긴 표 학습).
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -41,14 +47,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
-from minipfn.tabpfn_v2.train import (  # noqa: E402
-    TabPFNv2TrainConfig,
-    checkpoint_lr,
-    train_tabpfn_v2,
-)
+from minipfn.hub import run_architecture  # noqa: E402
+from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
+from minipfn.training.config import TrainConfig  # noqa: E402
+from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
-CONFIG_NAMES = ("smoke", "medium", "paper")
+# 일반 크기(smoke, medium)는 TrainConfig에, 논문 설정(paper, long_tables)은 recipe에 있다
+PRESETS = {
+    "smoke": TrainConfig.smoke,
+    "medium": TrainConfig.medium,
+    "paper": recipe.paper,
+    "long_tables": recipe.long_tables,
+}
+CONFIG_NAMES = tuple(PRESETS)
 
 
 def _env(name: str, cast=str):
@@ -67,6 +79,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config-name",
         choices=CONFIG_NAMES,
         default=os.environ.get("TABPFN_V2_CONFIG_NAME", "smoke"),
+    )
+    parser.add_argument(
+        "--arch",
+        choices=tuple(recipe.ARCHITECTURES),
+        default=os.environ.get("TABPFN_V2_ARCH"),
+        help="모델 구조: v2(Nature 2025) 또는 v2.5(TabPFN-2.5). 기본: 새로 학습하면 v2,"
+        " 이어서 학습하거나 가중치를 가져오면 원래 run의 구조",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
     parser.add_argument("--micro-batch", type=int, default=_env("TABPFN_V2_MICRO_BATCH", int))
@@ -90,15 +109,58 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--qk-clip", default=os.environ.get("TABPFN_V2_QK_CLIP") or None)
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
+    parser.add_argument("--init-run-id", default=os.environ.get("TABPFN_V2_INIT_RUN_ID"))
+    parser.add_argument("--init-step", type=int, default=_env("TABPFN_V2_INIT_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
     args = parser.parse_args(argv)
     if args.resume_step is not None and not args.resume_run_id:
         parser.error("--resume-step은 --resume-run-id와 같이 줘야 한다")
+    if args.init_step is not None and not args.init_run_id:
+        parser.error("--init-step은 --init-run-id와 같이 줘야 한다")
+    if args.init_run_id and args.resume_run_id:
+        parser.error("--init-run-id와 --resume-run-id는 함께 줄 수 없다")
+    if args.config_name == "long_tables" and not (args.init_run_id or args.resume_run_id):
+        # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나온다. 회귀 구간 경계는
+        # 가져온 checkpoint의 것을 이어 써서 paper 모델의 출력과 맞춘다
+        parser.error("long_tables는 --init-run-id(paper run)나 --resume-run-id와 같이 줘야 한다")
     return args
 
 
-def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
-    config = getattr(TabPFNv2TrainConfig, args.config_name)(args.task)
+def build_config(
+    args: argparse.Namespace, source: dict | None = None
+) -> tuple[TrainConfig, str | None]:
+    """(학습 설정, 구조 이름). `source`는 이어 가거나 가중치를 가져올 run의 모델 구조
+    (`hub.run_architecture`)다. 주면 그 구조를 쓰고, `--arch`도 줬으면 둘이 같은지 본다. 구조 이름은
+    `ARCHITECTURES`의 것과 맞지 않으면 None이다."""
+    keep_size = args.config_name == "smoke"
+
+    def preset(arch: str) -> TrainConfig:
+        if args.config_name == "long_tables":
+            return recipe.long_tables(args.task, arch=arch)
+        return recipe.with_architecture(
+            PRESETS[args.config_name](args.task), arch, keep_size=keep_size
+        )
+
+    if source is None:
+        arch = args.arch or "v2"
+        return _overrides(preset(arch), args), arch
+    arch = args.arch or recipe.architecture_name(replace(TrainConfig(task=args.task), **source))
+    if arch is None and args.config_name == "long_tables":
+        raise SystemExit(
+            f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
+        )
+    base = preset(arch or "v2")
+    if args.arch is not None:
+        differ = {k: (getattr(base, k), v) for k, v in source.items() if getattr(base, k) != v}
+        if differ:
+            raise SystemExit(
+                f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
+            )
+    return _overrides(replace(base, **source), args), arch
+
+
+def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
+    """인자·환경변수로 준 값을 설정에 덮어쓴다."""
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,
@@ -120,6 +182,15 @@ def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
     return config
 
 
+def _check_source(path: str, config: TrainConfig, *, resume: bool) -> float:
+    # MLflow run을 열기 전에 본다 (원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않도록).
+    # 기준 lr도 이 한 번의 읽기로 돌려준다
+    try:
+        return check_source_checkpoint(path, config, resume=resume)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+
+
 def _optional_float(value: str) -> float | None:
     return None if value.lower() in ("off", "none") else float(value)
 
@@ -138,11 +209,28 @@ def plot_history(history: dict, task: str) -> plt.Figure:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    config = build_config(args)
     rank = int(os.environ.get("RANK", "0"))
     is_main = rank == 0
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    source = None
+    if args.init_run_id or args.resume_run_id:
+        params = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id).data.params
+        if params["task"] != args.task:
+            raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
+        source = run_architecture(params)
+    config, arch = build_config(args, source)
+
+    init_path = None
+    if args.init_run_id:
+        name = "latest.pt" if args.init_step is None else f"step_{args.init_step:07d}.pt"
+        init_path = mlflow.artifacts.download_artifacts(
+            run_id=args.init_run_id,
+            artifact_path=f"checkpoints/{name}",
+            dst_path=str(out_dir / f"init_rank{rank}"),
+        )
+        _check_source(init_path, config, resume=False)
 
     resume_path = None
     if args.resume_run_id:
@@ -152,7 +240,7 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
-        saved_lr = checkpoint_lr(resume_path)
+        saved_lr = _check_source(resume_path, config, resume=True)
         if args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
             config = replace(config, lr=saved_lr)
@@ -171,12 +259,15 @@ def main(argv: list[str] | None = None) -> None:
         # 새 run에 쓴다
         resume_into = args.resume_run_id if args.resume_step is None else None
         run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
-        run_name = None if run_id else f"tabpfn-v2-{config.task}-{args.config_name}"
+        prefix = "tabpfn-v2-5" if arch == "v2.5" else "tabpfn-v2"
+        run_name = None if run_id else f"{prefix}-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)
         log_run_source(__file__, env_prefix="TABPFN_V2_")
 
-    result = train_tabpfn_v2(config, out_dir, resume_from=resume_path, mlflow_log=is_main)
+    result = train(
+        config, out_dir, resume_from=resume_path, mlflow_log=is_main, init_from=init_path
+    )
 
     if is_main:
         mlflow.log_figure(plot_history(result["history"], config.task), "loss_curve.png")

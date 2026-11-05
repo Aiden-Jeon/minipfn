@@ -1,12 +1,13 @@
 import torch
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.model import TabPFNTransformer, classification_loss
+from minipfn.models.row_transformer import RowTransformer
+from minipfn.recipes import tabpfn_v1 as spec
+from minipfn.training.losses import classification_loss
 
 
 def _tiny_model():
     torch.manual_seed(0)
-    model = TabPFNTransformer(num_features=6, n_out=4, emsize=16, nhead=2, nhid=32, nlayers=2)
+    model = RowTransformer(num_features=6, n_out=4, emsize=16, nhead=2, nhid=32, nlayers=2)
     # 0 초기화된 층은 처음에 항등이라 순열 불변 등을 확인하기 어려우므로 무작위로 다시 채운다.
     for p in model.parameters():
         torch.nn.init.normal_(p, std=0.2)
@@ -14,7 +15,7 @@ def _tiny_model():
 
 
 def test_paper_size_matches_reported_parameter_count():
-    model = TabPFNTransformer()  # 논문 크기 (12층, emsize 512)
+    model = RowTransformer(**spec.PAPER_MODEL)  # 논문 크기 (12층, emsize 512)
     assert abs(model.num_parameters() - spec.PAPER_N_PARAMETERS) / spec.PAPER_N_PARAMETERS < 0.001
 
 
@@ -86,7 +87,7 @@ def test_loss_ignores_marked_rows():
 
 def test_one_step_reduces_loss_on_fixed_batch():
     torch.manual_seed(0)
-    model = TabPFNTransformer(num_features=6, n_out=3, emsize=32, nhead=2, nhid=64, nlayers=2)
+    model = RowTransformer(num_features=6, n_out=3, emsize=32, nhead=2, nhid=64, nlayers=2)
     xtr, xte = torch.randn(4, 20, 6), torch.randn(4, 10, 6)
     ytr, yte = (xtr[..., 0] > 0).float(), (xte[..., 0] > 0).long()
     opt = torch.optim.Adam(model.parameters(), lr=3e-3)

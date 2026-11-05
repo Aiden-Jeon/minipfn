@@ -95,8 +95,8 @@ def test_paper_specific_flags(extra):
 
 
 def test_v1_dry_run_writes_source_json_and_notice(tmp_path):
-    from minipfn.tabpfn.hub import from_pretrained
-    from minipfn.tabpfn.train import TabPFNConfig, build_tabpfn_model, save_tabpfn
+    from minipfn.hub.tabpfn_v1 import from_pretrained
+    from minipfn.recipes.tabpfn_v1 import TabPFNConfig, build_tabpfn_model, save_tabpfn
 
     config = TabPFNConfig.smoke()
     torch.manual_seed(0)
@@ -132,12 +132,13 @@ def test_v1_training_checkpoint_without_config_is_rejected(tmp_path):
 
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_v2_dry_run_writes_source_in_config(tmp_path, task):
-    from minipfn.tabpfn_v2.hub import from_pretrained
-    from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
-    from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
+    from minipfn.hub import from_pretrained
+    from minipfn.models import save_checkpoint
+    from minipfn.models.cell_transformer import CellTransformer
+    from minipfn.training.config import TrainConfig
 
     torch.manual_seed(0)
-    model = TabPFNv2(TabPFNv2TrainConfig.smoke(task).model_config()).eval()
+    model = CellTransformer(TrainConfig.smoke(task).model_config()).eval()
     borders = None
     if task == "regression":
         borders = torch.linspace(-3, 3, model.config.n_out + 1)
@@ -151,16 +152,51 @@ def test_v2_dry_run_writes_source_in_config(tmp_path, task):
     )
     upload = out / "upload"
     assert {p.name for p in upload.iterdir()} == {"model.safetensors", "config.json", "README.md"}
-    assert json.loads((upload / "config.json").read_text())["source"] == checkpoint
-    _, loaded_borders = from_pretrained(upload)
+    config = json.loads((upload / "config.json").read_text())
+    assert config["source"] == checkpoint
+    # 이 weight의 추론 설정: smoke 모델은 v2 구조라 v2 멤버 종류, 멤버 수는 논문 기본값
+    from minipfn.recipes.tabpfn_v2 import MEMBER_KINDS_V2, N_ESTIMATORS
+
+    assert config["inference"] == {
+        "n_estimators": N_ESTIMATORS[task],
+        "member_kinds": list(MEMBER_KINDS_V2),
+    }
+    loaded, loaded_borders = from_pretrained(upload)
     assert (loaded_borders is None) == (borders is None)
+    assert loaded.inference_config == config["inference"]
+
+
+def test_v2_member_kinds_override_is_written(tmp_path):
+    # 카드의 수치를 다른 멤버 종류로 냈으면 --member-kinds로 준 값을 적는다
+    from minipfn.models import save_checkpoint
+    from minipfn.models.cell_transformer import CellTransformer
+    from minipfn.training.config import TrainConfig
+
+    model = CellTransformer(TrainConfig.smoke("classification").model_config()).eval()
+    checkpoint = str(tmp_path / "model.pt")
+    save_checkpoint(checkpoint, model, None)
+    card = _card(tmp_path, checkpoint)
+    out = tmp_path / "out"
+    args = ["--paper", "tabpfn_v2", "--task", "classification", "--checkpoint", checkpoint]
+    args += ["--repo-id", "a/b", "--model-card", str(card), "--out-dir", str(out), "--dry-run"]
+    push.main(args + ["--member-kinds", "v2.5"])
+    config = json.loads((out / "upload" / "config.json").read_text())
+    assert config["inference"]["member_kinds"] == ["quantile", "robust"]
+    with pytest.raises(SystemExit):
+        push.parse_args(args + ["--member-kinds", "box-cox"])
+    with pytest.raises(SystemExit):
+        push.parse_args(
+            ["--paper", "tabpfn", "--checkpoint", checkpoint, "--repo-id", "a/b"]
+            + ["--member-kinds", "v2"]
+        )
 
 
 def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
-    from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
-    from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
+    from minipfn.models import save_checkpoint
+    from minipfn.models.cell_transformer import CellTransformer
+    from minipfn.training.config import TrainConfig
 
-    model = TabPFNv2(TabPFNv2TrainConfig.smoke("classification").model_config()).eval()
+    model = CellTransformer(TrainConfig.smoke("classification").model_config()).eval()
     checkpoint = str(tmp_path / "model.pt")
     save_checkpoint(checkpoint, model, None)
     card = _card(tmp_path, checkpoint)

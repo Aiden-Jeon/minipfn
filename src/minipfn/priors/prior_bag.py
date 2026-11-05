@@ -1,40 +1,55 @@
-"""TabPFN v1 prior를 torch로 옮긴 것 (논문 4절·부록 C, 수치는 `spec.py`).
+"""Prior bag (TabPFN v1 `priors/`, 논문 4절·부록 C): 데이터셋 묶음("그룹")마다 GP prior 또는 MLP
+prior를 고르고, 표 데이터로 다듬는다. v1 prior가 쓰는 부품을 모두 이 파일에 둔다.
+
+그룹 하나는 하이퍼파라미터를 공유하고(`sample_group_hyperparameters`), 신경망 가중치만 데이터셋마다
+새로 뽑는다(v1 `new_mlp_per_example`). 그룹을 만드는 순서는 v1과 같다.
+
+1. GP(`sample_gp_tables`) 또는 MLP(`sample_mlp_dataset`)로 연속값 데이터. softmax([1, w])로
+   고르고, w는 설정의 `mlp_weight` 분포에서 뽑는다.
+2. 일부 그룹에서 일부 열을 범주형으로 바꾼다.
+3. 이상치 누르기·표준화, target을 클래스로.
+4. feature 수 보정과 0 패딩, 학습·테스트 행의 클래스 맞추기, 라벨 정리.
+
+파일 안의 순서:
+
+- 하이퍼파라미터 (v1 `differentiable_prior.py`): meta 분포에서 분포의 모수를 먼저 뽑고, 그
+  분포에서 값을 뽑는다. 하이퍼파라미터 하나는 `{"distribution": 종류, ...모수 범위}` dict로 적는다.
+  종류는 `uniform`, `meta_gamma`, `meta_beta`, `meta_trunc_norm_log_scaled`, `meta_choice`,
+  `meta_choice_mixed`다.
+- MLP prior (v1 `mlp.py`, 논문 4.3·4.4절): 무작위 MLP로 데이터셋을 만든다. `is_causal`이 True면
+  SCM prior(계산한 노드 가운데서 x, y를 고른다), False면 BNN prior(입력 = x, 마지막 출력 = y).
+- GP 표 (v1 `fast_gp.py`): RBF 커널 GP에서 k차원 입력의 표.
+- 표 데이터 처리 (v1 `flexible_categorical.py`, `tabpfn/utils.py`): 정규화, 이상치 누르기, 연속값을
+  클래스로 바꾸기, 학습·테스트 행의 클래스 맞추기. v1 추론(`minipfn.inference.rotation_ensemble`)도
+  입력 전처리에 같이 쓴다.
+- prior bag (v1 `prior_bag.py`): 위 부품으로 그룹을 만든다.
+
+어떤 분포와 확률을 쓸지는 `PriorBagConfig`로 받는다. v1 논문 설정은
+`minipfn.recipes.tabpfn_v1.PRIOR`(그 설정을 기본값으로 쓰는 `TabPFNPrior`도 거기에 있다).
+내부 텐서는 v1처럼 (행, 데이터셋, feature) 또는 (행, 데이터셋) 순서이고, `PriorBag`이 바깥에
+내보낼 때 (데이터셋, 행, feature)로 바꾼다.
 
 공식 v1 코드(github.com/automl/TabPFN `tabpfn_v1`, Apache 2.0, Copyright 2022 University of
-Freiburg)의 다음 구조를 따른다.
-
-- `priors/differentiable_prior.py`: 하이퍼파라미터를 두 단계로 뽑는다(분포의 모수 → 값).
-- `priors/prior_bag.py`: softmax([1, w])로 GP prior 또는 MLP prior를 고른다.
-- `priors/mlp.py`: MLP prior. `is_causal=True`면 SCM prior(그래프 노드에서 x, y를 고름),
-  `False`면 BNN prior(입력 = x, 출력 = y).
-- `priors/flexible_categorical.py`: feature 수·범주형 변환·정규화·클래스 변환·패딩.
-
-v1에서 데이터셋 8개짜리 forward batch 하나("그룹")는 하이퍼파라미터를 공유하고, 신경망
-가중치만 데이터셋마다 새로 뽑는다(`new_mlp_per_example`). 여기서도 그룹 단위로 만든다.
-내부 텐서는 v1처럼 (행, 데이터셋, feature) 순서이고, 바깥에 내보낼 때
-(데이터셋, 행, feature)로 바꾼다.
-
-v1과 다른 점: 난수를 전역 `random`·`np.random` 대신 생성기 객체에서 뽑는다. 결측값 주입은
+Freiburg)를 따르되, 난수는 전역 `random`·`np.random` 대신 생성기 객체에서 뽑는다. 결측값 주입은
 공개 체크포인트에서 꺼져 있었으므로 구현하지 않았다.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 from scipy import stats
-from torch.utils.data import IterableDataset, get_worker_info
 
-from minipfn.tabpfn import spec
-
-ACTIVATIONS = {"tanh": torch.tanh, "identity": lambda z: z, "relu": torch.relu}
-
+from minipfn.priors.base import IGNORE_INDEX
 
 # ---------------------------------------------------------------------------
-# 하이퍼파라미터 (v1 differentiable_prior.DifferentiableHyperparameter)
+# 하이퍼파라미터 (v1 differentiable_prior.py DifferentiableHyperparameter)
 # ---------------------------------------------------------------------------
+
+
 def _truncnorm(mu: float, sigma: float, rng: np.random.Generator) -> float:
     # v1 trunc_norm_sampler_f: [0, 1e6]으로 자른 정규분포
     a, b = (0 - mu) / sigma, (1_000_000 - mu) / sigma
@@ -73,25 +88,14 @@ def sample_hyperparameter(hp: dict, rng: np.random.Generator):
     raise ValueError(f"unknown distribution: {kind}")
 
 
-def sample_group_hyperparameters(
-    rng: np.random.Generator, max_classes: int, num_features: int
-) -> dict:
-    """그룹(데이터셋 8개)이 공유하는 하이퍼파라미터를 한 번에 뽑는다."""
-    hp = {name: sample_hyperparameter(d, rng) for name, d in spec.MLP_HYPERPARAMETERS.items()}
-    hp.update({name: sample_hyperparameter(d, rng) for name, d in spec.GP_HYPERPARAMETERS.items()})
-    # prior bag: P(MLP) = softmax([1, w])[1]
-    w = sample_hyperparameter(spec.PRIOR_BAG_MLP_WEIGHT, rng)
-    hp["use_mlp"] = bool(rng.random() < math.exp(w) / (math.e + math.exp(w)))
-    # flexible_categorical: 쓰는 feature 수와 클래스 수 상한
-    # (v1 uniform_int_sampler_f = round(U(a, b)))
-    hp["num_features_used"] = int(round(rng.uniform(1, num_features)))
-    hp["num_classes"] = int(round(rng.uniform(spec.NUM_CLASSES[0], max_classes)))
-    return hp
+# ---------------------------------------------------------------------------
+# MLP prior (v1 mlp.py). 내부 텐서는 (행, feature) 순서
+# ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# 데이터 생성: MLP prior (v1 priors/mlp.py)
-# ---------------------------------------------------------------------------
+ACTIVATIONS = {"tanh": torch.tanh, "identity": lambda z: z, "relu": torch.relu}
+
+
 def _init_weight(
     n_out: int,
     n_in: int,
@@ -100,6 +104,7 @@ def _init_weight(
     rng: np.random.Generator,
     gen: torch.Generator,
     device,
+    scale_weights_sqrt: bool,
 ) -> torch.Tensor:
     """가중치 행렬 하나 (n_out, n_in). v1 MLP.__init__의 초기화 규칙을 그대로 따른다."""
     init_std = hp["init_std"]
@@ -109,14 +114,14 @@ def _init_weight(
         n_blocks = int(rng.integers(1, math.ceil(math.sqrt(min(n_out, n_in))) + 1))
         bh, bw = n_out // n_blocks, n_in // n_blocks
         keep_prob = (n_blocks * bh * bw) / (n_out * n_in)
-        std = init_std / keep_prob ** (1 / 2 if spec.PRIOR_MLP_SCALE_WEIGHTS_SQRT else 1)
+        std = init_std / keep_prob ** (1 / 2 if scale_weights_sqrt else 1)
         for b in range(n_blocks):
             block = torch.randn(bh, bw, generator=gen, device=device) * std
             w[bh * b : bh * (b + 1), bw * b : bw * (b + 1)] = block
         return w
     dropout = min(hp["prior_mlp_dropout_prob"], 0.99) if apply_dropout else 0.0
     # v1 식 그대로: init_std / (1 - dropout ** (1/2))
-    std = init_std / (1.0 - dropout ** (1 / 2 if spec.PRIOR_MLP_SCALE_WEIGHTS_SQRT else 1))
+    std = init_std / (1.0 - dropout ** (1 / 2 if scale_weights_sqrt else 1))
     w = torch.randn(n_out, n_in, generator=gen, device=device) * std
     keep = torch.rand(n_out, n_in, generator=gen, device=device) < (1.0 - dropout)
     return w * keep
@@ -128,10 +133,23 @@ def _default_bias(n_out: int, n_in: int, gen: torch.Generator, device) -> torch.
     return (torch.rand(n_out, generator=gen, device=device) * 2 - 1) * bound
 
 
-def _sample_mlp_dataset(
-    seq_len: int, k: int, hp: dict, rng: np.random.Generator, gen: torch.Generator, device
+def sample_mlp_dataset(
+    seq_len: int,
+    k: int,
+    hp: dict,
+    rng: np.random.Generator,
+    gen: torch.Generator,
+    device,
+    *,
+    scale_weights_sqrt: bool,
+    random_feature_rotation: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """데이터셋 하나 (x: (T, k), y: (T,)). 가중치는 데이터셋마다 새로 뽑는다."""
+    """데이터셋 하나 (x: (T, k), y: (T,)). 가중치는 데이터셋마다 새로 뽑는다.
+
+    `hp`는 그룹이 공유하는 하이퍼파라미터(`sample_group_hyperparameters`).
+    `scale_weights_sqrt`면 dropout으로 지운 만큼 가중치 표준편차를 keep 비율의 제곱근으로 나눈다
+    (아니면 keep 비율로). `random_feature_rotation`이면 feature 순서를 무작위로 회전한다.
+    """
     is_causal = hp["is_causal"]
     hidden = int(hp["prior_mlp_hidden_dim"])
     num_causes = int(hp["num_causes"]) if is_causal else k
@@ -150,13 +168,29 @@ def _sample_mlp_dataset(
     # 2) 층 구조: Linear(원인 → hidden), 이후 (활성화 → Linear → 노이즈)를 num_layers-1번
     out_dims = [hidden] * (num_layers - 1) + ([] if is_causal else [1])
     layer0_w = _init_weight(
-        hidden, num_causes, hp, apply_dropout=False, rng=rng, gen=gen, device=device
+        hidden,
+        num_causes,
+        hp,
+        apply_dropout=False,
+        rng=rng,
+        gen=gen,
+        device=device,
+        scale_weights_sqrt=scale_weights_sqrt,
     )
     h = causes @ layer0_w.T + _default_bias(hidden, num_causes, gen, device)
     outputs = []
     n_in = hidden
     for n_out in out_dims:
-        w = _init_weight(n_out, n_in, hp, apply_dropout=True, rng=rng, gen=gen, device=device)
+        w = _init_weight(
+            n_out,
+            n_in,
+            hp,
+            apply_dropout=True,
+            rng=rng,
+            gen=gen,
+            device=device,
+            scale_weights_sqrt=scale_weights_sqrt,
+        )
         b = _default_bias(n_out, n_in, gen, device)
         if hp["pre_sample_weights"]:
             noise_std = torch.randn(1, n_out, generator=gen, device=device).abs() * hp["noise_std"]
@@ -188,21 +222,25 @@ def _sample_mlp_dataset(
 
     if torch.isnan(x).any() or torch.isnan(y).any():
         x = torch.zeros_like(x)
-        y = torch.full_like(y, float(spec.IGNORE_INDEX))
+        y = torch.full_like(y, float(IGNORE_INDEX))
 
-    if spec.RANDOM_FEATURE_ROTATION:
+    if random_feature_rotation:
         shift = int(rng.integers(0, k))
         x = x[:, (torch.arange(k, device=device) + shift) % k]
     return x, y[:, 0]
 
 
 # ---------------------------------------------------------------------------
-# 데이터 생성: GP prior (v1 priors/fast_gp.py)
+# GP 표 (v1 fast_gp.py)
 # ---------------------------------------------------------------------------
-def _sample_gp_group(
+
+
+def sample_gp_tables(
     seq_len: int, n_datasets: int, k: int, hp: dict, gen: torch.Generator, device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """RBF 커널 GP에서 데이터셋 n_datasets개. x는 표준정규분포(sampling='normal')."""
+    """RBF 커널 GP에서 표 데이터셋 n_datasets개 (TabPFN v1 `priors/fast_gp.py`). x는 k차원
+    표준정규분포(sampling='normal'), 하이퍼파라미터 `hp`의 outputscale·lengthscale·noise를 쓴다.
+    반환은 (행, 데이터셋, k), (행, 데이터셋) 순서다."""
     x = torch.randn(n_datasets, seq_len, k, generator=gen, device=device)
     xd = x.double()
     sq_dist = torch.cdist(xd, xd) ** 2
@@ -216,8 +254,10 @@ def _sample_gp_group(
 
 
 # ---------------------------------------------------------------------------
-# 표 데이터 처리 (v1 priors/flexible_categorical.py, tabpfn/utils.py)
+# 표 데이터 처리 (v1 flexible_categorical.py, tabpfn/utils.py)
 # ---------------------------------------------------------------------------
+
+
 def _masked_mean_std(x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     num = mask.sum(0).clamp(min=1)
     xm = torch.where(mask, x, torch.zeros_like(x))
@@ -296,7 +336,7 @@ def multiclass_rank(
     return d.float()
 
 
-def _make_compatible(
+def make_compatible(
     x: torch.Tensor, y: torch.Tensor, single_eval_pos: int, gen: torch.Generator
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """학습 행과 테스트 행의 클래스 집합이 같아질 때까지 행을 섞는다(최대 10번). 실패하면 -100."""
@@ -311,14 +351,14 @@ def _make_compatible(
             perm = torch.randperm(x.shape[0], generator=gen, device=x.device)
             x[:, b], y[:, b] = x[perm, b], y[perm, b]
         if not ok:
-            y[:, b] = spec.IGNORE_INDEX
+            y[:, b] = IGNORE_INDEX
     return x, y
 
 
-def _normalize_labels(y: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
+def normalize_labels(y: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
     """클래스 번호를 0..n-1로 다시 매기고 무작위로 회전한다 (v1 normalize_labels)."""
     for b in range(y.shape[1]):
-        valid = y[:, b] != spec.IGNORE_INDEX
+        valid = y[:, b] != IGNORE_INDEX
         if not valid.any():
             continue
         vals = y[valid, b]
@@ -329,18 +369,61 @@ def _normalize_labels(y: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
     return y
 
 
-class TabPFNPrior:
-    """TabPFN v1 prior 샘플러. `sample_group`이 하이퍼파라미터를 공유하는 데이터셋 묶음을 만든다."""
+# ---------------------------------------------------------------------------
+# prior bag (v1 prior_bag.py)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PriorBagConfig:
+    """prior bag이 쓰는 분포와 확률. 하이퍼파라미터 dict의 형식은 `sample_hyperparameter`."""
+
+    mlp_hyperparameters: dict  # MLP prior (`sample_mlp_dataset`)
+    gp_hyperparameters: dict  # GP prior (outputscale, lengthscale, noise)
+    mlp_weight: dict  # P(MLP) = softmax([1, w])[1]의 w 분포
+    min_classes: int  # 클래스 수 상한을 round(U(min_classes, max_classes))로 뽑는다
+    categorical_feature_p: float  # 일부 열을 범주형으로 바꾸는 그룹의 비율
+    categorical_ordered_p: float  # 범주형 열의 번호를 섞지 않고 둘 확률
+    output_multiclass_ordered_p: float  # target 클래스 번호를 섞지 않고 둘 확률
+    normalize_by_used_features: bool  # 쓰는 feature 수 k로 나눠 num_features / k배
+    # 학습·테스트 행의 클래스 집합을 맞춘다 (아니면 행을 섞고, 10번 실패하면 무시)
+    check_is_compatible: bool
+    scale_weights_sqrt: bool  # MLP 가중치의 dropout 보정 (`sample_mlp_dataset`)
+    random_feature_rotation: bool  # MLP 데이터셋의 feature 순서를 무작위로 회전
+
+
+def sample_group_hyperparameters(
+    rng: np.random.Generator, config: PriorBagConfig, max_classes: int, num_features: int
+) -> dict:
+    """그룹(데이터셋 묶음)이 공유하는 하이퍼파라미터를 한 번에 뽑는다."""
+    hp = {name: sample_hyperparameter(d, rng) for name, d in config.mlp_hyperparameters.items()}
+    gp = config.gp_hyperparameters
+    hp.update({name: sample_hyperparameter(d, rng) for name, d in gp.items()})
+    # prior bag: P(MLP) = softmax([1, w])[1]
+    w = sample_hyperparameter(config.mlp_weight, rng)
+    hp["use_mlp"] = bool(rng.random() < math.exp(w) / (math.e + math.exp(w)))
+    # flexible_categorical: 쓰는 feature 수와 클래스 수 상한
+    # (v1 uniform_int_sampler_f = round(U(a, b)))
+    hp["num_features_used"] = int(round(rng.uniform(1, num_features)))
+    hp["num_classes"] = int(round(rng.uniform(config.min_classes, max_classes)))
+    return hp
+
+
+class PriorBag:
+    """prior bag 샘플러. `sample_group`이 하이퍼파라미터를 공유하는 데이터셋 묶음을 만든다."""
 
     def __init__(
         self,
-        seq_len: int = spec.SEQ_LEN,
-        num_features: int = spec.MAX_FEATURES,
-        max_classes: int = spec.MAX_CLASSES,
-        group_size: int = spec.DATASETS_PER_PRIOR_GROUP,
+        config: PriorBagConfig,
+        *,
+        seq_len: int,
+        num_features: int,
+        max_classes: int,
+        group_size: int,
         device: torch.device | str = "cpu",
         seed: int = 0,
     ) -> None:
+        self.config = config
         self.seq_len = seq_len
         self.num_features = num_features
         self.max_classes = max_classes
@@ -356,98 +439,47 @@ class TabPFNPrior:
 
         반환: x (B, T, num_features), y (B, T) (-100 = 무시), 하이퍼파라미터.
         """
-        rng, gen, dev = self.rng, self.gen, self.device
+        rng, gen, dev, cfg = self.rng, self.gen, self.device, self.config
         T, B = self.seq_len, self.group_size
-        hp = sample_group_hyperparameters(rng, self.max_classes, self.num_features)
+        hp = sample_group_hyperparameters(rng, cfg, self.max_classes, self.num_features)
         k = hp["num_features_used"]
 
         # 1) GP 또는 MLP prior로 연속값 데이터 (T, B, k), (T, B)
         if hp["use_mlp"]:
+            mlp = {
+                "scale_weights_sqrt": cfg.scale_weights_sqrt,
+                "random_feature_rotation": cfg.random_feature_rotation,
+            }
             xs, ys = zip(
-                *(_sample_mlp_dataset(T, k, hp, rng, gen, dev) for _ in range(B)), strict=True
+                *(sample_mlp_dataset(T, k, hp, rng, gen, dev, **mlp) for _ in range(B)),
+                strict=True,
             )
             x, y = torch.stack(xs, 1), torch.stack(ys, 1)
         else:
-            x, y = _sample_gp_group(T, B, k, hp, gen, dev)
+            x, y = sample_gp_tables(T, B, k, hp, gen, dev)
 
-        # 2) 일부 열을 범주형으로 (그룹의 20%)
-        if rng.random() < spec.CATEGORICAL_FEATURE_P:
+        # 2) 일부 열을 범주형으로 (그룹의 categorical_feature_p)
+        if rng.random() < cfg.categorical_feature_p:
             p = rng.random()
             for col in range(k):
                 n_unique = max(round(rng.gamma(1, 10)), 2)
                 if rng.random() < p:
                     x[:, :, col] = multiclass_rank(
-                        x[:, :, col], n_unique, spec.CATEGORICAL_ORDERED_P, rng, gen
+                        x[:, :, col], n_unique, cfg.categorical_ordered_p, rng, gen
                     )
 
         # 3) 이상치 누르기 + 표준화, target을 클래스로
         x = normalize_data(remove_outliers(x))
         y = normalize_data(y)
-        y = multiclass_rank(y, hp["num_classes"], spec.OUTPUT_MULTICLASS_ORDERED_P, rng, gen)
+        y = multiclass_rank(y, hp["num_classes"], cfg.output_multiclass_ordered_p, rng, gen)
 
-        # 4) feature 수 보정(100/k배)과 0 패딩
-        if spec.NORMALIZE_BY_USED_FEATURES:
+        # 4) feature 수 보정(num_features/k배)과 0 패딩
+        if cfg.normalize_by_used_features:
             x = x / (k / self.num_features)
         x = torch.cat([x, torch.zeros(T, B, self.num_features - k, device=dev)], dim=-1)
 
         # 5) 학습/테스트 행 클래스 맞추기, 라벨 정리
-        if spec.CHECK_IS_COMPATIBLE:
-            x, y = _make_compatible(x, y, single_eval_pos, gen)
-        y = _normalize_labels(y, gen)
+        if cfg.check_is_compatible:
+            x, y = make_compatible(x, y, single_eval_pos, gen)
+        y = normalize_labels(y, gen)
         return x.transpose(0, 1).contiguous(), y.transpose(0, 1).contiguous(), hp
-
-
-def _derive_seed(*keys: int) -> int:
-    """정수 여러 개를 섞어 64비트 seed 하나로 만든다. 곱하고 더하는 방식과 달리 겹치지 않는다."""
-    return int(np.random.SeedSequence(keys).generate_state(1, np.uint64)[0])
-
-
-class TabPFNPriorDataset(IterableDataset):
-    """forward batch를 끝없이 내보낸다. `DataLoader(batch_size=None)`로 쓴다.
-
-    forward batch 하나는 prior 그룹 `groups_per_batch`개를 이어 붙인 것이다. v1은 그룹 하나
-    (데이터셋 8개)가 forward batch 하나이므로 기본값 1이 v1과 같다. batch마다 single_eval_pos를
-    Uniform{1, ..., max_eval_pos-1}에서 뽑는다. v1은 0부터 뽑지만, 학습 행이 0개면 데이터셋 전체가
-    무시되어(-100) gradient가 0이므로 빼도 학습은 같다. 0이 섞이면 그 GPU에서만 attention 가중치가
-    쓰이지 않아 DDP의 gradient 동기화가 어긋난다(8×H100 medium 실행에서 NCCL timeout).
-    `seed`(정수 또는 정수 tuple, 예: (config seed, 시작 step, rank))와 worker 번호를
-    `SeedSequence`로 섞어 seed를 만든다. 그래서 worker·GPU·resume 시점마다 서로 다른 데이터셋이
-    나오고, 정수 seed를 직접 쓰는 검증용 `TabPFNPrior`와도 겹치지 않는다.
-    """
-
-    def __init__(
-        self,
-        seq_len: int = spec.SEQ_LEN,
-        max_eval_pos: int = spec.MAX_EVAL_POS,
-        num_features: int = spec.MAX_FEATURES,
-        max_classes: int = spec.MAX_CLASSES,
-        group_size: int = spec.DATASETS_PER_PRIOR_GROUP,
-        groups_per_batch: int = 1,
-        seed: int | tuple[int, ...] = 0,
-    ) -> None:
-        super().__init__()
-        self.kwargs = dict(
-            seq_len=seq_len,
-            num_features=num_features,
-            max_classes=max_classes,
-            group_size=group_size,
-        )
-        self.max_eval_pos = max_eval_pos
-        self.groups_per_batch = groups_per_batch
-        self.seed = seed
-
-    def __iter__(self):
-        info = get_worker_info()
-        worker_id = info.id if info is not None else 0
-        if info is not None:
-            # worker가 많을 때 각자 CPU 스레드를 여러 개 쓰면 학습 프로세스까지 느려진다.
-            torch.set_num_threads(1)
-        keys = (self.seed,) if isinstance(self.seed, int) else tuple(self.seed)
-        prior = TabPFNPrior(**self.kwargs, seed=_derive_seed(*keys, worker_id, 0))
-        rng = np.random.default_rng(_derive_seed(*keys, worker_id, 1))  # single_eval_pos용
-        while True:
-            single_eval_pos = int(rng.integers(1, self.max_eval_pos))
-            groups = [prior.sample_group(single_eval_pos) for _ in range(self.groups_per_batch)]
-            x = torch.cat([g[0] for g in groups])
-            y = torch.cat([g[1] for g in groups])
-            yield x, y, single_eval_pos
