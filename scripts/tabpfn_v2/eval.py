@@ -50,7 +50,8 @@ from minipfn.inference.tabpfn_v2 import (
     TabPFNv2Classifier,
     TabPFNv2Regressor,
     _one_hot_sizes,
-    parse_member_kinds,
+    one_hot_kinds,
+    resolve_member_kinds,
 )
 from minipfn.utils import log_run_source
 
@@ -95,7 +96,7 @@ def _one_hot_modes(value: str) -> list[str]:
 
 def _member_kinds(value: str) -> tuple[str, ...]:
     try:
-        return parse_member_kinds(value)
+        return resolve_member_kinds(value)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
 
@@ -115,6 +116,20 @@ def expands_one_hot(task: bm.OpenMLTask) -> bool:
     cat = set(task.categorical_indices)
     cat |= {i for i, dtype in enumerate(X.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
     return bool(_one_hot_sizes({i: X.iloc[:, i].nunique() for i in cat}, X.shape[1]))
+
+
+def same_result_modes(
+    modes: list[str], member_kinds: tuple[str, ...], expands: bool
+) -> list[list[str]]:
+    """결과가 같은 one-hot 모드끼리 묶는다. 묶음마다 headline 모드(`headline_mode`)가 있으면 그것이
+    맨 앞이다. 펼칠 열이 없으면(`expands_one_hot`) 모두 한 묶음이고, 있으면 범주형 열을 펼치는 멤버
+    종류(`one_hot_kinds`)가 같은 모드끼리 묶인다(예: 분위수 멤버만 쓰면 off와 power가 같다)."""
+    headline = headline_mode(modes)
+    groups: dict[frozenset, list[str]] = {}
+    for mode in sorted(modes, key=lambda m: m != headline):  # headline을 먼저
+        key = one_hot_kinds(mode, member_kinds) if expands else frozenset()
+        groups.setdefault(key, []).append(mode)
+    return list(groups.values())
 
 
 def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
@@ -201,20 +216,17 @@ def main(argv: list[str] | None = None) -> None:
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()
         task = bm.load_openml_task(task_id)
-        expands = expands_one_hot(task)
         scores = {}
-        for mode in args.one_hot if expands else [headline]:
-            make = functools.partial(factories[suite], one_hot=mode)
+        for group in same_result_modes(args.one_hot, args.member_kinds, expands_one_hot(task)):
+            # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
+            make = functools.partial(factories[suite], one_hot=group[0])
             task_rows = bm.evaluate_task(task, make, n_folds=args.folds)
-            scores[mode] = float(np.nanmean([r["score"] for r in task_rows]))
-            rows.extend({**r, "suite": suite, "one_hot": mode, "reused": False} for r in task_rows)
-        if not expands:
-            # 펼칠 열이 없으면 모든 모드가 같은 결과라 한 번 낸 것을 다른 모드에도 쓴다
-            for mode in args.one_hot:
-                if mode != headline:
-                    rows.extend(
-                        {**r, "suite": suite, "one_hot": mode, "reused": True} for r in task_rows
-                    )
+            scores[group[0]] = float(np.nanmean([r["score"] for r in task_rows]))
+            for mode in group:
+                rows.extend(
+                    {**r, "suite": suite, "one_hot": mode, "reused": mode != group[0]}
+                    for r in task_rows
+                )
         paper = bm.paper_scores(suite)[task_id]
         shown = " ".join(f"{m} {v:.4f}" for m, v in scores.items())
         print(

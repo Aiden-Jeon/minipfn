@@ -141,13 +141,7 @@ def test_qk_clip_needs_attention_weights(tmp_path, tiny):
         train(config, tmp_path, mlflow_log=False)
 
 
-def test_training_checkpoint_from_run_uses_the_run_model_type(tmp_path, monkeypatch, tiny):
-    config = replace(TrainConfig.smoke(), model_type="tiny")
-    model = config.build_model()
-    path = tmp_path / "step_0000100.pt"
-    torch.save({"model": model.state_dict(), "step": 100, "borders": None}, path)
-    params = {"task": "classification", "model_type": "tiny"}
-    params |= {"emsize": str(config.emsize), "nhead": str(config.nhead)}
+def _fake_run(monkeypatch, path, params):
     run = types.SimpleNamespace(data=types.SimpleNamespace(params=params))
     monkeypatch.setattr(
         mlflow.artifacts, "download_artifacts", lambda artifact_uri, dst_path: str(path)
@@ -155,9 +149,60 @@ def test_training_checkpoint_from_run_uses_the_run_model_type(tmp_path, monkeypa
     monkeypatch.setattr(
         mlflow, "MlflowClient", lambda: types.SimpleNamespace(get_run=lambda run_id: run)
     )
-    loaded, _ = hub.load_model("runs:/abc/checkpoints/step_0000100.pt", "classification", tmp_path)
+
+
+def test_training_checkpoints_carry_the_model_settings(tmp_path, monkeypatch, tiny):
+    # run param 없이 checkpoint만으로 모델을 만든다 (TinyConfig에만 있는 필드도 그대로)
+    config = replace(TrainConfig.smoke(), model_type="tiny", steps=2)
+    train(config, tmp_path, mlflow_log=False)
+    state = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert state["model_type"] == "tiny" and state["config"] == config.model_config().to_dict()
+    _fake_run(monkeypatch, tmp_path / "latest.pt", params={})  # param을 읽으면 KeyError
+    loaded, _ = hub.load_model("runs:/abc/checkpoints/latest.pt", "classification", tmp_path)
     assert isinstance(loaded, TinyModel)
-    _same_weights(model, loaded)
+    assert isinstance(registry.load_checkpoint(tmp_path / "latest.pt")[0], TinyModel)
+
+
+def test_old_training_checkpoints_need_the_size_params(tmp_path, monkeypatch):
+    # 모델 설정을 남기기 전의 v2 학습 checkpoint는 run param으로 만든다. 크기 param이 없으면 멈춘다
+    config = TrainConfig.smoke()
+    path = tmp_path / "step_0000100.pt"
+    torch.save({"model": config.build_model().state_dict(), "borders": None}, path)
+    uri = "runs:/abc/checkpoints/step_0000100.pt"
+    params = {"task": "classification", "emsize": "32", "nlayers": "2", "nhead": "2"}
+    _fake_run(monkeypatch, path, params)
+    loaded, _ = hub.load_model(uri, "classification", tmp_path)
+    assert loaded.config == config.model_config()
+    _fake_run(monkeypatch, path, {k: v for k, v in params.items() if k != "nhead"})
+    with pytest.raises(SystemExit, match="nhead"):
+        hub.load_model(uri, "classification", tmp_path)
+    _fake_run(monkeypatch, path, {"task": "classification", "model_type": "tiny"})
+    with pytest.raises(SystemExit, match="모델 설정이 없다"):
+        hub.load_model(uri, "classification", tmp_path)
+
+
+def test_with_architecture_does_not_switch_other_model_types(tiny):
+    config = replace(TrainConfig.smoke(), model_type="tiny")
+    with pytest.raises(ValueError, match="tabpfn_v2 모델"):
+        recipe.with_architecture(config, "v2")
+    assert recipe.with_architecture(TrainConfig.smoke(), "v2.5").model_type == "tabpfn_v2"
+
+
+def test_init_and_resume_need_the_same_task_and_model(tmp_path):
+    config = replace(TrainConfig.smoke(), steps=2, collapse_threshold=None)
+    train(config, tmp_path / "a", mlflow_log=False)
+    latest = tmp_path / "a" / "latest.pt"
+    # head 수만 다르면 가중치 모양이 같아 load_state_dict는 그대로 읽어 버린다
+    other_heads = replace(config, nhead=4, steps=4)
+    for kw in ({"init_from": latest}, {"resume_from": latest}):
+        with pytest.raises(ValueError, match="nhead"):
+            train(other_heads, tmp_path / "b", mlflow_log=False, **kw)
+    with pytest.raises(ValueError, match="classification checkpoint"):
+        regression = replace(TrainConfig.smoke("regression"), steps=2)
+        train(regression, tmp_path / "c", init_from=latest, mlflow_log=False)
+    # 같은 설정이면 그대로 읽는다 (save_checkpoint 파일도)
+    final = tmp_path / "a" / "tabpfn_v2_final.pt"
+    train(replace(config, steps=1), tmp_path / "d", init_from=final, mlflow_log=False)
 
 
 def test_run_params_parse_bools():

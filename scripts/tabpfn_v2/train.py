@@ -127,23 +127,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace, source: dict | None = None) -> TrainConfig:
-    """`source`는 이어 가거나 가중치를 가져올 run의 모델 구조(`hub.run_architecture`)."""
-    config = PRESETS[args.config_name](args.task)
+    """`source`는 이어 가거나 가중치를 가져올 run의 모델 구조(`hub.run_architecture`). 주면 그
+    구조를 쓰고, `--arch`도 줬으면 둘이 같은지 본다."""
     keep_size = args.config_name == "smoke"
+
+    def preset(arch: str) -> TrainConfig:
+        if args.config_name == "long_tables":  # GPU당 micro batch가 구조마다 달라 구조를 같이 준다
+            return recipe.long_tables(args.task, arch=arch)
+        return recipe.with_architecture(
+            PRESETS[args.config_name](args.task), arch, keep_size=keep_size
+        )
+
     if source is None:
-        config = recipe.with_architecture(config, args.arch or "v2", keep_size=keep_size)
-    else:
-        if args.arch is not None:
-            wanted = recipe.with_architecture(config, args.arch, keep_size=keep_size)
-            differ = {
-                k: (getattr(wanted, k), v) for k, v in source.items() if getattr(wanted, k) != v
-            }
-            if differ:
-                raise SystemExit(
-                    f"--arch {args.arch}가 원래 run의 모델 구조와 다르다"
-                    f" (--arch 값, run 값): {differ}"
-                )
-        config = replace(config, **source)
+        return _overrides(preset(args.arch or "v2"), args)
+    if args.arch is not None:
+        wanted = preset(args.arch)
+        differ = {k: (getattr(wanted, k), v) for k, v in source.items() if getattr(wanted, k) != v}
+        if differ:
+            raise SystemExit(
+                f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
+            )
+    arch = args.arch or recipe.architecture_name(replace(TrainConfig(task=args.task), **source))
+    if arch is None and args.config_name == "long_tables":
+        raise SystemExit(
+            f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
+        )
+    return _overrides(replace(preset(arch or "v2"), **source), args)
+
+
+def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
+    """인자·환경변수로 준 값을 설정에 덮어쓴다."""
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,

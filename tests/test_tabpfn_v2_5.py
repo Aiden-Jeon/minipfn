@@ -159,17 +159,49 @@ def test_default_member_kinds_are_v2():
 
 
 def test_member_kinds_parse_names_and_lists():
-    from minipfn.inference.tabpfn_v2 import parse_member_kinds
+    from minipfn.inference.tabpfn_v2 import resolve_member_kinds
 
-    assert parse_member_kinds("v2.5") == MEMBER_KINDS_V2_5
-    assert parse_member_kinds("v2") == ("quantile", "power")
-    assert parse_member_kinds("robust, power") == ("robust", "power")
-    assert parse_member_kinds(["quantile"]) == ("quantile",)
+    assert resolve_member_kinds("v2.5") == MEMBER_KINDS_V2_5
+    assert resolve_member_kinds("v2") == ("quantile", "power")
+    assert resolve_member_kinds("robust, power") == ("robust", "power")
+    assert resolve_member_kinds(["quantile"]) == ("quantile",)
     for bad in ("", "v3", "quantile,box-cox"):
         with pytest.raises(ValueError, match="member_kinds"):
-            parse_member_kinds(bad)
+            resolve_member_kinds(bad)
     # 평가 스크립트도 같은 규칙을 쓴다 (모델 클래스와 따로 목록을 두지 않는다)
     from test_tabpfn_v2_benchmark import _eval_script
 
     script = _eval_script()
     assert script.parse_args(["--member-kinds", "v2.5"]).member_kinds == MEMBER_KINDS_V2_5
+
+
+def test_regressor_halves_the_target_power_within_each_member_kind():
+    X, y = load_diabetes(return_X_y=True)
+    model = _tiny(n_out=20)
+
+    def members(kinds, n):
+        reg = TabPFNv2Regressor(
+            model, torch.linspace(-3, 3, 21), n_estimators=n, member_kinds=kinds
+        )
+        reg.fit(X[:60], y[:60])
+        return [(p.member.kind, p.member.target_power) for p in reg.preprocessors_]
+
+    # v2 기본(두 종류)은 예전과 같다: F, F, T, T
+    assert members(("quantile", "power"), 4) == [
+        ("quantile", False),
+        ("power", False),
+        ("quantile", True),
+        ("power", True),
+    ]
+    # 세 종류면 종류마다 y power 변환이 한 번씩
+    got = members(("quantile", "power", "robust"), 6)
+    for kind in ("quantile", "power", "robust"):
+        assert sorted(tp for k, tp in got if k == kind) == [False, True]
+
+
+def test_one_hot_kinds_tell_which_members_expand():
+    from minipfn.inference.tabpfn_v2 import one_hot_kinds
+
+    assert one_hot_kinds("power", ("quantile", "robust")) == {"robust"}
+    assert one_hot_kinds("all", ("quantile", "robust")) == {"quantile", "robust"}
+    assert one_hot_kinds("power", ("quantile",)) == one_hot_kinds("off", ("quantile",))

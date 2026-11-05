@@ -135,3 +135,22 @@ def test_borders_use_the_training_table_sizes(monkeypatch):
     P.make_prior(config, seed=0)
     borders_sizes, prior_sizes = ({k: kw[k] for k in P.SIZE_FIELDS} for kw in seen)
     assert borders_sizes == prior_sizes == {k: getattr(config, k) for k in P.SIZE_FIELDS}
+
+
+def test_border_prior_with_default_sizes_is_the_paper_prior():
+    # 크기 설정을 기본값으로 주면 예전(크기 설정 없이 만든 prior)과 같은 경계다
+    from minipfn.training.config import TrainConfig
+
+    explicit = P.regression_borders(50, 4, seed=3, **P._sizes(TrainConfig("regression")))
+    assert torch.equal(explicit, P.regression_borders(50, 4, seed=3))
+
+
+def test_prior_rejects_sizes_it_cannot_draw():
+    import pytest
+
+    with pytest.raises(ValueError, match="max_cells"):
+        P.TabPFNv2Prior(
+            "regression", min_train_rows=60_000, max_train_rows=60_000, max_cells=50_000
+        )
+    with pytest.raises(ValueError, match="max_train_rows"):
+        P.TabPFNv2Prior("regression", min_train_rows=4096, max_train_rows=2048, max_cells=400_000)

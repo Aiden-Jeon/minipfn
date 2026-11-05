@@ -33,7 +33,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from minipfn.models import save_checkpoint
+from minipfn.models import DEFAULT_MODEL_TYPE, config_dict, model_class, save_checkpoint
 from minipfn.models.bar_distribution import FullSupportBarDistribution
 from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
@@ -138,6 +138,29 @@ def checkpoint_lr(path: str | Path) -> float:
     return float(state["scheduler"]["base_lrs"][0])
 
 
+def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
+    """`state`(학습 중 checkpoint 또는 `save_checkpoint` 파일)가 `config`와 같은 task·모델인지.
+
+    모양이 같은 다른 설정(head 수 등)은 `load_state_dict`가 그대로 읽어 버리므로 미리 맞춰 본다.
+    모델 설정을 남기기 전의 학습 중 checkpoint는 task만 본다.
+    """
+    regression = state.get("borders") is not None
+    if regression != (config.task == "regression"):
+        got = "regression" if regression else "classification"
+        raise ValueError(f"{name}은 {got} checkpoint다 (설정의 task: {config.task})")
+    if "config" not in state:
+        return
+    saved_type = state.get("model_type", DEFAULT_MODEL_TYPE)
+    if saved_type != config.model_type:
+        raise ValueError(f"{name}은 {saved_type} 모델이다 (설정의 model_type: {config.model_type})")
+    # 적지 않은 필드(기본값이라 빠진 것, 저장한 뒤에 생긴 것)는 그 기본값으로 채워 비교한다
+    saved = model_class(saved_type).config_class(**state["config"]).to_dict()
+    expected = config.model_config().to_dict()
+    diff = {k: (saved.get(k), v) for k, v in expected.items() if saved.get(k) != v}
+    if diff:
+        raise ValueError(f"{name}의 모델 설정이 이번 설정과 다르다 (저장된 값, 설정): {diff}")
+
+
 def check_resume_step(path: str | Path, config: TrainConfig) -> None:
     """이어 갈 checkpoint의 step이 이번에 멈출 step보다 앞인지. 아니면 학습할 것이 없다.
 
@@ -206,12 +229,14 @@ def train(
         raise ValueError("resume_from과 init_from은 함께 줄 수 없다")
     if init_from is not None:
         state = torch.load(init_from, map_location=device, weights_only=True)
+        check_checkpoint(state, config, "init_from")
         # 학습 중 checkpoint는 "model", `save_checkpoint`로 저장한 파일은 "state_dict"
         model.load_state_dict(state["model"] if "model" in state else state["state_dict"])
         borders = state["borders"]
     if resume_from is not None:
         check_resume_step(resume_from, config)
         state = torch.load(resume_from, map_location=device, weights_only=True)
+        check_checkpoint(state, config, "resume_from")
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         sched.load_state_dict(state["scheduler"])
@@ -469,6 +494,9 @@ def train(
         suspect = guard is not None and guard.suspect  # 무너지는 중일 수 있는 상태는 남기지 않는다
         if d.is_main and (done % config.checkpoint_every == 0 or keep or last) and not suspect:
             state = {
+                # 모델 종류와 설정 (학습 run param 없이도 이 파일만으로 모델을 만든다)
+                "model_type": config.model_type,
+                "config": config_dict(model.config),
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),

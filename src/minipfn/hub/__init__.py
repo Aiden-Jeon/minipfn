@@ -31,13 +31,15 @@ from minipfn.models import (
     build_model,
     config_dict,
     config_fields,
-    load_checkpoint,
+    model_from_state,
 )
 
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 BORDERS_KEY = "borders"
 HUB_PREFIX = "hf://"
+# 모델 설정을 checkpoint에 남기기 전의 학습 run에서 꼭 있어야 하는 param
+_REQUIRED_RUN_PARAMS = ("emsize", "nlayers", "nhead")
 
 
 def _model_params(model_type: str) -> tuple[str, ...]:
@@ -114,8 +116,9 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
       branch·tag·commit에서 받는다(예: `hf://owner/name@step-100k`)
     - `save_pretrained`로 만든 로컬 폴더, `minipfn.models.save_checkpoint`로 저장한 파일
 
-    학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
-    그 run에 기록된 param(task·model_type과 모델 구조 설정)으로 모델을 만든다.
+    학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)는 그 안에 남긴 모델
+    종류와 설정으로 모델을 만든다. 그것을 남기기 전의 v2·2.5 학습 checkpoint만 그 run에 기록된
+    param(task·emsize·nlayers·nhead와 2.5 구조 설정)으로 만든다.
     """
     import mlflow  # MLflow를 쓰는 경로에서만 불러온다 (Hub에서 받기만 할 때는 필요 없다)
 
@@ -134,7 +137,7 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
         return _check_task(from_pretrained(path), task, spec)
     state = torch.load(path, map_location="cpu", weights_only=True)
     if "config" in state:
-        return _check_task(load_checkpoint(path), task, spec)
+        return _check_task(model_from_state(state), task, spec)
     if run_id is None:
         raise SystemExit(
             f"{spec}는 학습 중 checkpoint라 모델 설정이 없다. runs:/<run_id>/...로 준다."
@@ -142,6 +145,13 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
     params = mlflow.MlflowClient().get_run(run_id).data.params
     if params["task"] != task:
         raise SystemExit(f"{spec}는 {params['task']} 모델이다 ({task} 모델이 필요하다).")
+    # 모델 설정을 checkpoint에 남기기 전의 run이라 v2·2.5다. 크기 param은 처음부터 기록했으니
+    # 없으면 기록이 덜 된 run이다. 2.5 구조 param은 2.5 이전 run에 없으므로 v2 기본값을 쓴다
+    if params.get("model_type", DEFAULT_MODEL_TYPE) != DEFAULT_MODEL_TYPE:
+        raise SystemExit(f"{spec}에 모델 설정이 없다 (model_type {params['model_type']}).")
+    missing = [name for name in _REQUIRED_RUN_PARAMS if name not in params]
+    if missing:
+        raise SystemExit(f"{spec}의 run에 모델 param {missing}이 없다.")
     model = replace(TrainConfig(task=params["task"]), **run_architecture(params)).build_model()
     model.load_state_dict(state["model"])
     return model.eval(), state["borders"]
