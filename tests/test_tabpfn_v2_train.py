@@ -9,7 +9,7 @@ from minipfn.models import load_checkpoint
 from minipfn.models.cell_transformer import CellTransformer
 from minipfn.recipes import tabpfn_v2 as recipe
 from minipfn.training.config import TrainConfig
-from minipfn.training.loop import _make_val_batches, checkpoint_lr, train
+from minipfn.training.loop import _make_val_batches, check_source_checkpoint, train
 from minipfn.training.losses import dequantize_targets
 from minipfn.training.stability import CollapseGuard, apply_qk_clip, qk_logit_bounds
 from minipfn.utils import lr_factor
@@ -242,7 +242,8 @@ def test_each_collapse_lowers_the_lr_by_the_rewind_factor(
     assert abs(state["scheduler"]["base_lrs"][0] - base) < 1e-15
     expected = base * lr_factor(50, config.warmup_steps, config.steps)
     assert abs(state["optimizer"]["param_groups"][0]["lr"] - expected) < 1e-12
-    assert abs(checkpoint_lr(tmp_path / "latest.pt") - base) < 1e-15  # 다음 chunk가 이어 간다
+    # 다음 chunk가 이어 간다 (마지막 step의 checkpoint라 이어 갈 step 검사는 뺀다)
+    assert abs(check_source_checkpoint(tmp_path / "latest.pt", config, resume=False) - base) < 1e-15
 
 
 def test_paper_preset_clips_qk_only_for_regression():
@@ -306,7 +307,8 @@ def test_collapse_guard_counts_windows_without_finite_loss():
 def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
     config = replace(TrainConfig.smoke("classification"), steps=10, log_every=1)
     train(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
-    assert checkpoint_lr(tmp_path / "a" / "latest.pt") == config.lr  # lr을 안 주면 이 값을 쓴다
+    # lr을 안 주면 이 값을 쓴다
+    assert check_source_checkpoint(tmp_path / "a" / "latest.pt", config, resume=True) == config.lr
     lower = replace(config, lr=config.lr / 2)
     train(
         replace(lower, stop_step=6),
@@ -496,12 +498,18 @@ def test_train_script_checks_the_source_checkpoint_before_the_run(tmp_path):
     script._check_source(latest, config, resume=False)  # 가중치만 가져오는 것은 step과 상관없다
 
 
-def test_with_architecture_sets_the_long_table_micro_batch():
-    # 긴 표 설정의 구조를 나중에 바꿔도 그 구조의 micro batch가 따라온다 (2.5에 2면 GPU 메모리 초과)
+def test_long_tables_sets_the_micro_batch_of_its_architecture():
+    assert recipe.long_tables("regression", arch="v2.5").micro_batch == 1
+    assert recipe.long_tables("regression", arch="v2").micro_batch == 2
+
+
+def test_with_architecture_keeps_the_micro_batch():
+    # 구조만 바꾸고 micro batch는 건드리지 않는다 (긴 표 값은 long_tables가 구조마다 정한다)
     v25 = recipe.with_architecture(recipe.long_tables("regression"), "v2.5")
-    assert v25 == recipe.long_tables("regression", arch="v2.5") and v25.micro_batch == 1
-    assert recipe.with_architecture(v25, "v2").micro_batch == 2
-    # 긴 표가 아니면 micro batch는 그대로 (paper 8)
+    assert v25.micro_batch == 2 and v25.nlayers == 18
+    v25_long = recipe.long_tables("regression", arch="v2.5")
+    assert recipe.with_architecture(v25_long, "v2").micro_batch == 1
+    # 긴 표가 아니어도 그대로 (paper 8)
     assert recipe.with_architecture(recipe.paper(), "v2.5").micro_batch == 8
 
 

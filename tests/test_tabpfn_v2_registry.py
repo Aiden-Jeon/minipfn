@@ -209,7 +209,7 @@ def test_init_and_resume_need_the_same_task_and_model(tmp_path):
         regression = replace(TrainConfig.smoke("regression"), steps=2)
         train(regression, tmp_path / "c", init_from=latest, mlflow_log=False)
     # 같은 설정이면 그대로 읽는다 (save_checkpoint 파일도)
-    final = tmp_path / "a" / "tabpfn_v2_final.pt"
+    final = tmp_path / "a" / "final.pt"
     train(replace(config, steps=1), tmp_path / "d", init_from=final, mlflow_log=False)
 
 

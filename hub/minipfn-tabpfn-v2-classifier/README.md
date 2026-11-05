@@ -11,7 +11,7 @@ tags:
 
 # minipfn TabPFN v2 classifier (reproduction)
 
-A from-scratch reimplementation of the TabPFN v2 classifier (Hollmann et al., [Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6), Nature 637, 2025). The model and inference follow the paper's Methods, and the training data come from the open TabICL prior. Code: [Aiden-Jeon/minipfn](https://github.com/Aiden-Jeon/minipfn) (model `src/minipfn/models/tabpfn_v2.py`, training settings `src/minipfn/recipes/tabpfn_v2.py`).
+A from-scratch reimplementation of the TabPFN v2 classifier (Hollmann et al., [Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6), Nature 637, 2025). The model and inference follow the paper's Methods, and the training data come from the open TabICL prior. Code: [Aiden-Jeon/minipfn](https://github.com/Aiden-Jeon/minipfn) (model `src/minipfn/models/cell_transformer.py`, training settings `src/minipfn/recipes/tabpfn_v2.py`).
 
 This is not the official TabPFN v2 checkpoint, and it uses no official code or weights. For the official models see [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN).
 
@@ -122,7 +122,7 @@ In the benchmark script, write the branch after `@`: `--classifier-path hf://aid
 ## Files
 
 - `model.safetensors`: weights
-- `config.json`: model size (`TabPFNv2Config`), task, and the training checkpoint the weights came from
+- `config.json`: model size (`CellTransformerConfig` fields), task, and the training checkpoint the weights came from
 - `images/`: figures used in this card
 
 ## License

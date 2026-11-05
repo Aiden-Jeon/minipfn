@@ -50,7 +50,7 @@ import mlflow  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.training.config import TrainConfig  # noqa: E402
-from minipfn.training.loop import check_source_checkpoint, checkpoint_lr, train  # noqa: E402
+from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
 # 일반 크기(smoke, medium)는 TrainConfig에, 논문 설정(paper, long_tables)은 recipe에 있다
@@ -182,10 +182,11 @@ def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
     return config
 
 
-def _check_source(path: str, config: TrainConfig, *, resume: bool) -> None:
-    # MLflow run을 열기 전에 본다 (원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않도록)
+def _check_source(path: str, config: TrainConfig, *, resume: bool) -> float:
+    # MLflow run을 열기 전에 본다 (원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않도록).
+    # 기준 lr도 이 한 번의 읽기로 돌려준다
     try:
-        check_source_checkpoint(path, config, resume=resume)
+        return check_source_checkpoint(path, config, resume=resume)
     except ValueError as e:
         raise SystemExit(str(e)) from None
 
@@ -239,8 +240,7 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
-        _check_source(resume_path, config, resume=True)
-        saved_lr = checkpoint_lr(resume_path)
+        saved_lr = _check_source(resume_path, config, resume=True)
         if args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
             config = replace(config, lr=saved_lr)

@@ -17,7 +17,8 @@ Hub repo id(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 �
 test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint마다 모드가 달라지면 step별 곡선을
 견줄 수 없어서다. one-hot으로 펼칠 열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하인 범주형 열)이 없는
 데이터셋은 모드와 상관없이 결과가 같아 한 번만 평가하고, 그 결과를 다른 모드에도 `reused=True`로
-쓴다.
+쓴다. 펼칠 열이 있는지는 fold마다 그 fold의 학습 행으로 본다
+(추론이 멤버 전처리를 학습 행으로 맞추므로).
 
 앙상블 멤버의 전처리는 `--member-kinds`로 고른다(기본 v2의 quantile,power. `v2.5`는 TabPFN-2.5의
 robust scaling + soft clipping을 쓰는 quantile,robust). TabPFN-2.5 checkpoint를 로컬에서
@@ -43,8 +44,13 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
-from minipfn.inference.ensemble import DEFAULT_ONE_HOT
-from minipfn.inference.preprocessing import ONE_HOT_MODES, one_hot_kinds, one_hot_sizes
+from minipfn.inference.ensemble import DEFAULT_ONE_HOT, max_features_of
+from minipfn.inference.preprocessing import (
+    ONE_HOT_MODES,
+    one_hot_kinds,
+    one_hot_sizes,
+    to_numeric,
+)
 from minipfn.priors.table_size import MAX_FEATURES
 from minipfn.recipes.tabpfn_v2 import (
     MEMBER_KINDS_V2,
@@ -105,17 +111,29 @@ def headline_mode(modes: list[str]) -> str:
     return DEFAULT_ONE_HOT if DEFAULT_ONE_HOT in modes else modes[0]
 
 
-def expands_one_hot(task: bm.OpenMLTask, max_width: int = MAX_FEATURES) -> bool:
-    """one-hot 모드에 따라 결과가 달라질 수 있는지.
+def fold_expands_one_hot(X: pd.DataFrame, categorical_indices: list[int], max_width: int) -> bool:
+    """학습 행 하나에서 추론이 범주형 열을 펼칠 열이 있는지.
+    `MemberPreprocessor.fit`과 같은 규칙이다: `to_numeric`으로 번호를 매긴 뒤
+    (범주 수는 학습 행의 범주만 센다) `one_hot_sizes`가 고른 열이 하나라도 있으면 펼친다."""
+    X_num, cat_ix, _ = to_numeric(X, categorical_indices)
+    n_categories = {
+        i: int(np.nanmax(X_num[:, i])) + 1 if np.isfinite(X_num[:, i]).any() else 1 for i in cat_ix
+    }
+    return bool(one_hot_sizes(n_categories, X_num.shape[1], max_width))
 
-    추론이 범주형으로 다루는 열(`categorical_indices`이거나 숫자가 아닌 열) 가운데 추론이 펼칠
-    열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하이고, 펼친 폭이 상한 `max_width` 안)이 있는지 본다
-    (전체 행 기준). 상한은 모델이 학습 때 본 feature 수다(`model.config.max_features`).
+
+def expands_one_hot(task: bm.OpenMLTask, max_width: int = MAX_FEATURES, n_folds: int = 10) -> bool:
+    """one-hot 모드에 따라 결과가 달라질 수 있는지: 어느 fold의 학습 행에서든 펼칠 열이 있으면 True.
+
+    전체 행으로 보면 안 된다. 범주가 전체로는 `MAX_ONE_HOT_CATEGORIES`개를 넘어도
+    fold의 학습 행에서는 그 이하일 수 있고, 멤버 전처리는 fold마다 학습 행으로 맞춘다.
+    `n_folds`는 평가에 쓰는 fold 수와 같아야 한다. 상한 `max_width`는 모델이 학습 때 본
+    feature 수다 (`max_features_of`).
     """
-    X = task.X
-    cat = set(task.categorical_indices)
-    cat |= {i for i, dtype in enumerate(X.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
-    return bool(one_hot_sizes({i: X.iloc[:, i].nunique() for i in cat}, X.shape[1], max_width))
+    return any(
+        fold_expands_one_hot(task.X.iloc[train_ix], task.categorical_indices, max_width)
+        for _, train_ix, _ in task.folds(n_folds)
+    )
 
 
 def same_result_modes(
@@ -168,7 +186,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             return TabPFNv2Classifier(model, **kw)
         return TabPFNv2Regressor(model, borders, **kw)
 
-    make.max_one_hot_width = model.config.max_features  # expands_one_hot이 같은 상한을 쓰도록
+    make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     return make
 
 
@@ -218,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
         start = time.time()
         task = bm.load_openml_task(task_id)
         scores = {}
-        expands = expands_one_hot(task, factories[suite].max_one_hot_width)
+        expands = expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
         for group in same_result_modes(args.one_hot, args.member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
             make = functools.partial(factories[suite], one_hot=group[0])

@@ -166,15 +166,17 @@ class GraphSCMPrior:
         return PriorBatch(torch.stack(xs), torch.stack(ys), n_train)
 
 
-SIZE_FIELDS = (
-    "min_train_rows",
-    "max_train_rows",
-    "n_eval_rows",
-    "max_features",
-    "log_uniform_rows",
-    "max_cells",
-    "feature_scale",
-)
+# 데이터셋 크기 규칙 필드와 기본값 (`GraphSCMPrior`의 크기 인자와 같다). 필드 추가는 여기서만
+SIZE_DEFAULTS = {
+    "min_train_rows": 1,
+    "max_train_rows": MAX_TRAIN_ROWS,
+    "n_eval_rows": N_EVAL_ROWS,
+    "max_features": MAX_FEATURES,
+    "log_uniform_rows": False,
+    "max_cells": MAX_CELLS,
+    "feature_scale": MAX_FEATURES,
+}
+SIZE_FIELDS = tuple(SIZE_DEFAULTS)
 
 
 def _sizes(config) -> dict:
@@ -241,34 +243,24 @@ def regression_borders(
     seed: int = 0,
     *,
     n_jobs: int = 1,
-    max_train_rows: int = MAX_TRAIN_ROWS,
-    n_eval_rows: int = N_EVAL_ROWS,
-    max_features: int = MAX_FEATURES,
-    min_train_rows: int = 1,
-    log_uniform_rows: bool = False,
-    max_cells: int = MAX_CELLS,
-    feature_scale: int = MAX_FEATURES,
+    **sizes,
 ) -> torch.Tensor:
     """회귀 출력 구간의 경계 (Methods "Regression details").
 
     prior에서 데이터셋을 많이 뽑아 z-정규화한 target을 모으고, 그 분포의 1/n_buckets 분위수들을
     경계로 쓴다. 양 끝은 half-normal 꼬리가 맡는다(`FullSupportBarDistribution`).
     같은 값이 많은 데이터셋(이산화한 target, 4σ에서 잘린 값)이 분위수를 끌어당겨 폭이 0에 가까운
-    구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함). 데이터셋 크기 인자는
-    `GraphSCMPrior`와 같고, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
+    구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함).
+    데이터셋 크기 인자는 `SIZE_FIELDS` 이름의 키워드로 주고, 빠지면 `SIZE_DEFAULTS`를 쓴다.
+    `GraphSCMPrior`와 같은 뜻이며, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
     """
+    unknown = set(sizes) - set(SIZE_DEFAULTS)
+    if unknown:
+        raise TypeError(f"regression_borders에 없는 크기 인자: {sorted(unknown)}")
     # n_jobs개 프로세스로 나눠 만든다 (프로세스마다 시드가 다르다)
-    sizes = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]
-    table = {
-        "min_train_rows": min_train_rows,
-        "max_train_rows": max_train_rows,
-        "n_eval_rows": n_eval_rows,
-        "max_features": max_features,
-        "log_uniform_rows": log_uniform_rows,
-        "max_cells": max_cells,
-        "feature_scale": feature_scale,
-    }
-    jobs = [(n, seed + i, table) for i, n in enumerate(sizes)]
+    counts = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]
+    table = {**SIZE_DEFAULTS, **sizes}
+    jobs = [(n, seed + i, table) for i, n in enumerate(counts)]
     if n_jobs == 1:
         targets = _border_targets(jobs[0])
     else:

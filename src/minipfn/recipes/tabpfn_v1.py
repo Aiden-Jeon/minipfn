@@ -69,7 +69,7 @@ PAPER_N_PARAMETERS = 25_820_000  # 논문 E.1: 25.82M
 # ---------------------------------------------------------------------------
 SEQ_LEN = 1152  # bptt = 1024 + 128 (v1)
 # single_eval_pos(학습 행 수) ~ Uniform{1, ..., 999}.
-# v1은 0부터 뽑는다 (prior.TabPFNPriorDataset 참고).
+# v1은 0부터 뽑는다 (minipfn.training.data.PriorGroups 참고: 1부터 뽑는 이유도 거기 적혀 있다).
 MAX_EVAL_POS = 1000
 # 한 forward batch의 데이터셋 8개가 prior 하이퍼파라미터를 공유한다 (v1)
 DATASETS_PER_PRIOR_GROUP = 8

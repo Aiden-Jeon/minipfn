@@ -124,12 +124,6 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
         print(f"lr: 기준 {old:.2e} → {lr:.2e} (step {step}부터 {lr * factor:.3e})", flush=True)
 
 
-def checkpoint_lr(path: str | Path) -> float:
-    """checkpoint가 쓰던 기준 lr. 이어서 학습할 때 lr을 따로 주지 않으면 이 값을 이어 간다."""
-    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    return float(state["scheduler"]["base_lrs"][0])
-
-
 def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     """`state`(학습 중 checkpoint 또는 `save_checkpoint` 파일)가 `config`와 같은 task·모델인지.
 
@@ -176,14 +170,18 @@ def check_resume_step(state: dict, config: TrainConfig) -> None:
         )
 
 
-def check_source_checkpoint(path: str | Path, config: TrainConfig, *, resume: bool) -> None:
+def check_source_checkpoint(path: str | Path, config: TrainConfig, *, resume: bool) -> float:
     """이어 가거나(`resume`) 가중치를 가져올 checkpoint를 이 설정으로 쓸 수 있는지 미리 본다
     (task·모델·이어 갈 step). `train`도 같은 것을 보지만, 학습 스크립트는 MLflow run을 열기 전에
-    불러서 원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않는다. 틀리면 ValueError."""
+    불러서 원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않는다. 틀리면 ValueError.
+
+    반환값은 checkpoint가 쓰던 기준 lr이다. 이어서 학습할 때 lr을 따로 주지 않으면 이 값을 잇는다.
+    checkpoint는 이 함수에서 한 번만 읽는다(mmap)."""
     state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     check_checkpoint(state, config, "resume_from" if resume else "init_from")
     if resume:
         check_resume_step(state, config)
+    return float(state["scheduler"]["base_lrs"][0])
 
 
 def _to_cpu(obj):
@@ -216,7 +214,40 @@ def train(
     `snapshot_every`마다 메모리에 남긴 건강한 상태로 되돌리고 데이터 시드를 바꿔 다시 간다
     (MLflow `rewinds`). 붕괴 중일 수 있는 상태는 checkpoint로 남기지 않는다.
     """
+    # 인자만 보고 알 수 있는 잘못은 분산 프로세스 그룹을 열기 전에 막는다
+    if resume_from is not None and init_from is not None:
+        raise ValueError("resume_from과 init_from은 함께 줄 수 없다")
     d, device = setup_distributed()
+    try:
+        return _train(
+            config,
+            out_dir,
+            d,
+            device,
+            resume_from=resume_from,
+            mlflow_log=mlflow_log,
+            init_from=init_from,
+        )
+    except BaseException:
+        # 모델을 만든 뒤의 검사(QK-clip, checkpoint 모양)에서 멈추면 다른 GPU가 기다리므로
+        # 프로세스 그룹을 닫고 올린다 (정상 경로는 `_train` 끝에서 닫는다)
+        if d.world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
+        raise
+
+
+def _train(
+    config: TrainConfig,
+    out_dir: str | Path,
+    d: DistContext,
+    device: torch.device,
+    *,
+    resume_from: str | Path | None,
+    mlflow_log: bool,
+    init_from: str | Path | None,
+) -> dict:
+    """`train`의 본체. 프로세스 그룹은 `train`이 연다.
+    정상으로 끝나면 여기서, 실패하면 `train`이 닫는다."""
     config = config.for_world_size(d.world_size)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -235,8 +266,6 @@ def train(
     )
     start_step, skipped_steps, borders, rewinds = 0, 0, None, 0
     history: dict[str, list] = {"step": [], "train_loss": [], "val_step": [], "val_loss": []}
-    if resume_from is not None and init_from is not None:
-        raise ValueError("resume_from과 init_from은 함께 줄 수 없다")
     if init_from is not None:
         state = torch.load(init_from, map_location=device, weights_only=True)
         check_checkpoint(state, config, "init_from")
@@ -532,7 +561,7 @@ def train(
         if guard is not None and done % config.snapshot_every == 0 and not guard.suspect:
             snapshot(done)
 
-    final_path = out_dir / "tabpfn_v2_final.pt"
+    final_path = out_dir / "final.pt"
     if d.is_main:
         save_checkpoint(final_path, model, None if borders is None else borders.cpu())
         (out_dir / "history.json").write_text(json.dumps(history))

@@ -25,7 +25,6 @@ from torch import nn
 from minipfn.inference import ensemble
 from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
-from minipfn.priors.table_size import MAX_CELLS
 
 if TYPE_CHECKING:
     from minipfn.training.config import TrainConfig
@@ -84,8 +83,8 @@ def long_tables(task: str = "classification", arch: str = "v2") -> TrainConfig:
     feature 2,000). 그 크기로 처음부터 학습하는 대신 TabICL처럼 짧은 표로 오래 학습한 뒤 긴 표로
     잠깐 더 학습한다: 학습 행 512~8,192개 log 균등, feature 수 분포를 500까지 펴고, 셀은
     400,000개까지. 가중치만 가져와(`init_from`) 새 optimizer로 lr 5e-5, warmup 1k + cosine
-    20k step. 검증 batch는 데이터셋 4개다. GPU당 micro batch는 구조가 정한다(`with_architecture`,
-    `LONG_TABLES_MICRO_BATCH`).
+    20k step. 검증 batch는 데이터셋 4개다. GPU당 micro batch는 구조에 맞춰
+    `LONG_TABLES_MICRO_BATCH`로 정한다.
     """
     if arch not in LONG_TABLES_MICRO_BATCH:
         raise ValueError(f"long_tables의 arch는 {tuple(LONG_TABLES_MICRO_BATCH)} 가운데서: {arch}")
@@ -103,7 +102,7 @@ def long_tables(task: str = "classification", arch: str = "v2") -> TrainConfig:
         lr=5e-5,
         keep_every=5_000,
     )
-    return with_architecture(sizes, arch)
+    return replace(with_architecture(sizes, arch), micro_batch=LONG_TABLES_MICRO_BATCH[arch])
 
 
 def _model_changes(config: TrainConfig, arch: str, keep_size: bool) -> dict:
@@ -129,14 +128,10 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
     바꿔 학습하지 않도록). `keep_size`(smoke)면 층 수는 그대로 두고 thinking 행은 4개까지만 써서
     작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다).
 
-    긴 표 설정(셀 상한이 v2 논문의 `MAX_CELLS`보다 큰 것, `long_tables`)이면 GPU당 micro batch도
-    구조에 맞춘다(`LONG_TABLES_MICRO_BATCH`). 그래서 긴 표 설정의 구조를 나중에 바꿔도 메모리에 맞는
-    micro batch가 따라온다. 인자로 준 micro batch는 그 뒤에 덮어쓴다(학습 스크립트).
+    micro batch는 건드리지 않는다. 긴 표의 micro batch는 `long_tables`가 구조에 맞춰 정하고
+    (`LONG_TABLES_MICRO_BATCH`), 구조만 바꾸면 그 값이 그대로 남는다.
     """
-    changes = _model_changes(config, arch, keep_size)
-    if config.max_cells > MAX_CELLS and arch in LONG_TABLES_MICRO_BATCH:
-        changes["micro_batch"] = LONG_TABLES_MICRO_BATCH[arch]
-    return replace(config, **changes)
+    return replace(config, **_model_changes(config, arch, keep_size))
 
 
 # ---------------------------------------------------------------------------

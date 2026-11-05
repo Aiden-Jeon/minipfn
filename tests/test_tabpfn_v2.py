@@ -265,3 +265,20 @@ def test_one_hot_width_follows_the_feature_count_the_model_was_trained_on():
     assert recipe.TabPFNv2Classifier(model).max_one_hot_width == 500
     assert recipe.TabPFNv2Classifier(_tiny_model()).max_one_hot_width == MAX_ONE_HOT_WIDTH
     assert recipe.TabPFNv2Classifier(model, max_one_hot_width=30).max_one_hot_width == 30
+
+
+def test_max_one_hot_width_falls_back_to_the_default_without_config_max_features():
+    # registry 규약만 지키는 모델은 config에 max_features가 없어도 추론이 돌아야 한다
+    from types import SimpleNamespace
+
+    from minipfn.inference.ensemble import max_features_of
+
+    class NoMaxFeatures(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(n_out=10)
+
+    model = NoMaxFeatures()
+    assert max_features_of(_tiny_model()) == MAX_ONE_HOT_WIDTH
+    assert max_features_of(model) == MAX_ONE_HOT_WIDTH  # MAX_FEATURES(160)
+    assert TabPFNv2Classifier(model).max_one_hot_width == MAX_ONE_HOT_WIDTH

@@ -18,10 +18,12 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   범주형 열은 번호를 섞음 (2) Yeo-Johnson power transform
 - 수치형 열에서 평균으로부터 표준편차 12배 밖의 값은 그 경계로 자른다
 - (`one_hot`을 주면) 범주형 열을 one-hot으로 펼친다. 논문 전처리 목록의 6번인데, 어느 멤버에 어떤
-  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 power 멤버만(분위수 멤버는 번호 섞기를
-  그대로), `"all"`은 모든 멤버. 범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
-  펼친 뒤 열 수가 `max_one_hot_width`(기본: 모델 설정의 `max_features`, 학습 때 본 feature 수)를
-  넘으면 범주가 많은 열부터 번호로 되돌린다. 범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던
+  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 분위수가 아닌 멤버(power·robust)만
+  (분위수 멤버는 번호 섞기를 그대로), `"all"`은 모든 멤버.
+  범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
+  펼친 뒤 열 수가 `max_one_hot_width`(기본: 모델 설정의 `max_features`, 학습 때 본 feature 수.
+  설정에 없으면 `MAX_FEATURES`)를 넘으면 범주가 많은 열부터 번호로 되돌린다.
+  범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던
   범주(번호로 바꿀 때 결측이 된다)는 NaN. 기본값 `DEFAULT_ONE_HOT`은 분류·회귀 모두 `"all"`이다.
   세 모드(off·power·all)를 benchmark에서 견줬을 때 분류는 suite 평균 ROC AUC(500k 0.9235 →
   0.9238), 회귀는 one-hot으로 결과가 바뀌는 11개에서 off 대비 RMSE 비율의 기하평균(QK-clip 200k,
@@ -75,6 +77,7 @@ from minipfn.inference.preprocessing import (
     one_hot_kinds,
     to_numeric,
 )
+from minipfn.priors.table_size import MAX_FEATURES
 
 DEFAULT_ONE_HOT = "all"
 SOFTMAX_TEMPERATURE = 0.9
@@ -98,6 +101,13 @@ def resolve_member_kinds(
     return kinds
 
 
+def max_features_of(model: nn.Module) -> int:
+    """모델이 학습 때 본 feature 수 상한 (`config.max_features`).
+    registry 규약에는 없는 값이라 없으면 `MAX_FEATURES`(논문 prior의 feature 수 상한)를 쓴다.
+    추론 기본값과 평가 스크립트가 이 함수를 같이 쓴다."""
+    return getattr(model.config, "max_features", MAX_FEATURES)
+
+
 class _Base:
     def __init__(
         self,
@@ -119,7 +129,7 @@ class _Base:
         self.softmax_temperature = softmax_temperature
         # one-hot으로 펼친 뒤 열 수의 상한: 모델이 학습 때 본 feature 수 (모델 설정의 max_features)
         if max_one_hot_width is None:
-            max_one_hot_width = model.config.max_features
+            max_one_hot_width = max_features_of(model)
         self.max_one_hot_width = max_one_hot_width
         self.model = model
         self.n_estimators = n_estimators

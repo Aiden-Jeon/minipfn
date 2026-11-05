@@ -4,7 +4,9 @@
 #   databricks air run -f scripts/tabpfn_v2_5/eval.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
 #     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--suite classification \
 #       --classifier-path runs:/<run_id>/checkpoints/step_0100000.pt"
-# 학습 중 checkpoint의 구조(층 수, thinking 행 등)는 그 run에 기록된 param에서 읽는다.
+# 모델 구조(층 수, thinking 행 등)는 checkpoint의 model_config(model_type과 설정)에서 읽는다.
+# 그 설정을 남기기 전의 학습 checkpoint(v2·2.5)만 run의 MLflow param에서 만든다
+# (minipfn.hub.load_model: 없는 2.5 구조 param은 v2 기본값).
 experiment_name: tabpfn-v2-5-reproduction
 mlflow_run_name: tabpfn-v2-5-eval
 environment:
