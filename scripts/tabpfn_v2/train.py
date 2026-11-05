@@ -26,6 +26,8 @@ ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 
 `--resume-run-id`(또는 `TABPFN_V2_RESUME_RUN_ID`)를 주면 그 run의 `checkpoints/latest.pt`에서
 이어서 학습한다. `--resume-step`(또는 `TABPFN_V2_RESUME_STEP`)을 같이 주면 그 step에 남긴
 `checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).
+`--init-run-id`(또는 `TABPFN_V2_INIT_RUN_ID`, 남긴 step은 `TABPFN_V2_INIT_STEP`)는 그 run의
+checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--config-name long_tables`로 긴 표 학습).
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -52,7 +54,7 @@ from minipfn.tabpfn_v2.train import (  # noqa: E402
 )
 from minipfn.utils import log_run_source  # noqa: E402
 
-CONFIG_NAMES = ("smoke", "medium", "paper")
+CONFIG_NAMES = ("smoke", "medium", "paper", "long_tables")
 
 
 def _env(name: str, cast=str):
@@ -100,10 +102,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--qk-clip", default=os.environ.get("TABPFN_V2_QK_CLIP") or None)
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
+    parser.add_argument("--init-run-id", default=os.environ.get("TABPFN_V2_INIT_RUN_ID"))
+    parser.add_argument("--init-step", type=int, default=_env("TABPFN_V2_INIT_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
     args = parser.parse_args(argv)
     if args.resume_step is not None and not args.resume_run_id:
         parser.error("--resume-step은 --resume-run-id와 같이 줘야 한다")
+    if args.init_step is not None and not args.init_run_id:
+        parser.error("--init-step은 --init-run-id와 같이 줘야 한다")
+    if args.init_run_id and args.resume_run_id:
+        parser.error("--init-run-id와 --resume-run-id는 함께 줄 수 없다")
     return args
 
 
@@ -154,6 +162,15 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    init_path = None
+    if args.init_run_id:
+        name = "latest.pt" if args.init_step is None else f"step_{args.init_step:07d}.pt"
+        init_path = mlflow.artifacts.download_artifacts(
+            run_id=args.init_run_id,
+            artifact_path=f"checkpoints/{name}",
+            dst_path=str(out_dir / f"init_rank{rank}"),
+        )
+
     resume_path = None
     if args.resume_run_id:
         name = "latest.pt" if args.resume_step is None else f"step_{args.resume_step:07d}.pt"
@@ -187,7 +204,9 @@ def main(argv: list[str] | None = None) -> None:
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)
         log_run_source(__file__, env_prefix="TABPFN_V2_")
 
-    result = train_tabpfn_v2(config, out_dir, resume_from=resume_path, mlflow_log=is_main)
+    result = train_tabpfn_v2(
+        config, out_dir, resume_from=resume_path, mlflow_log=is_main, init_from=init_path
+    )
 
     if is_main:
         mlflow.log_figure(plot_history(result["history"], config.task), "loss_curve.png")

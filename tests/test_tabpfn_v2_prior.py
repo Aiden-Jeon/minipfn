@@ -64,3 +64,35 @@ def test_cell_budget_uses_the_capped_feature_count():
     assert sizes[:, 1].max() <= 8 and sizes[:, 0].max() <= 64
     # feature 8개면 셀 제한(75,000)에 걸리지 않으므로 학습 행이 64개까지 고르게 나온다
     assert (sizes[:, 0] > 48).mean() > 0.2
+
+
+def test_log_uniform_rows_and_larger_cell_budget():
+    rng = np.random.default_rng(0)
+    kw = {"min_train_rows": 512, "log_uniform_rows": True, "max_cells": 400_000}
+    sizes = np.array([P.sample_table_size(rng, 8192, **kw) for _ in range(5000)])
+    n_train, n_features = sizes[:, 0], sizes[:, 1]
+    assert n_train.max() <= 8192 and ((n_train + P.N_EVAL_ROWS) * n_features < 400_000).all()
+    small = n_features <= 40  # 셀 제한에 걸리지 않는 표는 [512, 8192]에서 log 균등
+    assert n_train[small].min() >= 512
+    assert 0.4 < (n_train[small] < 2048).mean() < 0.6  # log 균등이면 2,048(가운데) 아래가 절반
+
+
+def test_uniform_rows_draw_the_same_sizes_as_before():
+    # 이어서 학습하는 논문 규모 run이 같은 시드에서 같은 크기를 뽑도록 기본값은 예전 식 그대로다
+    rng, ref = np.random.default_rng(1), np.random.default_rng(1)
+    for _ in range(200):
+        n_train = int(ref.integers(1, P.MAX_TRAIN_ROWS + 1))
+        n_features = 1 + int(round(ref.beta(*P.FEATURE_BETA) * (P.MAX_FEATURES - 1)))
+        max_train = max(1, (P.MAX_CELLS - 1) // n_features - P.N_EVAL_ROWS)
+        assert P.sample_table_size(rng) == (min(n_train, max_train), n_features)
+
+
+def test_feature_scale_widens_the_feature_distribution():
+    rng_a, rng_b = np.random.default_rng(0), np.random.default_rng(0)
+    paper = [P.sample_table_size(rng_a)[1] for _ in range(2000)]
+    wide = [
+        P.sample_table_size(rng_b, max_features=500, feature_scale=500, max_cells=400_000)[1]
+        for _ in range(2000)
+    ]
+    assert max(paper) <= 160 and max(wide) > 160 and max(wide) <= 500
+    assert np.mean(wide) > 2.5 * np.mean(paper)

@@ -1,0 +1,33 @@
+# TabPFN-2.5 benchmark 평가: v2와 같은 benchmark(논문 v2 Supplementary Tables 1·2의 57개)로 v2와
+# 견준다. 평가 코드는 v2와 같고(scripts/tabpfn_v2/eval.py), 앙상블 멤버 전처리는 기본으로 2.5의
+# robust scaling + soft clipping(quantile,robust)을 쓴다(TABPFN_V2_MEMBER_KINDS, v2 방식은 quantile,power).
+#   databricks air run -f scripts/tabpfn_v2_5/eval.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--suite classification \
+#       --classifier-path runs:/<run_id>/checkpoints/step_0100000.pt"
+# 학습 중 checkpoint의 구조(층 수, thinking 행 등)는 그 run에 기록된 param에서 읽는다.
+experiment_name: tabpfn-v2-5-reproduction
+mlflow_run_name: tabpfn-v2-5-eval
+environment:
+  version: databricks_ai_v6
+  dependencies:
+    - openml>=0.15
+    - huggingface-hub>=0.34
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v2/eval.py
+env_variables:
+  TABPFN_V2_MEMBER_KINDS: v2.5
+  TABPFN_V2_EXTRA_ARGS: ""
+max_retries: 0
+timeout_minutes: 240
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v2/eval.py --suite all
+  --member-kinds $TABPFN_V2_MEMBER_KINDS $TABPFN_V2_EXTRA_ARGS

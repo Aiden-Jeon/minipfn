@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from minipfn.bar_distribution import FullSupportBarDistribution
 from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, save_checkpoint
 from minipfn.tabpfn_v2.prior import (
+    MAX_CELLS,
     MAX_CLASSES,
     MAX_FEATURES,
     MAX_TRAIN_ROWS,
@@ -74,7 +75,8 @@ ARCHITECTURES = {
 
 @dataclass
 class TabPFNv2TrainConfig:
-    """모델·prior·최적화 설정. smoke(로컬 CPU), medium(짧은 실측), paper(논문 규모)."""
+    """모델·prior·최적화 설정. smoke(로컬 CPU), medium(짧은 실측), paper(논문 규모),
+    long_tables(paper로 학습한 모델을 긴·넓은 표로 이어 학습)."""
 
     task: Literal["classification", "regression"] = "classification"
     # 모델 (논문 기본 모델 크기). 아래 셋은 TabPFN-2.5가 바꾼 것(`with_architecture("v2.5")`)
@@ -88,6 +90,11 @@ class TabPFNv2TrainConfig:
     max_train_rows: int = MAX_TRAIN_ROWS
     n_eval_rows: int = N_EVAL_ROWS
     max_features: int = MAX_FEATURES
+    # 아래 넷은 논문에 없음 (long_tables에서 쓴다). 기본값이면 논문 크기 규칙 그대로다
+    min_train_rows: int = 1
+    log_uniform_rows: bool = False  # 학습 행 수를 [min, max]에서 log 균등으로
+    max_cells: int = MAX_CELLS  # 표 하나의 셀 수 상한 (검증 행 포함)
+    feature_scale: int = MAX_FEATURES  # feature 수 분포를 펼 최대값 (sample_table_size)
     missing_dataset_prob: float = 0.3
     border_datasets: int = 20_000  # 회귀 구간 경계를 정할 때 뽑는 데이터셋 수 (여기서 정함)
     # 최적화 (논문: 약 200만 step × batch 64. warmup 길이와 lr은 여기서 정함)
@@ -159,6 +166,33 @@ class TabPFNv2TrainConfig:
         if task == "regression":
             return cls(task=task, rewind_lr_factor=0.5, qk_clip=250.0)
         return cls(task=task)
+
+    @classmethod
+    def long_tables(cls, task: str = "classification") -> TabPFNv2TrainConfig:
+        """paper로 학습한 모델을 더 긴·넓은 표로 짧게 이어 학습한다 (논문에 없음, 값은 여기서 정함).
+
+        TabPFN-2.5는 prior를 "더 많은 행과 feature로 키웠다"고만 적었다(추론 권장 크기는 행 50,000,
+        feature 2,000). 그 크기로 처음부터 학습하는 대신 TabICL처럼 짧은 표로 오래 학습한 뒤 긴 표로
+        잠깐 더 학습한다: 학습 행 512~8,192개 log 균등, feature 수 분포를 500까지 펴고, 셀은
+        400,000개까지. 가중치만 가져와(`init_from`) 새 optimizer로 lr 5e-5, warmup 1k + cosine
+        20k step. v2(12층)는 GPU당 micro batch 2에서 GPU 메모리 52.6GB였는데 2.5는 층이 두 배라
+        micro batch 1로 둔다. 검증 batch는 데이터셋 4개다.
+        """
+        return replace(
+            cls.paper(task),
+            min_train_rows=512,
+            max_train_rows=8192,
+            log_uniform_rows=True,
+            max_features=500,
+            feature_scale=500,
+            max_cells=400_000,
+            micro_batch=1,
+            val_batch=4,
+            steps=20_000,
+            warmup_steps=1_000,
+            lr=5e-5,
+            keep_every=5_000,
+        )
 
     @classmethod
     def medium(cls, task: str = "classification") -> TabPFNv2TrainConfig:
@@ -239,9 +273,13 @@ class TabPFNv2TrainConfig:
             self.task,
             seed=seed,
             missing_dataset_prob=self.missing_dataset_prob,
+            min_train_rows=self.min_train_rows,
             max_train_rows=self.max_train_rows,
             n_eval_rows=self.n_eval_rows,
             max_features=self.max_features,
+            log_uniform_rows=self.log_uniform_rows,
+            max_cells=self.max_cells,
+            feature_scale=self.feature_scale,
         )
 
 
@@ -499,8 +537,12 @@ def train_tabpfn_v2(
     out_dir: str | Path,
     resume_from: str | Path | None = None,
     mlflow_log: bool = True,
+    init_from: str | Path | None = None,
 ) -> dict:
     """prior-fitting을 실행하고 마지막 체크포인트 경로와 loss 기록을 반환한다.
+
+    `resume_from`은 학습 상태 전체(optimizer·스케줄·step)를 이어 가고, `init_from`은 가중치(와
+    회귀 구간 경계)만 가져와 step 0부터 새 optimizer로 시작한다(long_tables).
 
     rank 0만 MLflow에 기록한다. 활성 run이 있으면 거기에 이어서 쓴다(AI Runtime은
     `MLFLOW_RUN_ID`로 run을 넘겨준다). `checkpoint_every` step마다 학습 상태 전체를
@@ -526,6 +568,13 @@ def train_tabpfn_v2(
     )
     start_step, skipped_steps, borders, rewinds = 0, 0, None, 0
     history: dict[str, list] = {"step": [], "train_loss": [], "val_step": [], "val_loss": []}
+    if resume_from is not None and init_from is not None:
+        raise ValueError("resume_from과 init_from은 함께 줄 수 없다")
+    if init_from is not None:
+        state = torch.load(init_from, map_location=device, weights_only=True)
+        # 학습 중 checkpoint는 "model", `save_checkpoint`로 저장한 파일은 "state_dict"
+        model.load_state_dict(state["model"] if "model" in state else state["state_dict"])
+        borders = state["borders"]
     if resume_from is not None:
         state = torch.load(resume_from, map_location=device, weights_only=True)
         model.load_state_dict(state["model"])

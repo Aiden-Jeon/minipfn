@@ -67,16 +67,28 @@ def sample_table_size(
     max_train_rows: int = MAX_TRAIN_ROWS,
     n_eval_rows: int = N_EVAL_ROWS,
     max_features: int = MAX_FEATURES,
+    *,
+    min_train_rows: int = 1,
+    log_uniform_rows: bool = False,
+    max_cells: int = MAX_CELLS,
+    feature_scale: int = MAX_FEATURES,
 ) -> tuple[int, int]:
     """(학습 행 수, feature 수). 셀 수 제한은 실제로 쓰는 feature 수와 검증 행까지 포함해 적용한다.
 
     논문 설정(기본값)에서는 feature 수를 자를 일이 없다. 작은 설정에서 feature 상한을 낮추면
-    잘린 feature 수로 셀 수를 센다.
+    잘린 feature 수로 셀 수를 센다. `log_uniform_rows`면 학습 행 수를 [min, max]에서 log 균등으로
+    뽑는다(논문에 없음. 긴 표로 이어 학습할 때 쓴다, TabICL의 2단계 학습처럼).
     """
-    n_train = int(rng.integers(1, max_train_rows + 1))
-    n_features = 1 + int(round(rng.beta(*FEATURE_BETA) * (MAX_FEATURES - 1)))
+    if log_uniform_rows:
+        log_n = rng.uniform(np.log(min_train_rows), np.log(max_train_rows))
+        n_train = int(round(np.exp(log_n)))
+    else:  # 하한은 TabPFNv2Prior가 나중에 맞춘다 (같은 시드면 예전과 같은 크기를 뽑도록)
+        n_train = int(rng.integers(1, max_train_rows + 1))
+    # feature 수는 Beta(0.95, 8)을 [1, feature_scale]로 편 것 (논문은 160). feature_scale은 논문에
+    # 없음: TabPFN-2.5처럼 feature가 많은 표로 학습할 때 분포 자체를 넓힌다
+    n_features = 1 + int(round(rng.beta(*FEATURE_BETA) * (feature_scale - 1)))
     n_features = min(n_features, max_features)
-    max_train = max(1, (MAX_CELLS - 1) // n_features - n_eval_rows)
+    max_train = max(1, (max_cells - 1) // n_features - n_eval_rows)
     return min(n_train, max_train), n_features
 
 
@@ -107,6 +119,9 @@ class TabPFNv2Prior:
         max_train_rows: int = MAX_TRAIN_ROWS,
         n_eval_rows: int = N_EVAL_ROWS,
         max_features: int = MAX_FEATURES,
+        log_uniform_rows: bool = False,
+        max_cells: int = MAX_CELLS,
+        feature_scale: int = MAX_FEATURES,
     ) -> None:
         self.task = task
         if task == "classification":
@@ -118,6 +133,9 @@ class TabPFNv2Prior:
         self.max_train_rows = max_train_rows
         self.n_eval_rows = n_eval_rows
         self.max_features = max_features
+        self.log_uniform_rows = log_uniform_rows
+        self.max_cells = max_cells
+        self.feature_scale = feature_scale
         # TabICL은 numpy·torch의 전역 난수를 쓴다
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -126,7 +144,14 @@ class TabPFNv2Prior:
 
     def sample_size(self) -> tuple[int, int]:
         n_train, n_features = sample_table_size(
-            self.rng, self.max_train_rows, self.n_eval_rows, self.max_features
+            self.rng,
+            self.max_train_rows,
+            self.n_eval_rows,
+            self.max_features,
+            min_train_rows=self.min_train_rows,
+            log_uniform_rows=self.log_uniform_rows,
+            max_cells=self.max_cells,
+            feature_scale=self.feature_scale,
         )
         return max(n_train, self.min_train_rows), n_features
 

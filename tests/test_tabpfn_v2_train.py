@@ -41,6 +41,34 @@ def test_classification_training_writes_checkpoint_and_resumes(tmp_path):
     assert resumed["history"]["step"][0] == result["history"]["step"][0]  # 이전 기록을 이어 붙인다
 
 
+def test_init_from_takes_only_the_weights(tmp_path):
+    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=4, val_every=2)
+    train_tabpfn_v2(config, tmp_path / "first", mlflow_log=False)
+    init = tmp_path / "first" / "latest.pt"
+    with pytest.raises(ValueError, match="init_from"):
+        train_tabpfn_v2(config, tmp_path / "x", resume_from=init, init_from=init, mlflow_log=False)
+    # step 0으로 학습하면 가중치가 그대로 남는다 (warmup 첫 step의 lr이 0)
+    frozen = replace(config, steps=1, warmup_steps=1, stop_step=1, collapse_threshold=None)
+    result = train_tabpfn_v2(frozen, tmp_path / "second", init_from=init, mlflow_log=False)
+    assert result["history"]["step"] == [1]  # 이전 기록은 이어 붙이지 않는다
+    before = torch.load(init, weights_only=True)["model"]
+    after = torch.load(tmp_path / "second" / "latest.pt", weights_only=True)
+    assert after["step"] == 1 and after["scheduler"]["last_epoch"] == 1
+    for name, tensor in before.items():
+        assert torch.equal(after["model"][name], tensor), name
+
+
+def test_long_tables_preset_keeps_the_paper_model_and_batch():
+    paper, long = TabPFNv2TrainConfig.paper(), TabPFNv2TrainConfig.long_tables()
+    assert long.model_config() == paper.model_config() and long.batch_size == paper.batch_size
+    assert long.grad_accumulation(8) == 8 and long.max_train_rows == 8192
+    assert long.max_features == long.feature_scale == 500
+    assert TabPFNv2TrainConfig.long_tables("regression").rewind_lr_factor == 0.5
+    # 2.5 구조와 함께 쓸 수 있다 (init_from은 같은 구조의 가중치여야 한다)
+    v25 = TabPFNv2TrainConfig.long_tables("regression").with_architecture("v2.5")
+    assert v25.nlayers == 18 and v25.n_thinking_rows == 64 and v25.max_train_rows == 8192
+
+
 def test_regression_training_stores_borders(tmp_path):
     config = replace(TabPFNv2TrainConfig.smoke("regression"), steps=2, border_datasets=10)
     result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
