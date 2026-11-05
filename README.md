@@ -1,6 +1,6 @@
 # minipfn
 
-Prior-Data Fitted Networks(PFN)와 TabPFN을 밑바닥부터 작게 구현하고, 논문 결과를 직접 재현하면서 이해하는 hands-on 가이드입니다.
+Prior-Data Fitted Networks(PFN)와 TabPFN(v1, v2)을 밑바닥부터 작게 구현하고, 논문 결과를 직접 재현하면서 이해하는 hands-on 가이드입니다.
 
 PFN은 prior에서 뽑은 합성 데이터셋을 대량으로 학습해, 새 데이터셋이 들어오면 forward pass 한 번으로 posterior predictive distribution(PPD)을 근사하는 모델입니다.
 
@@ -14,6 +14,11 @@ uv run jupyter lab  # 노트북 실행
 ```
 
 논문 규모로 학습한 TabPFN 가중치(논문 Table 1 ROC AUC 0.932, 논문 0.934)를 Hugging Face Hub [aiden-jeon/minipfn-tabpfn-v1](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v1)에 올려 두었습니다. GPU 없이 받아서 바로 예측할 수 있습니다([2절](#2-학습한-tabpfn으로-바로-예측하기)).
+
+TabPFN v2는 분류와 회귀를 따로 학습해 올렸습니다. 두 모델 모두 TabICL prior로 500k step을 학습했고, 점수는 논문 benchmark에서 쟀습니다.
+
+- 분류: [aiden-jeon/minipfn-tabpfn-v2-classifier](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-classifier). AMLB 29개 데이터셋 평균 ROC AUC 0.924로, 논문은 0.932입니다.
+- 회귀: [aiden-jeon/minipfn-tabpfn-v2-regressor](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-regressor). 28개 데이터셋에서 논문 대비 RMSE 비율의 중앙값이 1.023, 기하평균이 1.118입니다.
 
 직접 학습하려면 [3절](#3-바닥부터-학습하기)을, 개념부터 따라가려면 [4절](#4-step-by-step)의 노트북을 봅니다. 노트북 순서와 각 노트북의 핵심 질문은 [notebooks/README.md](notebooks/README.md)에 있습니다.
 
@@ -51,6 +56,41 @@ print("ROC AUC:", roc_auc_score(y_test, proba[:, 1]))  # 0.997
 uv run python scripts/tabpfn/eval.py --hub-repo aiden-jeon/minipfn-tabpfn-v1
 ```
 
+### TabPFN v2
+
+v2도 쓰는 방법은 같습니다. 분류는 `TabPFNv2Classifier`, 회귀는 `TabPFNv2Regressor`를 씁니다. pandas DataFrame의 범주형 열도 그대로 넣을 수 있습니다.
+
+```python
+from sklearn.datasets import load_diabetes
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+
+from minipfn.tabpfn_v2.hub import from_pretrained
+from minipfn.tabpfn_v2.inference import TabPFNv2Classifier, TabPFNv2Regressor
+
+# 분류: 위 예제와 같은 breast cancer 데이터에서 ROC AUC 0.998
+model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier")
+clf = TabPFNv2Classifier(model)  # .fit(x_train, y_train).predict_proba(x_test)
+
+# 회귀: 회귀 모델은 target 구간 경계(borders)를 함께 받는다
+x, y = load_diabetes(return_X_y=True)
+x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.5, random_state=0)
+model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-regressor")
+reg = TabPFNv2Regressor(model, borders).fit(x_train, y_train)
+pred = reg.predict(x_test)  # 예측 분포의 평균
+print("RMSE:", mean_squared_error(y_test, pred) ** 0.5)  # 55.4 (y_test 표준편차 74.0)
+```
+
+논문 benchmark(분류 29개·회귀 28개 × 10 fold)는 이렇게 잽니다. OpenML에서 데이터를 받으며, GPU가 있으면 빠릅니다(H100 한 장에서 분류 약 15분, 회귀 약 40분).
+
+```bash
+uv run python scripts/tabpfn_v2/eval.py \
+  --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
+  --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+```
+
+`main`에는 500k 가중치가 있고, 학습 중간의 100k~400k 가중치는 같은 repo의 branch `step-100k`~`step-400k`에 있습니다. `from_pretrained(repo, revision="step-100k")`로 받고, 평가 스크립트에서는 `hf://aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k`처럼 `@` 뒤에 branch를 적습니다.
+
 ## 3. 바닥부터 학습하기
 
 규모는 `--config-name`과 `--steps`로 정합니다. 학습·평가 기록은 MLflow run에 남습니다. PFN(GP prior 1D 회귀)은 학습 스크립트 없이 [`notebooks/01_pfn/04_pfn_gp_reproduction.ipynb`](notebooks/01_pfn/04_pfn_gp_reproduction.ipynb)에서 직접 학습합니다.
@@ -63,7 +103,12 @@ uv run python scripts/tabpfn/train.py --config-name smoke
 
 # GPU 여러 장이면 torchrun으로 GPU마다 프로세스를 하나씩 띄운다
 uv run torchrun --standalone --nproc_per_node=8 scripts/tabpfn/train.py --config-name paper
+
+# TabPFN v2 (config: smoke / medium / paper, --task classification | regression)
+uv run python scripts/tabpfn_v2/train.py --config-name smoke --task regression
 ```
+
+v2 논문 규모 학습은 AI Runtime에서 `scripts/tabpfn_v2/train.yaml`로 돌렸습니다. 100k step씩 나눠 이어서 학습하는 방법(`TABPFN_V2_STOP_STEP`, `TABPFN_V2_RESUME_RUN_ID`)과 노드 여러 대로 늘리는 방법은 yaml 머리 주석에 있습니다. 회귀 paper 설정에는 논문에 없는 안정화 장치 세 가지(반복 target dequantization, QK-clip τ=250, 붕괴 감지 후 되돌리기)가 기본으로 켜져 있습니다. 왜 필요한지는 [회귀 모델 카드](hub/minipfn-tabpfn-v2-regressor/README.md#training)에 적었습니다.
 
 ### 평가
 
@@ -95,8 +140,14 @@ Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 
 uv run python scripts/tabpfn/plot_card.py --run-id <학습 run_id> --eval-run-id <평가 run_id>
 uv run python hub/push_to_hub.py --paper tabpfn --repo-id <owner/name> \
   --checkpoint runs:/<학습 run_id>/model/tabpfn_final.pt
-uv run python hub/push_to_hub.py --paper tabpfn_v2 --task classification --repo-id <owner/name> \
+# v2는 --task classification 또는 regression
+uv run python scripts/tabpfn_v2/plot_card.py --task regression \
+  --checkpoint runs:/<학습 run_id>/checkpoints/step_0500000.pt --eval-runs 100000=<평가 run_id>,...
+uv run python hub/push_to_hub.py --paper tabpfn_v2 --task regression --repo-id <owner/name> \
   --checkpoint runs:/<학습 run_id>/checkpoints/step_0500000.pt
+# 중간 checkpoint는 main을 올린 뒤 branch로 (카드의 중간 checkpoint 표에 --checkpoint가 있어야 한다)
+uv run python hub/push_to_hub.py --paper tabpfn_v2 --task regression --repo-id <owner/name> \
+  --checkpoint runs:/<학습 run_id>/checkpoints/step_0100000.pt --revision step-100k
 ```
 
 카드만 고쳤을 때는 가중치를 다시 올리지 않아도 됩니다. main에 `hub/<repo 이름>/`의 변경이 들어오면 GitHub Actions가 `hub/sync_hub_card.py`로 카드만 Hub에 올립니다.
@@ -105,7 +156,7 @@ uv run python hub/push_to_hub.py --paper tabpfn_v2 --task classification --repo-
 
 - [`notebooks/01_pfn/`](notebooks/01_pfn) — Müller et al., *[Transformers Can Do Bayesian Inference](https://arxiv.org/pdf/2112.10510)*, ICLR 2022
 - [`notebooks/02_tabpfn/`](notebooks/02_tabpfn) — Hollmann et al., *[TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second](https://arxiv.org/pdf/2207.01848)*, ICLR 2023
-- [`notebooks/03_tabpfn_v2/`](notebooks/03_tabpfn_v2) — Hollmann et al., *[Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6)*, Nature 2025 (재현 진행 중)
+- [`notebooks/03_tabpfn_v2/`](notebooks/03_tabpfn_v2) — Hollmann et al., *[Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6)*, Nature 2025
 
 공식 구현은 [automl/PFNs](https://github.com/automl/PFNs), [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)입니다.
 

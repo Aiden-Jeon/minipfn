@@ -74,7 +74,7 @@ Without philippine, GesturePhaseSegmentationProcessed, wine-quality-white, kc1 a
 - **philippine** stays about 0.10 below the paper at every checkpoint from 100k to 500k. Two inference-time checks did not change it: capping the columns each ensemble member sees (500, 300 or 160) and capping its training rows (4,096 or 2,048). The cause is unknown.
 - **Behavior can shift between checkpoints.** On mfeat-factors, the 300k and 400k checkpoints score 0.94 on all 10 folds; 200k and 500k score 1.00.
 - **Row attention grows sharp during training.** Some heads come to put nearly all their weight on a single row (an attention sink). This is the likely source of the collapses that the guard rewound.
-- **Classification only.** The regressor is a separate model.
+- **Classification only.** The regressor is a separate model: [aiden-jeon/minipfn-tabpfn-v2-regressor](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-regressor).
 
 ## Usage
 
@@ -87,7 +87,8 @@ from minipfn.tabpfn_v2.hub import from_pretrained
 from minipfn.tabpfn_v2.inference import TabPFNv2Classifier
 
 model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier")
-clf = TabPFNv2Classifier(model).fit(x_train, y_train)  # pandas DataFrames with categorical columns work too
+# x_train can be a pandas DataFrame with categorical columns
+clf = TabPFNv2Classifier(model).fit(x_train, y_train)
 proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes_ order
 ```
 
@@ -99,6 +100,24 @@ uv run python scripts/tabpfn_v2/eval.py --suite classification \
 ```
 
 Add `--one-hot off,power,all` to also score the other one-hot modes. The headline numbers stay those of the default mode.
+
+## Intermediate checkpoints
+
+The checkpoints from the Results table are kept as branches of this repo. Each branch holds the weights, config and a short README that points back here; this card on `main` describes all of them.
+
+| Branch | Training checkpoint | Mean ROC AUC |
+| --- | --- | --- |
+| `step-100k` | `runs:/8e83c33e525b4477ac7ca520974b448a/checkpoints/latest.pt` | 0.9175 |
+| `step-200k` | `runs:/630bf9cacfc14480b9c4a5c433f35c72/checkpoints/latest.pt` | 0.9225 |
+| `step-300k` | `runs:/56838e7535724969a298245e10639d8d/checkpoints/step_0300000.pt` | 0.9208 |
+| `step-400k` | `runs:/87a5aab6216e4908ad5247885fdad94f/checkpoints/step_0400000.pt` | 0.9197 |
+| `main` (500k) | `runs:/a1df9e34774d49e7869eb381bf65509b/checkpoints/step_0500000.pt` | 0.9238 |
+
+```python
+model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier", revision="step-100k")
+```
+
+In the benchmark script, write the branch after `@`: `--classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier@step-100k`.
 
 ## Files
 

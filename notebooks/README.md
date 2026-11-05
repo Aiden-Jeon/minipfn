@@ -33,4 +33,6 @@
 | 03 | [논문 walkthrough](03_tabpfn_v2/03_tabpfn_v2_paper_walkthrough.ipynb) | v2는 v1의 무엇을 바꿔 행 10,000개·feature 500개의 분류와 회귀를 forward pass 한 번으로 하는가? |
 | 04 | [학습 데이터: TabICL prior](03_tabpfn_v2/04_tabicl_prior.ipynb) | 논문 prior 대신 쓰는 TabICL prior는 무엇이 같고 다르며, 학습에 쓸 만큼 빨리 만들어지는가? |
 
-재현(이 prior로 학습하고 논문 benchmark 숫자와 비교)은 진행 중입니다.
+재현 결과(이 prior로 500k step 학습한 뒤 논문 benchmark 숫자와 비교)는 노트북 대신 Hub 모델 카드에 정리했습니다. 분류는 [`hub/minipfn-tabpfn-v2-classifier`](../hub/minipfn-tabpfn-v2-classifier/README.md)로 평균 ROC AUC 0.924(논문 0.932), 회귀는 [`hub/minipfn-tabpfn-v2-regressor`](../hub/minipfn-tabpfn-v2-regressor/README.md)로 논문 대비 RMSE 비율 중앙값 1.023입니다.
+
+실행 파일: `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`, `scripts/tabpfn_v2/plot_card.py`, `scripts/tabpfn_v2/train.yaml`, `scripts/tabpfn_v2/eval.yaml` (Hub: `hub/minipfn-tabpfn-v2-classifier/README.md`·`hub/minipfn-tabpfn-v2-regressor/README.md` 카드, `hub/push_to_hub.py`)

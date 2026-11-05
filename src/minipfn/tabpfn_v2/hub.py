@@ -8,6 +8,7 @@ Hub에는 pickle 없이 읽을 수 있도록 가중치는 `model.safetensors`, �
 
 `load_model`은 체크포인트를 어디에 두었든 같은 방식으로 읽는다(평가·업로드 스크립트가 쓴다).
 Hub에서 받을 때는 `hf://owner/name`처럼 적는다(오타 난 로컬 경로를 Hub로 보내지 않도록).
+중간 checkpoint는 같은 repo의 branch(`step-100k` 등)에 있고 `hf://owner/name@step-100k`로 받는다.
 """
 
 from __future__ import annotations
@@ -69,14 +70,16 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.T
     """체크포인트를 CPU로 읽는다. `spec`은 다음 가운데 하나다.
 
     - `runs:/<run_id>/<경로>`: 학습 run이 MLflow에 남긴 파일 또는 폴더 (`dst`로 받는다)
-    - `hf://owner/name`: Hub repo (`save_pretrained`로 올린 것)
+    - `hf://owner/name`: Hub repo (`save_pretrained`로 올린 것). `@<revision>`을 붙이면 그
+      branch·tag·commit에서 받는다(예: `hf://owner/name@step-100k`)
     - `save_pretrained`로 만든 로컬 폴더, `model.save_checkpoint`로 저장한 파일
 
     학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
     그 run에 기록된 param(task·emsize·nlayers·nhead)으로 모델을 만든다.
     """
     if spec.startswith(HUB_PREFIX):
-        return _check_task(from_pretrained(spec.removeprefix(HUB_PREFIX)), task, spec)
+        repo_id, _, revision = spec.removeprefix(HUB_PREFIX).partition("@")
+        return _check_task(from_pretrained(repo_id, revision=revision or None), task, spec)
     run_id, path = None, Path(spec)
     if spec.startswith("runs:/"):
         run_id = spec.removeprefix("runs:/").split("/", 1)[0]
