@@ -25,7 +25,7 @@ import math
 import os
 import shutil
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Literal
 
@@ -36,7 +36,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from minipfn.bar_distribution import FullSupportBarDistribution
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, save_checkpoint
+from minipfn.tabpfn_v2.model import save_checkpoint
 from minipfn.tabpfn_v2.prior import (
     MAX_CELLS,
     MAX_CLASSES,
@@ -46,15 +46,27 @@ from minipfn.tabpfn_v2.prior import (
     TabPFNv2Prior,
     regression_borders,
 )
+from minipfn.tabpfn_v2.registry import (
+    DEFAULT_MODEL_TYPE,
+    build_model,
+    config_fields,
+    model_class,
+)
 from minipfn.utils import DistContext, lr_factor, setup_distributed
 
 N_BUCKETS = 5000
 
 # 모델 구조. v2는 Nature 논문 기본 모델, v2.5는 TabPFN-2.5(arXiv 2511.08667 "Architecture")가
 # 적은 변경: 층 수(회귀 18, 분류 24), 셀 3개 묶기, thinking 행 64개, 회귀 encoder를 2층 MLP로.
-# emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다
-_V2 = {"nlayers": 12, "features_per_group": 2, "n_thinking_rows": 0, "encoder": "linear"}
-_V2_5 = {"features_per_group": 3, "n_thinking_rows": 64, "encoder": "linear"}  # 두 task 공통
+# emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다. 둘 다 모델 클래스는 TabPFNv2다
+_V2 = {
+    "model_type": "tabpfn_v2",
+    "nlayers": 12,
+    "features_per_group": 2,
+    "n_thinking_rows": 0,
+    "encoder": "linear",
+}
+_V2_5 = {**_V2, "features_per_group": 3, "n_thinking_rows": 64}  # 두 task 공통
 ARCHITECTURES = {
     "v2": {"classification": _V2, "regression": _V2},
     "v2.5": {
@@ -70,6 +82,8 @@ class TabPFNv2TrainConfig:
     long_tables(paper로 학습한 모델을 긴·넓은 표로 이어 학습)."""
 
     task: Literal["classification", "regression"] = "classification"
+    # 모델 클래스 (`registry.MODEL_TYPES`). 아래 모델 설정 가운데 그 클래스의 설정에 있는 것만 쓴다
+    model_type: str = DEFAULT_MODEL_TYPE
     # 모델 (논문 기본 모델 크기). 아래 셋은 TabPFN-2.5가 바꾼 것(`with_architecture("v2.5")`)
     emsize: int = 192
     nlayers: int = 12
@@ -138,6 +152,7 @@ class TabPFNv2TrainConfig:
     qk_clip_every: int = 50
 
     def __post_init__(self) -> None:
+        model_class(self.model_type)  # 없는 이름이면 ValueError
         if not 0.0 < self.rewind_lr_factor <= 1.0:
             raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
         if self.qk_clip is not None and self.qk_clip <= 0:
@@ -222,16 +237,15 @@ class TabPFNv2TrainConfig:
             keep_every=10,
         )
 
-    def model_config(self) -> TabPFNv2Config:
-        return TabPFNv2Config(
-            emsize=self.emsize,
-            nlayers=self.nlayers,
-            nhead=self.nhead,
-            features_per_group=self.features_per_group,
-            n_out=self.n_out,
-            n_thinking_rows=self.n_thinking_rows,
-            encoder=self.encoder,
-        )
+    def model_config(self):
+        """`model_type` 모델의 설정. 그 설정에 있는 필드 가운데 여기에도 있는 것을 옮기고, 나머지는
+        그 설정의 기본값이다."""
+        mine = {f.name for f in fields(self)}
+        values = {n: getattr(self, n) for n in config_fields(self.model_type) if n in mine}
+        return model_class(self.model_type).config_class(n_out=self.n_out, **values)
+
+    def build_model(self):
+        return build_model(self.model_type, self.model_config())
 
     def with_architecture(self, arch: str, keep_size: bool = False) -> TabPFNv2TrainConfig:
         """모델 구조를 `ARCHITECTURES`의 것으로. `keep_size`(smoke)면 층 수는 그대로 두고 thinking
@@ -241,7 +255,8 @@ class TabPFNv2TrainConfig:
         changes = dict(ARCHITECTURES[arch][self.task])
         if keep_size:
             changes["nlayers"] = self.nlayers
-            changes["n_thinking_rows"] = min(changes["n_thinking_rows"], 4)
+            if "n_thinking_rows" in changes:
+                changes["n_thinking_rows"] = min(changes["n_thinking_rows"], 4)
         return replace(self, **changes)
 
     def for_world_size(self, world_size: int) -> TabPFNv2TrainConfig:
@@ -411,14 +426,8 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
 
 
 def _qk_weights(model) -> list[tuple[str, torch.Tensor]]:
-    # (종류, qkv weight). 입력이 LayerNorm 뒤인 attention만: 첫 층 feature attention은 입력이
-    # 임베딩 그대로라 아래 상한이 성립하지 않아 뺀다(그 attention은 폭주한 적도 없다)
-    return [
-        (kind, getattr(layer, kind).qkv.weight)
-        for i, layer in enumerate(model.layers)
-        for kind in ("feature_attention", "sample_attention")
-        if i > 0 or kind == "sample_attention"
-    ]
+    # (종류, qkv weight). 어느 attention을 볼지는 모델이 정한다 (`qk_clip_weights`)
+    return model.qk_clip_weights()
 
 
 @torch.no_grad()
@@ -431,6 +440,8 @@ def qk_logit_bounds(model) -> torch.Tensor:
     σ_max(Wq_hᵀ Wk_h) = σ_max(R_q R_kᵀ)라 E×E 대신 d×d에서 계산한다.
     """
     weights = _qk_weights(model)
+    if not weights:
+        return torch.zeros(0, model.config.nhead)
     nhead = model.config.nhead
     e = weights[0][1].shape[1]
     d = e // nhead
@@ -552,7 +563,9 @@ def train_tabpfn_v2(
         torch.backends.cuda.enable_cudnn_sdp(False)
 
     torch.manual_seed(config.seed)  # 모든 GPU가 같은 초기 가중치에서 시작한다
-    model = TabPFNv2(config.model_config()).to(device)
+    model = config.build_model().to(device)
+    if config.qk_clip is not None and not _qk_weights(model):
+        raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
     opt = torch.optim.Adam(model.parameters(), lr=config.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: lr_factor(s, config.warmup_steps, config.steps)
@@ -778,19 +791,22 @@ def train_tabpfn_v2(
                 # 스케줄의 기준 lr. 이어 갈 때 바꾸거나 붕괴 규칙으로 낮추면 config.lr과 달라진다
                 "base_lr": sched.base_lrs[0],
                 "grad_norm": float(grad_norm),
-                # 출력층 가중치 크기. 계속 커지면 출력이 날카로워지며 학습이 불안정해진다
-                "decoder_norm": model.decoder[-1].weight.norm().item(),
                 "skipped_steps": skipped_steps,
                 "sec_per_step": elapsed / n,
                 "data_wait_frac": window_wait / max(elapsed, 1e-9),
                 "datasets_per_sec": config.batch_size * n / max(elapsed, 1e-9),
             }
+            # 출력층 가중치 크기. 계속 커지면 출력이 날카로워지며 학습이 불안정해진다
+            if (decoder := model.decoder_weight()) is not None:
+                metrics["decoder_norm"] = decoder.norm().item()
             if use_cuda:
                 metrics["gpu_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
             # attention logit 상한 중 가장 큰 값 (sample attention이 폭주하면 수만 이상으로 커진다)
             bounds = qk_logit_bounds(model)
-            metrics["qk_bound_max"] = bounds.max().item()
-            metrics["qk_bound_sample_max"] = bounds[_sample_rows(model)].max().item()
+            if bounds.numel():
+                metrics["qk_bound_max"] = bounds.max().item()
+            if sample := _sample_rows(model):
+                metrics["qk_bound_sample_max"] = bounds[sample].max().item()
             if config.qk_clip is not None:
                 # 이 window에서 clip할 때마다 줄인 head 수의 합
                 metrics["qk_clipped_heads"] = float(window_clipped)

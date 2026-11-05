@@ -21,25 +21,40 @@ import mlflow
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_file
+from torch import nn
 
 from minipfn.tabpfn.hub import _is_local_path
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, load_checkpoint
+from minipfn.tabpfn_v2.registry import (
+    DEFAULT_MODEL_TYPE,
+    build_model,
+    config_fields,
+    load_checkpoint,
+)
 from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
 
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 BORDERS_KEY = "borders"
 HUB_PREFIX = "hf://"
-# 학습 run의 param으로 남는 모델 구조 설정 (TabPFNv2Config와 TabPFNv2TrainConfig에 모두 있는 것)
-_MODEL_PARAMS = tuple(
-    f.name
-    for f in fields(TabPFNv2Config)
-    if f.name in {g.name for g in fields(TabPFNv2TrainConfig)}
-)
+
+
+def _model_params(model_type: str) -> tuple[str, ...]:
+    # 학습 run의 param으로 남는 모델 구조 설정 (그 모델 설정과 TabPFNv2TrainConfig에 모두 있는 것)
+    train_fields = {f.name for f in fields(TabPFNv2TrainConfig)}
+    return tuple(name for name in config_fields(model_type) if name in train_fields)
+
+
+def _parse_param(default, text: str):
+    # MLflow param은 문자열이다. bool("False")는 True라서 bool만 따로 읽는다
+    if isinstance(default, bool):
+        if text not in ("True", "False"):
+            raise ValueError(f"bool param이 아니다: {text}")
+        return text == "True"
+    return type(default)(text)
 
 
 def save_pretrained(
-    model: TabPFNv2, borders: torch.Tensor | None, out_dir: str | Path, **extra
+    model: nn.Module, borders: torch.Tensor | None, out_dir: str | Path, **extra
 ) -> Path:
     """`out_dir`에 `model.safetensors`와 `config.json`을 쓴다. `extra`는 config.json에 더 적는다."""
     out_dir = Path(out_dir)
@@ -49,14 +64,19 @@ def save_pretrained(
         tensors[BORDERS_KEY] = borders.detach().cpu().contiguous()
     save_file(tensors, out_dir / WEIGHTS_NAME)
     task = "classification" if borders is None else "regression"
-    config = {"task": task, "model": model.config.to_dict(), **extra}
+    config = {
+        "task": task,
+        "model_type": model.model_type,
+        "model": model.config.to_dict(),
+        **extra,
+    }
     (out_dir / CONFIG_NAME).write_text(json.dumps(config, indent=2) + "\n")
     return out_dir
 
 
 def from_pretrained(
     repo_id_or_path: str | Path, revision: str | None = None
-) -> tuple[TabPFNv2, torch.Tensor | None]:
+) -> tuple[nn.Module, torch.Tensor | None]:
     """Hub repo id 또는 `save_pretrained`로 만든 로컬 폴더에서 (모델, 회귀 구간 경계)를 읽는다."""
     if _is_local_path(repo_id_or_path):
         local = Path(repo_id_or_path).expanduser()
@@ -68,12 +88,13 @@ def from_pretrained(
     config = json.loads(Path(config_path).read_text())
     tensors = load_file(weights_path)
     borders = tensors.pop(BORDERS_KEY, None)
-    model = TabPFNv2(TabPFNv2Config(**config["model"]))
+    # model_type이 없는 repo는 v2로 올린 것이다
+    model = build_model(config.get("model_type", DEFAULT_MODEL_TYPE), config["model"])
     model.load_state_dict(tensors)
     return model.eval(), borders
 
 
-def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.Tensor | None]:
+def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.Tensor | None]:
     """체크포인트를 CPU로 읽는다. `spec`은 다음 가운데 하나다.
 
     - `runs:/<run_id>/<경로>`: 학습 run이 MLflow에 남긴 파일 또는 폴더 (`dst`로 받는다)
@@ -82,7 +103,7 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.T
     - `save_pretrained`로 만든 로컬 폴더, `model.save_checkpoint`로 저장한 파일
 
     학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
-    그 run에 기록된 param(task·emsize·nlayers·nhead, 2.5 구조 설정)으로 모델을 만든다.
+    그 run에 기록된 param(task·model_type과 모델 구조 설정)으로 모델을 만든다.
     """
     if spec.startswith(HUB_PREFIX):
         repo_id, _, revision = spec.removeprefix(HUB_PREFIX).partition("@")
@@ -105,20 +126,21 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.T
     params = mlflow.MlflowClient().get_run(run_id).data.params
     if params["task"] != task:
         raise SystemExit(f"{spec}는 {params['task']} 모델이다 ({task} 모델이 필요하다).")
-    # 모델 구조 param. run에 없는 값(TabPFN-2.5 이전 run의 구조 설정)은 설정 기본값(v2)을 쓴다
-    defaults = TabPFNv2TrainConfig(task=params["task"])
+    # 모델 구조 param. run에 없는 값(model_type 이전 run은 v2, TabPFN-2.5 이전 run의 구조 설정)은
+    # 설정 기본값(v2)을 쓴다
+    model_type = params.get("model_type", DEFAULT_MODEL_TYPE)
+    defaults = TabPFNv2TrainConfig(task=params["task"], model_type=model_type)
     arch = {
-        name: type(getattr(defaults, name))(params[name])
-        for name in _MODEL_PARAMS
+        name: _parse_param(getattr(defaults, name), params[name])
+        for name in _model_params(model_type)
         if name in params
     }
-    config = replace(defaults, **arch)
-    model = TabPFNv2(config.model_config())
+    model = replace(defaults, **arch).build_model()
     model.load_state_dict(state["model"])
     return model.eval(), state["borders"]
 
 
-def _check_task(loaded: tuple[TabPFNv2, torch.Tensor | None], task: str, spec: str):
+def _check_task(loaded: tuple[nn.Module, torch.Tensor | None], task: str, spec: str):
     got = "classification" if loaded[1] is None else "regression"
     if got != task:
         raise SystemExit(f"{spec}는 {got} 모델이다 ({task} 모델이 필요하다).")

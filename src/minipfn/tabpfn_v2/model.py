@@ -116,6 +116,10 @@ class TabPFNv2Layer(nn.Module):
 
 
 class TabPFNv2(nn.Module):
+    # 모델 종류 (`registry.MODEL_TYPES`)
+    model_type = "tabpfn_v2"
+    config_class = TabPFNv2Config
+
     def __init__(self, config: TabPFNv2Config | None = None) -> None:
         super().__init__()
         self.config = config = config or TabPFNv2Config()
@@ -139,6 +143,19 @@ class TabPFNv2(nn.Module):
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def qk_clip_weights(self) -> list[tuple[str, torch.Tensor]]:
+        """QK-clip이 보는 (종류, qkv weight). 입력이 LayerNorm 뒤인 attention만: 첫 층 feature
+        attention은 입력이 임베딩 그대로라 logit 상한이 성립하지 않아 뺀다(폭주한 적도 없다)."""
+        return [
+            (kind, getattr(layer, kind).qkv.weight)
+            for i, layer in enumerate(self.layers)
+            for kind in ("feature_attention", "sample_attention")
+            if i > 0 or kind == "sample_attention"
+        ]
+
+    def decoder_weight(self) -> torch.Tensor:
+        return self.decoder[-1].weight
 
     def _embed_features(self, x: torch.Tensor, n_train: int) -> torch.Tensor:
         # x: (B, R, F) → 토큰 (B, R, G, E)
@@ -219,9 +236,12 @@ class TabPFNv2(nn.Module):
         return self.decoder(h[:, n_context:, -1])
 
 
-def save_checkpoint(path: str | Path, model: TabPFNv2, borders: torch.Tensor | None = None) -> None:
+def save_checkpoint(
+    path: str | Path, model: nn.Module, borders: torch.Tensor | None = None
+) -> None:
     """가중치, 설정, (회귀면) bar distribution 경계를 저장한다."""
     payload = {
+        "model_type": model.model_type,
         "config": model.config.to_dict(),
         "state_dict": model.state_dict(),
         "borders": borders,
@@ -231,8 +251,9 @@ def save_checkpoint(path: str | Path, model: TabPFNv2, borders: torch.Tensor | N
 
 def load_checkpoint(
     path: str | Path, map_location: str | torch.device = "cpu"
-) -> tuple[TabPFNv2, torch.Tensor | None]:
-    checkpoint = torch.load(path, map_location=map_location, weights_only=True)
-    model = TabPFNv2(TabPFNv2Config(**checkpoint["config"]))
-    model.load_state_dict(checkpoint["state_dict"])
-    return model.eval(), checkpoint["borders"]
+) -> tuple[nn.Module, torch.Tensor | None]:
+    """`save_checkpoint`로 저장한 파일을 읽는다. 모델 종류는 파일에 남긴 `model_type`을 따른다
+    (`registry.load_checkpoint`. 이전 파일에는 없어서 v2로 읽는다)."""
+    from minipfn.tabpfn_v2.registry import load_checkpoint as _load
+
+    return _load(path, map_location)
