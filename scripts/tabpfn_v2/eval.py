@@ -26,6 +26,21 @@ config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2
 quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
 `TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
+`--suite tabarena-lite`, `beyondarena`, `beyondarena-lite`는 TabArena-Lite·BeyondArena다
+(`minipfn.benchmarks.arena`, extra `arena`가 필요하다. pandas 2.3이 필요해 dev group과 따로
+설치하고 `uv run`에도 같은 옵션을 준다: `uv sync --no-dev --extra arena --group arena-dev`).
+공식 split을 돌리고 공개 leaderboard와 같은 방식으로 Elo·정규화 점수·
+improvability·승률을 낸다. 분류·회귀 체크포인트
+가운데 주지 않은 쪽과 논문 권장 크기(`recipes.tabpfn_v2.SUPPORTED_SIZE`; 클래스 수는 모델 출력 수)를
+넘는 split은 돌리지 않고 imputed로 둔다(`--max-train-rows`·`--max-features`로 바꾼다). 기본은 학습
+split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나눠 8개의 예측을 평균한다.
+`--datasets`로 일부만 돌릴 수 있다(나머지는 imputed). 결과는 `<out-dir>/<suite>/`
+(`minipfn.benchmarks.arena.run`).
+
+  uv run --no-dev --extra arena --group arena-dev python $EVAL --suite tabarena-lite \
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -34,6 +49,7 @@ experiment에 새 run을 만든다.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import os
 import time
@@ -55,17 +71,23 @@ from minipfn.inference.preprocessing import (
 )
 from minipfn.priors.table_size import MAX_FEATURES
 from minipfn.recipes.tabpfn_v2 import (
+    SUPPORTED_SIZE,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
     default_inference,
+    model_architecture,
     resolve_member_kinds,
 )
 from minipfn.utils import log_run_source
 
+ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--suite", choices=["classification", "regression", "all"], default="all")
+    parser.add_argument(
+        "--suite", choices=["classification", "regression", "all", *ARENA_SUITES], default="all"
+    )
     parser.add_argument("--tasks", help="쉼표로 구분한 OpenML task id (suite 안에서 고른다)")
     parser.add_argument("--folds", type=int, default=10)
     parser.add_argument(
@@ -86,6 +108,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
         " v2 = quantile,power, v2.5 = quantile,robust)",
+    )
+    parser.add_argument(
+        "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
+    )
+    parser.add_argument(
+        "--datasets", help="TabArena·BeyondArena: 쉼표로 구분한 데이터셋 이름 (나머지는 imputed)"
+    )
+    parser.add_argument(
+        "--max-train-rows", type=int, help="TabArena·BeyondArena: 학습 행 상한 (기본: 모델 구조)"
+    )
+    parser.add_argument(
+        "--max-features", type=int, help="TabArena·BeyondArena: feature 수 상한 (기본: 모델 구조)"
+    )
+    parser.add_argument(
+        "--method-name", default="minipfn-tabpfn-v2", help="TabArena·BeyondArena 결과의 방법 이름"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
@@ -192,7 +229,137 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
+    make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
+
+
+def arena_suite(name: str):
+    from minipfn.benchmarks import beyondarena, tabarena
+
+    if name == "tabarena-lite":
+        return tabarena.SUITE
+    return beyondarena.suite("lite" if name == "beyondarena-lite" else "core2k")
+
+
+def arena_limits(models: dict, args: argparse.Namespace) -> dict:
+    """문제 종류마다 돌릴 split의 상한. 체크포인트가 없는 쪽(분류·회귀)은 빠진다(imputed).
+    크기는 모델 구조의 논문 권장값(`SUPPORTED_SIZE`, 모르는 구조는 v2), 클래스 수는 모델 출력 수."""
+    from minipfn.benchmarks.arena import ModelLimits
+
+    limits = {}
+    for task, (model, _) in models.items():
+        size = dict(SUPPORTED_SIZE[model_architecture(model, task) or "v2"])
+        if args.max_train_rows is not None:
+            size["max_train_rows"] = args.max_train_rows
+        if args.max_features is not None:
+            size["max_features"] = args.max_features
+        if task == "classification":
+            lim = ModelLimits(**size, max_classes=int(model.config.n_out))
+            limits.update(binary=lim, multiclass=lim)
+        else:
+            limits["regression"] = ModelLimits(**size)
+    return limits
+
+
+def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
+    """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다. estimator는
+    AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔 넘긴다)."""
+    import json
+    import types
+
+    from minipfn.benchmarks import arena
+
+    suite = arena_suite(args.suite)
+    paths = {"classification": args.classifier_path, "regression": args.regressor_path}
+    factories = {
+        task: make_estimator_factory(task, args) for task, path in paths.items() if path is not None
+    }
+    if not factories:
+        raise SystemExit(f"{args.suite}에는 --classifier-path나 --regressor-path가 필요하다.")
+    one_hot = headline_mode(args.one_hot)
+    kinds = {task: make.member_kinds for task, make in factories.items()}
+    print(f"member kinds: { {t: ','.join(k) for t, k in kinds.items()} }, one-hot: {one_hot}")
+
+    def make(problem_type: str, categorical: list[int]):
+        task = "regression" if problem_type == "regression" else "classification"
+        return factories[task](types.SimpleNamespace(categorical_indices=categorical), one_hot)
+
+    # 끝난 split을 다시 쓸지 정하는 값: 체크포인트와 추론 설정이 같을 때만 다시 쓴다
+    fingerprint = json.dumps(
+        {
+            "paths": {t: paths[t] for t in factories},
+            "member_kinds": {t: list(k) for t, k in kinds.items()},
+            "one_hot": one_hot,
+        },
+        sort_keys=True,
+    )
+    models = {task: (f.model, f.borders) for task, f in factories.items()}
+    datasets = None if args.datasets is None else args.datasets.split(",")
+    summary = arena.run(
+        suite,
+        make,
+        limits=arena_limits(models, args),
+        out_dir=out_dir / args.suite,
+        method=args.method_name,
+        bagging=args.bagging,
+        datasets=datasets,
+        fingerprint=fingerprint,
+    )
+    print_arena_summary(summary)
+    if use_mlflow:
+        log_arena_mlflow(args, summary, out_dir / args.suite, kinds, one_hot)
+    return summary
+
+
+def print_arena_summary(summary: dict) -> None:
+    def line(label: str, s: dict) -> str:
+        if s.get("elo") is None:
+            return f"{label:24s} 결과가 있는 split이 없다 (imputed {s['imputed_pct']:.1f}%)"
+        xgb = s.get("winrate", {}).get("XGBoost (default)", {})
+        return (
+            f"{label:24s} elo {s['elo']:.0f} (+{s['elo_ci_plus']:.0f}/-{s['elo_ci_minus']:.0f}) "
+            f"score {s['score']:.3f} improvability {s['improvability']:.2f}% "
+            f"imputed {s['imputed_pct_leaderboard']:.1f}% "
+            f"win vs XGB(default) {xgb.get('all', float('nan')):.3f} "
+            f"position {s['position']}/{s['n_methods']}"
+        )
+
+    print(line(summary["suite"], summary))
+    for label, s in summary["breakdown"].items():
+        print(line(f"  {label}", s))
+
+
+def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: str) -> None:
+    prefix = summary["suite"].replace("-", "_")
+    mlflow.log_params(
+        {
+            "suite": args.suite,
+            "bagging": args.bagging,
+            "method_name": args.method_name,
+            "run_id_cache": summary["run_id"],
+            "one_hot": one_hot,
+            **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
+        }
+    )
+    paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
+    mlflow.log_params({k: v for k, v in paths.items() if v is not None})
+
+    def metrics(p: str, s: dict) -> dict:
+        keys = ("elo", "score", "improvability", "rank", "imputed_pct_leaderboard")
+        out = {f"{p}_{k}": s[k] for k in keys if s.get(k) is not None}
+        out[f"{p}_imputed_pct_splits"] = s["imputed_pct"]
+        for baseline, w in s.get("winrate", {}).items():
+            key = baseline.split(" (")[0].lower().replace("-", "").replace(".", "")
+            sub = baseline.split("(")[-1].rstrip(")").replace(" + ", "_").replace(" ", "_")
+            if w["all"] == w["all"]:  # NaN은 남기지 않는다
+                out[f"{p}_winrate_{key}_{sub}"] = w["all"]
+        return out
+
+    mlflow.log_metrics(metrics(prefix, summary))
+    for label, s in summary["breakdown"].items():
+        mlflow.log_metrics(metrics(f"{prefix}_{label.replace('-', '_')}", s))
+    for path in sorted(out_dir.glob("*.csv")) + [out_dir / "summary.json"]:
+        mlflow.log_artifact(str(path), f"eval/{summary['suite']}")
 
 
 def summarize(rows: list[dict]) -> pd.DataFrame:
@@ -205,11 +372,36 @@ def summarize(rows: list[dict]) -> pd.DataFrame:
     return per_dataset
 
 
+@contextlib.contextmanager
+def mlflow_run(use_mlflow: bool):
+    """평가 run 하나. AI Runtime에서는 플랫폼이 만든 run(`MLFLOW_RUN_ID`), 로컬에서는
+    `TABPFN_V2_EXPERIMENT`에 새 run. 도중에 예외가 나면 run을 FAILED로 끝낸다."""
+    if not use_mlflow:
+        yield
+        return
+    if "MLFLOW_RUN_ID" not in os.environ:
+        mlflow.set_experiment(os.environ.get("TABPFN_V2_EXPERIMENT", "tabpfn-v2-reproduction"))
+    with mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID")):
+        log_run_source(__file__, env_prefix="TABPFN_V2_")
+        yield
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tasks = selected_tasks(args)
+    use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
+    if args.suite in ARENA_SUITES:
+        with mlflow_run(use_mlflow):
+            run_arena(args, out_dir, use_mlflow)
+        return
+    tasks = selected_tasks(args)  # 고른 task가 틀렸으면 run을 만들기 전에 끝낸다
+    with mlflow_run(use_mlflow):
+        run_amlb(args, out_dir, tasks, use_mlflow)
+
+
+def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: bool) -> None:
+    """논문 benchmark(AMLB 분류 29개, AMLB·CTR23 회귀 28개)를 평가하고 논문 수치와 비교한다."""
     headline = headline_mode(args.one_hot)
     print(
         f"tasks: {len(tasks)}, folds: {args.folds}, device: {args.device}, "
@@ -217,12 +409,7 @@ def main(argv: list[str] | None = None) -> None:
         flush=True,
     )
 
-    use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
     if use_mlflow:
-        if "MLFLOW_RUN_ID" not in os.environ:
-            mlflow.set_experiment(os.environ.get("TABPFN_V2_EXPERIMENT", "tabpfn-v2-reproduction"))
-        mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID"))
-        log_run_source(__file__, env_prefix="TABPFN_V2_")
         mlflow.log_params(
             {
                 "suite": args.suite,
@@ -297,7 +484,6 @@ def main(argv: list[str] | None = None) -> None:
     if use_mlflow:
         for name in ("eval_rows.csv", "eval_per_dataset.csv", "eval_per_dataset_by_one_hot.csv"):
             mlflow.log_artifact(str(out_dir / name), "eval")
-        mlflow.end_run()
 
 
 if __name__ == "__main__":

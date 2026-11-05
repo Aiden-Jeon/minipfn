@@ -11,19 +11,27 @@ authors = [
 requires-python = ">=3.12"
 # 하한은 Databricks Serverless GPU 환경 v6에 맞춘다.
 # torch는 그 환경에서 테스트된 2.11(CUDA 13.0 빌드)로 고정해 로컬과 버전을 맞춘다.
+# pandas만 여기서는 2.2로 두고, 개발 환경(dev group)에서 v6과 같은 3.0.6 이상으로 올린다.
+# extra arena의 tabarena(autogluon)가 pandas<2.4를 요구해서 그 설치만 2.3이 된다(tool.uv.conflicts).
 dependencies = [
     "huggingface-hub>=0.34",
     "matplotlib>=3.10",
     "mlflow>=2.15",
     "numpy>=2.3",
     "openml>=0.15",
-    "pandas>=3.0.6",
+    "pandas>=2.2",
     "safetensors>=0.5",
     "scikit-learn>=1.7",
     "scipy>=1.16",
     "tabicl>=2.2",
     "torch>=2.11,<2.12",
     "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+# TabArena·BeyondArena 평가 (minipfn.benchmarks.arena). tabarena와 autogluon은 사전 배포판뿐이다
+arena = [
+    "tabarena[data-foundry]>=0.1.1.dev20261031",
 ]
 
 [build-system]
@@ -36,10 +44,22 @@ dev = [
     "ipywidgets>=8.1.9",
     "jupyterlab>=4.6.4",
     "nbstripout>=0.9.1",
+    "pandas>=3.0.6",
     "pytest>=9.1.1",
     "python-dotenv>=1.2",
     "ruff>=0.16.8",
 ]
+# extra arena와 함께 쓰는 개발 도구 (dev와는 pandas 때문에 같이 설치할 수 없다):
+#   uv sync --no-dev --extra arena --group arena-dev
+arena-dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
+
+[tool.uv]
+prerelease = "if-necessary"
+# dev(pandas 3)와 extra arena(pandas<2.4)는 따로 푼다
+conflicts = [[{ extra = "arena" }, { group = "dev" }]]
 
 [tool.ruff]
 line-length = 100
