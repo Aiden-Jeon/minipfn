@@ -5,7 +5,7 @@
 - `rbf_kernel`/`analytic_gp_posterior`: 노트북 03 §8과 동일한 식으로, 재현 결과를 대조할 "정답"을
   계산한다.
 
-TabPFN v1 prior bag의 k차원 GP 표는 `minipfn.priors.prior_bag.sample_gp_tables`에 있다.
+TabPFN v1 prior bag의 k차원 GP 표는 `minipfn.priors.generators.gp`에 있다.
 """
 
 from __future__ import annotations

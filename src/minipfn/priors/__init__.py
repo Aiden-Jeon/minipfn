@@ -1,13 +1,22 @@
 """학습 데이터 (prior 축). 모듈은 무엇을 만드는지로 이름을 붙이고, 논문별 설정은
 `minipfn.recipes`에 둔다.
 
+표 데이터 prior는 단계별 부품을 `pipeline.Pipeline`으로 묶어 만든다. 새 논문의 prior는 대개 생성기
+하나나 후처리 몇 개만 더하고 나머지 부품은 다시 쓴다.
+
 - `base`: 공용 학습 루프에 내는 `PriorBatch`, 손실에서 무시할 target `IGNORE_INDEX`
-- `gp`: 1D GP 회귀 prior (`GPPriorSampler`)와 analytic posterior (PFN recipe가 쓴다)
-- `simple_scm`: primer 노트북용 단순한 SCM 샘플러
-- `prior_bag`: 그룹마다 GP 또는 MLP(SCM / BNN) prior를 고르는 prior bag과 그 부품 전부
-  (하이퍼파라미터 2단계 샘플링, MLP prior, GP 표, 표 데이터 처리). TabPFN v1 recipe가 쓴다
+- `pipeline`: 하이퍼파라미터 → 생성기 → 후처리 → `PriorBatch` 조립기, 생성기 섞기(`Mixture`)
 - `table_size`: batch마다 학습 행·feature 수를 뽑는 표 크기 규칙
-- `graph_scm`: TabICLv2 graph SCM + 표 크기 규칙 + 결측값 (TabPFN v2 recipe가 쓴다)
+- `hyperparameters`: meta 분포 2단계 샘플링(TabPFN v1), 클래스 수
+- `generators`: 그룹 하나의 연속값 표 (MLP SCM / BNN, GP 표, graph SCM)
+- `transforms`: 그룹 다듬기 (범주형 열, 표준화, 클래스, 패딩, 결측값, 거르기)
+
+부품을 묶은 prior:
+
+- `prior_bag`: 그룹마다 GP 또는 MLP 생성기를 고르는 prior bag (TabPFN v1 recipe가 쓴다)
+- `graph_scm`: graph SCM 생성기 + 표 크기 규칙 + 결측값 (TabPFN v2 recipe가 쓴다)
+- `gp`: 1D GP 회귀 prior (`GPPriorSampler`)와 analytic posterior (PFN recipe가 쓴다. 표 prior가
+  아니라 조립기를 쓰지 않는다)
 
 공용 학습 루프(`minipfn.training.loop`)가 쓰는 prior는 `PRIOR_TYPES`에서 이름
 (`TrainConfig.prior_type`)으로 고른다. 그 prior 모듈은 다음을 둔다.
@@ -18,6 +27,11 @@
   같은 표 크기 설정으로 뽑는다
 - `check_config(config)`: 표 크기 설정을 그 prior로 만들 수 있는지 (틀리면 ValueError)
 - `MAX_CLASSES`: 분류 데이터셋의 클래스 수 상한 (분류 모델의 출력 수)
+
+레지스트리에는 부품 조합을 마친 prior만 이름으로 올린다(조합 하나 = 이 폴더의 모듈 하나 = 이름
+하나). 부품이나 수치를 바꾼 실험은 새 조립 모듈을 만들어 등록하고, 학습 설정에는 그 이름만
+적는다. 그래서 MLflow run param의 `prior_type` 하나로 어떤 데이터로 학습했는지 알 수 있다. 이름은
+다른 축처럼 무엇인지를 나타내는 일반 명사로 붙인다.
 
 PFN(`gp`)·TabPFN v1(`prior_bag`) recipe는 각자의 학습 루프에서 prior를 바로 쓴다.
 """
