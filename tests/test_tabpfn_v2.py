@@ -64,6 +64,20 @@ def test_missing_values_constant_columns_and_odd_feature_counts():
     assert torch.isfinite(out).all()
 
 
+def test_column_empty_in_training_rows_is_left_missing():
+    # BeyondArena heart_disease_hungary의 한 split: 학습 행에서 값이 모두 결측인 수치 열.
+    # power 멤버의 Yeo-Johnson fit이 실패하던 경우다
+    g = np.random.default_rng(0)
+    x = g.normal(size=(40, 4))
+    x[:30, 2] = np.nan  # 학습 행(앞 30개)에서는 비고 테스트 행에는 값이 있다
+    y_class, y_value = (x[:, 0] > 0).astype(int), x[:, 0] + 0.1 * g.normal(size=40)
+    for kinds in ("v2", "v2.5"):
+        clf = TabPFNv2Classifier(_tiny_model(), member_kinds=kinds).fit(x[:30], y_class[:30])
+        assert np.isfinite(clf.predict_proba(x[30:])).all()
+        reg = TabPFNv2Regressor(_tiny_model(), torch.linspace(-3, 3, 11), member_kinds=kinds)
+        assert np.isfinite(reg.fit(x[:30], y_value[:30]).predict(x[30:])).all()
+
+
 def test_checkpoint_roundtrip(tmp_path):
     model = _tiny_model(n_out=8)
     borders = torch.linspace(-3, 3, 9)

@@ -158,8 +158,11 @@ class MemberPreprocessor:
             self.transformer = PowerTransformer(method="yeo-johnson", standardize=True)
         else:
             self.transformer = RobustSoftClip()
-        if num_ix:
-            self.transformer.fit(X[:, num_ix])
+        # 학습 행에 값이 하나도 없는 수치 열은 변환기에 넣지 않고 결측으로 둔다(Yeo-Johnson은 빈
+        # 열에서 실패한다. 분위수·robust 변환은 그 열을 원래도 NaN으로 냈다)
+        self.fit_ix = [i for i in num_ix if np.isfinite(X[:, i]).any()]
+        if self.fit_ix:
+            self.transformer.fit(X[:, self.fit_ix])
         self.svd = None
         base = self._base(X)
         n_components = 0
@@ -186,9 +189,11 @@ class MemberPreprocessor:
             ok = np.isfinite(X[:, i]) & (X[:, i] < len(perm))
             X[ok, i] = perm[X[ok, i].astype(int)]
         transformed = X.copy()
-        if self.num_ix:
+        empty = [i for i in self.num_ix if i not in self.fit_ix]
+        transformed[:, empty] = np.nan
+        if self.fit_ix:
             with np.errstate(all="ignore"):
-                transformed[:, self.num_ix] = self.transformer.transform(X[:, self.num_ix])
+                transformed[:, self.fit_ix] = self.transformer.transform(X[:, self.fit_ix])
         if self.member.kind == "quantile":
             out = np.concatenate([X, transformed[:, self.num_ix]], axis=1)  # 원래 열 + 분위수 열
         else:

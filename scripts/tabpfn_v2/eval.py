@@ -26,6 +26,19 @@ config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2
 quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
 `TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
+`--suite tabarena-lite`, `beyondarena`, `beyondarena-lite`는 TabArena-Lite·BeyondArena다
+(`minipfn.benchmarks.arena`, extra `arena`가 필요하다: `uv sync --extra arena`). 공식 split을 돌리고
+공개 leaderboard와 같은 방식으로 Elo·정규화 점수·improvability·승률을 낸다. 분류·회귀 체크포인트
+가운데 주지 않은 쪽과 논문 권장 크기(`recipes.tabpfn_v2.SUPPORTED_SIZE`; 클래스 수는 모델 출력 수)를
+넘는 split은 돌리지 않고 imputed로 둔다(`--max-train-rows`·`--max-features`로 바꾼다). 기본은 학습
+split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나눠 8개의 예측을 평균한다.
+`--datasets`로 일부만 돌릴 수 있다(나머지는 imputed). 결과는 `<out-dir>/<suite>/`
+(`minipfn.benchmarks.arena.run`).
+
+  uv run python $EVAL --suite tabarena-lite \
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -55,17 +68,23 @@ from minipfn.inference.preprocessing import (
 )
 from minipfn.priors.table_size import MAX_FEATURES
 from minipfn.recipes.tabpfn_v2 import (
+    SUPPORTED_SIZE,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
     default_inference,
+    model_architecture,
     resolve_member_kinds,
 )
 from minipfn.utils import log_run_source
 
+ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--suite", choices=["classification", "regression", "all"], default="all")
+    parser.add_argument(
+        "--suite", choices=["classification", "regression", "all", *ARENA_SUITES], default="all"
+    )
     parser.add_argument("--tasks", help="쉼표로 구분한 OpenML task id (suite 안에서 고른다)")
     parser.add_argument("--folds", type=int, default=10)
     parser.add_argument(
@@ -86,6 +105,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
         " v2 = quantile,power, v2.5 = quantile,robust)",
+    )
+    parser.add_argument(
+        "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
+    )
+    parser.add_argument(
+        "--datasets", help="TabArena·BeyondArena: 쉼표로 구분한 데이터셋 이름 (나머지는 imputed)"
+    )
+    parser.add_argument(
+        "--max-train-rows", type=int, help="TabArena·BeyondArena: 학습 행 상한 (기본: 모델 구조)"
+    )
+    parser.add_argument(
+        "--max-features", type=int, help="TabArena·BeyondArena: feature 수 상한 (기본: 모델 구조)"
+    )
+    parser.add_argument(
+        "--method-name", default="minipfn-tabpfn-v2", help="TabArena·BeyondArena 결과의 방법 이름"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
@@ -195,6 +229,127 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     return make
 
 
+def arena_suite(name: str):
+    from minipfn.benchmarks import beyondarena, tabarena
+
+    if name == "tabarena-lite":
+        return tabarena.SUITE
+    return beyondarena.suite("lite" if name == "beyondarena-lite" else "core2k")
+
+
+def arena_limits(models: dict, args: argparse.Namespace) -> dict:
+    """문제 종류마다 돌릴 split의 상한. 체크포인트가 없는 쪽(분류·회귀)은 빠진다(imputed).
+    크기는 모델 구조의 논문 권장값(`SUPPORTED_SIZE`, 모르는 구조는 v2), 클래스 수는 모델 출력 수."""
+    from minipfn.benchmarks.arena import ModelLimits
+
+    limits = {}
+    for task, (model, _) in models.items():
+        size = dict(SUPPORTED_SIZE[model_architecture(model, task) or "v2"])
+        if args.max_train_rows is not None:
+            size["max_train_rows"] = args.max_train_rows
+        if args.max_features is not None:
+            size["max_features"] = args.max_features
+        if task == "classification":
+            lim = ModelLimits(**size, max_classes=int(model.config.n_out))
+            limits.update(binary=lim, multiclass=lim)
+        else:
+            limits["regression"] = ModelLimits(**size)
+    return limits
+
+
+def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
+    """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다."""
+    from minipfn.benchmarks import arena
+
+    suite = arena_suite(args.suite)
+    paths = {"classification": args.classifier_path, "regression": args.regressor_path}
+    models, kinds = {}, {}
+    for task, path in paths.items():
+        if path is None:
+            continue
+        models[task] = load_model(path, task, out_dir / "checkpoints" / task)
+        kinds[task] = args.member_kinds or default_inference(models[task][0], task)["member_kinds"]
+    if not models:
+        raise SystemExit(f"{args.suite}에는 --classifier-path나 --regressor-path가 필요하다.")
+    one_hot = headline_mode(args.one_hot)
+    print(f"member kinds: { {t: ','.join(k) for t, k in kinds.items()} }, one-hot: {one_hot}")
+
+    def make(problem_type: str, categorical: list[int]):
+        task = "regression" if problem_type == "regression" else "classification"
+        model, borders = models[task]
+        kw = {
+            "categorical_features_indices": categorical,
+            "one_hot": one_hot,
+            "member_kinds": kinds[task],
+            "device": args.device,
+        }
+        if task == "classification":
+            return TabPFNv2Classifier(model, **kw)
+        return TabPFNv2Regressor(model, borders, **kw)
+
+    datasets = None if args.datasets is None else args.datasets.split(",")
+    summary = arena.run(
+        suite,
+        make,
+        limits=arena_limits(models, args),
+        out_dir=out_dir / args.suite,
+        method=args.method_name,
+        bagging=args.bagging,
+        datasets=datasets,
+    )
+    print_arena_summary(summary)
+    if use_mlflow:
+        log_arena_mlflow(args, summary, out_dir / args.suite, kinds, one_hot)
+    return summary
+
+
+def print_arena_summary(summary: dict) -> None:
+    def line(label: str, s: dict) -> str:
+        xgb = s.get("winrate", {}).get("XGBoost (default)", {})
+        return (
+            f"{label:24s} elo {s['elo']:.0f} (+{s['elo_ci_plus']:.0f}/-{s['elo_ci_minus']:.0f}) "
+            f"score {s['score']:.3f} improvability {s['improvability']:.2f}% "
+            f"imputed {s['imputed_pct_leaderboard']:.1f}% "
+            f"win vs XGB(default) {xgb.get('all', float('nan')):.3f} "
+            f"position {s['position']}/{s['n_methods']}"
+        )
+
+    print(line(summary["suite"], summary))
+    for label, s in summary["breakdown"].items():
+        print(line(f"  {label}", s))
+
+
+def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: str) -> None:
+    prefix = summary["suite"].replace("-", "_")
+    mlflow.log_params(
+        {
+            "suite": args.suite,
+            "bagging": args.bagging,
+            "one_hot": one_hot,
+            **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
+        }
+    )
+    paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
+    mlflow.log_params({k: v for k, v in paths.items() if v is not None})
+
+    def metrics(p: str, s: dict) -> dict:
+        out = {
+            f"{p}_{k}": s[k]
+            for k in ("elo", "score", "improvability", "rank", "imputed_pct_leaderboard")
+        }
+        for baseline, w in s.get("winrate", {}).items():
+            key = baseline.split(" (")[0].lower().replace("-", "").replace(".", "")
+            sub = baseline.split("(")[-1].rstrip(")").replace(" + ", "_").replace(" ", "_")
+            out[f"{p}_winrate_{key}_{sub}"] = w["all"]
+        return out
+
+    mlflow.log_metrics(metrics(prefix, summary))
+    for label, s in summary["breakdown"].items():
+        mlflow.log_metrics(metrics(f"{prefix}_{label.replace('-', '_')}", s))
+    for path in sorted(out_dir.glob("*.csv")) + [out_dir / "summary.json"]:
+        mlflow.log_artifact(str(path), f"eval/{summary['suite']}")
+
+
 def summarize(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     keys = ["one_hot", "suite", "task_id", "dataset"]
@@ -209,6 +364,18 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.suite in ARENA_SUITES:
+        use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
+        if use_mlflow:
+            if "MLFLOW_RUN_ID" not in os.environ:
+                experiment = os.environ.get("TABPFN_V2_EXPERIMENT", "tabpfn-v2-reproduction")
+                mlflow.set_experiment(experiment)
+            mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID"))
+            log_run_source(__file__, env_prefix="TABPFN_V2_")
+        run_arena(args, out_dir, use_mlflow)
+        if use_mlflow:
+            mlflow.end_run()
+        return
     tasks = selected_tasks(args)
     headline = headline_mode(args.one_hot)
     print(

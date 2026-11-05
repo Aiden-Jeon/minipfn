@@ -1,0 +1,47 @@
+# TabPFN v2·2.5 TabArena-Lite·BeyondArena 평가 (scripts/tabpfn_v2/eval.py --suite tabarena-lite 등).
+# 공식 split을 돌리고 공개 leaderboard(Hugging Face Space TabArena/leaderboard)와 같은 방식으로
+# Elo·정규화 점수·improvability·승률을 낸다. suite와 체크포인트는 TABPFN_V2_EXTRA_ARGS로 준다:
+#   databricks air run -f scripts/tabpfn_v2/eval_arena.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override "env_variables.TABPFN_V2_SUITE=beyondarena" \
+#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--classifier-path runs:/<run_id>/checkpoints/step_0500000.pt"
+# 기본 체크포인트는 Hub의 v2 공개 가중치다. 2.5 checkpoint를 평가할 때는 experiment_name을
+# tabpfn-v2-5-reproduction으로 바꾸고 --method-name minipfn-tabpfn-v2.5를 준다(멤버 전처리와 크기
+# 상한은 모델 구조로 정해진다).
+experiment_name: tabpfn-v2-reproduction
+mlflow_run_name: tabpfn-v2-eval-arena
+environment:
+  version: databricks_ai_v6
+  # tabarena는 autogluon 사전 배포판과 ray를 쓰고 pandas<2.4를 요구한다(환경의 pandas 3은 2.3으로
+  # 내려간다). data-foundry extra는 BeyondArena 데이터를 받는다. 환경 설치(uv)는 pre-release를
+  # 버전을 적은 패키지에만 허용하므로 uv.lock과 같은 버전을 하나하나 적는다
+  dependencies:
+    - huggingface-hub>=0.34
+    - tabarena[data-foundry]==0.1.1.dev20261031114042
+    - bencheval==0.1.1.dev20261031114042
+    - autogluon.tabular==1.6.4b20261101
+    - autogluon.core[ray]==1.6.4b20261101
+    - autogluon.common==1.6.4b20261101
+    - autogluon.features==1.6.4b20261101
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v2/eval.py
+env_variables:
+  TABPFN_V2_SUITE: tabarena-lite
+  TABPFN_V2_CLASSIFIER: hf://aiden-jeon/minipfn-tabpfn-v2-classifier
+  TABPFN_V2_REGRESSOR: hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+  TABPFN_V2_EXTRA_ARGS: ""
+max_retries: 0
+# BeyondArena core2k(split 2,000개)는 v2 크기 상한 안의 1,685개를 돌린다
+timeout_minutes: 480
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v2/eval.py --suite $TABPFN_V2_SUITE
+  --classifier-path $TABPFN_V2_CLASSIFIER --regressor-path $TABPFN_V2_REGRESSOR
+  $TABPFN_V2_EXTRA_ARGS

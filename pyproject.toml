@@ -11,19 +11,26 @@ authors = [
 requires-python = ">=3.12"
 # 하한은 Databricks Serverless GPU 환경 v6에 맞춘다.
 # torch는 그 환경에서 테스트된 2.11(CUDA 13.0 빌드)로 고정해 로컬과 버전을 맞춘다.
+# pandas만 그보다 낮춘다: extra arena의 tabarena(autogluon)가 pandas<2.4를 요구한다.
 dependencies = [
     "huggingface-hub>=0.34",
     "matplotlib>=3.10",
     "mlflow>=2.15",
     "numpy>=2.3",
     "openml>=0.15",
-    "pandas>=3.0.6",
+    "pandas>=2.2",
     "safetensors>=0.5",
     "scikit-learn>=1.7",
     "scipy>=1.16",
     "tabicl>=2.2",
     "torch>=2.11,<2.12",
     "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+# TabArena·BeyondArena 평가 (minipfn.benchmarks.arena). tabarena와 autogluon은 사전 배포판뿐이다
+arena = [
+    "tabarena[data-foundry]>=0.1.1.dev20261031",
 ]
 
 [build-system]
@@ -40,6 +47,9 @@ dev = [
     "python-dotenv>=1.2",
     "ruff>=0.16.8",
 ]
+
+[tool.uv]
+prerelease = "if-necessary"
 
 [tool.ruff]
 line-length = 100
