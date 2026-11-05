@@ -8,4 +8,6 @@
   v1 학습 루프, 회전 앙상블 설정(`TabPFNv1Classifier`)
 - `tabpfn_v2`: TabPFN v2·2.5의 학습 설정(`graph_scm` prior + `CellTransformer` + 공용 학습 루프)과
   구조, 전처리 멤버 앙상블 설정(`TabPFNv2Classifier`·`TabPFNv2Regressor`)
+- `tabpfn_v3`: TabPFN-3·3.5의 구조(`graph_scm` prior + `ColumnRowTransformer` + 공용 학습 루프)와
+  추론 설정(`default_inference`)
 """

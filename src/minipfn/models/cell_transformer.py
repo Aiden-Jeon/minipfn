@@ -73,6 +73,28 @@ class CellTransformerConfig:
         return asdict(self)
 
 
+def standardize_cells(
+    x: torch.Tensor, n_train: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """셀 값 (B, R, F) → (z값, 결측 표시, 쓴 열 표시 (B, 1, F)). `column_row_transformer`도 쓴다.
+
+    1) 결측 표시를 만들고, 학습 행으로 z-정규화한다 (결측 칸은 평균, 즉 0이 된다)
+    2) 학습 행에서 상수인 열은 정보가 없으므로 0으로 둔다
+    """
+    missing = ~torch.isfinite(x)
+    x = torch.where(missing, torch.nan, x)
+    mean = torch.nanmean(x[:, :n_train], dim=1, keepdim=True)
+    var = torch.nanmean(torch.square(x[:, :n_train] - mean), dim=1, keepdim=True)
+    std = torch.sqrt(torch.nan_to_num(var, nan=0.0))
+    x = torch.nan_to_num((x - mean) / std.clamp_min(1e-6), nan=0.0)
+    # 학습 행에서 거의 상수인 열은 다른 행에서 값이 아주 커질 수 있다. bf16 역전파가 넘치지
+    # 않도록 ±100으로 자른다
+    x = x.clamp(-100.0, 100.0)
+    indicator = missing.to(x.dtype) * NAN_INDICATOR
+    used = (std > 1e-6).to(x.dtype)
+    return x * used, indicator, used
+
+
 class Attention(nn.Module):
     def __init__(self, emsize: int, nhead: int) -> None:
         super().__init__()
@@ -174,21 +196,8 @@ class CellTransformer(nn.Module):
         b, r, f = x.shape
         g = self.config.features_per_group
 
-        # 1) 결측 표시를 만들고, 학습 행으로 z-정규화한다 (결측 칸은 평균, 즉 0이 된다)
-        missing = ~torch.isfinite(x)
-        x = torch.where(missing, torch.nan, x)
-        mean = torch.nanmean(x[:, :n_train], dim=1, keepdim=True)
-        var = torch.nanmean(torch.square(x[:, :n_train] - mean), dim=1, keepdim=True)
-        std = torch.sqrt(torch.nan_to_num(var, nan=0.0))
-        x = torch.nan_to_num((x - mean) / std.clamp_min(1e-6), nan=0.0)
-        # 학습 행에서 거의 상수인 열은 다른 행에서 값이 아주 커질 수 있다. bf16 역전파가 넘치지
-        # 않도록 ±100으로 자른다
-        x = x.clamp(-100.0, 100.0)
-        indicator = missing.to(x.dtype) * NAN_INDICATOR
-
-        # 2) 학습 행에서 상수인 열은 정보가 없으므로 0으로 둔다
-        used = (std > 1e-6).to(x.dtype)
-        x = x * used
+        # 1)·2) 학습 행으로 z-정규화, 결측 표시, 학습 행에서 상수인 열은 0
+        x, indicator, used = standardize_cells(x, n_train)
 
         # 3) 열 수를 묶음 크기의 배수로 맞추고 묶는다. 쓴 열이 적은 묶음은 √(g / 쓴 열 수)배
         pad = -f % g

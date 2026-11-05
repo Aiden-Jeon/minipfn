@@ -18,7 +18,8 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   범주형 열은 번호를 섞음 (2) Yeo-Johnson power transform
 - 수치형 열에서 평균으로부터 표준편차 12배 밖의 값은 그 경계로 자른다
 - (`one_hot`을 주면) 범주형 열을 one-hot으로 펼친다. 논문 전처리 목록의 6번인데, 어느 멤버에 어떤
-  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 분위수가 아닌 멤버(power·robust)만
+  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 분위수가 아닌 멤버
+  (power·robust·standard)만
   (분위수 멤버는 번호 섞기를 그대로), `"all"`은 모든 멤버.
   범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
   펼친 뒤 열 수가 `max_one_hot_width`(기본: 모델 설정의 `max_features`, 학습 때 본 feature 수.

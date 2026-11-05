@@ -43,6 +43,12 @@ class TrainConfig:
     features_per_group: int = 2
     n_thinking_rows: int = 0
     encoder: str = "linear"
+    # column_row_transformer(TabPFN-3·3.5, `recipes.tabpfn_v3`)에만 있는 구조 설정. emsize·
+    # nlayers·nhead·features_per_group·encoder는 위 필드를 같이 쓴다(그 모델에서 nlayers·nhead는
+    # 행 ICL의 것)
+    n_inducing: int = 128
+    n_cls: int = 4
+    qk_norm: bool = False
     # prior / 표 크기 (논문 Methods, `minipfn.priors.table_size`). max_features는 모델 설정에도
     # 남아 추론이 읽는다(학습 때 본 feature 수)
     max_train_rows: int = MAX_TRAIN_ROWS

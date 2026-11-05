@@ -1,13 +1,15 @@
 """앙상블 멤버의 전처리 (TabPFN v2 논문 Methods "Inference details"의 전처리 목록).
 
 멤버 하나는 학습 행에 전처리를 맞추고(`MemberPreprocessor.fit`), 학습 행과 테스트 행에 같은 변환을
-쓴다. 멤버 종류(`MEMBER_KINDS`)는 세 가지다.
+쓴다. 멤버 종류(`MEMBER_KINDS`)는 네 가지다.
 
 - `"quantile"`: 분위수 변환한 열을 원래 열 옆에 붙이고 SVD 성분을 덧붙인다. 범주형 열은 번호를
   섞는다
 - `"power"`: Yeo-Johnson power transform
 - `"robust"`: RealMLP(Holzmüller et al. 2024)의 robust scaling + smooth clipping
   (`RobustSoftClip`)
+- `"standard"`: 열 값을 바꾸지 않는다(이상치 자르기만). 표준화는 모델이 학습 행으로 한다. TabPFN-3.5
+  추론이 이것 하나만 쓴다
 
 모든 멤버에서 수치형 열의 평균으로부터 표준편차 `OUTLIER_SIGMA`배 밖의 값은 그 경계로 자르고, 열
 순서를 섞고, 표준정규 난수로 된 샘플 식별자 열을 붙인다. `one_hot`인 멤버는 범주형 열을 one-hot으로
@@ -28,7 +30,7 @@ from sklearn.preprocessing import OrdinalEncoder, PowerTransformer, QuantileTran
 OUTLIER_SIGMA = 12.0
 MAX_ONE_HOT_CATEGORIES = 20  # benchmark의 socmob(17개)은 펼치고 colleges(수천 개)는 번호로 둔다
 ONE_HOT_MODES = ("off", "power", "all")
-MEMBER_KINDS = ("quantile", "power", "robust")
+MEMBER_KINDS = ("quantile", "power", "robust", "standard")
 SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
 
 
@@ -104,14 +106,14 @@ def one_hot_kinds(one_hot: str, member_kinds: tuple[str, ...]) -> frozenset[str]
     """`one_hot` 모드에서 범주형 열을 펼치는 멤버 종류. 이 집합이 같은 두 모드는 결과도 같다."""
     if one_hot == "all":
         return frozenset(member_kinds)
-    if one_hot == "power":  # 분위수가 아닌 멤버(power·robust)만
+    if one_hot == "power":  # 분위수가 아닌 멤버(power·robust·standard)만
         return frozenset(k for k in member_kinds if k != "quantile")
     return frozenset()
 
 
 @dataclass
 class Member:
-    kind: str  # "quantile" | "power" | "robust"
+    kind: str  # "quantile" | "power" | "robust" | "standard"
     class_permutation: np.ndarray | None
     target_power: bool
     seed: int
@@ -156,9 +158,11 @@ class MemberPreprocessor:
             )
         elif self.member.kind == "power":
             self.transformer = PowerTransformer(method="yeo-johnson", standardize=True)
-        else:
+        elif self.member.kind == "robust":
             self.transformer = RobustSoftClip()
-        if num_ix:
+        else:  # standard: 값은 그대로
+            self.transformer = None
+        if num_ix and self.transformer is not None:
             self.transformer.fit(X[:, num_ix])
         self.svd = None
         base = self._base(X)
@@ -186,7 +190,7 @@ class MemberPreprocessor:
             ok = np.isfinite(X[:, i]) & (X[:, i] < len(perm))
             X[ok, i] = perm[X[ok, i].astype(int)]
         transformed = X.copy()
-        if self.num_ix:
+        if self.num_ix and self.transformer is not None:
             with np.errstate(all="ignore"):
                 transformed[:, self.num_ix] = self.transformer.transform(X[:, self.num_ix])
         if self.member.kind == "quantile":
