@@ -41,8 +41,6 @@ def test_hub_inference_imports_do_not_load_the_training_stack():
         "import sys\n"
         "import minipfn.hub.tabpfn_v1, minipfn.recipes.tabpfn_v1\n"
         "import minipfn.hub, minipfn.recipes.tabpfn_v2\n"
-        "import minipfn.tabpfn.hub, minipfn.tabpfn.inference\n"
-        "import minipfn.tabpfn_v2.hub, minipfn.tabpfn_v2.inference\n"
         "loaded = [m for m in ('mlflow', 'minipfn.training.config') if m in sys.modules]\n"
         "assert not loaded, loaded\n"
     )
@@ -91,7 +89,7 @@ def test_top_level_inference_names_load_lazily():
         "from minipfn.hub import from_pretrained as f\n"
         "from minipfn.recipes import tabpfn_v1 as v1, tabpfn_v2 as v2\n"
         "assert from_pretrained is f and TabPFNv1Classifier is v1.TabPFNv1Classifier\n"
-        "from minipfn.tabpfn.inference import TabPFNClassifier as old_name\n"
+        "from minipfn.recipes.tabpfn_v1 import TabPFNClassifier as old_name\n"
         "assert old_name is TabPFNv1Classifier  # 예전 Hub 카드의 이름\n"
         "assert TabPFNv2Classifier is v2.TabPFNv2Classifier\n"
         "assert TabPFNv2Regressor is v2.TabPFNv2Regressor\n"

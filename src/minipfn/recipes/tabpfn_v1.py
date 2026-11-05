@@ -716,7 +716,7 @@ class TabPFNv1Classifier(RotationEnsembleClassifier):
         )
 
 
-# 예전 이름 (예전 Hub 카드와 `minipfn.tabpfn.inference`가 썼다)
+# 예전 이름 (예전 v1 Hub 카드가 썼다)
 TabPFNClassifier = TabPFNv1Classifier
 
 

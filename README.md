@@ -110,8 +110,6 @@ uv run python scripts/tabpfn_v2/eval.py \
 
 예를 들어 TabPFN-2.5는 graph SCM prior, cell Transformer의 2.5 구조(`recipes/tabpfn_v2.py`의 `ARCHITECTURES`), 공용 학습 루프, 2.5 멤버 종류 묶음(`MEMBER_KIND_PRESETS["v2.5"]`)을 씁니다. 공용 학습 루프는 `TrainConfig`의 `prior_type`·`model_type`으로 prior와 모델을 고르므로, 한 축만 바꿔 비교할 수 있습니다. 예전 이름(`prior_type="tabicl"`, `model_type="tabpfn_v2"`)은 읽을 때 지금 이름으로 바꿉니다.
 
-예전 경로 `minipfn.tabpfn.hub`·`minipfn.tabpfn.inference`·`minipfn.tabpfn_v2.hub`·`minipfn.tabpfn_v2.inference`는 예전 Hub 모델 카드의 예제가 쓰던 것이라 새 모듈(`hub`, recipe)의 별칭으로 남겨 두었습니다.
-
 ### 학습
 
 ```bash
