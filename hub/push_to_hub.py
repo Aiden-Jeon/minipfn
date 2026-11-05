@@ -29,12 +29,14 @@
 학습 중간 checkpoint는 `--revision step-100k`처럼 같은 repo의 branch로 올린다. `main`(모델 카드가
 설명하는 최종 가중치)을 먼저 올려 repo가 있어야 한다. branch는 repo의 첫 commit에서 만들어
 `main`의 카드와 그림을 물려받지 않고, 가중치·설정과 함께 그 step을 설명하는 짧은 README를 둔다.
-이때도 `main`의 카드에 `--checkpoint`가 적혀 있어야 한다(카드의 중간 checkpoint 표).
+이때는 `main` 카드의 한 줄(중간 checkpoint 표의 행)에 branch와 `--checkpoint`가 함께 적혀
+있어야 한다 — branch 이름과 다른 step의 가중치가 올라가지 않도록. v2만 지원한다.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from pathlib import Path
 
@@ -78,6 +80,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--task는 --paper tabpfn_v2에서만 씁니다 (v1은 분류만)")
     if args.revision == "main":
         args.revision = None
+    if args.paper == "tabpfn" and args.revision is not None:
+        parser.error("--revision은 --paper tabpfn_v2에서만 씁니다")
     return args
 
 
@@ -151,15 +155,25 @@ def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path)
 
 
 PREPARE = {"tabpfn": prepare_tabpfn, "tabpfn_v2": prepare_tabpfn_v2}
+FRONT_MATTER = re.compile(r"\A---\r?\n.*?^---[ \t]*(?:\r?\n|\Z)", re.S | re.M)
+
+
+def check_card_revision(card: Path, revision: str, checkpoint: str) -> None:
+    """main 카드의 한 줄에 branch와 체크포인트가 함께 있는지. 다른 step의 가중치를 막는다."""
+    if not any(
+        f"`{revision}`" in line and f"`{checkpoint}`" in line
+        for line in card.read_text().splitlines()
+    ):
+        raise SystemExit(
+            f"모델 카드에 `{revision}`와 `{checkpoint}`를 함께 적은 줄이 없습니다. 카드의 중간"
+            " checkpoint 표에 그 branch의 행을 추가하거나 branch 이름을 확인해 주세요."
+        )
 
 
 def revision_card(model_card: Path, repo_id: str, revision: str, checkpoint: str) -> str:
     """중간 checkpoint branch의 README. main 카드의 front matter를 그대로 쓰고 본문은 짧게 둔다."""
-    text = model_card.read_text()
-    front = ""
-    if text.startswith("---\n"):
-        end = text.index("\n---\n", 4) + len("\n---\n")
-        front = text[:end] + "\n"
+    match = FRONT_MATTER.match(model_card.read_text())
+    front = match.group(0).rstrip() + "\n\n" if match else ""
     url = f"https://huggingface.co/{repo_id}"
     return (
         f"{front}# {repo_id} @ `{revision}`\n\n"
@@ -187,9 +201,13 @@ def main(argv: list[str] | None = None) -> None:
     model_card = resolve_model_card(args.repo_id, args.model_card)
     images = card_images(model_card)
     check_card_checkpoint(model_card, args.checkpoint, args.paper)
+    if args.revision is not None:
+        check_card_revision(model_card, args.revision, args.checkpoint)
     api = None if args.dry_run else HfApi()
     if api is not None:
         check_visibility(api, args.repo_id, args.private)
+        if args.revision is not None and not api.repo_exists(args.repo_id):
+            raise SystemExit(f"{args.repo_id}가 없습니다. --revision 없이 main을 먼저 올려 주세요.")
 
     out_dir = Path(args.out_dir)
     upload_dir = out_dir / "upload"

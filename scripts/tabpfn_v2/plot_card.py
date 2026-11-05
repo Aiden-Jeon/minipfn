@@ -85,7 +85,13 @@ def _k(x, _=None) -> str:
     return f"{x / 1000:.0f}k" if x else "0"
 
 
-def plot_training_curves(history: dict, path: Path) -> tuple[float, int]:
+def plot_training_curves(
+    history: dict,
+    path: Path,
+    loss: str = "CE",
+    ylabel: str = "cross-entropy",
+    ylim: tuple[float, float] = (0.6, 1.2),
+) -> tuple[float, int]:
     step = np.asarray(history["step"])
     train = np.asarray(history["train_loss"])
     n = len(step) // SMOOTH * SMOOTH
@@ -95,10 +101,13 @@ def plot_training_curves(history: dict, path: Path) -> tuple[float, int]:
     val = pd.Series(history["val_loss"], index=history["val_step"]).groupby(level=0).last()
 
     fig, ax = plt.subplots(figsize=(8, 3.8))
-    ax.plot(step_s, train_s, color=BLUE, lw=1.2, alpha=0.55, label="train CE (1k-step mean)")
-    ax.plot(val.index, val.values, color=BLUE, lw=2, label="val CE (64 fixed prior datasets)")
-    ax.set_ylim(0.6, 1.2)
-    ax.set(xlabel="optimizer step", ylabel="cross-entropy", title="Prior-fitting loss")
+    ax.plot(step_s, train_s, color=BLUE, lw=1.2, alpha=0.55, label=f"train {loss} (1k-step mean)")
+    ax.plot(val.index, val.values, color=BLUE, lw=2, label=f"val {loss} (64 fixed prior datasets)")
+    # 학습 초반의 큰 loss는 잘라 낸다. 그 뒤 구간이 범위를 벗어나면 위쪽을 넓힌다
+    after = train_s[step_s >= 25_000]
+    top = max(ylim[1], float(np.nanmax(after)) + 0.05) if len(after) else ylim[1]
+    ax.set_ylim(ylim[0], top)
+    ax.set(xlabel="optimizer step", ylabel=ylabel, title="Prior-fitting loss")
     ax.xaxis.set_major_locator(plt.MultipleLocator(100_000))
     ax.xaxis.set_major_formatter(_k)
     ax.legend(loc="upper right")
@@ -176,28 +185,6 @@ def geomean(x: pd.Series) -> float:
     return float(np.exp(np.log(x).mean()))
 
 
-def plot_training_curves_regression(history: dict, path: Path) -> tuple[float, int]:
-    step = np.asarray(history["step"])
-    train = np.asarray(history["train_loss"])
-    n = len(step) // SMOOTH * SMOOTH
-    step_s = step[:n].reshape(-1, SMOOTH)[:, -1]
-    train_s = train[:n].reshape(-1, SMOOTH).mean(axis=1)
-    val = pd.Series(history["val_loss"], index=history["val_step"]).groupby(level=0).last()
-
-    fig, ax = plt.subplots(figsize=(8, 3.8))
-    ax.plot(step_s, train_s, color=BLUE, lw=1.2, alpha=0.55, label="train NLL (1k-step mean)")
-    ax.plot(val.index, val.values, color=BLUE, lw=2, label="val NLL (64 fixed prior datasets)")
-    ax.set_ylim(-1.6, 0.2)
-    ax.set(xlabel="optimizer step", ylabel="negative log-likelihood", title="Prior-fitting loss")
-    ax.xaxis.set_major_locator(plt.MultipleLocator(100_000))
-    ax.xaxis.set_major_formatter(_k)
-    ax.legend(loc="upper right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return float(val.iloc[-1]), int(val.index[-1])
-
-
 def plot_by_step_regression(ratios: pd.Series, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 3.4))
     ax.axhline(1.0, color=GRAY, lw=1.5, ls="--")
@@ -213,7 +200,7 @@ def plot_by_step_regression(ratios: pd.Series, path: Path) -> None:
         ax.annotate(
             f"{y:.3f}", (x, y), xytext=(0, 9), textcoords="offset points", ha="center", color=INK
         )
-    ax.set_ylim(0.95, max(1.3, ratios.max() + 0.05))
+    ax.set_ylim(min(0.95, ratios.min() - 0.05), max(1.3, ratios.max() + 0.05))
     ax.set_xlim(ratios.index[0] - 40_000, ratios.index[-1] + 40_000)
     ax.xaxis.set_major_locator(plt.MultipleLocator(100_000))
     ax.xaxis.set_major_formatter(_k)
@@ -275,15 +262,18 @@ def load_inputs(args: argparse.Namespace) -> tuple[dict, dict[int, pd.DataFrame]
         df = pd.read_csv(csv)
         if "suite" in df.columns:
             df = df[df["suite"] == args.task]
+        if df.empty:
+            raise SystemExit(f"평가 run {run_id}에 {args.task} 결과가 없다 (--task를 확인).")
         evals[int(step)] = df
     return history, dict(sorted(evals.items()))
 
 
 def main_regression(args: argparse.Namespace, history: dict, evals: dict) -> None:
-    ratios = pd.Series({step: geomean(rmse_ratio(df)) for step, df in evals.items()})
+    per_step = {step: rmse_ratio(df) for step, df in evals.items()}
+    ratios = pd.Series({step: geomean(r) for step, r in per_step.items()})
     last_step, last = list(evals.items())[-1]
-    val_nll, val_step = plot_training_curves_regression(
-        history, args.out_dir / "training_curves.png"
+    val_nll, val_step = plot_training_curves(
+        history, args.out_dir / "training_curves.png", "NLL", "negative log-likelihood", (-1.6, 0.2)
     )
     plot_by_step_regression(ratios, args.out_dir / "benchmark_by_step.png")
     plot_per_dataset_regression(last, last_step, args.out_dir / "benchmark_rmse_ratio.png")
@@ -291,14 +281,14 @@ def main_regression(args: argparse.Namespace, history: dict, evals: dict) -> Non
     print(f"checkpoint {args.checkpoint}")
     print(f"val NLL at {val_step}: {val_nll:.3f}")
     for step, df in evals.items():
-        r = rmse_ratio(df)
+        r = per_step[step]
         print(
             f"step {step}: RMSE ratio geo. mean {geomean(r):.3f}, median {r.median():.3f}, "
             f"within 1.1x {(r <= 1.1).sum()}/{len(r)}, mean neg RMSE {df['score'].mean():.1f}"
         )
     print(f"paper mean neg RMSE {last['paper'].mean():.1f}")
     print(
-        last.assign(ratio=rmse_ratio(last))[["dataset", "score", "paper", "ratio"]]
+        last.assign(ratio=per_step[last_step])[["dataset", "score", "paper", "ratio"]]
         .sort_values("ratio")
         .round(4)
         .to_string(index=False)

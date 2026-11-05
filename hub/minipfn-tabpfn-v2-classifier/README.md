@@ -103,7 +103,7 @@ Add `--one-hot off,power,all` to also score the other one-hot modes. The headlin
 
 ## Intermediate checkpoints
 
-The checkpoints from the Results table are kept as branches of this repo. Each branch holds only the weights and config; this card on `main` describes all of them.
+The checkpoints from the Results table are kept as branches of this repo. Each branch holds the weights, config and a short README that points back here; this card on `main` describes all of them.
 
 | Branch | Training checkpoint | Mean ROC AUC |
 | --- | --- | --- |

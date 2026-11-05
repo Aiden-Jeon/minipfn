@@ -165,7 +165,8 @@ def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
     save_checkpoint(checkpoint, model, None)
     card = _card(tmp_path, checkpoint)
     card.write_text(
-        "---\nlicense: apache-2.0\n---\n\n# Card\n\n![x](images/x.png)\n" + card.read_text()
+        "---\nlicense: apache-2.0\n---\n\n# Card\n\n![x](images/x.png)\n"
+        + f"| `step-100k` | `{checkpoint}` |\n"
     )
     (card.parent / "images").mkdir()
     (card.parent / "images" / "x.png").write_bytes(b"png")
@@ -179,9 +180,29 @@ def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
     # branch에는 main 카드의 그림을 올리지 않는다
     assert {p.name for p in upload.iterdir()} == {"model.safetensors", "config.json", "README.md"}
     readme = (upload / "README.md").read_text()
-    assert readme.startswith("---\nlicense: apache-2.0\n---\n")
-    assert "`step-100k`" in readme and f"`{checkpoint}`" in readme
-    assert 'revision="step-100k"' in readme
+    assert readme.startswith("---\nlicense: apache-2.0\n---\n\n# a/b @ `step-100k`")
+    assert f"`{checkpoint}`" in readme and 'revision="step-100k"' in readme
+
+
+def test_revision_must_sit_on_the_same_card_line_as_its_checkpoint(tmp_path, no_download):
+    card = tmp_path / "README.md"
+    card.write_text("Main `runs:/a/500k.pt`.\n| `step-100k` | `runs:/a/100k.pt` |\n")
+    base = ["--paper", "tabpfn_v2", "--task", "classification", "--repo-id", "a/b"]
+    base += ["--model-card", str(card), "--dry-run"]
+    with pytest.raises(SystemExit, match="함께 적은 줄"):
+        push.main(base + ["--checkpoint", "runs:/a/500k.pt", "--revision", "step-100k"])
+    with pytest.raises(SystemExit, match="함께 적은 줄"):
+        push.main(base + ["--checkpoint", "runs:/a/100k.pt", "--revision", "step-200k"])
+    with pytest.raises(SystemExit):
+        push.parse_args(
+            ["--paper", "tabpfn", "--checkpoint", "x", "--repo-id", "a/b", "--revision", "s"]
+        )
+
+
+def test_front_matter_without_trailing_newline():
+    match = push.FRONT_MATTER.match("---\nlicense: x\n---")
+    assert match and match.group(0).rstrip() == "---\nlicense: x\n---"
+    assert push.FRONT_MATTER.match("# no front matter\n") is None
 
 
 class _RevisionApi:
