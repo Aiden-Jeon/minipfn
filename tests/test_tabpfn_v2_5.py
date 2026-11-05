@@ -193,6 +193,8 @@ def test_regressor_halves_the_target_power_within_each_member_kind():
         ("quantile", True),
         ("power", True),
     ]
+    # 한 종류도 예전과 같다: F, F, T, T (예전 benchmark 숫자를 그대로 다시 낸다)
+    assert [tp for _, tp in members(("quantile",), 4)] == [False, False, True, True]
     # 세 종류면 종류마다 y power 변환이 한 번씩
     got = members(("quantile", "power", "robust"), 6)
     for kind in ("quantile", "power", "robust"):

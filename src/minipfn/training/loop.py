@@ -33,7 +33,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from minipfn.models import DEFAULT_MODEL_TYPE, config_dict, model_class, save_checkpoint
+from minipfn.models import (
+    DEFAULT_MODEL_TYPE,
+    config_dict,
+    config_from_dict,
+    save_checkpoint,
+    state_config,
+    state_weights,
+)
 from minipfn.models.bar_distribution import FullSupportBarDistribution
 from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
@@ -148,32 +155,46 @@ def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     if regression != (config.task == "regression"):
         got = "regression" if regression else "classification"
         raise ValueError(f"{name}은 {got} checkpoint다 (설정의 task: {config.task})")
-    if "config" not in state:
+    saved_config = state_config(state)
+    if saved_config is None:
         return
     saved_type = state.get("model_type", DEFAULT_MODEL_TYPE)
     if saved_type != config.model_type:
         raise ValueError(f"{name}은 {saved_type} 모델이다 (설정의 model_type: {config.model_type})")
-    # 적지 않은 필드(기본값이라 빠진 것, 저장한 뒤에 생긴 것)는 그 기본값으로 채워 비교한다
-    saved = model_class(saved_type).config_class(**state["config"]).to_dict()
+    # 적지 않은 필드(기본값이라 빠진 것, 저장한 뒤에 생긴 것)는 그 기본값으로 채워 비교한다.
+    # 이 코드가 모르는 필드가 있으면 config_from_dict가 그 이름으로 멈춘다
+    try:
+        saved = config_from_dict(saved_type, saved_config).to_dict()
+    except ValueError as e:
+        raise ValueError(f"{name}: {e}") from None
     expected = config.model_config().to_dict()
     diff = {k: (saved.get(k), v) for k, v in expected.items() if saved.get(k) != v}
     if diff:
         raise ValueError(f"{name}의 모델 설정이 이번 설정과 다르다 (저장된 값, 설정): {diff}")
 
 
-def check_resume_step(path: str | Path, config: TrainConfig) -> None:
+def check_resume_step(state: dict, config: TrainConfig) -> None:
     """이어 갈 checkpoint의 step이 이번에 멈출 step보다 앞인지. 아니면 학습할 것이 없다.
 
     다른 설정의 run(예: paper run을 long_tables로)을 잘못 이으면 학습 없이 끝나고 결과를 그 run에
-    덮어쓰게 된다. `train`도 확인하지만, 스크립트는 MLflow run을 열기 전에 부른다.
+    덮어쓰게 된다.
     """
-    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     step, stop = int(state["step"]), min(config.stop_step or config.steps, config.steps)
     if step >= stop:
         raise ValueError(
             f"이어 갈 checkpoint가 이미 step {step}이라 멈출 step {stop}까지 학습할 것이 없다"
             " (같은 설정의 run을 이어 가는지, steps·stop_step이 맞는지 확인)"
         )
+
+
+def check_source_checkpoint(path: str | Path, config: TrainConfig, *, resume: bool) -> None:
+    """이어 가거나(`resume`) 가중치를 가져올 checkpoint를 이 설정으로 쓸 수 있는지 미리 본다
+    (task·모델·이어 갈 step). `train`도 같은 것을 보지만, 학습 스크립트는 MLflow run을 열기 전에
+    불러서 원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않는다. 틀리면 ValueError."""
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    check_checkpoint(state, config, "resume_from" if resume else "init_from")
+    if resume:
+        check_resume_step(state, config)
 
 
 def _to_cpu(obj):
@@ -230,13 +251,12 @@ def train(
     if init_from is not None:
         state = torch.load(init_from, map_location=device, weights_only=True)
         check_checkpoint(state, config, "init_from")
-        # 학습 중 checkpoint는 "model", `save_checkpoint`로 저장한 파일은 "state_dict"
-        model.load_state_dict(state["model"] if "model" in state else state["state_dict"])
+        model.load_state_dict(state_weights(state))
         borders = state["borders"]
     if resume_from is not None:
-        check_resume_step(resume_from, config)
         state = torch.load(resume_from, map_location=device, weights_only=True)
         check_checkpoint(state, config, "resume_from")
+        check_resume_step(state, config)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         sched.load_state_dict(state["scheduler"])
@@ -496,7 +516,9 @@ def train(
             state = {
                 # 모델 종류와 설정 (학습 run param 없이도 이 파일만으로 모델을 만든다)
                 "model_type": config.model_type,
-                "config": config_dict(model.config),
+                # `config`가 아니라 `model_config`: 예전 코드가 save_checkpoint 파일로 오인하지
+                # 않도록 (`models.state_config`)
+                "model_config": config_dict(model.config),
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),

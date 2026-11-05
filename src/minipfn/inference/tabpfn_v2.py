@@ -29,8 +29,10 @@
   범주형 열은 power 멤버처럼 번호 그대로다. `MEMBER_KINDS_V2_5 = ("quantile", "robust")`
   (2.5가 Yeo-Johnson을 계속 쓰는지는 적혀 있지 않다)
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
-- 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다(전처리 종류마다 절반씩:
-  종류를 한 바퀴 돌 때마다 켜고 끈다). 예측 분포는 구간 경계만
+- 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
+  켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
+  바뀐다. 멤버 수가 `2 × max(2, 종류 수)`의 배수일 때 전체와 종류마다 정확히 절반이다(기본 8개는
+  종류 1~2개에서 그렇다). 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
 
 회귀 예측값(평균)에는 논문에 없는 것을 정했다 (여기서 정함).
@@ -435,8 +437,8 @@ class TabPFNv2Regressor(_Base):
             _Member(
                 kind=self._kind(i),
                 class_permutation=None,
-                # 종류를 한 바퀴 돌 때마다 켜고 끈다: 종류마다 y power 변환이 절반씩
-                target_power=(i // len(self.member_kinds)) % 2 == 1,
+                # max(2, 종류 수)개마다 켜고 끈다 (종류 1~2개는 예전과 같은 끔, 끔, 켬, 켬)
+                target_power=(i // max(2, len(self.member_kinds))) % 2 == 1,
                 seed=int(rng.integers(0, 2**31 - 1)),
             )
             for i in range(self.n_estimators)

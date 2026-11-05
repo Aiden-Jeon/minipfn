@@ -32,6 +32,7 @@ from minipfn.models import (
     config_dict,
     config_fields,
     model_from_state,
+    state_config,
 )
 
 WEIGHTS_NAME = "model.safetensors"
@@ -136,7 +137,7 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
     if path.is_dir():
         return _check_task(from_pretrained(path), task, spec)
     state = torch.load(path, map_location="cpu", weights_only=True)
-    if "config" in state:
+    if state_config(state) is not None:
         return _check_task(model_from_state(state), task, spec)
     if run_id is None:
         raise SystemExit(

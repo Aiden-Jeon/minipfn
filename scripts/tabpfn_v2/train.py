@@ -50,7 +50,7 @@ import mlflow  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.training.config import TrainConfig  # noqa: E402
-from minipfn.training.loop import check_resume_step, checkpoint_lr, train  # noqa: E402
+from minipfn.training.loop import check_source_checkpoint, checkpoint_lr, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
 # 일반 크기(smoke, medium)는 TrainConfig에, 논문 설정(paper, long_tables)은 recipe에 있다
@@ -126,33 +126,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def build_config(args: argparse.Namespace, source: dict | None = None) -> TrainConfig:
-    """`source`는 이어 가거나 가중치를 가져올 run의 모델 구조(`hub.run_architecture`). 주면 그
-    구조를 쓰고, `--arch`도 줬으면 둘이 같은지 본다."""
+def build_config(
+    args: argparse.Namespace, source: dict | None = None
+) -> tuple[TrainConfig, str | None]:
+    """(학습 설정, 구조 이름). `source`는 이어 가거나 가중치를 가져올 run의 모델 구조
+    (`hub.run_architecture`)다. 주면 그 구조를 쓰고, `--arch`도 줬으면 둘이 같은지 본다. 구조 이름은
+    `ARCHITECTURES`의 것과 맞지 않으면 None이다."""
     keep_size = args.config_name == "smoke"
 
     def preset(arch: str) -> TrainConfig:
-        if args.config_name == "long_tables":  # GPU당 micro batch가 구조마다 달라 구조를 같이 준다
+        if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
         return recipe.with_architecture(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
 
     if source is None:
-        return _overrides(preset(args.arch or "v2"), args)
-    if args.arch is not None:
-        wanted = preset(args.arch)
-        differ = {k: (getattr(wanted, k), v) for k, v in source.items() if getattr(wanted, k) != v}
-        if differ:
-            raise SystemExit(
-                f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
-            )
+        arch = args.arch or "v2"
+        return _overrides(preset(arch), args), arch
     arch = args.arch or recipe.architecture_name(replace(TrainConfig(task=args.task), **source))
     if arch is None and args.config_name == "long_tables":
         raise SystemExit(
             f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
         )
-    return _overrides(replace(preset(arch or "v2"), **source), args)
+    base = preset(arch or "v2")
+    if args.arch is not None:
+        differ = {k: (getattr(base, k), v) for k, v in source.items() if getattr(base, k) != v}
+        if differ:
+            raise SystemExit(
+                f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
+            )
+    return _overrides(replace(base, **source), args), arch
 
 
 def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
@@ -176,6 +180,14 @@ def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
     if args.qk_clip is not None:
         config = replace(config, qk_clip=_optional_float(args.qk_clip))
     return config
+
+
+def _check_source(path: str, config: TrainConfig, *, resume: bool) -> None:
+    # MLflow run을 열기 전에 본다 (원래 run의 tag·코드를 덮어쓰거나 빈 run을 남기지 않도록)
+    try:
+        check_source_checkpoint(path, config, resume=resume)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
 
 
 def _optional_float(value: str) -> float | None:
@@ -207,7 +219,7 @@ def main(argv: list[str] | None = None) -> None:
         if params["task"] != args.task:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
-    config = build_config(args, source)
+    config, arch = build_config(args, source)
 
     init_path = None
     if args.init_run_id:
@@ -217,6 +229,7 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"init_rank{rank}"),
         )
+        _check_source(init_path, config, resume=False)
 
     resume_path = None
     if args.resume_run_id:
@@ -226,10 +239,7 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
-        try:  # MLflow run을 열기 전에 (원래 run의 tag·코드를 덮어쓰지 않도록)
-            check_resume_step(resume_path, config)
-        except ValueError as e:
-            raise SystemExit(str(e)) from None
+        _check_source(resume_path, config, resume=True)
         saved_lr = checkpoint_lr(resume_path)
         if args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
@@ -249,8 +259,6 @@ def main(argv: list[str] | None = None) -> None:
         # 새 run에 쓴다
         resume_into = args.resume_run_id if args.resume_step is None else None
         run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
-        # smoke는 층 수를 줄여 구조 이름이 맞지 않으므로 --arch를 먼저 본다
-        arch = args.arch or recipe.architecture_name(config) or "v2"
         prefix = "tabpfn-v2-5" if arch == "v2.5" else "tabpfn-v2"
         run_name = None if run_id else f"{prefix}-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)

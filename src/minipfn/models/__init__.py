@@ -62,20 +62,48 @@ def config_dict(config: Any) -> dict:
     return out
 
 
+def config_from_dict(model_type: str, values: dict) -> Any:
+    """저장한 dict에서 그 모델의 설정. 빠진 필드는 기본값이다. 이 코드가 모르는 필드가 있으면(더
+    새 코드나 다른 브랜치에서 저장한 것) 그 이름을 담은 ValueError를 낸다."""
+    cls = model_class(model_type).config_class
+    unknown = sorted(set(values) - {f.name for f in fields(cls)})
+    if unknown:
+        raise ValueError(
+            f"{model_type} 모델 설정에 이 코드가 모르는 필드 {unknown}가 있다"
+            " (더 새 코드나 다른 브랜치에서 저장한 checkpoint일 수 있다)"
+        )
+    return cls(**values)
+
+
 def build_model(model_type: str, config: Any) -> nn.Module:
     """`config`는 그 모델의 설정 dataclass 또는 같은 내용의 dict다."""
-    cls = model_class(model_type)
     if not is_dataclass(config):
-        config = cls.config_class(**config)
-    return cls(config)
+        config = config_from_dict(model_type, config)
+    return model_class(model_type)(config)
+
+
+def state_config(state: dict) -> dict | None:
+    """checkpoint에 남긴 모델 설정 (없으면 None). `save_checkpoint` 파일은 `config`, 학습 중
+    checkpoint는 `model_config`에 둔다. 예전 코드는 `config`가 있으면 `save_checkpoint` 파일로 보고
+    `state_dict`를 찾으므로, 학습 중 checkpoint는 다른 키를 써서 예전 코드도 run param으로 읽게
+    한다."""
+    return state.get("model_config", state.get("config"))
+
+
+def state_weights(state: dict) -> dict:
+    """checkpoint의 가중치: `save_checkpoint` 파일은 `state_dict`, 학습 중 checkpoint는 `model`."""
+    return state["state_dict"] if "state_dict" in state else state["model"]
 
 
 def model_from_state(state: dict) -> tuple[nn.Module, torch.Tensor | None]:
-    """모델 설정(`config`)이 든 checkpoint에서 (모델, 회귀 구간 경계). `save_checkpoint` 파일(가중치
-    `state_dict`)과 학습 중 checkpoint(가중치 `model`) 모두 읽는다. 모델 종류는 파일에 남긴
-    `model_type`을 따르고, 없는 이전 파일은 v2다."""
-    model = build_model(state.get("model_type", DEFAULT_MODEL_TYPE), state["config"])
-    model.load_state_dict(state["state_dict"] if "state_dict" in state else state["model"])
+    """모델 설정(`state_config`)이 든 checkpoint에서 (모델, 회귀 구간 경계). `save_checkpoint`
+    파일과 학습 중 checkpoint 모두 읽는다. 모델 종류는 파일에 남긴 `model_type`을 따르고, 없는
+    이전 파일은 v2다."""
+    config = state_config(state)
+    if config is None:
+        raise ValueError("checkpoint에 모델 설정이 없다 (설정을 남기기 전의 학습 중 checkpoint)")
+    model = build_model(state.get("model_type", DEFAULT_MODEL_TYPE), config)
+    model.load_state_dict(state_weights(state))
     return model.eval(), state["borders"]
 
 

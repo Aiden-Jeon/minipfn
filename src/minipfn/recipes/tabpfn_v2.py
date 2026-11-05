@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from minipfn.models import DEFAULT_MODEL_TYPE
+from minipfn.priors.base import MAX_CELLS
 from minipfn.training.config import TrainConfig
 
 # 모델 구조. v2는 Nature 논문 기본 모델, v2.5는 TabPFN-2.5(arXiv 2511.08667 "Architecture")가
@@ -38,10 +39,16 @@ LONG_TABLES_MICRO_BATCH = {"v2": 2, "v2.5": 1}
 
 
 def architecture_name(config: TrainConfig) -> str | None:
-    """`config`의 모델 구조가 `ARCHITECTURES`의 어느 것과 같은지 (없으면 None)."""
-    for name, by_task in ARCHITECTURES.items():
-        if all(getattr(config, k) == v for k, v in by_task[config.task].items()):
-            return name
+    """`config`의 모델 구조가 `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 층 수를
+    줄인 설정(`with_architecture(..., keep_size=True)`로 만든 것)도 그 구조로 본다."""
+    for name in ARCHITECTURES:
+        for keep_size in (False, True):
+            try:
+                changes = _model_changes(config, name, keep_size)
+            except ValueError:  # 다른 모델 클래스
+                return None
+            if all(getattr(config, k) == v for k, v in changes.items()):
+                return name
     return None
 
 
@@ -61,34 +68,30 @@ def long_tables(task: str = "classification", arch: str = "v2") -> TrainConfig:
     feature 2,000). 그 크기로 처음부터 학습하는 대신 TabICL처럼 짧은 표로 오래 학습한 뒤 긴 표로
     잠깐 더 학습한다: 학습 행 512~8,192개 log 균등, feature 수 분포를 500까지 펴고, 셀은
     400,000개까지. 가중치만 가져와(`init_from`) 새 optimizer로 lr 5e-5, warmup 1k + cosine
-    20k step. GPU당 micro batch는 구조마다 다르므로(`LONG_TABLES_MICRO_BATCH`) 구조를 `arch`로
-    받는다(나중에 `with_architecture`로 바꾸면 micro batch는 따라 바뀌지 않는다). 검증 batch는
-    데이터셋 4개다.
+    20k step. 검증 batch는 데이터셋 4개다. GPU당 micro batch는 구조가 정한다(`with_architecture`,
+    `LONG_TABLES_MICRO_BATCH`).
     """
     if arch not in LONG_TABLES_MICRO_BATCH:
         raise ValueError(f"long_tables의 arch는 {tuple(LONG_TABLES_MICRO_BATCH)} 가운데서: {arch}")
-    return replace(
-        with_architecture(paper(task), arch),
+    sizes = replace(
+        paper(task),
         min_train_rows=512,
         max_train_rows=8192,
         log_uniform_rows=True,
         max_features=500,
         feature_scale=500,
         max_cells=400_000,
-        micro_batch=LONG_TABLES_MICRO_BATCH[arch],
         val_batch=4,
         steps=20_000,
         warmup_steps=1_000,
         lr=5e-5,
         keep_every=5_000,
     )
+    return with_architecture(sizes, arch)
 
 
-def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -> TrainConfig:
-    """모델 구조를 `ARCHITECTURES`의 것으로. 구조가 모델 클래스(`model_type`)도 정한다. 이미
-    기본값이 아닌 다른 모델 클래스로 정한 설정은 바꾸지 않고 에러를 낸다(다른 모델을 v2로 조용히
-    바꿔 학습하지 않도록). `keep_size`(smoke)면 층 수는 그대로 두고 thinking 행은 4개까지만 써서
-    작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
+def _model_changes(config: TrainConfig, arch: str, keep_size: bool) -> dict:
+    # `arch` 구조로 바꿀 모델 설정 (with_architecture와 architecture_name이 같이 쓴다)
     if arch not in ARCHITECTURES:
         raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
     changes = dict(ARCHITECTURES[arch][config.task])
@@ -101,4 +104,20 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
         changes["nlayers"] = config.nlayers
         if "n_thinking_rows" in changes:
             changes["n_thinking_rows"] = min(changes["n_thinking_rows"], 4)
+    return changes
+
+
+def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -> TrainConfig:
+    """모델 구조를 `ARCHITECTURES`의 것으로. 구조가 모델 클래스(`model_type`)도 정한다. 이미
+    기본값이 아닌 다른 모델 클래스로 정한 설정은 바꾸지 않고 에러를 낸다(다른 모델을 v2로 조용히
+    바꿔 학습하지 않도록). `keep_size`(smoke)면 층 수는 그대로 두고 thinking 행은 4개까지만 써서
+    작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다).
+
+    긴 표 설정(셀 상한이 v2 논문의 `MAX_CELLS`보다 큰 것, `long_tables`)이면 GPU당 micro batch도
+    구조에 맞춘다(`LONG_TABLES_MICRO_BATCH`). 그래서 긴 표 설정의 구조를 나중에 바꿔도 메모리에 맞는
+    micro batch가 따라온다. 인자로 준 micro batch는 그 뒤에 덮어쓴다(학습 스크립트).
+    """
+    changes = _model_changes(config, arch, keep_size)
+    if config.max_cells > MAX_CELLS and arch in LONG_TABLES_MICRO_BATCH:
+        changes["micro_batch"] = LONG_TABLES_MICRO_BATCH[arch]
     return replace(config, **changes)

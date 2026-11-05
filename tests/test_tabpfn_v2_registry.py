@@ -156,7 +156,11 @@ def test_training_checkpoints_carry_the_model_settings(tmp_path, monkeypatch, ti
     config = replace(TrainConfig.smoke(), model_type="tiny", steps=2)
     train(config, tmp_path, mlflow_log=False)
     state = torch.load(tmp_path / "latest.pt", weights_only=True)
-    assert state["model_type"] == "tiny" and state["config"] == config.model_config().to_dict()
+    assert state["model_type"] == "tiny"
+    assert state["model_config"] == config.model_config().to_dict()
+    # `config` 키가 있으면 예전 코드는 save_checkpoint 파일로 보고 state_dict를 찾다가 깨진다.
+    # 키를 나눠서 예전 코드는 run param으로 읽는다
+    assert "config" not in state and "state_dict" not in state
     _fake_run(monkeypatch, tmp_path / "latest.pt", params={})  # param을 읽으면 KeyError
     loaded, _ = hub.load_model("runs:/abc/checkpoints/latest.pt", "classification", tmp_path)
     assert isinstance(loaded, TinyModel)
@@ -211,3 +215,19 @@ def test_run_params_parse_bools():
     assert hub._parse_param(3, "24") == 24 and hub._parse_param("linear", "mlp") == "mlp"
     with pytest.raises(ValueError):
         hub._parse_param(False, "1")
+
+
+def test_unknown_model_fields_are_named(tmp_path):
+    # 다른 브랜치·새 코드가 더한 필드가 있는 checkpoint는 TypeError 대신 그 필드 이름으로 멈춘다
+    from minipfn.training.loop import check_checkpoint
+
+    config = TrainConfig.smoke()
+    with pytest.raises(ValueError, match="모르는 필드 \\['n_cls_tokens'\\]"):
+        registry.build_model("tabpfn_v2", {**config.model_config().to_dict(), "n_cls_tokens": 4})
+    state = {
+        "model_type": "tabpfn_v2",
+        "model_config": {**config.model_config().to_dict(), "n_cls_tokens": 4},
+        "borders": None,
+    }
+    with pytest.raises(ValueError, match="init_from: .*모르는 필드"):
+        check_checkpoint(state, config, "init_from")

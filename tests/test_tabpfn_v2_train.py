@@ -432,8 +432,9 @@ def test_train_script_takes_the_architecture_of_the_source_run(monkeypatch):
         ["--config-name", "long_tables", "--init-run-id", "r", "--task", "regression"]
     )
     assert args.arch is None
-    config = script.build_config(args, source)
-    assert recipe.architecture_name(config) == "v2.5" and config.max_train_rows == 8192
+    config, arch = script.build_config(args, source)
+    assert arch == recipe.architecture_name(config) == "v2.5" and config.max_train_rows == 8192
+    assert config.micro_batch == 1  # 2.5 구조의 긴 표 micro batch
     # 같은 구조를 --arch로 줘도 된다
     args = script.parse_args(
         [
@@ -447,7 +448,7 @@ def test_train_script_takes_the_architecture_of_the_source_run(monkeypatch):
             "v2.5",
         ]
     )
-    assert script.build_config(args, source) == config
+    assert script.build_config(args, source) == (config, "v2.5")
     # 다르면 시작 전에 멈춘다
     args = script.parse_args(
         [
@@ -465,7 +466,40 @@ def test_train_script_takes_the_architecture_of_the_source_run(monkeypatch):
         script.build_config(args, source)
     # 원래 run이 없으면 기본은 v2
     args = script.parse_args(["--config-name", "paper", "--task", "regression"])
-    assert recipe.architecture_name(script.build_config(args)) == "v2"
+    config, arch = script.build_config(args)
+    assert arch == recipe.architecture_name(config) == "v2"
+    # smoke(층 수를 줄인 2.5) run을 이어도 구조 이름은 v2.5 (run 이름 접두어에 쓴다)
+    smoke = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5", keep_size=True)
+    source = run_architecture({k: str(v) for k, v in vars(smoke).items()})
+    args = script.parse_args(
+        ["--config-name", "smoke", "--task", "regression", "--resume-run-id", "r"]
+    )
+    config, arch = script.build_config(args, source)
+    assert arch == "v2.5" and config.nlayers == smoke.nlayers and config.n_thinking_rows == 4
+
+
+def test_train_script_checks_the_source_checkpoint_before_the_run(tmp_path):
+    # task·모델 설정이 틀린 checkpoint는 MLflow run을 열기 전에 멈춘다
+    script = _train_script()
+    config = replace(TrainConfig.smoke(), steps=2, collapse_threshold=None)
+    train(config, tmp_path / "a", mlflow_log=False)
+    latest = str(tmp_path / "a" / "latest.pt")
+    with pytest.raises(SystemExit, match="nhead"):
+        script._check_source(latest, replace(config, nhead=4, steps=4), resume=True)
+    with pytest.raises(SystemExit, match="학습할 것이 없다"):
+        script._check_source(latest, config, resume=True)
+    with pytest.raises(SystemExit, match="classification checkpoint"):
+        script._check_source(latest, TrainConfig.smoke("regression"), resume=False)
+    script._check_source(latest, config, resume=False)  # 가중치만 가져오는 것은 step과 상관없다
+
+
+def test_with_architecture_sets_the_long_table_micro_batch():
+    # 긴 표 설정의 구조를 나중에 바꿔도 그 구조의 micro batch가 따라온다 (2.5에 2면 GPU 메모리 초과)
+    v25 = recipe.with_architecture(recipe.long_tables("regression"), "v2.5")
+    assert v25 == recipe.long_tables("regression", arch="v2.5") and v25.micro_batch == 1
+    assert recipe.with_architecture(v25, "v2").micro_batch == 2
+    # 긴 표가 아니면 micro batch는 그대로 (paper 8)
+    assert recipe.with_architecture(recipe.paper(), "v2.5").micro_batch == 8
 
 
 @pytest.mark.parametrize(
