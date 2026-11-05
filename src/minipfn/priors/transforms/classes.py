@@ -90,7 +90,7 @@ def train_rows_cover_classes(
     클래스마다 한 행씩 먼저 학습 행에 넣고, 나머지 학습 행은 무작위로 채운다. 클래스가 2개보다
     적거나 학습 행 수보다 많으면 None(그 데이터셋은 버린다).
     """
-    labels = y.long().numpy()
+    labels = y.long().cpu().numpy()
     classes = np.unique(labels)
     if len(classes) < 2 or len(classes) > n_train:
         return None
@@ -98,7 +98,7 @@ def train_rows_cover_classes(
     rest = rng.permutation(np.setdiff1d(np.arange(len(labels)), first))
     n_more = n_train - len(first)
     train = rng.permutation(np.concatenate([first, rest[:n_more]]))
-    return torch.from_numpy(np.concatenate([train, rest[n_more:]]))
+    return torch.from_numpy(np.concatenate([train, rest[n_more:]])).to(y.device)
 
 
 class ToClasses:

@@ -3,8 +3,8 @@ import torch
 
 from minipfn.priors.base import IGNORE_INDEX, PriorBatch
 from minipfn.priors.generators.mlp import MLP
+from minipfn.priors.hyperparameters import GroupHyperparameters
 from minipfn.priors.pipeline import Group, Mixture, Pipeline, Rng
-from minipfn.priors.prior_bag import sample_group_hyperparameters
 from minipfn.priors.transforms import (
     CoverClasses,
     DropInvalid,
@@ -93,8 +93,18 @@ def test_generator_gets_the_used_feature_count_and_batch_is_datasets_first():
     assert batch.x.shape == (4, 7, 5) and batch.y.shape == (4, 7)
     assert (batch.x[..., :2] == 1).all() and (batch.x[..., 2:] == 0).all()
     assert torch.equal(batch.y[0], torch.arange(7.0) % 2)
-    with pytest.raises(ValueError, match="배수"):
-        pipe.sample_batch(3, 7, 5, 5)
+    for bad in (3, 0, -2):
+        with pytest.raises(ValueError, match="배수"):
+            pipe.sample_batch(bad, 7, 5, 5)
+
+
+def test_sample_group_can_run_only_some_transforms():
+    pipe = Pipeline(
+        Constant(1.0), rng=Rng.from_seed(0), transforms=[RejectFirst(10)], max_attempts=2
+    )
+    assert (pipe.sample_group(5, 3, 2, transforms=[]).x == 1).all()
+    with pytest.raises(RuntimeError):
+        pipe.sample_group(5, 3, 2)
 
 
 def test_v1_generator_with_v2_missing_values():
@@ -102,8 +112,12 @@ def test_v1_generator_with_v2_missing_values():
     pipe = Pipeline(
         MLP(scale_weights_sqrt=True, random_feature_rotation=True),
         rng=Rng.from_seed(0),
-        hyperparameters=lambda rng, n_train, n_features: sample_group_hyperparameters(
-            rng.numpy, spec.PRIOR, 10, n_features
+        hyperparameters=GroupHyperparameters(
+            spec.MLP_HYPERPARAMETERS,
+            spec.GP_HYPERPARAMETERS,
+            mlp_weight=spec.PRIOR_BAG_MLP_WEIGHT,
+            min_classes=2,
+            max_classes=10,
         ),
         transforms=[
             Standardize(),
@@ -146,3 +160,33 @@ def test_missing_only_touches_x_of_chosen_datasets():
     assert not torch.isnan(Missing(0.0, 0.9)(group, Rng.from_seed(0)).x).any()
     out = Missing(1.0, 0.9)(group, Rng.from_seed(1))
     assert torch.isnan(out.x).any() and torch.equal(out.y, group.y)
+
+
+def test_settings_baked_into_parts_are_read_only():
+    from minipfn.priors.graph_scm import GraphSCMPrior
+    from minipfn.recipes.tabpfn_v1 import TabPFNPrior
+
+    graph = GraphSCMPrior("regression", seed=0, missing_dataset_prob=0.5, n_eval_rows=8)
+    assert graph.missing_dataset_prob == 0.5 and graph.task == "regression"
+    bag = TabPFNPrior(seq_len=16, num_features=4, group_size=2)
+    assert bag.num_features == 4 and bag.group_size == 2
+    for obj, name in [(graph, "missing_dataset_prob"), (graph, "task"), (bag, "num_features")]:
+        with pytest.raises(AttributeError):
+            setattr(obj, name, 0)
+
+
+ACCELERATOR = (
+    "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else None
+)
+
+
+@pytest.mark.skipif(ACCELERATOR is None, reason="GPU(cuda·mps)가 없다")
+def test_transforms_keep_tensors_on_their_device():
+    # 생성기가 GPU 텐서를 내고 Rng는 CPU인 경우 (device를 Rng가 아니라 텐서에서 읽는다)
+    dev = torch.device(ACCELERATOR)
+    y = torch.tensor([[0.0, 1.0]] * 5 + [[1.0, 0.0]] * 5, device=dev)
+    group = Group(torch.randn(10, 2, 3, device=dev), y, 6, {})
+    rng = Rng.from_seed(0)
+    for transform in (Missing(1.0, 0.5), CoverClasses(), PadFeatures(5, rescale=True)):
+        out = transform(group, rng)
+        assert out.x.device.type == dev.type and out.y.device.type == dev.type

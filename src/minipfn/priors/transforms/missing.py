@@ -25,7 +25,7 @@ class Missing:
             x = group.x[:, d]
             if r.random() < self.dataset_prob:
                 rate = r.uniform(0.0, self.max_rate)
-                mask = torch.from_numpy(r.random(tuple(x.shape)) < rate)
+                mask = torch.from_numpy(r.random(tuple(x.shape)) < rate).to(x.device)
                 x = x.masked_fill(mask, float("nan"))
             xs.append(x)
         return Group(torch.stack(xs, 1), group.y, group.n_train, group.hp)

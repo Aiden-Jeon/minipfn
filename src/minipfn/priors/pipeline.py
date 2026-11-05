@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -109,13 +108,21 @@ class Pipeline:
         self.group_size = group_size
         self.max_attempts = max_attempts
 
-    def sample_group(self, n_rows: int, n_train: int, n_features: int) -> Group:
+    def sample_group(
+        self,
+        n_rows: int,
+        n_train: int,
+        n_features: int,
+        transforms: Sequence[Transform] | None = None,
+    ) -> Group:
+        """그룹 하나. `transforms`를 주면 설정한 후처리 대신 그것을 쓴다(일부 단계만 거칠 때)."""
+        transforms = self.transforms if transforms is None else transforms
         for _ in range(self.max_attempts):
             hp = self.hyperparameters(self.rng, n_train, n_features) if self.hyperparameters else {}
             n_used = hp.get("num_features_used", n_features)
             x, y = self.generator(n_rows, n_used, self.group_size, hp, self.rng)
             group: Group | None = Group(x, y, n_train, hp)
-            for transform in self.transforms:
+            for transform in transforms:
                 group = transform(group, self.rng)
                 if group is None:
                     break
@@ -129,11 +136,11 @@ class Pipeline:
         self, batch_size: int, n_rows: int, n_train: int, n_features: int
     ) -> PriorBatch:
         """데이터셋 batch_size개 (group_size의 배수여야 한다)."""
-        n_groups = math.ceil(batch_size / self.group_size)
-        if n_groups * self.group_size != batch_size:
+        if batch_size < 1 or batch_size % self.group_size:
             raise ValueError(
-                f"batch_size {batch_size}가 group_size {self.group_size}의 배수가 아니다"
+                f"batch_size {batch_size}는 group_size {self.group_size}의 양의 배수여야 한다"
             )
+        n_groups = batch_size // self.group_size
         groups = [self.sample_group(n_rows, n_train, n_features) for _ in range(n_groups)]
         x = torch.cat([g.x.float() for g in groups], dim=1)
         y = torch.cat([g.y.float() for g in groups], dim=1)

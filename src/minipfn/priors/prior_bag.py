@@ -2,8 +2,8 @@
 생성기를 고르고, 표 데이터로 다듬는다. 부품(`minipfn.priors.generators`, `transforms`,
 `hyperparameters`)을 `Pipeline`으로 묶은 것이다.
 
-그룹 하나는 하이퍼파라미터를 공유하고(`sample_group_hyperparameters`), 신경망 가중치만 데이터셋마다
-새로 뽑는다(v1 `new_mlp_per_example`). 그룹을 만드는 순서는 v1과 같다.
+그룹 하나는 하이퍼파라미터를 공유하고(`hyperparameters.GroupHyperparameters`), 신경망 가중치만
+데이터셋마다 새로 뽑는다(v1 `new_mlp_per_example`). 그룹을 만드는 순서는 v1과 같다.
 
 1. 하이퍼파라미터: MLP·GP 하이퍼파라미터, 어느 생성기를 쓸지(softmax([1, w]), w는 설정의
    `mlp_weight` 분포), 쓰는 feature 수, 클래스 수.
@@ -22,7 +22,6 @@ Freiburg)를 따르되, 난수는 전역 `random`·`np.random` 대신 생성기 
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,7 +29,7 @@ import torch
 
 from minipfn.priors.generators.gp import GPTables
 from minipfn.priors.generators.mlp import MLP
-from minipfn.priors.hyperparameters import sample_hyperparameter
+from minipfn.priors.hyperparameters import GroupHyperparameters
 from minipfn.priors.pipeline import Mixture, Pipeline, Rng
 from minipfn.priors.transforms import (
     Categorical,
@@ -44,7 +43,8 @@ from minipfn.priors.transforms import (
 
 @dataclass(frozen=True)
 class PriorBagConfig:
-    """prior bag이 쓰는 분포와 확률. 하이퍼파라미터 dict의 형식은 `sample_hyperparameter`."""
+    """prior bag이 쓰는 분포와 확률. 하이퍼파라미터 dict의 형식은
+    `minipfn.priors.hyperparameters.sample_hyperparameter`."""
 
     mlp_hyperparameters: dict  # MLP prior (`sample_mlp_dataset`)
     gp_hyperparameters: dict  # GP prior (outputscale, lengthscale, noise)
@@ -60,21 +60,22 @@ class PriorBagConfig:
     random_feature_rotation: bool  # MLP 데이터셋의 feature 순서를 무작위로 회전
 
 
+def group_hyperparameters(config: PriorBagConfig, max_classes: int) -> GroupHyperparameters:
+    """설정의 분포로 그룹 하이퍼파라미터 부품을 만든다."""
+    return GroupHyperparameters(
+        config.mlp_hyperparameters,
+        config.gp_hyperparameters,
+        mlp_weight=config.mlp_weight,
+        min_classes=config.min_classes,
+        max_classes=max_classes,
+    )
+
+
 def sample_group_hyperparameters(
     rng: np.random.Generator, config: PriorBagConfig, max_classes: int, num_features: int
 ) -> dict:
-    """그룹(데이터셋 묶음)이 공유하는 하이퍼파라미터를 한 번에 뽑는다."""
-    hp = {name: sample_hyperparameter(d, rng) for name, d in config.mlp_hyperparameters.items()}
-    gp = config.gp_hyperparameters
-    hp.update({name: sample_hyperparameter(d, rng) for name, d in gp.items()})
-    # prior bag: P(MLP) = softmax([1, w])[1]
-    w = sample_hyperparameter(config.mlp_weight, rng)
-    hp["use_mlp"] = bool(rng.random() < math.exp(w) / (math.e + math.exp(w)))
-    # flexible_categorical: 쓰는 feature 수와 클래스 수 상한
-    # (v1 uniform_int_sampler_f = round(U(a, b)))
-    hp["num_features_used"] = int(round(rng.uniform(1, num_features)))
-    hp["num_classes"] = int(round(rng.uniform(config.min_classes, max_classes)))
-    return hp
+    """그룹(데이터셋 묶음)이 공유하는 하이퍼파라미터를 한 번에 뽑는다 (`GroupHyperparameters`)."""
+    return group_hyperparameters(config, max_classes).sample(rng, num_features)
 
 
 def _mlp_or_gp(hp: dict) -> str:
@@ -95,12 +96,12 @@ class PriorBag:
         device: torch.device | str = "cpu",
         seed: int = 0,
     ) -> None:
-        self.config = config
-        self.seq_len = seq_len
-        self.num_features = num_features
-        self.max_classes = max_classes
-        self.group_size = group_size
-        self.device = torch.device(device)
+        # 아래 설정은 부품을 만들 때 들어가므로 바꿀 수 없다(읽기 전용 속성)
+        self._config = config
+        self._seq_len = seq_len
+        self._num_features = num_features
+        self._max_classes = max_classes
+        self._device = torch.device(device)
         mlp = MLP(
             scale_weights_sqrt=config.scale_weights_sqrt,
             random_feature_rotation=config.random_feature_rotation,
@@ -116,14 +117,35 @@ class PriorBag:
         transforms.append(Relabel())
         self.pipeline = Pipeline(
             Mixture({"mlp": mlp, "gp": GPTables()}, _mlp_or_gp),
-            rng=Rng.from_seed(seed, self.device),
-            hyperparameters=self._hyperparameters,
+            rng=Rng.from_seed(seed, self._device),
+            hyperparameters=group_hyperparameters(config, max_classes),
             transforms=transforms,
             group_size=group_size,
         )
 
-    def _hyperparameters(self, rng: Rng, n_train: int, n_features: int) -> dict:
-        return sample_group_hyperparameters(rng.numpy, self.config, self.max_classes, n_features)
+    @property
+    def config(self) -> PriorBagConfig:
+        return self._config
+
+    @property
+    def seq_len(self) -> int:
+        return self._seq_len
+
+    @property
+    def num_features(self) -> int:
+        return self._num_features
+
+    @property
+    def max_classes(self) -> int:
+        return self._max_classes
+
+    @property
+    def group_size(self) -> int:
+        return self.pipeline.group_size
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
 
     @torch.no_grad()
     def sample_group(self, single_eval_pos: int) -> tuple[torch.Tensor, torch.Tensor, dict]:

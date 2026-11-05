@@ -4,6 +4,8 @@
   분포에서 분포의 모수를 먼저 뽑고, 그 분포에서 값을 뽑는다. 하이퍼파라미터 하나는
   `{"distribution": 종류, ...모수 범위}` dict로 적는다. 종류는 `uniform`, `meta_gamma`,
   `meta_beta`, `meta_trunc_norm_log_scaled`, `meta_choice`, `meta_choice_mixed`다.
+- `GroupHyperparameters`: TabPFN v1 prior bag의 그룹 하이퍼파라미터 (생성기 선택, 쓰는 feature 수,
+  클래스 수 포함).
 - `ClassCount`: 분류 데이터셋의 클래스 수를 학습 행 수에 맞춰 뽑는다.
 """
 
@@ -67,3 +69,44 @@ class ClassCount:
     def __call__(self, rng: Rng, n_train: int, n_features: int) -> dict:
         max_classes = min(self.max_classes, n_train)
         return {"num_classes": int(rng.numpy.integers(2, max_classes + 1))}
+
+
+class GroupHyperparameters:
+    """그룹(데이터셋 묶음)이 공유하는 하이퍼파라미터 (TabPFN v1 prior bag).
+
+    MLP·GP 생성기의 하이퍼파라미터를 meta 분포에서 뽑고(`sample_hyperparameter`), 어느 생성기를 쓸지
+    (`use_mlp`, P(MLP) = softmax([1, w])[1], w ~ `mlp_weight`), 쓰는 feature 수
+    (`num_features_used` = round(U(1, feature 수))), 클래스 수 상한(`num_classes` =
+    round(U(min_classes, max_classes)))을 정한다. 분포 표의 v1 논문 값은
+    `minipfn.recipes.tabpfn_v1`에 있다.
+    """
+
+    def __init__(
+        self,
+        mlp: dict,
+        gp: dict,
+        *,
+        mlp_weight: dict,
+        min_classes: int,
+        max_classes: int,
+    ) -> None:
+        self.mlp = mlp
+        self.gp = gp
+        self.mlp_weight = mlp_weight
+        self.min_classes = min_classes
+        self.max_classes = max_classes
+
+    def __call__(self, rng: Rng, n_train: int, n_features: int) -> dict:
+        return self.sample(rng.numpy, n_features)
+
+    def sample(self, rng: np.random.Generator, num_features: int) -> dict:
+        hp = {name: sample_hyperparameter(d, rng) for name, d in self.mlp.items()}
+        hp.update({name: sample_hyperparameter(d, rng) for name, d in self.gp.items()})
+        # prior bag: P(MLP) = softmax([1, w])[1]
+        w = sample_hyperparameter(self.mlp_weight, rng)
+        hp["use_mlp"] = bool(rng.random() < math.exp(w) / (math.e + math.exp(w)))
+        # flexible_categorical: 쓰는 feature 수와 클래스 수 상한
+        # (v1 uniform_int_sampler_f = round(U(a, b)))
+        hp["num_features_used"] = int(round(rng.uniform(1, num_features)))
+        hp["num_classes"] = int(round(rng.uniform(self.min_classes, self.max_classes)))
+        return hp

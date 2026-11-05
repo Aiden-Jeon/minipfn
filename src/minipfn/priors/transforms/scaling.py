@@ -32,5 +32,5 @@ class PadFeatures:
         n_rows, n_datasets, k = x.shape
         if self.rescale:
             x = x / (k / self.n_features)
-        pad = torch.zeros(n_rows, n_datasets, self.n_features - k, device=rng.device)
+        pad = torch.zeros(n_rows, n_datasets, self.n_features - k, device=x.device)
         return Group(torch.cat([x, pad], dim=-1), group.y, group.n_train, group.hp)

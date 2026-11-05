@@ -59,7 +59,7 @@ class GraphSCMPrior:
         max_cells: int = MAX_CELLS,
         feature_scale: int = MAX_FEATURES,
     ) -> None:
-        self.task = task
+        self._task = task
         if task == "classification":
             min_train_rows = max(min_train_rows, 2)  # 클래스가 2개 이상 학습 행에 나오려면
         check_sizes(
@@ -70,8 +70,7 @@ class GraphSCMPrior:
             max_cells=max_cells,
             feature_scale=feature_scale,
         )
-        self.missing_dataset_prob = missing_dataset_prob
-        self.max_missing_rate = max_missing_rate
+        # 크기 설정은 batch마다 읽는다. task와 결측값 설정은 부품에 들어가므로 읽기 전용 속성이다
         self.min_train_rows = min_train_rows
         self.max_train_rows = max_train_rows
         self.n_eval_rows = n_eval_rows
@@ -82,16 +81,28 @@ class GraphSCMPrior:
         self.rng = Rng.from_seed(seed)
         generator = GraphSCM(task, seed=seed)  # TabICL의 전역 난수 시드도 여기서 고정한다
         classification = task == "classification"
-        accept = [DropInvalid(), CoverClasses()] if classification else [DropInvalid()]
-        parts = {
-            "rng": self.rng,
-            "hyperparameters": ClassCount(MAX_CLASSES) if classification else None,
-            "max_attempts": MAX_ATTEMPTS,
-        }
-        # 결측값을 넣기 전의 데이터셋 하나 (회귀 구간 경계, `_one_dataset`)
-        self._datasets = Pipeline(generator, transforms=accept, **parts)
-        missing = Missing(missing_dataset_prob, max_missing_rate)
-        self.pipeline = Pipeline(generator, transforms=[*accept, missing], **parts)
+        # 결측값을 넣기 전까지 (회귀 구간 경계와 `_one_dataset`은 여기까지만 거친다)
+        self._accept = [DropInvalid(), CoverClasses()] if classification else [DropInvalid()]
+        self._missing = Missing(missing_dataset_prob, max_missing_rate)
+        self.pipeline = Pipeline(
+            generator,
+            rng=self.rng,
+            hyperparameters=ClassCount(MAX_CLASSES) if classification else None,
+            transforms=[*self._accept, self._missing],
+            max_attempts=MAX_ATTEMPTS,
+        )
+
+    @property
+    def task(self) -> str:
+        return self._task
+
+    @property
+    def missing_dataset_prob(self) -> float:
+        return self._missing.dataset_prob
+
+    @property
+    def max_missing_rate(self) -> float:
+        return self._missing.max_rate
 
     def sample_size(self) -> tuple[int, int]:
         n_train, n_features = sample_table_size(
@@ -108,7 +119,8 @@ class GraphSCMPrior:
 
     def _one_dataset(self, n_train: int, n_features: int) -> tuple[torch.Tensor, torch.Tensor]:
         """결측값을 넣기 전의 데이터셋 하나: x (행, feature), y (행)."""
-        group = self._datasets.sample_group(n_train + self.n_eval_rows, n_train, n_features)
+        n_rows = n_train + self.n_eval_rows
+        group = self.pipeline.sample_group(n_rows, n_train, n_features, transforms=self._accept)
         return group.x[:, 0], group.y[:, 0]
 
     def sample_batch(self, batch_size: int, size: tuple[int, int] | None = None) -> PriorBatch:
