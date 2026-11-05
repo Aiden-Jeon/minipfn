@@ -1,10 +1,12 @@
-"""prior가 학습 루프(`minipfn.training.loop`)에 내는 batch."""
+"""prior가 학습 루프(`minipfn.training.loop`)에 내는 batch와, prior·손실이 같이 쓰는 상수."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
+
+IGNORE_INDEX = -100  # 손실에서 무시할 target (cross-entropy의 ignore_index)
 
 
 @dataclass

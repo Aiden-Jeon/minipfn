@@ -46,8 +46,8 @@ from torch.utils.data import DataLoader
 from minipfn.inference import rotation_ensemble
 from minipfn.inference.rotation_ensemble import FitMode, RotationEnsembleClassifier
 from minipfn.models.row_transformer import RowTransformer, configure_attention_backends
+from minipfn.priors.base import IGNORE_INDEX
 from minipfn.priors.prior_bag import PriorBag, PriorBagConfig
-from minipfn.priors.tabular import IGNORE_INDEX
 from minipfn.training.data import PriorGroups
 from minipfn.training.losses import classification_loss
 from minipfn.utils import lr_factor, setup_distributed
@@ -178,7 +178,7 @@ NORMALIZE_BY_USED_FEATURES = True
 CHECK_IS_COMPATIBLE = (
     True  # 학습/테스트 행의 클래스 집합이 같아야 한다. 아니면 행을 섞고, 10번 실패하면 무시(-100)
 )
-# IGNORE_INDEX(-100, 무시할 target)는 `minipfn.priors.tabular`의 것을 쓴다
+# IGNORE_INDEX(-100, 무시할 target)는 `minipfn.priors.base`의 것을 쓴다
 
 # ---------------------------------------------------------------------------
 # 평가 (논문 5.2절·부록 F, v1 RunFullDatasetAnalyses, tabular_evaluation,

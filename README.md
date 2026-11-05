@@ -100,12 +100,12 @@ uv run python scripts/tabpfn_v2/eval.py \
 
 `src/minipfn/`의 코드는 네 축으로 나눕니다. prior(`priors/`: 학습 데이터), 모델(`models/`: 구조와 모델 registry), 학습(`training/`: 설정, 공용 학습 루프, 데이터 공급, 손실, 안정화), 추론(`inference/`: 앙상블과 전처리)입니다. 여기에 평가(`benchmarks/`)와 Hub 업로드(`hub/`)를 따로 둡니다.
 
-축 안의 모듈은 무엇인지로 이름을 붙인 부품입니다. 예를 들어 prior는 `gp`·`mlp_scm`·`prior_bag`·`graph_scm`, 모델은 토큰 하나가 무엇인지에 따라 `point_transformer`(점)·`row_transformer`(행)·`cell_transformer`(셀 묶음)입니다. 논문 이름은 `recipes/`에만 씁니다. recipe는 논문이 정한 수치와 그 수치로 부품을 묶은 설정이고, 논문 기본값을 붙인 추론 클래스(`TabPFNv1Classifier`, `TabPFNv2Classifier` 등)와 그 논문에만 있는 학습 루프(PFN, TabPFN v1)도 여기에 둡니다. 축은 recipe를 import하지 않습니다. 실행 스크립트와 AI Runtime yaml은 `scripts/<paper>/`에 둡니다.
+축 안의 모듈은 무엇인지로 이름을 붙인 부품입니다. 예를 들어 prior는 `gp`·`prior_bag`·`graph_scm`, 모델은 토큰 하나가 무엇인지에 따라 `point_transformer`(점)·`row_transformer`(행)·`cell_transformer`(셀 묶음)입니다. 논문 이름은 `recipes/`에만 씁니다. recipe는 논문이 정한 수치와 그 수치로 부품을 묶은 설정이고, 논문 기본값을 붙인 추론 클래스(`TabPFNv1Classifier`, `TabPFNv2Classifier` 등)와 그 논문에만 있는 학습 루프(PFN, TabPFN v1)도 여기에 둡니다. 축은 recipe를 import하지 않습니다. 실행 스크립트와 AI Runtime yaml은 `scripts/<paper>/`에 둡니다.
 
 | recipe | prior | 모델 | 학습 | 추론 |
 |---|---|---|---|---|
 | `recipes/pfn.py` | `priors/gp.py` | `models/point_transformer.py` | `recipes/pfn.py`의 `train_pfn` | `recipes/pfn.py`의 `pfn_predict` |
-| `recipes/tabpfn_v1.py` | `priors/prior_bag.py` (+ `mlp_scm`, `tabular`, `gp`) | `models/row_transformer.py` | `recipes/tabpfn_v1.py`의 `train_tabpfn` | `inference/rotation_ensemble.py` |
+| `recipes/tabpfn_v1.py` | `priors/prior_bag.py` | `models/row_transformer.py` | `recipes/tabpfn_v1.py`의 `train_tabpfn` | `inference/rotation_ensemble.py` |
 | `recipes/tabpfn_v2.py` (v2, 2.5) | `priors/graph_scm.py` (+ `table_size`) | `models/cell_transformer.py` | `training/loop.py` | `inference/ensemble.py` (+ `preprocessing`) |
 
 예를 들어 TabPFN-2.5는 graph SCM prior, cell Transformer의 2.5 구조(`recipes/tabpfn_v2.py`의 `ARCHITECTURES`), 공용 학습 루프, 2.5 멤버 종류 묶음(`MEMBER_KIND_PRESETS["v2.5"]`)을 씁니다. 공용 학습 루프는 `TrainConfig`의 `prior_type`·`model_type`으로 prior와 모델을 고르므로, 한 축만 바꿔 비교할 수 있습니다. 예전 이름(`prior_type="tabicl"`, `model_type="tabpfn_v2"`)은 읽을 때 지금 이름으로 바꿉니다.

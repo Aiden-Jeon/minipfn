@@ -38,7 +38,7 @@ import torch
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 
 from minipfn.models.row_transformer import RowTransformer
-from minipfn.priors.tabular import (
+from minipfn.priors.prior_bag import (
     apply_normalization,
     normalization_stats,
     outlier_bounds,

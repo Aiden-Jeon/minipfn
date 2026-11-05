@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from minipfn.models.bar_distribution import FullSupportBarDistribution
-from minipfn.priors.tabular import IGNORE_INDEX
+from minipfn.priors.base import IGNORE_INDEX
 
 
 def prior_loss(

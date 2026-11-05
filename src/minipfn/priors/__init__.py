@@ -1,12 +1,11 @@
 """학습 데이터 (prior 축). 모듈은 무엇을 만드는지로 이름을 붙이고, 논문별 설정은
 `minipfn.recipes`에 둔다.
 
-- `gp`: GP prior (1D 회귀 `GPPriorSampler`, analytic posterior, 표 데이터용 `sample_gp_tables`)
+- `base`: 공용 학습 루프에 내는 `PriorBatch`, 손실에서 무시할 target `IGNORE_INDEX`
+- `gp`: 1D GP 회귀 prior (`GPPriorSampler`)와 analytic posterior (PFN recipe가 쓴다)
 - `simple_scm`: primer 노트북용 단순한 SCM 샘플러
-- `hyperparameters`: 하이퍼파라미터를 meta 분포에서 두 단계로 뽑기
-- `mlp_scm`: MLP prior (SCM / BNN)
-- `tabular`: 표 데이터 처리 (정규화, 이상치, 클래스 변환)
-- `prior_bag`: 그룹마다 GP 또는 MLP prior를 고르는 prior bag (TabPFN v1 recipe가 쓴다)
+- `prior_bag`: 그룹마다 GP 또는 MLP(SCM / BNN) prior를 고르는 prior bag과 그 부품 전부
+  (하이퍼파라미터 2단계 샘플링, MLP prior, GP 표, 표 데이터 처리). TabPFN v1 recipe가 쓴다
 - `table_size`: batch마다 학습 행·feature 수를 뽑는 표 크기 규칙
 - `graph_scm`: TabICLv2 graph SCM + 표 크기 규칙 + 결측값 (TabPFN v2 recipe가 쓴다)
 
