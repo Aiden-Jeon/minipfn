@@ -191,7 +191,8 @@ def test_v2_member_kinds_override_is_written(tmp_path):
         )
 
 
-def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
+def test_v2_revision_dry_run_writes_a_short_card(tmp_path, monkeypatch):
+    import minipfn.hub
     from minipfn.models import save_checkpoint
     from minipfn.models.cell_transformer import CellTransformer
     from minipfn.training.config import TrainConfig
@@ -218,6 +219,23 @@ def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
     readme = (upload / "README.md").read_text()
     assert readme.startswith("---\nlicense: apache-2.0\n---\n\n# a/b @ `step-100k`")
     assert f"`{checkpoint}`" in readme and 'revision="step-100k"' in readme
+
+    # 카드의 예제 코드를 그대로 돌린다. Hub 대신 upload 폴더에서 그 branch의 파일을 읽는다
+    calls = []
+
+    def download(repo_id, filename, revision=None):
+        calls.append((repo_id, revision))
+        return str(upload / filename)
+
+    monkeypatch.setattr(minipfn.hub, "hf_hub_download", download)
+    snippet = readme.split("```python\n", 1)[1].split("```", 1)[0]
+    namespace = {}
+    exec(snippet, namespace)
+    assert set(calls) == {("a/b", "step-100k")}
+    loaded = namespace["model"]
+    assert isinstance(loaded, CellTransformer) and namespace["borders"] is None
+    for (name, a), b in zip(model.state_dict().items(), loaded.state_dict().values(), strict=True):
+        assert torch.equal(a, b), name
 
 
 def test_revision_must_sit_on_the_same_card_line_as_its_checkpoint(tmp_path, no_download):
