@@ -46,12 +46,11 @@ from minipfn.hub import load_model
 from minipfn.inference.tabpfn_v2 import (
     DEFAULT_MEMBER_KINDS,
     DEFAULT_ONE_HOT,
-    MEMBER_KINDS,
-    MEMBER_KINDS_V2_5,
     ONE_HOT_MODES,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
     _one_hot_sizes,
+    parse_member_kinds,
 )
 from minipfn.utils import log_run_source
 
@@ -95,14 +94,10 @@ def _one_hot_modes(value: str) -> list[str]:
 
 
 def _member_kinds(value: str) -> tuple[str, ...]:
-    if value == "v2":
-        return DEFAULT_MEMBER_KINDS
-    if value == "v2.5":
-        return MEMBER_KINDS_V2_5
-    kinds = tuple(k.strip() for k in value.split(",") if k.strip())
-    if not kinds or set(kinds) - set(MEMBER_KINDS):
-        raise argparse.ArgumentTypeError(f"멤버 종류는 {MEMBER_KINDS} 가운데서: {value}")
-    return kinds
+    try:
+        return parse_member_kinds(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def headline_mode(modes: list[str]) -> str:

@@ -107,3 +107,31 @@ def test_min_train_rows_fit_in_the_cell_budget():
     n_train, n_features = sizes[:, 0], sizes[:, 1]
     assert n_train.min() >= 512
     assert ((n_train + P.N_EVAL_ROWS) * n_features < 400_000).all()
+
+
+def test_borders_use_the_training_table_sizes(monkeypatch):
+    # 학습 prior와 회귀 구간 경계가 같은 데이터셋 크기 분포에서 나온다 (긴 표 설정도)
+    from dataclasses import replace
+
+    from minipfn.training.config import TrainConfig
+
+    config = replace(
+        TrainConfig.smoke("regression"),
+        min_train_rows=30,
+        log_uniform_rows=True,
+        max_cells=3000,
+        feature_scale=20,
+        border_datasets=3,
+    )
+    seen = []
+    real = P.TabPFNv2Prior
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(P, "TabPFNv2Prior", spy)
+    P.make_borders(config, n_buckets=10, seed=0)
+    P.make_prior(config, seed=0)
+    borders_sizes, prior_sizes = ({k: kw[k] for k in P.SIZE_FIELDS} for kw in seen)
+    assert borders_sizes == prior_sizes == {k: getattr(config, k) for k in P.SIZE_FIELDS}

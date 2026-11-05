@@ -3,11 +3,12 @@
 import json
 import types
 
+import mlflow
 import pytest
 import torch
 
 from minipfn import hub
-from minipfn.models import save_checkpoint
+from minipfn.models import config_dict, save_checkpoint
 from minipfn.models.tabpfn_v2 import TabPFNv2
 from minipfn.training.config import TrainConfig
 
@@ -78,9 +79,9 @@ def test_training_checkpoint_from_run_uses_run_params(tmp_path, monkeypatch):
         seen["uri"] = artifact_uri
         return str(path)
 
-    monkeypatch.setattr(hub.mlflow.artifacts, "download_artifacts", download)
+    monkeypatch.setattr(mlflow.artifacts, "download_artifacts", download)
     monkeypatch.setattr(
-        hub.mlflow, "MlflowClient", lambda: types.SimpleNamespace(get_run=lambda run_id: run)
+        mlflow, "MlflowClient", lambda: types.SimpleNamespace(get_run=lambda run_id: run)
     )
     uri = "runs:/abc123/checkpoints/step_0000100.pt"
     loaded, borders = hub.load_model(uri, "classification", tmp_path)
@@ -118,7 +119,48 @@ def test_run_uri_to_a_pretrained_folder(tmp_path, monkeypatch):
     clf = _model()
     folder = hub.save_pretrained(clf, None, tmp_path / "pretrained")
     monkeypatch.setattr(
-        hub.mlflow.artifacts, "download_artifacts", lambda artifact_uri, dst_path: str(folder)
+        mlflow.artifacts, "download_artifacts", lambda artifact_uri, dst_path: str(folder)
     )
     loaded, _ = hub.load_model("runs:/abc/model", "classification", tmp_path)
     _same_weights(clf, loaded)
+
+
+# v2 첫 공개(Hub에 올린 v2 가중치) 때의 모델 설정 필드. 예전 minipfn의 from_pretrained는
+# `TabPFNv2Config(**config["model"])`로 읽으므로 이 밖의 키가 있으면 깨진다
+V2_RELEASE_FIELDS = {
+    "emsize",
+    "nlayers",
+    "nhead",
+    "nhid_factor",
+    "features_per_group",
+    "n_out",
+    "column_embedding_seed",
+}
+
+
+def test_v2_config_json_has_only_fields_older_releases_know(tmp_path):
+    out = hub.save_pretrained(_model(), None, tmp_path / "v2")
+    model = json.loads((out / hub.CONFIG_NAME).read_text())["model"]
+    assert set(model) == V2_RELEASE_FIELDS
+    # 학습 checkpoint도 같다 (예전 load_checkpoint도 같은 방식으로 읽는다)
+    save_checkpoint(tmp_path / "v2.pt", _model())
+    assert set(torch.load(tmp_path / "v2.pt", weights_only=True)["config"]) == V2_RELEASE_FIELDS
+
+
+def test_v2_5_config_json_keeps_the_added_fields(tmp_path):
+    from dataclasses import replace
+
+    from minipfn.recipes import tabpfn_v2 as recipe
+
+    config = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5", keep_size=True)
+    torch.manual_seed(0)
+    model = config.build_model().eval()
+    out = hub.save_pretrained(model, torch.linspace(-3, 3, 5001), tmp_path / "v25")
+    saved = json.loads((out / hub.CONFIG_NAME).read_text())["model"]
+    assert saved["n_thinking_rows"] == 4 and saved["encoder"] == "mlp"
+    loaded, _ = hub.from_pretrained(out)
+    assert loaded.config == model.config
+    _same_weights(model, loaded)
+    # 하나만 기본값이 아니면 그것만 적는다
+    only_rows = replace(model.config, encoder="linear")
+    assert set(config_dict(only_rows)) == V2_RELEASE_FIELDS | {"n_thinking_rows"}

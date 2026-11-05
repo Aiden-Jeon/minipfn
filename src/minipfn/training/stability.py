@@ -8,21 +8,17 @@ import torch
 import torch.distributed as dist
 
 
-def _qk_weights(model) -> list[tuple[str, torch.Tensor]]:
-    # (종류, qkv weight). 어느 attention을 볼지는 모델이 정한다 (`qk_clip_weights`)
-    return model.qk_clip_weights()
-
-
 @torch.no_grad()
 def qk_logit_bounds(model) -> torch.Tensor:
     """attention마다 head별 logit 상한 σ_max(Wq_hᵀ Wk_h) · E / √d. 모양 (attention 수, head 수).
 
-    attention 순서는 `_qk_weights`와 같다. 층 입력은 affine 없는 LayerNorm 뒤라 토큰 크기가 √E로
-    같으므로 |q·k| / √d ≤ σ_max · E / √d이다. 논문 규모 회귀 checkpoint에서 이 값은 실제 최대
-    logit과 거의 같았다(678k vs 676k). Wq_hᵀ = Q_q R_q, Wk_hᵀ = Q_k R_k로 QR 분해하면
+    attention 순서는 `model.qk_clip_weights()`(어느 attention을 볼지는 모델이 정한다)와 같다. 층
+    입력은 affine 없는 LayerNorm 뒤라 토큰 크기가 √E로 같으므로 |q·k| / √d ≤ σ_max · E / √d이다.
+    논문 규모 회귀 checkpoint에서 이 값은 실제 최대 logit과 거의 같았다(678k vs 676k).
+    Wq_hᵀ = Q_q R_q, Wk_hᵀ = Q_k R_k로 QR 분해하면
     σ_max(Wq_hᵀ Wk_h) = σ_max(R_q R_kᵀ)라 E×E 대신 d×d에서 계산한다.
     """
-    weights = _qk_weights(model)
+    weights = model.qk_clip_weights()
     if not weights:
         return torch.zeros(0, model.config.nhead)
     nhead = model.config.nhead
@@ -37,9 +33,9 @@ def qk_logit_bounds(model) -> torch.Tensor:
     return (sigma * e / math.sqrt(d)).float()
 
 
-def _sample_rows(model) -> list[int]:
-    # qk_logit_bounds의 행 가운데 sample attention인 것
-    return [i for i, (kind, _) in enumerate(_qk_weights(model)) if kind == "sample_attention"]
+def sample_attention_rows(model) -> list[int]:
+    """`qk_logit_bounds`의 행 가운데 sample attention인 것 (학습 지표 `qk_bound_sample_max`)."""
+    return [i for i, (kind, _) in enumerate(model.qk_clip_weights()) if kind == "sample_attention"]
 
 
 @torch.no_grad()
@@ -55,7 +51,7 @@ def apply_qk_clip(model, tau: float, world_size: int = 1) -> tuple[torch.Tensor,
     if world_size > 1:
         dist.all_reduce(scale, op=dist.ReduceOp.MIN)
     nhead = model.config.nhead
-    for (_, w), s in zip(_qk_weights(model), scale, strict=True):
+    for (_, w), s in zip(model.qk_clip_weights(), scale, strict=True):
         e = w.shape[1]
         head = s.to(w.dtype).repeat_interleave(e // nhead)[:, None]  # (E, 1): 행마다 그 head의 배율
         w[:e].mul_(head)

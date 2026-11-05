@@ -10,6 +10,9 @@ Hub에는 pickle 없이 읽을 수 있도록 가중치는 `model.safetensors`, �
 `load_model`은 체크포인트를 어디에 두었든 같은 방식으로 읽는다(평가·업로드 스크립트가 쓴다).
 Hub에서 받을 때는 `hf://owner/name`처럼 적는다(오타 난 로컬 경로를 Hub로 보내지 않도록).
 중간 checkpoint는 같은 repo의 branch(`step-100k` 등)에 있고 `hf://owner/name@step-100k`로 받는다.
+
+mlflow와 학습 설정은 쓰는 함수 안에서 불러온다. Hub에서 받아 추론만 할 때(v1 포함) 학습 스택을
+불러오지 않도록.
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ import json
 from dataclasses import fields, replace
 from pathlib import Path
 
-import mlflow
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_file
@@ -27,10 +29,10 @@ from torch import nn
 from minipfn.models import (
     DEFAULT_MODEL_TYPE,
     build_model,
+    config_dict,
     config_fields,
     load_checkpoint,
 )
-from minipfn.training.config import TrainConfig
 
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
@@ -40,6 +42,8 @@ HUB_PREFIX = "hf://"
 
 def _model_params(model_type: str) -> tuple[str, ...]:
     # 학습 run의 param으로 남는 모델 구조 설정 (그 모델 설정과 TrainConfig에 모두 있는 것)
+    from minipfn.training.config import TrainConfig
+
     train_fields = {f.name for f in fields(TrainConfig)}
     return tuple(name for name in config_fields(model_type) if name in train_fields)
 
@@ -75,7 +79,7 @@ def save_pretrained(
     config = {
         "task": task,
         "model_type": model.model_type,
-        "model": model.config.to_dict(),
+        "model": config_dict(model.config),
         **extra,
     }
     (out_dir / CONFIG_NAME).write_text(json.dumps(config, indent=2) + "\n")
@@ -113,6 +117,10 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
     학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
     그 run에 기록된 param(task·model_type과 모델 구조 설정)으로 모델을 만든다.
     """
+    import mlflow  # MLflow를 쓰는 경로에서만 불러온다 (Hub에서 받기만 할 때는 필요 없다)
+
+    from minipfn.training.config import TrainConfig
+
     if spec.startswith(HUB_PREFIX):
         repo_id, _, revision = spec.removeprefix(HUB_PREFIX).partition("@")
         return _check_task(from_pretrained(repo_id, revision=revision or None), task, spec)
@@ -134,18 +142,26 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
     params = mlflow.MlflowClient().get_run(run_id).data.params
     if params["task"] != task:
         raise SystemExit(f"{spec}는 {params['task']} 모델이다 ({task} 모델이 필요하다).")
-    # 모델 구조 param. run에 없는 값(model_type 이전 run은 v2, TabPFN-2.5 이전 run의 구조 설정)은
-    # 설정 기본값(v2)을 쓴다
-    model_type = params.get("model_type", DEFAULT_MODEL_TYPE)
-    defaults = TrainConfig(task=params["task"], model_type=model_type)
-    arch = {
-        name: _parse_param(getattr(defaults, name), params[name])
-        for name in _model_params(model_type)
-        if name in params
-    }
-    model = replace(defaults, **arch).build_model()
+    model = replace(TrainConfig(task=params["task"]), **run_architecture(params)).build_model()
     model.load_state_dict(state["model"])
     return model.eval(), state["borders"]
+
+
+def run_architecture(params: dict[str, str]) -> dict:
+    """학습 run의 MLflow param에서 모델 구조: `model_type`과 그 모델의 구조 설정(TrainConfig 필드).
+
+    run에 없는 값(model_type 이전 run은 v2, TabPFN-2.5 이전 run의 구조 설정)은 설정 기본값(v2)을
+    쓴다. 반환값을 `replace(config, **...)`로 학습 설정에 넣는다.
+    """
+    from minipfn.training.config import TrainConfig
+
+    model_type = params.get("model_type", DEFAULT_MODEL_TYPE)
+    defaults = TrainConfig(task=params["task"], model_type=model_type)
+    names = ("model_type", *_model_params(model_type))
+    return {
+        name: _parse_param(getattr(defaults, name), params.get(name, str(getattr(defaults, name))))
+        for name in names
+    }
 
 
 def _check_task(loaded: tuple[nn.Module, torch.Tensor | None], task: str, spec: str):

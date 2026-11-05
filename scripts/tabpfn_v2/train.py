@@ -9,7 +9,8 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 
 모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
 (arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
-회귀 MLP encoder)이다.
+회귀 MLP encoder)이다. 이어서 학습하거나 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를
+주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
 `TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
@@ -46,9 +47,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
+from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.training.config import TrainConfig  # noqa: E402
-from minipfn.training.loop import checkpoint_lr, train  # noqa: E402
+from minipfn.training.loop import check_resume_step, checkpoint_lr, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
 # 일반 크기(smoke, medium)는 TrainConfig에, 논문 설정(paper, long_tables)은 recipe에 있다
@@ -81,8 +83,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--arch",
         choices=tuple(recipe.ARCHITECTURES),
-        default=os.environ.get("TABPFN_V2_ARCH", "v2"),
-        help="모델 구조: v2(Nature 2025) 또는 v2.5(TabPFN-2.5)",
+        default=os.environ.get("TABPFN_V2_ARCH"),
+        help="모델 구조: v2(Nature 2025) 또는 v2.5(TabPFN-2.5). 기본: 새로 학습하면 v2,"
+        " 이어서 학습하거나 가중치를 가져오면 원래 run의 구조",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
     parser.add_argument("--micro-batch", type=int, default=_env("TABPFN_V2_MICRO_BATCH", int))
@@ -117,15 +120,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.init_run_id and args.resume_run_id:
         parser.error("--init-run-id와 --resume-run-id는 함께 줄 수 없다")
     if args.config_name == "long_tables" and not (args.init_run_id or args.resume_run_id):
-        # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나오고, 회귀 구간 경계도
-        # 가져올 checkpoint가 없어 긴 표 prior와 맞지 않는 기본 prior로 계산된다
+        # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나온다. 회귀 구간 경계는
+        # 가져온 checkpoint의 것을 이어 써서 paper 모델의 출력과 맞춘다
         parser.error("long_tables는 --init-run-id(paper run)나 --resume-run-id와 같이 줘야 한다")
     return args
 
 
-def build_config(args: argparse.Namespace) -> TrainConfig:
+def build_config(args: argparse.Namespace, source: dict | None = None) -> TrainConfig:
+    """`source`는 이어 가거나 가중치를 가져올 run의 모델 구조(`hub.run_architecture`)."""
     config = PRESETS[args.config_name](args.task)
-    config = recipe.with_architecture(config, args.arch, keep_size=args.config_name == "smoke")
+    keep_size = args.config_name == "smoke"
+    if source is None:
+        config = recipe.with_architecture(config, args.arch or "v2", keep_size=keep_size)
+    else:
+        if args.arch is not None:
+            wanted = recipe.with_architecture(config, args.arch, keep_size=keep_size)
+            differ = {
+                k: (getattr(wanted, k), v) for k, v in source.items() if getattr(wanted, k) != v
+            }
+            if differ:
+                raise SystemExit(
+                    f"--arch {args.arch}가 원래 run의 모델 구조와 다르다"
+                    f" (--arch 값, run 값): {differ}"
+                )
+        config = replace(config, **source)
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,
@@ -165,11 +183,18 @@ def plot_history(history: dict, task: str) -> plt.Figure:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    config = build_config(args)
     rank = int(os.environ.get("RANK", "0"))
     is_main = rank == 0
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    source = None
+    if args.init_run_id or args.resume_run_id:
+        params = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id).data.params
+        if params["task"] != args.task:
+            raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
+        source = run_architecture(params)
+    config = build_config(args, source)
 
     init_path = None
     if args.init_run_id:
@@ -188,6 +213,10 @@ def main(argv: list[str] | None = None) -> None:
             artifact_path=f"checkpoints/{name}",
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
+        try:  # MLflow run을 열기 전에 (원래 run의 tag·코드를 덮어쓰지 않도록)
+            check_resume_step(resume_path, config)
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
         saved_lr = checkpoint_lr(resume_path)
         if args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
@@ -207,7 +236,9 @@ def main(argv: list[str] | None = None) -> None:
         # 새 run에 쓴다
         resume_into = args.resume_run_id if args.resume_step is None else None
         run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
-        prefix = "tabpfn-v2" if args.arch == "v2" else "tabpfn-v2-5"
+        # smoke는 층 수를 줄여 구조 이름이 맞지 않으므로 --arch를 먼저 본다
+        arch = args.arch or recipe.architecture_name(config) or "v2"
+        prefix = "tabpfn-v2-5" if arch == "v2.5" else "tabpfn-v2"
         run_name = None if run_id else f"{prefix}-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)

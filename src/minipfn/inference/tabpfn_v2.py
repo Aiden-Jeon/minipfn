@@ -64,7 +64,7 @@ from sklearn.preprocessing import (
 )
 
 from minipfn.models.tabpfn_v2 import TabPFNv2
-from minipfn.priors.tabicl import MAX_FEATURES
+from minipfn.priors.base import MAX_FEATURES
 
 OUTLIER_SIGMA = 12.0
 MAX_ONE_HOT_CATEGORIES = 20  # benchmark의 socmob(17개)은 펼치고 colleges(수천 개)는 번호로 둔다
@@ -75,6 +75,8 @@ SOFTMAX_TEMPERATURE = 0.9
 MEMBER_KINDS = ("quantile", "power", "robust")
 DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2
 MEMBER_KINDS_V2_5 = ("quantile", "robust")
+# 이름으로 고르는 멤버 종류 묶음 (평가 스크립트의 `--member-kinds v2.5` 등)
+MEMBER_KIND_PRESETS = {"v2": DEFAULT_MEMBER_KINDS, "v2.5": MEMBER_KINDS_V2_5}
 SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
 
 
@@ -144,6 +146,21 @@ class RobustSoftClip:
     def transform(self, X: np.ndarray) -> np.ndarray:
         z = (X - self.median_) * self.scale_
         return z / np.sqrt(1.0 + (z / SOFT_CLIP) ** 2)
+
+
+def parse_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """멤버 전처리 종류. `MEMBER_KIND_PRESETS`의 이름, 쉼표로 구분한 문자열, 종류 목록을 받는다."""
+    if isinstance(value, str):
+        if value in MEMBER_KIND_PRESETS:
+            return MEMBER_KIND_PRESETS[value]
+        value = [k.strip() for k in value.split(",") if k.strip()]
+    kinds = tuple(value)
+    if not kinds or set(kinds) - set(MEMBER_KINDS):
+        raise ValueError(
+            f"member_kinds는 {MEMBER_KINDS}에서 고르거나 {tuple(MEMBER_KIND_PRESETS)} 가운데"
+            f" 하나다: {value}"
+        )
+    return kinds
 
 
 @dataclass
@@ -264,10 +281,8 @@ class _Base:
     ) -> None:
         if one_hot not in ONE_HOT_MODES:
             raise ValueError(f"one_hot은 {ONE_HOT_MODES} 가운데 하나여야 한다: {one_hot}")
-        if not member_kinds or set(member_kinds) - set(MEMBER_KINDS):
-            raise ValueError(f"member_kinds는 {MEMBER_KINDS}에서 고른다: {member_kinds}")
         self.one_hot = one_hot
-        self.member_kinds = tuple(member_kinds)
+        self.member_kinds = parse_member_kinds(member_kinds)
         self.model = model
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices

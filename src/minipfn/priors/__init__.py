@@ -5,10 +5,14 @@
 
 - `make_prior(config, seed)`: `sample_batch(batch_size)`로 `PriorBatch`를 내는 객체. 데이터셋 크기
   설정은 `config`(`TrainConfig`)에서 읽는다
-- `regression_borders(n_buckets, n_datasets, seed, *, n_jobs, max_train_rows, n_eval_rows,
-  max_features)`: 회귀 bar distribution 구간 경계
+- `make_borders(config, n_buckets, seed, n_jobs)`: 회귀 bar distribution 구간 경계. 학습 prior와
+  같은 데이터셋 크기 설정으로 뽑는다
 
-PFN(`gp`, `scm`)·TabPFN v1(`tabpfn_v1`) prior는 각자의 학습 루프가 직접 쓴다.
+- `check_config(config)`: 데이터셋 크기 설정을 그 prior로 만들 수 있는지 (틀리면 ValueError)
+- `MAX_CLASSES`: 분류 데이터셋의 클래스 수 상한 (분류 모델의 출력 수)
+
+데이터셋 크기 기본값은 `priors.base`에 있다. PFN(`gp`, `scm`)·TabPFN v1(`tabpfn_v1`) prior는 각자의
+학습 루프가 직접 쓴다.
 """
 
 from __future__ import annotations

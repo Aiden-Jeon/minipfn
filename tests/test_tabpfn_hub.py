@@ -30,3 +30,18 @@ def test_from_pretrained_rejects_missing_local_paths(tmp_path):
     for path in (tmp_path / "tabpfn_final.pt", str(tmp_path / "typo"), "tabpfn_hub/uplaod/x"):
         with pytest.raises(FileNotFoundError):
             from_pretrained(path)
+
+
+def test_hub_inference_imports_do_not_load_the_training_stack():
+    # README·Hub 카드의 추론 예제는 mlflow와 학습 설정을 불러오지 않는다 (새 프로세스에서 확인)
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import minipfn.hub.tabpfn_v1, minipfn.inference.tabpfn_v1\n"
+        "import minipfn.hub, minipfn.inference.tabpfn_v2\n"
+        "loaded = [m for m in ('mlflow', 'minipfn.training.config') if m in sys.modules]\n"
+        "assert not loaded, loaded\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

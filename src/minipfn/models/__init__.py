@@ -20,7 +20,7 @@ ICL 3단계) 다른 클래스로 둔다. 학습 루프·prior·추론 전처리�
 from __future__ import annotations
 
 import importlib
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,18 @@ def config_fields(model_type: str) -> tuple[str, ...]:
     return tuple(f.name for f in fields(model_class(model_type).config_class))
 
 
+def config_dict(config: Any) -> dict:
+    """모델 설정을 checkpoint·Hub config.json에 적을 dict로. 설정 클래스의 `ADDED_FIELDS`(나중에
+    더한 필드)는 기본값이면 뺀다. 그 필드를 모르는 예전 코드도 기본 구조의 모델은 읽고, 읽을 때
+    빠진 필드는 기본값으로 채워진다(`build_model`)."""
+    out = config.to_dict()
+    added = set(getattr(config, "ADDED_FIELDS", ()))
+    for f in fields(config):
+        if f.name in added and f.default is not MISSING and out[f.name] == f.default:
+            del out[f.name]
+    return out
+
+
 def build_model(model_type: str, config: Any) -> nn.Module:
     """`config`는 그 모델의 설정 dataclass 또는 같은 내용의 dict다."""
     cls = model_class(model_type)
@@ -76,7 +88,7 @@ def save_checkpoint(
     """가중치, 설정, (회귀면) bar distribution 경계를 저장한다."""
     payload = {
         "model_type": model.model_type,
-        "config": model.config.to_dict(),
+        "config": config_dict(model.config),
         "state_dict": model.state_dict(),
         "borders": borders,
     }

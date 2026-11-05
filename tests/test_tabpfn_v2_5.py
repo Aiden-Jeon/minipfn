@@ -156,3 +156,20 @@ def test_default_member_kinds_are_v2():
     assert [p.member.kind for p in clf.preprocessors_] == ["quantile", "power"] * 2
     with pytest.raises(ValueError):
         TabPFNv2Classifier(_tiny(), member_kinds=("quantile", "box-cox"))
+
+
+def test_member_kinds_parse_names_and_lists():
+    from minipfn.inference.tabpfn_v2 import parse_member_kinds
+
+    assert parse_member_kinds("v2.5") == MEMBER_KINDS_V2_5
+    assert parse_member_kinds("v2") == ("quantile", "power")
+    assert parse_member_kinds("robust, power") == ("robust", "power")
+    assert parse_member_kinds(["quantile"]) == ("quantile",)
+    for bad in ("", "v3", "quantile,box-cox"):
+        with pytest.raises(ValueError, match="member_kinds"):
+            parse_member_kinds(bad)
+    # 평가 스크립트도 같은 규칙을 쓴다 (모델 클래스와 따로 목록을 두지 않는다)
+    from test_tabpfn_v2_benchmark import _eval_script
+
+    script = _eval_script()
+    assert script.parse_args(["--member-kinds", "v2.5"]).member_kinds == MEMBER_KINDS_V2_5

@@ -27,6 +27,7 @@ TabPFN-2.5(arXiv 2511.08667 "Architecture")가 바꾼 것은 설정으로 켠다
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +50,11 @@ class TabPFNv2Config:
     column_embedding_seed: int = 42
     n_thinking_rows: int = 0  # TabPFN-2.5: 64
     encoder: str = "linear"  # 셀 묶음 encoder. "linear"(v2) 또는 "mlp"(TabPFN-2.5 회귀)
+
+    # v2 첫 공개 뒤에 더한 필드. 기본값이면 config.json·checkpoint에 적지 않는다
+    # (`models.config_dict`). 예전 minipfn은 `TabPFNv2Config(**config["model"])`로 읽어서 모르는
+    # 키가 있으면 깨진다
+    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("n_thinking_rows", "encoder")
 
     def __post_init__(self) -> None:
         if self.encoder not in ENCODERS:

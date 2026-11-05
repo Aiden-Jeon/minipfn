@@ -34,6 +34,14 @@ ARCHITECTURES = {
 }
 
 
+def architecture_name(config: TrainConfig) -> str | None:
+    """`config`의 모델 구조가 `ARCHITECTURES`의 어느 것과 같은지 (없으면 None)."""
+    for name, by_task in ARCHITECTURES.items():
+        if all(getattr(config, k) == v for k, v in by_task[config.task].items()):
+            return name
+    return None
+
+
 def paper(task: str = "classification") -> TrainConfig:
     # 분류는 2e-4에서 붕괴가 드물어(300k까지 rewind 1번) lr을 그대로 둔다.
     # 회귀의 QK-clip 250: 50k scratch 비교에서 250·500 모두 상한을 지켰고 val NLL도 비슷했다

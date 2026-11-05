@@ -40,10 +40,9 @@ from minipfn.training.config import N_BUCKETS, TrainConfig
 from minipfn.training.losses import dequantize_targets, prior_loss
 from minipfn.training.stability import (
     CollapseGuard,
-    _qk_weights,
-    _sample_rows,
     apply_qk_clip,
     qk_logit_bounds,
+    sample_attention_rows,
 )
 from minipfn.utils import DistContext, lr_factor, setup_distributed
 
@@ -75,14 +74,11 @@ def _borders(config: TrainConfig, d: DistContext, device: torch.device) -> torch
         start = time.time()
         borders = (
             prior_module(config.prior_type)
-            .regression_borders(
+            .make_borders(
+                config,
                 N_BUCKETS,
-                config.border_datasets,
                 seed=20_000_000 + config.seed,
                 n_jobs=max(1, min(32, (os.cpu_count() or 1) // 2)),
-                max_train_rows=config.max_train_rows,
-                n_eval_rows=config.n_eval_rows,
-                max_features=config.max_features,
             )
             .to(device)
         )
@@ -142,6 +138,21 @@ def checkpoint_lr(path: str | Path) -> float:
     return float(state["scheduler"]["base_lrs"][0])
 
 
+def check_resume_step(path: str | Path, config: TrainConfig) -> None:
+    """이어 갈 checkpoint의 step이 이번에 멈출 step보다 앞인지. 아니면 학습할 것이 없다.
+
+    다른 설정의 run(예: paper run을 long_tables로)을 잘못 이으면 학습 없이 끝나고 결과를 그 run에
+    덮어쓰게 된다. `train`도 확인하지만, 스크립트는 MLflow run을 열기 전에 부른다.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    step, stop = int(state["step"]), min(config.stop_step or config.steps, config.steps)
+    if step >= stop:
+        raise ValueError(
+            f"이어 갈 checkpoint가 이미 step {step}이라 멈출 step {stop}까지 학습할 것이 없다"
+            " (같은 설정의 run을 이어 가는지, steps·stop_step이 맞는지 확인)"
+        )
+
+
 def _to_cpu(obj):
     """state_dict 안의 텐서를 CPU로 복사한다 (메모리에 남겨 둘 사본)."""
     if isinstance(obj, torch.Tensor):
@@ -183,7 +194,7 @@ def train(
 
     torch.manual_seed(config.seed)  # 모든 GPU가 같은 초기 가중치에서 시작한다
     model = config.build_model().to(device)
-    if config.qk_clip is not None and not _qk_weights(model):
+    if config.qk_clip is not None and not model.qk_clip_weights():
         raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
     opt = torch.optim.Adam(model.parameters(), lr=config.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -199,6 +210,7 @@ def train(
         model.load_state_dict(state["model"] if "model" in state else state["state_dict"])
         borders = state["borders"]
     if resume_from is not None:
+        check_resume_step(resume_from, config)
         state = torch.load(resume_from, map_location=device, weights_only=True)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
@@ -424,7 +436,7 @@ def train(
             bounds = qk_logit_bounds(model)
             if bounds.numel():
                 metrics["qk_bound_max"] = bounds.max().item()
-            if sample := _sample_rows(model):
+            if sample := sample_attention_rows(model):
                 metrics["qk_bound_sample_max"] = bounds[sample].max().item()
             if config.qk_clip is not None:
                 # 이 window에서 clip할 때마다 줄인 head 수의 합

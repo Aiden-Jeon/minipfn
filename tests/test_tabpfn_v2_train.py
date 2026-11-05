@@ -383,3 +383,109 @@ def test_resuming_with_qk_clip_clips_before_the_first_snapshot(tmp_path, monkeyp
     assert resumed["step"] == 4
     plain.load_state_dict(resumed["model"])
     assert qk_logit_bounds(plain).max() <= tau * (1 + 1e-4)
+
+
+def test_resume_past_the_stop_step_is_an_error(tmp_path):
+    # paper run(300k)을 long_tables(20k step)로 잘못 이으면 학습 없이 끝나고 그 run에 결과를
+    # 덮어쓰던 것을 막는다
+    config = replace(TrainConfig.smoke("classification"), steps=4, val_every=2)
+    train(config, tmp_path / "a", mlflow_log=False)
+    with pytest.raises(ValueError, match="학습할 것이 없다"):
+        train(config, tmp_path / "b", resume_from=tmp_path / "a" / "latest.pt", mlflow_log=False)
+    with pytest.raises(ValueError, match="학습할 것이 없다"):
+        train(
+            replace(config, steps=10, stop_step=3),
+            tmp_path / "c",
+            resume_from=tmp_path / "a" / "latest.pt",
+            mlflow_log=False,
+        )
+
+
+def _train_script():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "scripts" / "tabpfn_v2" / "train.py"
+    spec = importlib.util.spec_from_file_location("train_tabpfn_v2_script", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_train_script_takes_the_architecture_of_the_source_run(monkeypatch):
+    from minipfn.hub import run_architecture
+
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    v25 = recipe.with_architecture(recipe.paper("regression"), "v2.5")
+    # 원래 run이 MLflow에 남긴 param (문자열)
+    params = {k: str(v) for k, v in vars(v25).items()}
+    source = run_architecture(params)
+    assert source["nlayers"] == 18 and source["encoder"] == "mlp"
+
+    args = script.parse_args(
+        ["--config-name", "long_tables", "--init-run-id", "r", "--task", "regression"]
+    )
+    assert args.arch is None
+    config = script.build_config(args, source)
+    assert recipe.architecture_name(config) == "v2.5" and config.max_train_rows == 8192
+    # 같은 구조를 --arch로 줘도 된다
+    args = script.parse_args(
+        [
+            "--config-name",
+            "long_tables",
+            "--init-run-id",
+            "r",
+            "--task",
+            "regression",
+            "--arch",
+            "v2.5",
+        ]
+    )
+    assert script.build_config(args, source) == config
+    # 다르면 시작 전에 멈춘다
+    args = script.parse_args(
+        [
+            "--config-name",
+            "long_tables",
+            "--init-run-id",
+            "r",
+            "--task",
+            "regression",
+            "--arch",
+            "v2",
+        ]
+    )
+    with pytest.raises(SystemExit, match="모델 구조와 다르다"):
+        script.build_config(args, source)
+    # 원래 run이 없으면 기본은 v2
+    args = script.parse_args(["--config-name", "paper", "--task", "regression"])
+    assert recipe.architecture_name(script.build_config(args)) == "v2"
+
+
+@pytest.mark.parametrize(
+    "changes, match",
+    [
+        ({"log_uniform_rows": True, "min_train_rows": 0}, "min_train_rows는 1 이상"),
+        ({"n_eval_rows": 400_000}, "max_cells"),
+        ({"min_train_rows": 9000}, "max_train_rows"),
+        ({"feature_scale": 0}, "feature_scale"),
+    ],
+)
+def test_bad_table_sizes_fail_when_the_config_is_built(changes, match):
+    # 예전에는 DataLoader worker 안에서 NaN 변환·0으로 나누기로 터졌다
+    with pytest.raises(ValueError, match=match):
+        replace(recipe.long_tables("regression"), **{"min_train_rows": 512, **changes})
+
+
+def test_classification_outputs_come_from_the_prior(monkeypatch):
+    import types
+
+    from minipfn import priors
+
+    fake = types.SimpleNamespace(MAX_CLASSES=20, check_config=lambda config: None)
+    monkeypatch.setitem(priors.PRIOR_TYPES, "fake", "fake_prior_module")
+    monkeypatch.setitem(__import__("sys").modules, "fake_prior_module", fake)
+    assert TrainConfig(prior_type="fake").n_out == 20
+    assert TrainConfig().n_out == 10 and TrainConfig(task="regression").n_out == 5000

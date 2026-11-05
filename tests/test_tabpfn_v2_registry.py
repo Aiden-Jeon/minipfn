@@ -4,6 +4,7 @@ import json
 import types
 from dataclasses import asdict, dataclass, replace
 
+import mlflow
 import pytest
 import torch
 from torch import nn
@@ -149,10 +150,10 @@ def test_training_checkpoint_from_run_uses_the_run_model_type(tmp_path, monkeypa
     params |= {"emsize": str(config.emsize), "nhead": str(config.nhead)}
     run = types.SimpleNamespace(data=types.SimpleNamespace(params=params))
     monkeypatch.setattr(
-        hub.mlflow.artifacts, "download_artifacts", lambda artifact_uri, dst_path: str(path)
+        mlflow.artifacts, "download_artifacts", lambda artifact_uri, dst_path: str(path)
     )
     monkeypatch.setattr(
-        hub.mlflow, "MlflowClient", lambda: types.SimpleNamespace(get_run=lambda run_id: run)
+        mlflow, "MlflowClient", lambda: types.SimpleNamespace(get_run=lambda run_id: run)
     )
     loaded, _ = hub.load_model("runs:/abc/checkpoints/step_0000100.pt", "classification", tmp_path)
     assert isinstance(loaded, TinyModel)

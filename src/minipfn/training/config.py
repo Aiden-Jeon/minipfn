@@ -12,13 +12,7 @@ from typing import Literal
 
 from minipfn.models import DEFAULT_MODEL_TYPE, build_model, config_fields, model_class
 from minipfn.priors import DEFAULT_PRIOR_TYPE, prior_module
-from minipfn.priors.tabicl import (
-    MAX_CELLS,
-    MAX_CLASSES,
-    MAX_FEATURES,
-    MAX_TRAIN_ROWS,
-    N_EVAL_ROWS,
-)
+from minipfn.priors.base import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 
 N_BUCKETS = 5000
 
@@ -104,7 +98,7 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         model_class(self.model_type)  # 없는 이름이면 ValueError
-        prior_module(self.prior_type)
+        prior_module(self.prior_type).check_config(self)  # 없는 이름이거나 크기 설정이 틀리면
         if not 0.0 < self.rewind_lr_factor <= 1.0:
             raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
         if self.qk_clip is not None and self.qk_clip <= 0:
@@ -114,7 +108,10 @@ class TrainConfig:
 
     @property
     def n_out(self) -> int:
-        return MAX_CLASSES if self.task == "classification" else N_BUCKETS
+        # 분류는 prior가 만드는 클래스 수 상한, 회귀는 bar distribution 구간 수
+        if self.task == "classification":
+            return prior_module(self.prior_type).MAX_CLASSES
+        return N_BUCKETS
 
     @classmethod
     def medium(cls, task: str = "classification") -> TrainConfig:
