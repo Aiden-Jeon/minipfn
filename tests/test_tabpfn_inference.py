@@ -2,13 +2,14 @@ import numpy as np
 import pytest
 import torch
 
-from minipfn.inference.tabpfn_v1 import TabPFNClassifier, _Preprocessor, tabpfn_predict_proba
-from minipfn.models.tabpfn_v1 import TabPFNTransformer
+from minipfn.inference.rotation_ensemble import _Preprocessor
+from minipfn.models.row_transformer import RowTransformer
+from minipfn.recipes.tabpfn_v1 import TabPFNClassifier, tabpfn_predict_proba
 
 
 def _tiny_model():
     torch.manual_seed(0)
-    model = TabPFNTransformer(num_features=10, n_out=4, emsize=16, nhead=2, nhid=32, nlayers=2)
+    model = RowTransformer(num_features=10, n_out=4, emsize=16, nhead=2, nhid=32, nlayers=2)
     # 0 초기화된 층은 처음에 항등이라 캐시 경로 차이가 드러나지 않으므로 무작위로 다시 채운다.
     for p in model.parameters():
         torch.nn.init.normal_(p, std=0.2)

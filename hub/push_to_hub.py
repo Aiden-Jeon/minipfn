@@ -120,7 +120,7 @@ def check_visibility(api: HfApi, repo_id: str, private: bool) -> None:
 def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
     """v1: `tabpfn_final.pt`를 변환하고, 원본 모델과 변환한 파일에서 다시 읽은 모델을 돌려준다."""
     from minipfn.hub.tabpfn_v1 import from_pretrained, save_pretrained
-    from minipfn.training.tabpfn_v1 import tabpfn_from_state
+    from minipfn.recipes.tabpfn_v1 import tabpfn_from_state
 
     path = args.checkpoint
     if path.startswith("runs:/"):

@@ -88,7 +88,7 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 
 ```python
 from minipfn.hub import from_pretrained
-from minipfn.inference.tabpfn_v2 import TabPFNv2Regressor
+from minipfn.recipes.tabpfn_v2 import TabPFNv2Regressor
 
 model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-regressor")
 # x_train can be a pandas DataFrame with categorical columns

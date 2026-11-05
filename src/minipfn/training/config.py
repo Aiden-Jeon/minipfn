@@ -10,9 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 from typing import Literal
 
-from minipfn.models import DEFAULT_MODEL_TYPE, build_model, config_fields, model_class
-from minipfn.priors import DEFAULT_PRIOR_TYPE, prior_module
-from minipfn.priors.base import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
+from minipfn.models import (
+    DEFAULT_MODEL_TYPE,
+    build_model,
+    canonical_model_type,
+    config_fields,
+    model_class,
+)
+from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_module
+from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 
 N_BUCKETS = 5000
 
@@ -23,10 +29,11 @@ class TrainConfig:
     medium(짧은 실측)은 여기에, 논문별 설정(paper, long_tables, 구조)은 `minipfn.recipes`에 있다."""
 
     task: Literal["classification", "regression"] = "classification"
-    # 학습 데이터 종류 (`minipfn.priors.PRIOR_TYPES`)
+    # 학습 데이터 종류 (`minipfn.priors.PRIOR_TYPES`). 예전 이름(`PRIOR_TYPE_ALIASES`)은 지금
+    # 이름으로 바꾼다
     prior_type: str = DEFAULT_PRIOR_TYPE
     # 모델 클래스 (`minipfn.models.MODEL_TYPES`). 아래 모델 설정 가운데 그 클래스의 설정에 있는 것만
-    # 쓴다
+    # 쓴다. 예전 이름(`MODEL_TYPE_ALIASES`)은 지금 이름으로 바꾼다
     model_type: str = DEFAULT_MODEL_TYPE
     # 모델 (논문 기본 모델 크기). 아래 셋은 TabPFN-2.5가 바꾼 것
     # (`recipes.tabpfn_v2.with_architecture(config, "v2.5")`)
@@ -36,7 +43,8 @@ class TrainConfig:
     features_per_group: int = 2
     n_thinking_rows: int = 0
     encoder: str = "linear"
-    # prior / 데이터셋 크기 (논문 Methods)
+    # prior / 표 크기 (논문 Methods, `minipfn.priors.table_size`). max_features는 모델 설정에도
+    # 남아 추론이 읽는다(학습 때 본 feature 수)
     max_train_rows: int = MAX_TRAIN_ROWS
     n_eval_rows: int = N_EVAL_ROWS
     max_features: int = MAX_FEATURES
@@ -97,6 +105,8 @@ class TrainConfig:
     qk_clip_every: int = 50
 
     def __post_init__(self) -> None:
+        self.model_type = canonical_model_type(self.model_type)
+        self.prior_type = canonical_prior_type(self.prior_type)
         model_class(self.model_type)  # 없는 이름이면 ValueError
         prior_module(self.prior_type).check_config(self)  # 없는 이름이거나 크기 설정이 틀리면
         if not 0.0 < self.rewind_lr_factor <= 1.0:

@@ -29,7 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
-from minipfn.training.tabpfn_v1 import TabPFNConfig, train_tabpfn  # noqa: E402
+from minipfn.recipes.tabpfn_v1 import TabPFNConfig, train_tabpfn  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
 CONFIG_NAMES = ("smoke", "medium", "paper")

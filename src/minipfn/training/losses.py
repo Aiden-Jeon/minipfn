@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from minipfn.models.bar_distribution import FullSupportBarDistribution
+from minipfn.priors.tabular import IGNORE_INDEX
 
 
 def prior_loss(
@@ -56,3 +57,15 @@ def dequantize_targets(
     # float 반올림으로 오른쪽 꼬리 경계(borders[-2])에 닿지 않게 그 바로 아래 값까지만
     shifted = torch.minimum(shifted, torch.nextafter(borders[-2], borders[-3]))
     return torch.where(repeated & interior, shifted, y_eval)
+
+
+def classification_loss(logits: torch.Tensor, y_test: torch.Tensor) -> torch.Tensor:
+    """테스트 행 cross-entropy. 무시할 행(-100)은 0으로 세고 전체 평균을 낸다 (TabPFN v1과 같은
+    가중)."""
+    losses = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        y_test.reshape(-1).long(),
+        ignore_index=IGNORE_INDEX,
+        reduction="none",
+    )
+    return losses.mean()

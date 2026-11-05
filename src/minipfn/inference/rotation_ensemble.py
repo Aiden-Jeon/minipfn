@@ -1,7 +1,13 @@
-"""TabPFN v1 추론: sklearn 스타일 `TabPFNClassifier`와 stateless `tabpfn_predict_proba`.
+"""회전 앙상블 분류기 (TabPFN v1 `transformer_predict`의 추론): sklearn 스타일
+`RotationEnsembleClassifier`.
 
-    clf = TabPFNClassifier(model).fit(x_train, y_train)
-    proba = clf.predict_proba(x_test)
+    clf = RotationEnsembleClassifier(model, n_ensemble=32, softmax_temperature=0.8)
+    proba = clf.fit(x_train, y_train).predict_proba(x_test)
+
+`model`은 행 하나가 토큰인 `minipfn.models.row_transformer.RowTransformer`다. 앙상블 멤버는
+(클래스 번호 회전, feature 순서 회전) × 전처리 2가지(그대로, 열별 Yeo-Johnson)에서 앞의
+`n_ensemble`개이고, 멤버의 logit을 온도로 나눠 평균한 뒤 softmax한다. v1 논문 설정(멤버 32개, 온도
+0.8)을 기본값으로 둔 것은 `minipfn.recipes.tabpfn_v1.TabPFNClassifier`다.
 
 `fit`은 가중치를 학습하지 않고 학습 행을 context로 준비한다. `fit_mode`는 그 준비를 `fit`에서
 어디까지 해 둘지 정한다. 결과는 같고 비용만 다르다(공식 TabPFN v2의 `fit_mode`와 같은 이름).
@@ -9,15 +15,15 @@
 - "fit_preprocessors"(기본): 전처리를 학습 행에 맞추고 변환한 학습 행을 캐시한다. `predict`마다
   학습 행 attention(n²)을 다시 계산한다. 테스트 행이 많은 batch 예측용.
 - "fit_with_cache": 층별 학습 행 key·value까지 캐시한다. `predict`는 테스트 행 → 학습 행
-  attention(n·m)만 계산해 한 행 예측이 빠르다. 캐시가 크다(논문 크기, 학습 1,000행, 앙상블 32개에서
-  fp32 약 1.6GB). context를 고정하고 한 행씩 예측하는 서빙용.
+  attention(n·m)만 계산해 한 행 예측이 빠르다. 캐시가 크다(v1 논문 크기, 학습 1,000행, 앙상블
+  32개에서 fp32 약 1.6GB). context를 고정하고 한 행씩 예측하는 서빙용.
 
 학습 행끼리는 양방향으로 attention하므로 학습 행을 하나 더하면 캐시 전체가 바뀐다. context가
-바뀌면 `fit`을 다시 부르고, 요청마다 context가 다르면 `tabpfn_predict_proba`를 쓴다.
+바뀌면 `fit`을 다시 부르고, 요청마다 context가 다르면 `predict_proba`(이 모듈의 함수)를 쓴다.
 
-전처리와 앙상블은 v1 `transformer_predict`를 따른다(`evaluate` 모듈 docstring 참고). v1은
-power transform이 경고를 내면 그 열을 변환하지 않는데, 이 판단을 학습 행으로만 해서(v1은 학습·테스트
-행을 함께 변환하며 판단한다) 테스트 행의 예측이 함께 넣은 다른 테스트 행에 영향받지 않게 했다.
+v1은 power transform이 경고를 내면 그 열을 변환하지 않는데, 이 판단을 학습 행으로만 해서(v1은
+학습·테스트 행을 함께 변환하며 판단한다) 테스트 행의 예측이 함께 넣은 다른 테스트 행에 영향받지
+않게 했다.
 """
 
 from __future__ import annotations
@@ -31,14 +37,13 @@ import numpy as np
 import torch
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 
-from minipfn.models.tabpfn_v1 import TabPFNTransformer
-from minipfn.priors.tabpfn_v1 import (
+from minipfn.models.row_transformer import RowTransformer
+from minipfn.priors.tabular import (
     apply_normalization,
     normalization_stats,
     outlier_bounds,
     squash_outliers,
 )
-from minipfn.recipes import tabpfn_v1 as spec
 
 FitMode = Literal["fit_preprocessors", "fit_with_cache"]
 TEST_ROWS_PER_FORWARD = 1024  # fit_with_cache에서 한 forward에 넣는 테스트 행 수 (메모리 상한)
@@ -103,14 +108,16 @@ class _Preprocessor:
         return x / (x.shape[-1] / self.max_features)
 
 
-class TabPFNClassifier:
-    """학습한 v1 TabPFN을 sklearn처럼 쓰는 분류기. 레이블은 아무 값이나 된다(클래스 10개까지)."""
+class RotationEnsembleClassifier:
+    """학습한 `RowTransformer`를 sklearn처럼 쓰는 분류기. 레이블은 아무 값이나 된다(클래스는 모델
+    출력 수까지)."""
 
     def __init__(
         self,
-        model: TabPFNTransformer,
+        model: RowTransformer,
         *,
-        n_ensemble: int = spec.N_ENSEMBLE,
+        n_ensemble: int,
+        softmax_temperature: float,
         fit_mode: FitMode = "fit_preprocessors",
         seed: int = 0,
         batch_size: int = 16,
@@ -120,13 +127,14 @@ class TabPFNClassifier:
             raise ValueError(f"fit_mode는 'fit_preprocessors' 또는 'fit_with_cache': {fit_mode!r}")
         self.model = model
         self.n_ensemble = n_ensemble
+        self.softmax_temperature = softmax_temperature
         self.fit_mode = fit_mode
         self.seed = seed
         self.batch_size = batch_size  # 한 forward에 넣는 앙상블 멤버 수
         self.device = device  # None이면 모델이 있는 장치를 쓴다. 주면 fit에서 모델을 그리로 옮긴다.
 
     @torch.no_grad()
-    def fit(self, X: Any, y: Any) -> TabPFNClassifier:
+    def fit(self, X: Any, y: Any) -> RotationEnsembleClassifier:
         x = _as_rows(X)
         self.n_features_in_ = x.shape[1]
         self.label_encoder_ = LabelEncoder()
@@ -204,7 +212,7 @@ class TabPFNClassifier:
                     ],
                     dim=1,
                 )
-            logits.append(out[..., :n_classes].float().cpu() / spec.SOFTMAX_TEMPERATURE)
+            logits.append(out[..., :n_classes].float().cpu() / self.softmax_temperature)
         logits = torch.cat(logits)  # (N, m, C)
 
         total = torch.zeros(logits.shape[1:])
@@ -244,21 +252,28 @@ def _as_rows(X: Any) -> torch.Tensor:
     return torch.tensor(x)
 
 
-def tabpfn_predict_proba(
-    model: TabPFNTransformer,
+def predict_proba(
+    model: RowTransformer,
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_test: np.ndarray,
-    n_ensemble: int = spec.N_ENSEMBLE,
+    *,
+    n_ensemble: int,
+    softmax_temperature: float,
     seed: int = 0,
     batch_size: int = 16,
     device: torch.device | str | None = None,
 ) -> np.ndarray:
     """테스트 행의 클래스 확률 (m, C). context(학습 행)가 호출마다 바뀔 때 쓰는 stateless 버전.
 
-    v1 TabPFNClassifier.predict_proba와 같은 앙상블. 열 순서는 정렬한 레이블 순서다.
+    `RotationEnsembleClassifier.predict_proba`와 같은 앙상블. 열 순서는 정렬한 레이블 순서다.
     device를 주지 않으면 모델이 있는 장치에서 돌리고 모델을 옮기지 않는다."""
-    clf = TabPFNClassifier(
-        model, n_ensemble=n_ensemble, seed=seed, batch_size=batch_size, device=device
+    clf = RotationEnsembleClassifier(
+        model,
+        n_ensemble=n_ensemble,
+        softmax_temperature=softmax_temperature,
+        seed=seed,
+        batch_size=batch_size,
+        device=device,
     )
     return clf.fit(x_train, y_train).predict_proba(x_test)

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from minipfn.models import load_checkpoint
-from minipfn.models.tabpfn_v2 import TabPFNv2
+from minipfn.models.cell_transformer import CellTransformer
 from minipfn.recipes import tabpfn_v2 as recipe
 from minipfn.training.config import TrainConfig
 from minipfn.training.loop import _make_val_batches, checkpoint_lr, train
@@ -56,7 +56,10 @@ def test_init_from_takes_only_the_weights(tmp_path):
 
 def test_long_tables_preset_keeps_the_paper_model_and_batch():
     paper, long = recipe.paper(), recipe.long_tables()
-    assert long.model_config() == paper.model_config() and long.batch_size == paper.batch_size
+    # 모델 구조는 같고, 모델 설정에 남는 학습 feature 수만 늘어난다 (추론의 one-hot 폭 상한)
+    assert long.model_config().max_features == 500
+    assert replace(long.model_config(), max_features=paper.max_features) == paper.model_config()
+    assert long.batch_size == paper.batch_size
     # v2(12층)는 GPU당 micro batch 2 (batch 64 = 2 × 4 × GPU 8)
     assert long.micro_batch == 2 and long.grad_accumulation(8) == 4
     assert long.max_train_rows == 8192 and long.max_features == long.feature_scale == 500
@@ -319,7 +322,7 @@ def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
 
 
 def test_qk_logit_bounds_match_the_spectral_norm():
-    model = TabPFNv2(TrainConfig.smoke("regression").model_config())
+    model = CellTransformer(TrainConfig.smoke("regression").model_config())
     torch.manual_seed(0)
     for layer in model.layers:
         torch.nn.init.normal_(layer.sample_attention.qkv.weight, std=0.5)
@@ -335,7 +338,7 @@ def test_qk_logit_bounds_match_the_spectral_norm():
 
 
 def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
-    model = TabPFNv2(TrainConfig.smoke("regression").model_config())
+    model = CellTransformer(TrainConfig.smoke("regression").model_config())
     attention = model.layers[0].sample_attention
     with torch.no_grad():
         attention.qkv.weight.normal_(std=0.5)
@@ -371,7 +374,7 @@ def test_resuming_with_qk_clip_clips_before_the_first_snapshot(tmp_path, monkeyp
     train(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
     tau = 1.0  # clip 없이 학습한 checkpoint의 상한보다 훨씬 작다
     state = torch.load(tmp_path / "a" / "latest.pt", weights_only=True)
-    plain = TabPFNv2(config.model_config())
+    plain = CellTransformer(config.model_config())
     plain.load_state_dict(state["model"])
     assert qk_logit_bounds(plain).max() > tau
 

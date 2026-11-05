@@ -1,18 +1,17 @@
-"""TabICL prior (prior 축, `prior_type="tabicl"`): TabICLv2 graph prior + TabPFN v2 논문의
-데이터셋 크기 규칙과 결측값.
+"""Graph SCM prior (prior 축, `prior_type="graph_scm"`): TabICLv2의 graph SCM으로 표를 만들고,
+표 크기 규칙(`minipfn.priors.table_size`)과 결측값을 더한다.
 
-v2 논문의 prior 코드는 공개되지 않았으므로, 같은 계열의 공개 prior인 TabICLv2 graph prior
-(soda-inria/tabicl, BSD-3-Clause)로 데이터셋 하나하나를 만든다. TabICL prior는 무작위 DAG 위의
-계산 그래프로 feature와 target을 만들고, 범주형 feature, 이산화, Kumaraswamy 휘기, 회귀 target을
-이미 포함한다. 여기에 논문 Methods의 두 가지를 더한다.
+TabICLv2 graph prior(soda-inria/tabicl, BSD-3-Clause)는 무작위 DAG 위의 계산 그래프로 feature와
+target을 만들고, 범주형 feature, 이산화, Kumaraswamy 휘기, 회귀 target을 이미 포함한다. 여기에
+두 가지를 더한다. TabPFN v2 recipe(`minipfn.recipes.tabpfn_v2`)가 이 prior를 쓴다(v2 논문의 prior
+코드는 공개되지 않아 같은 계열의 공개 prior로 대신한다).
 
-1. 데이터셋 크기 ("Training details"): 학습 행은 2,048개까지 균등, 검증 행(정답을 가리는 행)은
-   128개, feature 수는 Beta(0.95, 8.0)을 1~160으로 늘린 값, 표 하나의 셀은 75,000개 미만.
-   GPU에서 묶어 계산하려고 batch 안의 데이터셋은 같은 크기를 쓴다(크기는 batch마다 새로 뽑는다).
-2. 결측값 ("Post-processing"): 일부 데이터셋에서 셀마다 같은 확률로 값을 지운다(MCAR).
+1. 표 크기: batch마다 `sample_table_size`로 학습 행·feature 수를 뽑는다(기본값은 v2 논문 Methods
+   "Training details"). GPU에서 묶어 계산하려고 batch 안의 데이터셋은 같은 크기를 쓴다.
+2. 결측값(v2 논문 "Post-processing"): 일부 데이터셋에서 셀마다 같은 확률로 값을 지운다(MCAR).
    비율은 논문에 없어서 여기서 정했다(`missing_dataset_prob`, `max_missing_rate`).
 
-    prior = TabPFNv2Prior(task="classification", seed=0)
+    prior = GraphSCMPrior(task="classification", seed=0)
     batch = prior.sample_batch(8)  # x (8, 행, feature), y (8, 행), n_train
 
 TabICL은 numpy·torch의 전역 난수를 쓰고, 같은 시드여도 파이썬 프로세스의 문자열 hash 시드
@@ -28,18 +27,17 @@ from typing import Literal
 import numpy as np
 import torch
 
-from minipfn.priors.base import (
+from minipfn.priors.base import PriorBatch
+from minipfn.priors.table_size import (
     MAX_CELLS,
     MAX_FEATURES,
     MAX_TRAIN_ROWS,
     N_EVAL_ROWS,
-    PriorBatch,
     check_sizes,
+    sample_table_size,
 )
 
-# 논문 Methods "Training details"의 수치 (크기 상한은 priors.base). 분류 클래스 수 상한은 이 prior가
-# 정하고, 분류 모델의 출력 수가 된다(`TrainConfig.n_out`)
-FEATURE_BETA = (0.95, 8.0)
+# 분류 데이터셋의 클래스 수 상한 (v2 논문). 분류 모델의 출력 수가 된다(`TrainConfig.n_out`)
 MAX_CLASSES = 10
 MAX_ATTEMPTS = 100  # 데이터셋 하나를 만들 때 다시 뽑는 최대 횟수 (멈추지 않고 오류를 내도록)
 
@@ -68,39 +66,7 @@ def _graph_scm_classes():
     return GraphSCM, PriorConfig
 
 
-def sample_table_size(
-    rng: np.random.Generator,
-    max_train_rows: int = MAX_TRAIN_ROWS,
-    n_eval_rows: int = N_EVAL_ROWS,
-    max_features: int = MAX_FEATURES,
-    *,
-    min_train_rows: int = 1,
-    log_uniform_rows: bool = False,
-    max_cells: int = MAX_CELLS,
-    feature_scale: int = MAX_FEATURES,
-) -> tuple[int, int]:
-    """(학습 행 수, feature 수). 셀 수 제한은 실제로 쓰는 feature 수와 검증 행까지 포함해 적용한다.
-
-    논문 설정(기본값)에서는 feature 수를 자를 일이 없다. 작은 설정에서 feature 상한을 낮추면
-    잘린 feature 수로 셀 수를 센다. `log_uniform_rows`면 학습 행 수를 [min, max]에서 log 균등으로
-    뽑는다(논문에 없음. 긴 표로 이어 학습할 때 쓴다, TabICL의 2단계 학습처럼).
-    """
-    if log_uniform_rows:
-        log_n = rng.uniform(np.log(min_train_rows), np.log(max_train_rows))
-        n_train = int(round(np.exp(log_n)))
-    else:  # 하한은 TabPFNv2Prior가 나중에 맞춘다 (같은 시드면 예전과 같은 크기를 뽑도록)
-        n_train = int(rng.integers(1, max_train_rows + 1))
-    # feature 수는 Beta(0.95, 8)을 [1, feature_scale]로 편 것 (논문은 160). feature_scale은 논문에
-    # 없음: TabPFN-2.5처럼 feature가 많은 표로 학습할 때 분포 자체를 넓힌다
-    n_features = 1 + int(round(rng.beta(*FEATURE_BETA) * (feature_scale - 1)))
-    # 학습 행 하한(min_train_rows)을 채워도 셀 제한을 넘지 않도록 feature 수를 줄인다
-    # (논문 설정에서는 상한이 581개라 걸리지 않는다)
-    n_features = min(n_features, max_features, (max_cells - 1) // (min_train_rows + n_eval_rows))
-    max_train = max(1, (max_cells - 1) // n_features - n_eval_rows)
-    return min(n_train, max_train), n_features
-
-
-class TabPFNv2Prior:
+class GraphSCMPrior:
     def __init__(
         self,
         task: Literal["classification", "regression"],
@@ -224,9 +190,9 @@ def check_config(config) -> None:
     check_sizes(**sizes)
 
 
-def make_prior(config, seed: int) -> TabPFNv2Prior:
+def make_prior(config, seed: int) -> GraphSCMPrior:
     """학습 설정(`minipfn.training.config.TrainConfig`)의 데이터셋 크기로 prior를 만든다."""
-    return TabPFNv2Prior(
+    return GraphSCMPrior(
         config.task, seed=seed, missing_dataset_prob=config.missing_dataset_prob, **_sizes(config)
     )
 
@@ -260,7 +226,7 @@ def _train_rows_cover_classes(
 def _border_targets(args: tuple[int, int, dict]) -> torch.Tensor:
     # 회귀 데이터셋 n개의 고유한 target 값 (결측값은 넣지 않는다)
     n_datasets, seed, sizes = args
-    prior = TabPFNv2Prior("regression", seed=seed, missing_dataset_prob=0.0, **sizes)
+    prior = GraphSCMPrior("regression", seed=seed, missing_dataset_prob=0.0, **sizes)
     values = []
     for _ in range(n_datasets):
         n_train, n_features = prior.sample_size()
@@ -289,7 +255,7 @@ def regression_borders(
     경계로 쓴다. 양 끝은 half-normal 꼬리가 맡는다(`FullSupportBarDistribution`).
     같은 값이 많은 데이터셋(이산화한 target, 4σ에서 잘린 값)이 분위수를 끌어당겨 폭이 0에 가까운
     구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함). 데이터셋 크기 인자는
-    `TabPFNv2Prior`와 같고, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
+    `GraphSCMPrior`와 같고, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
     """
     # n_jobs개 프로세스로 나눠 만든다 (프로세스마다 시드가 다르다)
     sizes = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]

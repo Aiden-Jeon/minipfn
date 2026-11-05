@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from minipfn.hub.tabpfn_v1 import CONFIG_NAME, WEIGHTS_NAME, from_pretrained, save_pretrained
-from minipfn.training.tabpfn_v1 import TabPFNConfig, build_tabpfn_model
+from minipfn.recipes.tabpfn_v1 import TabPFNConfig, build_tabpfn_model
 
 
 def test_save_and_load_pretrained_roundtrip(tmp_path):
@@ -39,8 +39,10 @@ def test_hub_inference_imports_do_not_load_the_training_stack():
 
     code = (
         "import sys\n"
-        "import minipfn.hub.tabpfn_v1, minipfn.inference.tabpfn_v1\n"
-        "import minipfn.hub, minipfn.inference.tabpfn_v2\n"
+        "import minipfn.hub.tabpfn_v1, minipfn.recipes.tabpfn_v1\n"
+        "import minipfn.hub, minipfn.recipes.tabpfn_v2\n"
+        "import minipfn.tabpfn.hub, minipfn.tabpfn.inference\n"
+        "import minipfn.tabpfn_v2.hub, minipfn.tabpfn_v2.inference\n"
         "loaded = [m for m in ('mlflow', 'minipfn.training.config') if m in sys.modules]\n"
         "assert not loaded, loaded\n"
     )

@@ -20,8 +20,8 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_file
 
 from minipfn.hub import _is_local_path
-from minipfn.models.tabpfn_v1 import TabPFNTransformer
-from minipfn.training.tabpfn_v1 import TabPFNConfig, tabpfn_from_state
+from minipfn.models.row_transformer import RowTransformer
+from minipfn.recipes.tabpfn_v1 import TabPFNConfig, tabpfn_from_state
 
 HUB_REPO_ID = "aiden-jeon/minipfn-tabpfn-v1"
 WEIGHTS_NAME = "model.safetensors"
@@ -47,7 +47,7 @@ def from_pretrained(
     repo_id_or_path: str | Path = HUB_REPO_ID,
     revision: str | None = None,
     map_location: str | torch.device = "cpu",
-) -> tuple[TabPFNTransformer, TabPFNConfig]:
+) -> tuple[RowTransformer, TabPFNConfig]:
     """Hub repo id 또는 `save_pretrained`로 만든 로컬 폴더에서 모델을 읽는다.
 
     같은 이름의 로컬 폴더가 있으면 Hub보다 먼저 읽는다. `revision`(branch, tag, commit)을 주면

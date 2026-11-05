@@ -32,7 +32,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from minipfn.hub.tabpfn_v1 import from_pretrained
-from minipfn.inference.tabpfn_v1 import TabPFNClassifier
+from minipfn.recipes.tabpfn_v1 import TabPFNClassifier
 
 x, y = load_breast_cancer(return_X_y=True)
 x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.5, random_state=0)
@@ -48,7 +48,7 @@ print("ROC AUC:", roc_auc_score(y_test, proba[:, 1]))  # 0.997
 - `"fit_preprocessors"`(기본): 전처리만 캐시합니다. 테스트 행을 한꺼번에 많이 예측하는 batch 작업에 맞습니다.
 - `"fit_with_cache"`: 층별 학습 행 key·value까지 캐시합니다. 학습 행을 고정하고 한 행씩 예측하는 서빙에 맞습니다. 메모리를 많이 씁니다(학습 1,000행 기준 약 1.6GB).
 
-요청마다 학습 행이 다르면 함수 `minipfn.inference.tabpfn_v1.tabpfn_predict_proba(model, x_train, y_train, x_test)`를 씁니다.
+요청마다 학습 행이 다르면 함수 `minipfn.recipes.tabpfn_v1.tabpfn_predict_proba(model, x_train, y_train, x_test)`를 씁니다.
 
 같은 모델로 논문 Table 1(OpenML-CC18 18개 데이터셋 × 5 split)을 측정할 수 있습니다.
 
@@ -66,7 +66,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 
 from minipfn.hub import from_pretrained
-from minipfn.inference.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
+from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
 
 # 분류: 위 예제와 같은 breast cancer 데이터에서 ROC AUC 0.998
 model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier")
@@ -97,11 +97,19 @@ uv run python scripts/tabpfn_v2/eval.py \
 
 ### 코드 구성
 
-`src/minipfn/`의 코드는 네 축으로 나눕니다. prior(`priors/`: 학습 데이터), 모델(`models/`: 구조와 모델 registry), 학습(`training/`: 설정, 학습 루프, 손실, 안정화), 추론(`inference/`: 전처리 멤버와 앙상블)입니다. 여기에 평가(`benchmarks/`)와 Hub 업로드(`hub/`)를 따로 둡니다.
+`src/minipfn/`의 코드는 네 축으로 나눕니다. prior(`priors/`: 학습 데이터), 모델(`models/`: 구조와 모델 registry), 학습(`training/`: 설정, 공용 학습 루프, 데이터 공급, 손실, 안정화), 추론(`inference/`: 앙상블과 전처리)입니다. 여기에 평가(`benchmarks/`)와 Hub 업로드(`hub/`)를 따로 둡니다.
 
-논문 하나는 각 축에서 무엇을 쓸지 고른 조합입니다. 논문이 정한 수치와 조합은 `recipes/`에 두고, 실행 스크립트와 AI Runtime yaml은 `scripts/<paper>/`에 둡니다. 예를 들어 TabPFN-2.5는 TabICL prior(`priors/tabicl.py`), v2 모델 클래스의 2.5 구조(`recipes/tabpfn_v2.py`의 `ARCHITECTURES`), 공통 학습 루프(`training/loop.py`), 2.5 전처리 멤버(`inference/tabpfn_v2.py`)를 씁니다. 학습 루프는 `TrainConfig`의 `prior_type`·`model_type`으로 prior와 모델을 고르므로, 한 축만 바꿔 비교할 수 있습니다.
+축 안의 모듈은 무엇인지로 이름을 붙인 부품입니다. 예를 들어 prior는 `gp`·`mlp_scm`·`prior_bag`·`graph_scm`, 모델은 토큰 하나가 무엇인지에 따라 `point_transformer`(점)·`row_transformer`(행)·`cell_transformer`(셀 묶음)입니다. 논문 이름은 `recipes/`에만 씁니다. recipe는 논문이 정한 수치와 그 수치로 부품을 묶은 설정이고, 논문 기본값을 붙인 추론 클래스(`TabPFNClassifier`, `TabPFNv2Classifier` 등)와 그 논문에만 있는 학습 루프(PFN, TabPFN v1)도 여기에 둡니다. 축은 recipe를 import하지 않습니다. 실행 스크립트와 AI Runtime yaml은 `scripts/<paper>/`에 둡니다.
 
-PFN과 TabPFN v1 재현 코드는 각 축 아래 `pfn.py`·`tabpfn_v1.py` 등으로 두고, 학습 루프도 각자의 것을 씁니다. 예전 경로 `minipfn.tabpfn.hub`·`minipfn.tabpfn.inference`·`minipfn.tabpfn_v2.hub`·`minipfn.tabpfn_v2.inference`는 예전 Hub 모델 카드의 예제가 쓰던 것이라 새 모듈의 별칭으로 남겨 두었습니다.
+| recipe | prior | 모델 | 학습 | 추론 |
+|---|---|---|---|---|
+| `recipes/pfn.py` | `priors/gp.py` | `models/point_transformer.py` | `recipes/pfn.py`의 `train_pfn` | `recipes/pfn.py`의 `pfn_predict` |
+| `recipes/tabpfn_v1.py` | `priors/prior_bag.py` (+ `mlp_scm`, `tabular`, `gp`) | `models/row_transformer.py` | `recipes/tabpfn_v1.py`의 `train_tabpfn` | `inference/rotation_ensemble.py` |
+| `recipes/tabpfn_v2.py` (v2, 2.5) | `priors/graph_scm.py` (+ `table_size`) | `models/cell_transformer.py` | `training/loop.py` | `inference/ensemble.py` (+ `preprocessing`) |
+
+예를 들어 TabPFN-2.5는 graph SCM prior, cell Transformer의 2.5 구조(`recipes/tabpfn_v2.py`의 `ARCHITECTURES`), 공용 학습 루프, 2.5 멤버 종류 묶음(`MEMBER_KIND_PRESETS["v2.5"]`)을 씁니다. 공용 학습 루프는 `TrainConfig`의 `prior_type`·`model_type`으로 prior와 모델을 고르므로, 한 축만 바꿔 비교할 수 있습니다. 예전 이름(`prior_type="tabicl"`, `model_type="tabpfn_v2"`)은 읽을 때 지금 이름으로 바꿉니다.
+
+예전 경로 `minipfn.tabpfn.hub`·`minipfn.tabpfn.inference`·`minipfn.tabpfn_v2.hub`·`minipfn.tabpfn_v2.inference`는 예전 Hub 모델 카드의 예제가 쓰던 것이라 새 모듈(`hub`, recipe)의 별칭으로 남겨 두었습니다.
 
 ### 학습
 

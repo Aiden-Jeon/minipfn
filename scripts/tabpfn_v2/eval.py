@@ -43,14 +43,13 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
-from minipfn.inference.tabpfn_v2 import (
-    DEFAULT_MEMBER_KINDS,
-    DEFAULT_ONE_HOT,
-    ONE_HOT_MODES,
+from minipfn.inference.ensemble import DEFAULT_ONE_HOT
+from minipfn.inference.preprocessing import ONE_HOT_MODES, one_hot_kinds, one_hot_sizes
+from minipfn.priors.table_size import MAX_FEATURES
+from minipfn.recipes.tabpfn_v2 import (
+    MEMBER_KINDS_V2,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
-    _one_hot_sizes,
-    one_hot_kinds,
     resolve_member_kinds,
 )
 from minipfn.utils import log_run_source
@@ -76,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--member-kinds",
         type=_member_kinds,
-        default=DEFAULT_MEMBER_KINDS,
+        default=MEMBER_KINDS_V2,
         help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: v2 = quantile,power."
         " v2.5는 quantile,robust)",
     )
@@ -106,16 +105,17 @@ def headline_mode(modes: list[str]) -> str:
     return DEFAULT_ONE_HOT if DEFAULT_ONE_HOT in modes else modes[0]
 
 
-def expands_one_hot(task: bm.OpenMLTask) -> bool:
+def expands_one_hot(task: bm.OpenMLTask, max_width: int = MAX_FEATURES) -> bool:
     """one-hot 모드에 따라 결과가 달라질 수 있는지.
 
     추론이 범주형으로 다루는 열(`categorical_indices`이거나 숫자가 아닌 열) 가운데 추론이 펼칠
-    열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하이고, 펼친 폭이 상한 안)이 있는지 본다 (전체 행 기준).
+    열(범주가 `MAX_ONE_HOT_CATEGORIES`개 이하이고, 펼친 폭이 상한 `max_width` 안)이 있는지 본다
+    (전체 행 기준). 상한은 모델이 학습 때 본 feature 수다(`model.config.max_features`).
     """
     X = task.X
     cat = set(task.categorical_indices)
     cat |= {i for i, dtype in enumerate(X.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
-    return bool(_one_hot_sizes({i: X.iloc[:, i].nunique() for i in cat}, X.shape[1]))
+    return bool(one_hot_sizes({i: X.iloc[:, i].nunique() for i in cat}, X.shape[1], max_width))
 
 
 def same_result_modes(
@@ -168,6 +168,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             return TabPFNv2Classifier(model, **kw)
         return TabPFNv2Regressor(model, borders, **kw)
 
+    make.max_one_hot_width = model.config.max_features  # expands_one_hot이 같은 상한을 쓰도록
     return make
 
 
@@ -217,7 +218,8 @@ def main(argv: list[str] | None = None) -> None:
         start = time.time()
         task = bm.load_openml_task(task_id)
         scores = {}
-        for group in same_result_modes(args.one_hot, args.member_kinds, expands_one_hot(task)):
+        expands = expands_one_hot(task, factories[suite].max_one_hot_width)
+        for group in same_result_modes(args.one_hot, args.member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
             make = functools.partial(factories[suite], one_hot=group[0])
             task_rows = bm.evaluate_task(task, make, n_folds=args.folds)

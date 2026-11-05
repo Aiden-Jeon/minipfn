@@ -9,7 +9,7 @@ from minipfn.benchmarks.cc18 import (
     sklearn_baselines,
     tabpfn_predict_proba,
 )
-from minipfn.models.tabpfn_v1 import TabPFNTransformer
+from minipfn.models.row_transformer import RowTransformer
 
 
 def _toy(n=300, n_classes=3, seed=0):
@@ -41,7 +41,7 @@ def test_splits_differ_and_are_deterministic():
 
 def test_predict_proba_shape_and_normalization():
     torch.manual_seed(0)
-    model = TabPFNTransformer(num_features=10, n_out=4, emsize=16, nhead=2, nhid=32, nlayers=1)
+    model = RowTransformer(num_features=10, n_out=4, emsize=16, nhead=2, nhid=32, nlayers=1)
     x, y = _toy(n=120)
     x_tr, y_tr, x_te, _ = generate_split(x, y, 1)
     for n_ensemble in (1, 4):

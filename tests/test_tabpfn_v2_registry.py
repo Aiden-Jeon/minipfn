@@ -12,7 +12,7 @@ from torch import nn
 from minipfn import hub
 from minipfn import models as registry
 from minipfn.models import save_checkpoint
-from minipfn.models.tabpfn_v2 import TabPFNv2, TabPFNv2Config
+from minipfn.models.cell_transformer import CellTransformer, CellTransformerConfig
 from minipfn.recipes import tabpfn_v2 as recipe
 from minipfn.training.config import TrainConfig
 from minipfn.training.loop import train
@@ -69,8 +69,8 @@ def _same_weights(a, b):
 
 
 def test_build_model_from_dataclass_or_dict():
-    config = TabPFNv2Config(emsize=16, nlayers=2, nhead=2)
-    assert isinstance(registry.build_model("tabpfn_v2", config), TabPFNv2)
+    config = CellTransformerConfig(emsize=16, nlayers=2, nhead=2)
+    assert isinstance(registry.build_model("tabpfn_v2", config), CellTransformer)
     assert registry.build_model("tabpfn_v2", config.to_dict()).config == config
     with pytest.raises(ValueError, match="model_type"):
         registry.build_model("tabpfn_v9", config)
@@ -82,8 +82,8 @@ def test_build_model_from_dataclass_or_dict():
 def test_v2_model_config_is_unchanged(arch):
     # registry를 거쳐도 v2·2.5 설정은 예전처럼 학습 설정의 필드에서 옮긴다
     config = recipe.with_architecture(recipe.paper("regression"), arch)
-    assert config.model_type == "tabpfn_v2"
-    assert config.model_config() == TabPFNv2Config(
+    assert config.model_type == "cell_transformer"
+    assert config.model_config() == CellTransformerConfig(
         emsize=config.emsize,
         nlayers=config.nlayers,
         nhead=config.nhead,
@@ -92,19 +92,19 @@ def test_v2_model_config_is_unchanged(arch):
         n_thinking_rows=config.n_thinking_rows,
         encoder=config.encoder,
     )
-    assert isinstance(config.build_model(), TabPFNv2)
+    assert isinstance(config.build_model(), CellTransformer)
 
 
 def test_checkpoint_records_the_model_type_and_old_files_read_as_v2(tmp_path):
     model = TrainConfig.smoke().build_model()
     save_checkpoint(tmp_path / "new.pt", model)
     payload = torch.load(tmp_path / "new.pt", weights_only=True)
-    assert payload["model_type"] == "tabpfn_v2"
+    assert payload["model_type"] == "cell_transformer"
     del payload["model_type"]  # model_type을 남기기 전에 저장한 파일
     torch.save(payload, tmp_path / "old.pt")
     for name in ("new.pt", "old.pt"):
         loaded, _ = registry.load_checkpoint(tmp_path / name)
-        assert isinstance(loaded, TabPFNv2)
+        assert isinstance(loaded, CellTransformer)
         _same_weights(model, loaded)
 
 
@@ -113,11 +113,11 @@ def test_hub_config_records_the_model_type_and_old_repos_read_as_v2(tmp_path):
     out = hub.save_pretrained(model, None, tmp_path / "clf")
     config = json.loads((out / hub.CONFIG_NAME).read_text())
     # 예전 from_pretrained는 config["model"]만 읽으므로 model_type은 그 밖에 둔다
-    assert config["model_type"] == "tabpfn_v2" and "model_type" not in config["model"]
+    assert config["model_type"] == "cell_transformer" and "model_type" not in config["model"]
     del config["model_type"]  # 이미 Hub에 올린 v2 repo
     (out / hub.CONFIG_NAME).write_text(json.dumps(config))
     loaded, _ = hub.from_pretrained(out)
-    assert isinstance(loaded, TabPFNv2)
+    assert isinstance(loaded, CellTransformer)
     _same_weights(model, loaded)
 
 
@@ -176,6 +176,10 @@ def test_old_training_checkpoints_need_the_size_params(tmp_path, monkeypatch):
     params = {"task": "classification", "emsize": "32", "nlayers": "2", "nhead": "2"}
     _fake_run(monkeypatch, path, params)
     loaded, _ = hub.load_model(uri, "classification", tmp_path)
+    assert loaded.config == replace(config.model_config(), max_features=160)
+    # 학습 때 본 feature 수는 run param에 있으면 그것을 쓴다
+    _fake_run(monkeypatch, path, {**params, "max_features": "8"})
+    loaded, _ = hub.load_model(uri, "classification", tmp_path)
     assert loaded.config == config.model_config()
     _fake_run(monkeypatch, path, {k: v for k, v in params.items() if k != "nhead"})
     with pytest.raises(SystemExit, match="nhead"):
@@ -187,9 +191,9 @@ def test_old_training_checkpoints_need_the_size_params(tmp_path, monkeypatch):
 
 def test_with_architecture_does_not_switch_other_model_types(tiny):
     config = replace(TrainConfig.smoke(), model_type="tiny")
-    with pytest.raises(ValueError, match="tabpfn_v2 모델"):
+    with pytest.raises(ValueError, match="cell_transformer 모델"):
         recipe.with_architecture(config, "v2")
-    assert recipe.with_architecture(TrainConfig.smoke(), "v2.5").model_type == "tabpfn_v2"
+    assert recipe.with_architecture(TrainConfig.smoke(), "v2.5").model_type == "cell_transformer"
 
 
 def test_init_and_resume_need_the_same_task_and_model(tmp_path):
@@ -231,3 +235,33 @@ def test_unknown_model_fields_are_named(tmp_path):
     }
     with pytest.raises(ValueError, match="init_from: .*모르는 필드"):
         check_checkpoint(state, config, "init_from")
+
+
+def test_old_type_names_read_as_the_new_names():
+    # 예전 학습 run param·checkpoint·Hub config.json의 이름(tabpfn_v2, tabicl)도 읽는다
+    from minipfn.models.cell_transformer import CellTransformer as Cell
+
+    config = TrainConfig(model_type="tabpfn_v2", prior_type="tabicl")
+    assert (config.model_type, config.prior_type) == ("cell_transformer", "graph_scm")
+    assert registry.model_class("tabpfn_v2") is Cell
+    params = {"task": "classification", "model_type": "tabpfn_v2", "max_features": "500"}
+    arch = hub.run_architecture(params)
+    assert arch["model_type"] == "cell_transformer"
+    # 학습 때 본 feature 수는 구조가 아니다: 긴 표로 이어 학습하면 바뀐다
+    assert "max_features" not in arch
+
+
+def test_max_features_is_saved_only_when_it_differs_and_not_compared_on_resume(tmp_path):
+    from minipfn.training.loop import check_checkpoint
+
+    config = TrainConfig()  # v2 논문 크기: max_features 160
+    assert "max_features" not in registry.config_dict(config.model_config())
+    wide = replace(config, max_features=500, feature_scale=500)
+    assert registry.config_dict(wide.model_config())["max_features"] == 500
+    # 160으로 학습한 checkpoint에서 500으로 이어 학습한다 (long_tables), 예전 model_type 이름으로
+    state = {
+        "model_type": "tabpfn_v2",
+        "model_config": registry.config_dict(config.model_config()),
+        "borders": None,
+    }
+    check_checkpoint(state, wide, "init_from")

@@ -1,4 +1,4 @@
-"""TabPFN v2 prior-fitting 학습 루프 (Methods "Training details").
+"""공용 prior-fitting 학습 루프 (TabPFN v2 논문 Methods "Training details"의 절차).
 
 매 optimizer step: GPU마다 prior에서 데이터셋 `micro_batch`개짜리 batch를 받아, 학습 행을 보고
 정답을 가린 검증 행 128개의 정답을 맞히는 손실을 줄인다. 분류는 cross-entropy, 회귀는 구간
@@ -31,12 +31,14 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader
 
 from minipfn.models import (
     DEFAULT_MODEL_TYPE,
+    canonical_model_type,
     config_dict,
     config_from_dict,
+    info_fields,
     save_checkpoint,
     state_config,
     state_weights,
@@ -44,6 +46,7 @@ from minipfn.models import (
 from minipfn.models.bar_distribution import FullSupportBarDistribution
 from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
+from minipfn.training.data import PriorBatches
 from minipfn.training.losses import dequantize_targets, prior_loss
 from minipfn.training.stability import (
     CollapseGuard,
@@ -52,24 +55,6 @@ from minipfn.training.stability import (
     sample_attention_rows,
 )
 from minipfn.utils import DistContext, lr_factor, setup_distributed
-
-
-class PriorBatches(IterableDataset):
-    """DataLoader worker마다 다른 시드로 prior batch를 끝없이 만든다."""
-
-    def __init__(self, config: TrainConfig, seed: tuple[int, ...]) -> None:
-        self.config = config
-        self.seed = seed
-
-    def __iter__(self):
-        info = get_worker_info()
-        worker = 0 if info is None else info.id
-        torch.set_num_threads(1)
-        seed = hash((*self.seed, worker)) % (2**31)
-        prior = self.config.make_prior(seed)
-        while True:
-            batch = prior.sample_batch(self.config.micro_batch)
-            yield batch.x, batch.y, batch.n_train
 
 
 def _borders(config: TrainConfig, d: DistContext, device: torch.device) -> torch.Tensor | None:
@@ -158,8 +143,8 @@ def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     saved_config = state_config(state)
     if saved_config is None:
         return
-    saved_type = state.get("model_type", DEFAULT_MODEL_TYPE)
-    if saved_type != config.model_type:
+    saved_type = canonical_model_type(state.get("model_type", DEFAULT_MODEL_TYPE))
+    if saved_type != canonical_model_type(config.model_type):
         raise ValueError(f"{name}은 {saved_type} 모델이다 (설정의 model_type: {config.model_type})")
     # 적지 않은 필드(기본값이라 빠진 것, 저장한 뒤에 생긴 것)는 그 기본값으로 채워 비교한다.
     # 이 코드가 모르는 필드가 있으면 config_from_dict가 그 이름으로 멈춘다
@@ -168,7 +153,11 @@ def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     except ValueError as e:
         raise ValueError(f"{name}: {e}") from None
     expected = config.model_config().to_dict()
-    diff = {k: (saved.get(k), v) for k, v in expected.items() if saved.get(k) != v}
+    # 가중치 모양과 상관없는 필드(학습 때 본 feature 수 등)는 이어 학습하며 바뀔 수 있다
+    skip = set(info_fields(saved_type))
+    diff = {
+        k: (saved.get(k), v) for k, v in expected.items() if k not in skip and saved.get(k) != v
+    }
     if diff:
         raise ValueError(f"{name}의 모델 설정이 이번 설정과 다르다 (저장된 값, 설정): {diff}")
 

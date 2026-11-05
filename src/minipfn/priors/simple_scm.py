@@ -1,7 +1,8 @@
-"""표 데이터용 prior: TabPFN(arXiv:2207.01848) 4절의 무작위 SCM 샘플러.
+"""단순한 무작위 SCM 샘플러 (표 데이터 prior를 처음 소개하는 primer용).
 
-`notebooks/02_tabpfn/01_scm_primer.ipynb` 6절에서 만든 코드를 다른 노트북에서도 쓰도록 옮겼다.
-하이퍼파라미터 분포는 논문(부록 E.4)보다 단순하게 잡았다.
+TabPFN(arXiv:2207.01848) 4절의 SCM prior를 `notebooks/02_tabpfn/01_scm_primer.ipynb` 6절에서 작게
+만든 코드를 다른 노트북에서도 쓰도록 옮겼다. 하이퍼파라미터 분포는 논문(부록 E.4)보다 단순하게
+잡았다. 학습에 쓰는 v1 prior는 `minipfn.priors.prior_bag`(+ `mlp_scm`)이다.
 """
 
 from __future__ import annotations

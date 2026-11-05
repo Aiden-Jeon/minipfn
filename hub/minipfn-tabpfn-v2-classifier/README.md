@@ -84,7 +84,7 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 
 ```python
 from minipfn.hub import from_pretrained
-from minipfn.inference.tabpfn_v2 import TabPFNv2Classifier
+from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier
 
 model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier")
 # x_train can be a pandas DataFrame with categorical columns

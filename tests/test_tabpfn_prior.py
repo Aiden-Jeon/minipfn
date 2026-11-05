@@ -1,14 +1,18 @@
+from functools import partial
+
 import numpy as np
 import torch
 
-from minipfn.priors.tabpfn_v1 import (
-    TabPFNPrior,
-    TabPFNPriorDataset,
-    _sample_gp_group,
-    sample_group_hyperparameters,
-    sample_hyperparameter,
-)
+from minipfn.priors.gp import sample_gp_tables
+from minipfn.priors.hyperparameters import sample_hyperparameter
+from minipfn.priors.prior_bag import sample_group_hyperparameters
 from minipfn.recipes import tabpfn_v1 as spec
+from minipfn.recipes.tabpfn_v1 import TabPFNPrior
+from minipfn.training.data import PriorGroups
+
+
+def TabPFNPriorDataset(*, max_eval_pos, seed=0, **prior_kwargs):  # noqa: N802
+    return PriorGroups(partial(TabPFNPrior, **prior_kwargs), max_eval_pos=max_eval_pos, seed=seed)
 
 
 def _small_prior(seed=0, seq_len=128):
@@ -65,7 +69,7 @@ def test_feature_scaling_by_used_features():
 def test_hyperparameter_bounds():
     rng = np.random.default_rng(0)
     for _ in range(200):
-        hp = sample_group_hyperparameters(rng, max_classes=10, num_features=100)
+        hp = sample_group_hyperparameters(rng, spec.PRIOR, max_classes=10, num_features=100)
         assert hp["num_layers"] >= 2 and hp["prior_mlp_hidden_dim"] >= 4
         assert hp["num_causes"] >= 2
         assert 0 <= hp["prior_mlp_dropout_prob"] <= 0.6
@@ -84,14 +88,15 @@ def test_meta_choice_mixes_both_values():
 
 def test_prior_bag_mostly_mlp():
     rng = np.random.default_rng(0)
-    use_mlp = [sample_group_hyperparameters(rng, 10, 100)["use_mlp"] for _ in range(1000)]
+    hps = [sample_group_hyperparameters(rng, spec.PRIOR, 10, 100) for _ in range(1000)]
+    use_mlp = [hp["use_mlp"] for hp in hps]
     assert 0.85 < np.mean(use_mlp) < 1.0
 
 
 def test_gp_group_shapes():
     gen = torch.Generator().manual_seed(0)
     hp = {"outputscale": 1.0, "lengthscale": 1.0, "noise": 1e-4}
-    x, y = _sample_gp_group(64, 3, 5, hp, gen, "cpu")
+    x, y = sample_gp_tables(64, 3, 5, hp, gen, "cpu")
     assert x.shape == (64, 3, 5) and y.shape == (64, 3)
     assert torch.isfinite(y).all()
 

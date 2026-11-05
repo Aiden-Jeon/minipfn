@@ -1,5 +1,5 @@
-"""학습한 모델(`minipfn.models` registry의 모델: TabPFN v2·2.5 등)을 Hugging Face Hub에 올리고
-받는다. TabPFN v1은 형식이 달라 `minipfn.hub.tabpfn_v1`에 있다.
+"""학습한 모델(`minipfn.models` registry의 모델: TabPFN v2·2.5의 cell_transformer 등)을 Hugging
+Face Hub에 올리고 받는다. TabPFN v1은 형식이 달라 `minipfn.hub.tabpfn_v1`에 있다.
 
 Hub에는 pickle 없이 읽을 수 있도록 가중치는 `model.safetensors`, 설정은 `config.json`으로 둔다.
 회귀 모델은 bar distribution 구간 경계를 `model.safetensors` 안에 `borders`라는 이름으로 함께 둔다.
@@ -29,8 +29,10 @@ from torch import nn
 from minipfn.models import (
     DEFAULT_MODEL_TYPE,
     build_model,
+    canonical_model_type,
     config_dict,
     config_fields,
+    info_fields,
     model_from_state,
     state_config,
 )
@@ -44,10 +46,11 @@ _REQUIRED_RUN_PARAMS = ("emsize", "nlayers", "nhead")
 
 
 def _model_params(model_type: str) -> tuple[str, ...]:
-    # 학습 run의 param으로 남는 모델 구조 설정 (그 모델 설정과 TrainConfig에 모두 있는 것)
+    # 학습 run의 param으로 남는 모델 구조 설정 (그 모델 설정과 TrainConfig에 모두 있는 것). 가중치
+    # 모양과 상관없는 필드(`info_fields`)는 구조가 아니라 뺀다
     from minipfn.training.config import TrainConfig
 
-    train_fields = {f.name for f in fields(TrainConfig)}
+    train_fields = {f.name for f in fields(TrainConfig)} - set(info_fields(model_type))
     return tuple(name for name in config_fields(model_type) if name in train_fields)
 
 
@@ -148,12 +151,19 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
         raise SystemExit(f"{spec}는 {params['task']} 모델이다 ({task} 모델이 필요하다).")
     # 모델 설정을 checkpoint에 남기기 전의 run이라 v2·2.5다. 크기 param은 처음부터 기록했으니
     # 없으면 기록이 덜 된 run이다. 2.5 구조 param은 2.5 이전 run에 없으므로 v2 기본값을 쓴다
-    if params.get("model_type", DEFAULT_MODEL_TYPE) != DEFAULT_MODEL_TYPE:
+    if canonical_model_type(params.get("model_type", DEFAULT_MODEL_TYPE)) != DEFAULT_MODEL_TYPE:
         raise SystemExit(f"{spec}에 모델 설정이 없다 (model_type {params['model_type']}).")
     missing = [name for name in _REQUIRED_RUN_PARAMS if name not in params]
     if missing:
         raise SystemExit(f"{spec}의 run에 모델 param {missing}이 없다.")
-    model = replace(TrainConfig(task=params["task"]), **run_architecture(params)).build_model()
+    config = replace(TrainConfig(task=params["task"]), **run_architecture(params))
+    # 학습 때 본 feature 수 등 구조가 아닌 모델 설정도 run param에 있으면 그 값을 쓴다
+    info = {
+        name: _parse_param(getattr(config, name), params[name])
+        for name in info_fields(config.model_type)
+        if name in params
+    }
+    model = replace(config, **info).build_model()
     model.load_state_dict(state["model"])
     return model.eval(), state["borders"]
 
@@ -162,16 +172,22 @@ def run_architecture(params: dict[str, str]) -> dict:
     """학습 run의 MLflow param에서 모델 구조: `model_type`과 그 모델의 구조 설정(TrainConfig 필드).
 
     run에 없는 값(model_type 이전 run은 v2, TabPFN-2.5 이전 run의 구조 설정)은 설정 기본값(v2)을
-    쓴다. 반환값을 `replace(config, **...)`로 학습 설정에 넣는다.
+    쓴다. 예전 model_type 이름(`tabpfn_v2`)은 지금 이름으로 바꾼다. 반환값을
+    `replace(config, **...)`로 학습 설정에 넣는다.
     """
     from minipfn.training.config import TrainConfig
 
-    model_type = params.get("model_type", DEFAULT_MODEL_TYPE)
+    model_type = canonical_model_type(params.get("model_type", DEFAULT_MODEL_TYPE))
     defaults = TrainConfig(task=params["task"], model_type=model_type)
-    names = ("model_type", *_model_params(model_type))
+    names = _model_params(model_type)
     return {
-        name: _parse_param(getattr(defaults, name), params.get(name, str(getattr(defaults, name))))
-        for name in names
+        "model_type": model_type,
+        **{
+            name: _parse_param(
+                getattr(defaults, name), params.get(name, str(getattr(defaults, name)))
+            )
+            for name in names
+        },
     }
 
 

@@ -52,7 +52,7 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 
 ```python
 from minipfn.hub.tabpfn_v1 import from_pretrained
-from minipfn.inference.tabpfn_v1 import TabPFNClassifier
+from minipfn.recipes.tabpfn_v1 import TabPFNClassifier
 
 model, config = from_pretrained("aiden-jeon/minipfn-tabpfn-v1")
 clf = TabPFNClassifier(model).fit(x_train, y_train)
@@ -64,7 +64,7 @@ proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes
 - `"fit_preprocessors"` (default): caches the preprocessing. Use it for batch prediction.
 - `"fit_with_cache"`: also caches each layer's training-row keys and values, so predicting one row only computes test-to-train attention. Use it for serving with a fixed training set. The cache takes about 1.6 GB at 1,000 training rows.
 
-If the training rows change with every request, use `minipfn.inference.tabpfn_v1.tabpfn_predict_proba(model, x_train, y_train, x_test)`. To reproduce Table 1:
+If the training rows change with every request, use `minipfn.recipes.tabpfn_v1.tabpfn_predict_proba(model, x_train, y_train, x_test)`. To reproduce Table 1:
 
 ```bash
 uv run python scripts/tabpfn/eval.py --hub-repo aiden-jeon/minipfn-tabpfn-v1

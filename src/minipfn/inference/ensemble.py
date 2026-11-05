@@ -1,12 +1,18 @@
-"""TabPFN v2 추론: 앙상블과 전처리 (Methods "Inference details", "Regression details").
+"""전처리 멤버 앙상블 (TabPFN v2 논문 Methods "Inference details", "Regression details"의 추론):
+sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train)` 모델이면 클래스와
+상관없이 쓴다 (`minipfn.models` registry의 모델).
 
-    clf = TabPFNv2Classifier(model).fit(x_train, y_train)
+    clf = EnsembleClassifier(model, n_estimators=4).fit(x_train, y_train)
     proba = clf.predict_proba(x_test)
 
-`fit`은 가중치를 학습하지 않는다. 멤버마다 전처리를 학습 행에 맞춰 두고, 예측할 때 학습 행과
-테스트 행을 함께 forward한다. 논문이 기본 설정으로 적은 것 가운데 다음을 쓴다.
+논문 설정(멤버 수, 멤버 종류 묶음 "v2"·"v2.5")을 기본값으로 둔 것은
+`minipfn.recipes.tabpfn_v2.TabPFNv2Classifier`·`TabPFNv2Regressor`다.
 
-- 멤버 수: 분류 4개, 회귀 8개
+`fit`은 가중치를 학습하지 않는다. 멤버마다 전처리를 학습 행에 맞춰 두고, 예측할 때 학습 행과
+테스트 행을 함께 forward한다. 논문이 기본 설정으로 적은 것 가운데 다음을 쓴다 (멤버 전처리는
+`minipfn.inference.preprocessing`).
+
+- 멤버 수(`n_estimators`): 논문 기본값은 분류 4개, 회귀 8개
 - 멤버마다: feature 순서 섞기, (분류) 클래스 번호 섞기, 표준정규 난수로 된 샘플 식별자 열
 - 전처리 두 가지를 번갈아: (1) 분위수 변환한 열을 원래 열 옆에 붙이고 SVD 성분을 덧붙임,
   범주형 열은 번호를 섞음 (2) Yeo-Johnson power transform
@@ -14,11 +20,12 @@
 - (`one_hot`을 주면) 범주형 열을 one-hot으로 펼친다. 논문 전처리 목록의 6번인데, 어느 멤버에 어떤
   범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 power 멤버만(분위수 멤버는 번호 섞기를
   그대로), `"all"`은 모든 멤버. 범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
-  펼친 뒤 열 수가 `MAX_ONE_HOT_WIDTH`(prior의 최대 feature 수)를 넘으면 범주가 많은 열부터 번호로
-  되돌린다. 범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던 범주(번호로 바꿀 때 결측이 된다)는
-  NaN. 기본값 `DEFAULT_ONE_HOT`은 분류·회귀 모두 `"all"`이다. 세 모드(off·power·all)를 benchmark에서
-  견줬을 때 분류는 suite 평균 ROC AUC(500k 0.9235 → 0.9238), 회귀는 one-hot으로 결과가 바뀌는
-  11개에서 off 대비 RMSE 비율의 기하평균(QK-clip 200k, power 0.964, all 0.958)이 가장 좋았다.
+  펼친 뒤 열 수가 `max_one_hot_width`(기본: 모델 설정의 `max_features`, 학습 때 본 feature 수)를
+  넘으면 범주가 많은 열부터 번호로 되돌린다. 범주가 2개면 열 하나(0/1)로 둔다. 결측과 학습에 없던
+  범주(번호로 바꿀 때 결측이 된다)는 NaN. 기본값 `DEFAULT_ONE_HOT`은 분류·회귀 모두 `"all"`이다.
+  세 모드(off·power·all)를 benchmark에서 견줬을 때 분류는 suite 평균 ROC AUC(500k 0.9235 →
+  0.9238), 회귀는 one-hot으로 결과가 바뀌는 11개에서 off 대비 RMSE 비율의 기하평균(QK-clip 200k,
+  power 0.964, all 0.958)이 가장 좋았다.
   회귀의 neg RMSE 단순 평균은 RMSE가 수만인 MIP-2016 하나가 정해서 기준으로 쓰지 않았다
 - (`member_kinds`) 멤버 전처리 종류를 차례로 돌려 쓴다. 기본 `("quantile", "power")`는 위의 v2
   두 가지다. TabPFN-2.5(arXiv 2511.08667)는 "robust scaling과 soft clipping을 분위수·표준 변환과
@@ -26,9 +33,9 @@
   smooth clipping이다: 열마다 (x − 중앙값) / (3사분위 − 1사분위)
   (사분위 폭이 0이면 2 / (최대 − 최소)), 그다음 x / √(1 + (x/3)²). 표준 변환은 모델 안에서
   학습 행으로 z-정규화하므로 따로 하지 않는다.
-  범주형 열은 power 멤버처럼 번호 그대로다. `MEMBER_KINDS_V2_5 = ("quantile", "robust")`
+  범주형 열은 power 멤버처럼 번호 그대로다. recipe의 `MEMBER_KINDS_V2_5 = ("quantile", "robust")`
   (2.5가 Yeo-Johnson을 계속 쓰는지는 적혀 있지 않다)
-- 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
+- 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
   바뀐다. 멤버 수가 `2 × max(2, 종류 수)`의 배수일 때 전체와 종류마다 정확히 절반이다(기본 8개는
@@ -51,243 +58,57 @@
 
 from __future__ import annotations
 
-import warnings
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import (
-    LabelEncoder,
-    OrdinalEncoder,
-    PowerTransformer,
-    QuantileTransformer,
+from sklearn.preprocessing import LabelEncoder, PowerTransformer
+from torch import nn
+
+from minipfn.inference.preprocessing import (
+    MEMBER_KINDS,
+    ONE_HOT_MODES,
+    Member,
+    MemberPreprocessor,
+    apply_encoder,
+    one_hot_kinds,
+    to_numeric,
 )
 
-from minipfn.models.tabpfn_v2 import TabPFNv2
-from minipfn.priors.base import MAX_FEATURES
-
-OUTLIER_SIGMA = 12.0
-MAX_ONE_HOT_CATEGORIES = 20  # benchmark의 socmob(17개)은 펼치고 colleges(수천 개)는 번호로 둔다
-MAX_ONE_HOT_WIDTH = MAX_FEATURES  # 펼친 뒤 열 수의 상한: 학습 때 본 feature 수를 넘지 않게
-ONE_HOT_MODES = ("off", "power", "all")
 DEFAULT_ONE_HOT = "all"
 SOFTMAX_TEMPERATURE = 0.9
-MEMBER_KINDS = ("quantile", "power", "robust")
-DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2
-MEMBER_KINDS_V2_5 = ("quantile", "robust")
-# 이름으로 고르는 멤버 종류 묶음 (평가 스크립트의 `--member-kinds v2.5` 등)
-MEMBER_KIND_PRESETS = {"v2": DEFAULT_MEMBER_KINDS, "v2.5": MEMBER_KINDS_V2_5}
-SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
+DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2 논문의 두 가지
 
 
-def _to_numeric(X: Any, categorical: list[int] | None) -> tuple[np.ndarray, list[int], Any]:
-    """범주형·문자열 열을 순서 번호로 바꾼다. 결측은 NaN으로 남긴다."""
-    df = pd.DataFrame(X).reset_index(drop=True)
-    cat = set(categorical or [])
-    cat |= {i for i, dtype in enumerate(df.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
-    cat_ix = sorted(cat)
-    encoder = None
-    if cat_ix:
-        encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)
-        encoder.fit(df.iloc[:, cat_ix].astype(str).where(df.iloc[:, cat_ix].notna()))
-    return _apply_encoder(df, cat_ix, encoder), cat_ix, encoder
-
-
-def _apply_encoder(df: pd.DataFrame, cat_ix: list[int], encoder: Any) -> np.ndarray:
-    df = pd.DataFrame(df).reset_index(drop=True)
-    out = np.empty(df.shape, dtype=np.float64)
-    num_ix = [i for i in range(df.shape[1]) if i not in cat_ix]
-    if num_ix:
-        out[:, num_ix] = df.iloc[:, num_ix].apply(pd.to_numeric, errors="coerce").to_numpy(float)
-    if cat_ix:
-        cats = df.iloc[:, cat_ix]
-        out[:, cat_ix] = encoder.transform(cats.astype(str).where(cats.notna()))
-    return out
-
-
-def _one_hot_width(n: int) -> int:
-    return 1 if n == 2 else n  # 범주 2개는 0/1 열 하나
-
-
-def _one_hot_sizes(n_categories: dict[int, int], n_features: int) -> dict[int, int]:
-    """one-hot으로 펼칠 열과 그 범주 수.
-
-    범주가 `MAX_ONE_HOT_CATEGORIES`개 이하인 열을 펼친다. 펼친 뒤 열 수(원래 열 기준)가
-    `MAX_ONE_HOT_WIDTH`를 넘으면 범주가 많은 열부터 번호로 되돌린다 (열 수가 늘지 않는 범주 2개 이하
-    열은 그대로 펼친다).
-    """
-    sizes = {i: n for i, n in n_categories.items() if n <= MAX_ONE_HOT_CATEGORIES}
-    width = n_features + sum(_one_hot_width(n) - 1 for n in sizes.values())
-    wide = [i for i in sizes if _one_hot_width(sizes[i]) > 1]
-    for i in sorted(wide, key=lambda i: -sizes[i]):
-        if width <= MAX_ONE_HOT_WIDTH:
-            break
-        width -= _one_hot_width(sizes.pop(i)) - 1
-    return sizes
-
-
-class RobustSoftClip:
-    """RealMLP의 robust scaling + smooth clipping (열마다, 결측은 NaN 그대로)."""
-
-    def fit(self, X: np.ndarray) -> RobustSoftClip:
-        with np.errstate(all="ignore"), warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)  # 모두 결측인 열
-            low, q1, median, q3, high = np.nanquantile(X, [0, 0.25, 0.5, 0.75, 1], axis=0)
-            span = high - low
-        iqr = q3 - q1
-        self.scale_ = np.zeros(X.shape[1])
-        ok = iqr > 0
-        self.scale_[ok] = 1.0 / iqr[ok]
-        flat = ~ok & (span > 0)  # 사분위 폭이 0인 열(대부분 같은 값)
-        self.scale_[flat] = 2.0 / span[flat]
-        self.median_ = np.nan_to_num(median)
-        return self
-
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        z = (X - self.median_) * self.scale_
-        return z / np.sqrt(1.0 + (z / SOFT_CLIP) ** 2)
-
-
-def resolve_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
-    """멤버 전처리 종류. `MEMBER_KIND_PRESETS`의 이름, 쉼표로 구분한 문자열, 종류 목록을 받는다."""
+def resolve_member_kinds(
+    value: str | tuple[str, ...] | list[str], presets: dict[str, tuple[str, ...]] | None = None
+) -> tuple[str, ...]:
+    """멤버 전처리 종류. `presets`의 이름(recipe의 `MEMBER_KIND_PRESETS` 등), 쉼표로 구분한 문자열,
+    종류 목록을 받는다."""
+    presets = presets or {}
     if isinstance(value, str):
-        if value in MEMBER_KIND_PRESETS:
-            return MEMBER_KIND_PRESETS[value]
+        if value in presets:
+            return presets[value]
         value = [k.strip() for k in value.split(",") if k.strip()]
     kinds = tuple(value)
     if not kinds or set(kinds) - set(MEMBER_KINDS):
-        raise ValueError(
-            f"member_kinds는 {MEMBER_KINDS}에서 고르거나 {tuple(MEMBER_KIND_PRESETS)} 가운데"
-            f" 하나다: {value}"
-        )
+        names = f" 또는 {tuple(presets)} 가운데 하나" if presets else ""
+        raise ValueError(f"member_kinds는 {MEMBER_KINDS}에서 고른다{names}: {value}")
     return kinds
-
-
-def one_hot_kinds(one_hot: str, member_kinds: tuple[str, ...]) -> frozenset[str]:
-    """`one_hot` 모드에서 범주형 열을 펼치는 멤버 종류. 이 집합이 같은 두 모드는 결과도 같다."""
-    if one_hot == "all":
-        return frozenset(member_kinds)
-    if one_hot == "power":  # 분위수가 아닌 멤버(power·robust)만
-        return frozenset(k for k in member_kinds if k != "quantile")
-    return frozenset()
-
-
-@dataclass
-class _Member:
-    kind: str  # "quantile" | "power" | "robust"
-    class_permutation: np.ndarray | None
-    target_power: bool
-    seed: int
-    one_hot: bool = False
-
-
-class _MemberPreprocessor:
-    """멤버 하나의 전처리. fit은 학습 행으로만 한다."""
-
-    def __init__(self, member: _Member, cat_ix: list[int]) -> None:
-        self.member = member
-        self.cat_ix = cat_ix
-
-    def fit(self, X: np.ndarray) -> _MemberPreprocessor:
-        rng = np.random.default_rng(self.member.seed)
-        mean, std = np.nanmean(X, axis=0), np.nanstd(X, axis=0)
-        self.lower, self.upper = mean - OUTLIER_SIGMA * std, mean + OUTLIER_SIGMA * std
-        # 범주형 열은 자르지 않는다 (번호를 자르면 드문 범주가 다른 범주와 합쳐진다)
-        self.lower[self.cat_ix], self.upper[self.cat_ix] = -np.inf, np.inf
-        X = self._clip(X)
-        num_ix = [i for i in range(X.shape[1]) if i not in self.cat_ix]
-        self.num_ix = num_ix
-        # 범주형 열의 번호는 0부터 (학습 행의 범주 수 - 1)까지다
-        n_categories = {
-            i: int(np.nanmax(X[:, i])) + 1 if np.isfinite(X[:, i]).any() else 1 for i in self.cat_ix
-        }
-        self.one_hot_sizes = _one_hot_sizes(n_categories, X.shape[1]) if self.member.one_hot else {}
-        self.cat_maps = {}
-        if self.member.kind == "quantile":
-            # 범주형 열: 번호를 섞는다 (분위수 멤버만, one-hot으로 펼치는 열은 빼고)
-            for i in self.cat_ix:
-                if i not in self.one_hot_sizes:
-                    self.cat_maps[i] = rng.permutation(n_categories[i])
-            n_quantiles = max(min(X.shape[0] // 10, 1000), 2)
-            self.transformer = QuantileTransformer(
-                n_quantiles=n_quantiles, random_state=self.member.seed
-            )
-        elif self.member.kind == "power":
-            self.transformer = PowerTransformer(method="yeo-johnson", standardize=True)
-        else:
-            self.transformer = RobustSoftClip()
-        if num_ix:
-            self.transformer.fit(X[:, num_ix])
-        self.svd = None
-        base = self._base(X)
-        n_components = 0
-        if self.member.kind == "quantile" and X.shape[1] >= 2:
-            # SVD 성분 min(n/10 + 1, d/2)개. 표준화하고 결측은 0으로 채워 넣는다
-            n_components = max(1, min(X.shape[0] // 10 + 1, X.shape[1] // 2))
-            self.svd_mean = np.nanmean(base, axis=0)
-            self.svd_std = np.nanstd(base, axis=0) + 1e-8
-            self.svd = TruncatedSVD(n_components=n_components, random_state=self.member.seed)
-            self.svd.fit(self._standardize(base))
-        # 열 순서: 변환한 열 + SVD 성분 + 샘플 식별자 1개를 한꺼번에 섞는다
-        self.order = rng.permutation(base.shape[1] + n_components + 1)
-        return self
-
-    def _standardize(self, base: np.ndarray) -> np.ndarray:
-        return np.nan_to_num((base - self.svd_mean) / self.svd_std, nan=0.0)
-
-    def _clip(self, X: np.ndarray) -> np.ndarray:
-        return np.clip(X, self.lower, self.upper)
-
-    def _base(self, X: np.ndarray) -> np.ndarray:
-        X = X.copy()
-        for i, perm in self.cat_maps.items():
-            ok = np.isfinite(X[:, i]) & (X[:, i] < len(perm))
-            X[ok, i] = perm[X[ok, i].astype(int)]
-        transformed = X.copy()
-        if self.num_ix:
-            with np.errstate(all="ignore"):
-                transformed[:, self.num_ix] = self.transformer.transform(X[:, self.num_ix])
-        if self.member.kind == "quantile":
-            out = np.concatenate([X, transformed[:, self.num_ix]], axis=1)  # 원래 열 + 분위수 열
-        else:
-            out = transformed
-        if not self.one_hot_sizes:
-            return out
-        # 번호 열을 빼고 one-hot 열을 뒤에 붙인다 (앞 d개 열이 원래 열 순서라 위치가 같다)
-        keep = [j for j in range(out.shape[1]) if j not in self.one_hot_sizes]
-        blocks = [self._one_hot(X[:, i], n) for i, n in self.one_hot_sizes.items()]
-        return np.concatenate([out[:, keep], *blocks], axis=1)
-
-    @staticmethod
-    def _one_hot(codes: np.ndarray, n: int) -> np.ndarray:
-        # 결측과 범위 밖 번호는 NaN: 번호 열과 똑같이 결측으로 본다
-        known = np.isfinite(codes) & (codes >= 0) & (codes < n)
-        block = np.full((len(codes), n), np.nan)
-        block[known] = 0.0
-        block[np.flatnonzero(known), codes[known].astype(int)] = 1.0
-        return block[:, 1:] if n == 2 else block
-
-    def transform(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        base = self._base(self._clip(X))
-        parts = [base]
-        if self.svd is not None:
-            parts.append(self.svd.transform(self._standardize(base)))
-        parts.append(rng.standard_normal((X.shape[0], 1)))  # 샘플 식별자 열
-        return np.concatenate(parts, axis=1)[:, self.order]
 
 
 class _Base:
     def __init__(
         self,
-        model: TabPFNv2,
+        model: nn.Module,
         *,
         n_estimators: int,
         categorical_features_indices: list[int] | None = None,
         one_hot: str = DEFAULT_ONE_HOT,
         member_kinds: tuple[str, ...] | str = DEFAULT_MEMBER_KINDS,
+        softmax_temperature: float = SOFTMAX_TEMPERATURE,
+        max_one_hot_width: int | None = None,
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
@@ -295,18 +116,25 @@ class _Base:
             raise ValueError(f"one_hot은 {ONE_HOT_MODES} 가운데 하나여야 한다: {one_hot}")
         self.one_hot = one_hot
         self.member_kinds = resolve_member_kinds(member_kinds)
+        self.softmax_temperature = softmax_temperature
+        # one-hot으로 펼친 뒤 열 수의 상한: 모델이 학습 때 본 feature 수 (모델 설정의 max_features)
+        if max_one_hot_width is None:
+            max_one_hot_width = model.config.max_features
+        self.max_one_hot_width = max_one_hot_width
         self.model = model
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
         self.device = torch.device(device)
         self.random_state = random_state
 
-    def _fit_members(self, X: Any, members: list[_Member]) -> None:
+    def _fit_members(self, X: Any, members: list[Member]) -> None:
         expanded = one_hot_kinds(self.one_hot, self.member_kinds)
         for m in members:
             m.one_hot = m.kind in expanded
-        X_num, self.cat_ix_, self.encoder_ = _to_numeric(X, self.categorical_features_indices)
-        self.preprocessors_ = [_MemberPreprocessor(m, self.cat_ix_).fit(X_num) for m in members]
+        X_num, self.cat_ix_, self.encoder_ = to_numeric(X, self.categorical_features_indices)
+        self.preprocessors_ = [
+            MemberPreprocessor(m, self.cat_ix_, self.max_one_hot_width).fit(X_num) for m in members
+        ]
         # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
         self.X_trains_ = [
             prep.transform(X_num, np.random.default_rng(prep.member.seed + 2))
@@ -317,7 +145,7 @@ class _Base:
         return self.member_kinds[i % len(self.member_kinds)]
 
     def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
-        X_test = _apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
+        X_test = apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
         model = self.model.to(self.device).eval()
         autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
         for i, (prep, y_train) in enumerate(zip(self.preprocessors_, y_trains, strict=True)):
@@ -334,11 +162,10 @@ class _Base:
             yield i, logits
 
 
-class TabPFNv2Classifier(_Base):
-    def __init__(self, model: TabPFNv2, *, n_estimators: int = 4, **kwargs: Any) -> None:
-        super().__init__(model, n_estimators=n_estimators, **kwargs)
+class EnsembleClassifier(_Base):
+    """분류: 멤버마다 클래스 번호를 섞고, logit을 온도로 나눠 softmax한 뒤 평균한다."""
 
-    def fit(self, X: Any, y: Any) -> TabPFNv2Classifier:
+    def fit(self, X: Any, y: Any) -> EnsembleClassifier:
         rng = np.random.default_rng(self.random_state)
         self.label_encoder_ = LabelEncoder()
         y = self.label_encoder_.fit_transform(np.asarray(y))
@@ -349,7 +176,7 @@ class TabPFNv2Classifier(_Base):
                 f"클래스 {n_classes}개는 모델 출력({self.model.config.n_out}개)보다 많다."
             )
         members = [
-            _Member(
+            Member(
                 kind=self._kind(i),
                 class_permutation=rng.permutation(n_classes),
                 target_power=False,
@@ -368,7 +195,7 @@ class TabPFNv2Classifier(_Base):
         for i, logits in self._iter_logits(X, self.y_trains_):
             perm = self.preprocessors_[i].member.class_permutation
             logits = logits[:, :n_classes][:, perm]  # 섞은 번호의 logit을 원래 클래스 순서로
-            probs.append(torch.softmax(logits / SOFTMAX_TEMPERATURE, dim=-1))
+            probs.append(torch.softmax(logits / self.softmax_temperature, dim=-1))
         return torch.stack(probs).mean(0).cpu().numpy()
 
     def predict(self, X: Any) -> np.ndarray:
@@ -416,25 +243,20 @@ def _bucket_values(borders: torch.Tensor, u_train: np.ndarray) -> np.ndarray:
     return values
 
 
-class TabPFNv2Regressor(_Base):
-    def __init__(
-        self,
-        model: TabPFNv2,
-        borders: torch.Tensor,
-        *,
-        n_estimators: int = 8,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(model, n_estimators=n_estimators, **kwargs)
+class EnsembleRegressor(_Base):
+    """회귀: 구간 확률을 멤버마다 자기 공간에서 계산해 평균한다 (모듈 docstring)."""
+
+    def __init__(self, model: nn.Module, borders: torch.Tensor, **kwargs: Any) -> None:
+        super().__init__(model, **kwargs)
         self.borders = borders.float().cpu()  # 계산할 때만 장치로 옮기고, 결과는 CPU로 돌려준다
 
-    def fit(self, X: Any, y: Any) -> TabPFNv2Regressor:
+    def fit(self, X: Any, y: Any) -> EnsembleRegressor:
         rng = np.random.default_rng(self.random_state)
         y = np.asarray(y, dtype=np.float64)
         self.y_mean_, self.y_std_ = float(y.mean()), float(y.std()) + 1e-12
         z = (y - self.y_mean_) / self.y_std_
         members = [
-            _Member(
+            Member(
                 kind=self._kind(i),
                 class_permutation=None,
                 # max(2, 종류 수)개마다 켜고 끈다 (종류 1~2개는 예전과 같은 끔, 끔, 켬, 켬)
@@ -470,7 +292,7 @@ class TabPFNv2Regressor(_Base):
         borders = self.borders.to(self.device)
         probs = []
         for i, logits in self._iter_logits(X, self.y_trains_):
-            p = torch.softmax(logits / SOFTMAX_TEMPERATURE, dim=-1)
+            p = torch.softmax(logits / self.softmax_temperature, dim=-1)
             if self.border_maps_[i] is not None:
                 # power transform한 공간의 경계를 z 공간으로 되돌린 것 위에서 확률을 옮긴다
                 p = _probs_on_borders(p, self.border_maps_[i].to(self.device), borders)
@@ -483,6 +305,6 @@ class TabPFNv2Regressor(_Base):
         멤버마다 자기 구간 값(`bucket_values_`)으로 계산한다."""
         means = []
         for i, logits in self._iter_logits(X, self.y_trains_):
-            p = torch.softmax(logits / SOFTMAX_TEMPERATURE, dim=-1)
+            p = torch.softmax(logits / self.softmax_temperature, dim=-1)
             means.append(p @ self.bucket_values_[i].to(p.device))
         return torch.stack(means).mean(0).cpu().numpy() * self.y_std_ + self.y_mean_

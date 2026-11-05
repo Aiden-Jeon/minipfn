@@ -6,14 +6,15 @@ import pytest
 import torch
 from sklearn.datasets import load_breast_cancer, load_diabetes
 
-from minipfn.inference.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor, _probs_on_borders
+from minipfn.inference.ensemble import _probs_on_borders
 from minipfn.models import load_checkpoint, save_checkpoint
-from minipfn.models.tabpfn_v2 import TabPFNv2, TabPFNv2Config
+from minipfn.models.cell_transformer import CellTransformer, CellTransformerConfig
+from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
 
 
-def _tiny_model(n_out: int = 10) -> TabPFNv2:
+def _tiny_model(n_out: int = 10) -> CellTransformer:
     torch.manual_seed(0)
-    model = TabPFNv2(TabPFNv2Config(emsize=16, nlayers=2, nhead=2, n_out=n_out))
+    model = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2, n_out=n_out))
     # 0으로 초기화한 출력층이 있으면 attention이 아무 일도 하지 않으므로 무작위로 채운다
     for p in model.parameters():
         torch.nn.init.normal_(p, std=0.3)
@@ -21,7 +22,7 @@ def _tiny_model(n_out: int = 10) -> TabPFNv2:
 
 
 def test_default_size_is_paper_model():
-    model = TabPFNv2()
+    model = CellTransformer()
     assert model.config.emsize == 192 and model.config.nlayers == 12
     assert 7_000_000 < model.num_parameters() < 7_500_000  # 논문 기본 모델은 약 7.2M
 
@@ -98,7 +99,7 @@ def test_regressor_runs():
 
 
 def test_regressor_tail_bucket_uses_training_target_range():
-    from minipfn.inference.tabpfn_v2 import _bucket_values
+    from minipfn.inference.ensemble import _bucket_values
 
     # 맨 바깥 구간이 넓은 경계: half-normal 꼬리 평균이면 z 30 근처가 된다
     borders = torch.tensor([-30.0, -4.0, -1.0, 1.0, 4.0, 30.0])
@@ -112,7 +113,7 @@ def test_regressor_tail_bucket_uses_training_target_range():
 def test_clipped_inverse_stays_in_training_range_on_both_sides():
     from sklearn.preprocessing import PowerTransformer
 
-    from minipfn.inference.tabpfn_v2 import _clipped_inverse
+    from minipfn.inference.ensemble import _clipped_inverse
 
     rng = np.random.default_rng(0)
     # λ > 2: 왼쪽 끝에 몰린 값 + 오른쪽 덩어리 (역변환이 왼쪽에서 끝난다)
@@ -167,20 +168,20 @@ def test_nearly_constant_training_column_does_not_blow_up():
 
 
 def test_outlier_clip_leaves_categorical_codes_alone():
-    from minipfn.inference.tabpfn_v2 import _Member, _MemberPreprocessor
+    from minipfn.inference.preprocessing import Member, MemberPreprocessor
 
     x = np.zeros((1000, 2))
     x[:3, 0] = 50.0  # 드문 범주 번호 50
     x[:, 1] = np.random.default_rng(0).normal(size=1000)
-    member = _Member(kind="quantile", class_permutation=None, target_power=False, seed=0)
-    prep = _MemberPreprocessor(member, cat_ix=[0]).fit(x)
+    member = Member(kind="quantile", class_permutation=None, target_power=False, seed=0)
+    prep = MemberPreprocessor(member, cat_ix=[0], max_one_hot_width=160).fit(x)
     assert prep.upper[0] == np.inf and len(prep.cat_maps[0]) == 51
     codes = prep._base(prep._clip(x))[:, 0]
     assert len(np.unique(codes[:3])) == 1 and codes[0] != codes[3]  # 50은 다른 범주와 섞이지 않는다
 
 
 def test_one_hot_expands_small_categorical_columns_only():
-    from minipfn.inference.tabpfn_v2 import _Member, _MemberPreprocessor
+    from minipfn.inference.preprocessing import Member, MemberPreprocessor
 
     rng = np.random.default_rng(0)
     x = np.stack(
@@ -193,8 +194,8 @@ def test_one_hot_expands_small_categorical_columns_only():
         axis=1,
     ).astype(float)
     x[0, 0] = np.nan
-    member = _Member(kind="power", class_permutation=None, target_power=False, seed=0, one_hot=True)
-    prep = _MemberPreprocessor(member, cat_ix=[0, 1, 2]).fit(x)
+    member = Member(kind="power", class_permutation=None, target_power=False, seed=0, one_hot=True)
+    prep = MemberPreprocessor(member, cat_ix=[0, 1, 2], max_one_hot_width=160).fit(x)
     assert prep.one_hot_sizes == {0: 3, 1: 2}  # 범주 30개 열은 번호로 둔다
     base = prep._base(prep._clip(x))
     assert base.shape[1] == 2 + 3 + 1  # 번호 열 1개 + 수치 1개, 3범주 → 3열, 2범주 → 1열
@@ -206,23 +207,26 @@ def test_one_hot_expands_small_categorical_columns_only():
     assert out.shape == (200, base.shape[1] + 1)  # 샘플 식별자 열
 
 
+MAX_ONE_HOT_WIDTH = 160  # v2 논문 prior의 feature 수 상한 (모델 설정 max_features의 기본값)
+
+
 def test_one_hot_width_is_capped_by_reverting_the_widest_columns():
-    from minipfn.inference.tabpfn_v2 import MAX_ONE_HOT_WIDTH, _one_hot_sizes
+    from minipfn.inference.preprocessing import one_hot_sizes
 
     # 범주 20개 열 8개 + 범주 2개 열 10개 + 수치 열 2개: 펼치면 2 + 160 + 10 = 172열
     n_categories = {i: 20 for i in range(8)} | {i: 2 for i in range(8, 18)}
-    sizes = _one_hot_sizes(n_categories, n_features=20)
+    sizes = one_hot_sizes(n_categories, n_features=20, max_width=MAX_ONE_HOT_WIDTH)
     assert sum(1 if n == 2 else n for n in sizes.values()) + 2 <= MAX_ONE_HOT_WIDTH
     assert len([n for n in sizes.values() if n == 20]) == 7 and 0 not in sizes  # 하나만 되돌린다
     assert all(i in sizes for i in range(8, 18))  # 열 수가 늘지 않는 2범주 열은 그대로
     # 원래 열이 이미 상한보다 많으면 열 수를 늘리는 펼침은 하지 않는다
-    assert _one_hot_sizes({0: 5, 1: 2}, n_features=MAX_ONE_HOT_WIDTH + 1) == {1: 2}
+    assert one_hot_sizes({0: 5, 1: 2}, MAX_ONE_HOT_WIDTH + 1, MAX_ONE_HOT_WIDTH) == {1: 2}
 
 
 def test_one_hot_out_of_range_codes_are_missing():
-    from minipfn.inference.tabpfn_v2 import _MemberPreprocessor
+    from minipfn.inference.preprocessing import MemberPreprocessor
 
-    block = _MemberPreprocessor._one_hot(np.array([0.0, 2.0, 3.0, np.nan, -1.0]), 3)
+    block = MemberPreprocessor._one_hot(np.array([0.0, 2.0, 3.0, np.nan, -1.0]), 3)
     assert np.array_equal(block[:2], [[1, 0, 0], [0, 0, 1]])
     assert np.isnan(block[2:]).all()  # 범위 밖과 결측은 번호 열처럼 결측
 
@@ -246,3 +250,18 @@ def test_predict_is_repeatable_and_regressor_keeps_borders_on_cpu():
     assert np.array_equal(clf.predict_proba(x[60:70]), clf.predict_proba(x[60:70]))
     reg = TabPFNv2Regressor(_tiny_model(n_out=32), torch.linspace(-4, 4, 33).double())
     assert reg.borders.device.type == "cpu" and reg.borders.dtype == torch.float32
+
+
+def test_one_hot_width_follows_the_feature_count_the_model_was_trained_on():
+    # 긴 표로 학습한 모델(max_features 500)은 160열을 넘게 펼쳐도 된다
+    from dataclasses import replace
+
+    from minipfn.recipes import tabpfn_v2 as recipe
+    from minipfn.training.config import TrainConfig
+
+    wide = replace(TrainConfig.smoke(), max_features=500, feature_scale=500)
+    assert wide.model_config().max_features == 500
+    model = wide.build_model().eval()
+    assert recipe.TabPFNv2Classifier(model).max_one_hot_width == 500
+    assert recipe.TabPFNv2Classifier(_tiny_model()).max_one_hot_width == MAX_ONE_HOT_WIDTH
+    assert recipe.TabPFNv2Classifier(model, max_one_hot_width=30).max_one_hot_width == 30

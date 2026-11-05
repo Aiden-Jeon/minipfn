@@ -9,7 +9,7 @@ import torch
 
 from minipfn import hub
 from minipfn.models import config_dict, save_checkpoint
-from minipfn.models.tabpfn_v2 import TabPFNv2
+from minipfn.models.cell_transformer import CellTransformer
 from minipfn.training.config import TrainConfig
 
 
@@ -20,7 +20,7 @@ def chdir_tmp(tmp_path, monkeypatch):
 
 def _model(task="classification"):
     torch.manual_seed(0)
-    return TabPFNv2(TrainConfig.smoke(task).model_config()).eval()
+    return CellTransformer(TrainConfig.smoke(task).model_config()).eval()
 
 
 def _same_weights(a, b):
@@ -138,12 +138,21 @@ V2_RELEASE_FIELDS = {
 }
 
 
+def _paper_width_model():
+    # 학습 때 본 feature 수가 v2 논문 그대로(160)인 모델. smoke 설정은 8이라 config.json에 적힌다
+    from dataclasses import replace
+
+    torch.manual_seed(0)
+    config = replace(TrainConfig.smoke().model_config(), max_features=160)
+    return CellTransformer(config).eval()
+
+
 def test_v2_config_json_has_only_fields_older_releases_know(tmp_path):
-    out = hub.save_pretrained(_model(), None, tmp_path / "v2")
+    out = hub.save_pretrained(_paper_width_model(), None, tmp_path / "v2")
     model = json.loads((out / hub.CONFIG_NAME).read_text())["model"]
     assert set(model) == V2_RELEASE_FIELDS
     # 학습 checkpoint도 같다 (예전 load_checkpoint도 같은 방식으로 읽는다)
-    save_checkpoint(tmp_path / "v2.pt", _model())
+    save_checkpoint(tmp_path / "v2.pt", _paper_width_model())
     assert set(torch.load(tmp_path / "v2.pt", weights_only=True)["config"]) == V2_RELEASE_FIELDS
 
 
@@ -162,5 +171,5 @@ def test_v2_5_config_json_keeps_the_added_fields(tmp_path):
     assert loaded.config == model.config
     _same_weights(model, loaded)
     # 하나만 기본값이 아니면 그것만 적는다
-    only_rows = replace(model.config, encoder="linear")
+    only_rows = replace(model.config, encoder="linear", max_features=160)
     assert set(config_dict(only_rows)) == V2_RELEASE_FIELDS | {"n_thinking_rows"}

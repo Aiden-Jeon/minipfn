@@ -1,18 +1,26 @@
-"""학습 데이터 (prior 축).
+"""학습 데이터 (prior 축). 모듈은 무엇을 만드는지로 이름을 붙이고, 논문별 설정은
+`minipfn.recipes`에 둔다.
 
-학습 루프(`minipfn.training.loop`)가 쓰는 prior는 `PRIOR_TYPES`에서 이름
-(`TrainConfig.prior_type`)으로 고른다. prior 모듈은 다음 두 함수를 둔다.
+- `gp`: GP prior (1D 회귀 `GPPriorSampler`, analytic posterior, 표 데이터용 `sample_gp_tables`)
+- `simple_scm`: primer 노트북용 단순한 SCM 샘플러
+- `hyperparameters`: 하이퍼파라미터를 meta 분포에서 두 단계로 뽑기
+- `mlp_scm`: MLP prior (SCM / BNN)
+- `tabular`: 표 데이터 처리 (정규화, 이상치, 클래스 변환)
+- `prior_bag`: 그룹마다 GP 또는 MLP prior를 고르는 prior bag (TabPFN v1 recipe가 쓴다)
+- `table_size`: batch마다 학습 행·feature 수를 뽑는 표 크기 규칙
+- `graph_scm`: TabICLv2 graph SCM + 표 크기 규칙 + 결측값 (TabPFN v2 recipe가 쓴다)
 
-- `make_prior(config, seed)`: `sample_batch(batch_size)`로 `PriorBatch`를 내는 객체. 데이터셋 크기
+공용 학습 루프(`minipfn.training.loop`)가 쓰는 prior는 `PRIOR_TYPES`에서 이름
+(`TrainConfig.prior_type`)으로 고른다. 그 prior 모듈은 다음을 둔다.
+
+- `make_prior(config, seed)`: `sample_batch(batch_size)`로 `PriorBatch`를 내는 객체. 표 크기
   설정은 `config`(`TrainConfig`)에서 읽는다
 - `make_borders(config, n_buckets, seed, n_jobs)`: 회귀 bar distribution 구간 경계. 학습 prior와
-  같은 데이터셋 크기 설정으로 뽑는다
-
-- `check_config(config)`: 데이터셋 크기 설정을 그 prior로 만들 수 있는지 (틀리면 ValueError)
+  같은 표 크기 설정으로 뽑는다
+- `check_config(config)`: 표 크기 설정을 그 prior로 만들 수 있는지 (틀리면 ValueError)
 - `MAX_CLASSES`: 분류 데이터셋의 클래스 수 상한 (분류 모델의 출력 수)
 
-데이터셋 크기 기본값은 `priors.base`에 있다. PFN(`gp`, `scm`)·TabPFN v1(`tabpfn_v1`) prior는 각자의
-학습 루프가 직접 쓴다.
+PFN(`gp`)·TabPFN v1(`prior_bag`) recipe는 각자의 학습 루프에서 prior를 바로 쓴다.
 """
 
 from __future__ import annotations
@@ -22,18 +30,35 @@ from types import ModuleType
 
 from minipfn.priors.base import PriorBatch
 
-# 이름 → 모듈 (쓸 때 import한다. tabicl prior는 tabicl 패키지가 필요하다)
+# 이름 → 모듈 (쓸 때 import한다. graph_scm은 tabicl 패키지가 필요하다)
 PRIOR_TYPES: dict[str, str] = {
-    "tabicl": "minipfn.priors.tabicl",
+    "graph_scm": "minipfn.priors.graph_scm",
 }
-# prior_type을 남기지 않은 이전 학습 run은 모두 tabicl prior다
-DEFAULT_PRIOR_TYPE = "tabicl"
+# 예전 이름 → 지금 이름. 예전 학습 run의 MLflow param에 남아 있어 읽을 때 받는다
+PRIOR_TYPE_ALIASES: dict[str, str] = {
+    "tabicl": "graph_scm",
+}
+# prior_type을 남기지 않은 이전 학습 run은 모두 graph_scm prior다
+DEFAULT_PRIOR_TYPE = "graph_scm"
+
+
+def canonical_prior_type(prior_type: str) -> str:
+    """예전 이름이면 지금 이름으로. 없는 이름은 그대로 둔다(`prior_module`이 ValueError를 낸다)."""
+    return PRIOR_TYPE_ALIASES.get(prior_type, prior_type)
 
 
 def prior_module(prior_type: str) -> ModuleType:
-    if prior_type not in PRIOR_TYPES:
+    name = canonical_prior_type(prior_type)
+    if name not in PRIOR_TYPES:
         raise ValueError(f"prior_type은 {tuple(PRIOR_TYPES)} 가운데 하나여야 한다: {prior_type}")
-    return importlib.import_module(PRIOR_TYPES[prior_type])
+    return importlib.import_module(PRIOR_TYPES[name])
 
 
-__all__ = ["DEFAULT_PRIOR_TYPE", "PRIOR_TYPES", "PriorBatch", "prior_module"]
+__all__ = [
+    "DEFAULT_PRIOR_TYPE",
+    "PRIOR_TYPES",
+    "PRIOR_TYPE_ALIASES",
+    "PriorBatch",
+    "canonical_prior_type",
+    "prior_module",
+]

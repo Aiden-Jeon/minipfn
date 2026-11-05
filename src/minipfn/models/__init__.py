@@ -1,8 +1,15 @@
-"""모델 (모델 축). 학습·checkpoint·Hub 코드는 모델 클래스를 직접 부르지 않고 여기서 만든다.
+"""모델 (모델 축). 파일은 토큰 하나가 무엇인지로 이름을 붙이고, 논문별 크기·구조는
+`minipfn.recipes`에 둔다.
 
+- `point_transformer`: 데이터 점 (x, y) 하나 = 토큰 (PFN recipe)
+- `row_transformer`: 표의 행 하나 = 토큰 (TabPFN v1 recipe)
+- `cell_transformer`: 셀 묶음 하나 = 토큰, 행·열 두 방향 attention (TabPFN v2·2.5 recipe)
+- `bar_distribution`: 회귀 출력을 구간 분류로 다루는 예측분포 (모델에 붙는 부품)
+
+공용 학습 루프·checkpoint·Hub 코드는 모델 클래스를 직접 부르지 않고 아래 registry로 만든다.
 TabPFN-3(arXiv 2605.13986)은 v2·2.5와 뼈대가 달라(셀 토큰의 2-way attention 대신 열 → 행 → 행
-ICL 3단계) 다른 클래스로 둔다. 학습 루프·prior·추론 전처리·benchmark는 같이 쓰므로, 모델 클래스가
-지킬 것만 여기서 정한다.
+ICL 3단계) 다른 클래스로 둔다. 학습 루프·prior·추론 전처리·benchmark는 같이 쓰므로, registry
+모델 클래스가 지킬 것만 여기서 정한다.
 
 - 클래스 속성 `model_type`(아래 `MODEL_TYPES`의 이름)과 `config_class`(dataclass. `n_out`
   필드와 `to_dict()`가 있다)
@@ -15,6 +22,10 @@ ICL 3단계) 다른 클래스로 둔다. 학습 루프·prior·추론 전처리�
   (`training.stability.qk_logit_bounds`). 종류가 "sample_attention"인 것이 학습 지표
   `qk_bound_sample_max`에 들어간다. 없으면 빈 목록
 - `decoder_weight()`: 출력층 가중치 (학습 지표 `decoder_norm`). 없으면 None
+- (선택) 설정 클래스의 `ADDED_FIELDS`: 첫 공개 뒤에 더한 필드. 기본값이면 저장하지 않는다
+  (`config_dict`)
+- (선택) 설정 클래스의 `INFO_FIELDS`: 가중치 모양과 상관없는 필드(학습 때 본 feature 수 등).
+  이어 학습할 때 비교하지 않고 학습 run의 모델 구조에도 넣지 않는다 (`info_fields`)
 """
 
 from __future__ import annotations
@@ -29,16 +40,26 @@ from torch import nn
 
 # 이름 → "모듈:클래스" (쓸 때 import한다) 또는 클래스
 MODEL_TYPES: dict[str, str | type[nn.Module]] = {
-    "tabpfn_v2": "minipfn.models.tabpfn_v2:TabPFNv2",
+    "cell_transformer": "minipfn.models.cell_transformer:CellTransformer",
 }
-# model_type을 남기지 않은 이전 checkpoint·학습 run·Hub repo는 모두 v2(2.5 포함)다
-DEFAULT_MODEL_TYPE = "tabpfn_v2"
+# 예전 이름 → 지금 이름. 예전 checkpoint·학습 run param·Hub config.json에 남아 있어 읽을 때 받는다
+MODEL_TYPE_ALIASES: dict[str, str] = {
+    "tabpfn_v2": "cell_transformer",
+}
+# model_type을 남기지 않은 이전 checkpoint·학습 run·Hub repo는 모두 cell_transformer(v2·2.5)다
+DEFAULT_MODEL_TYPE = "cell_transformer"
+
+
+def canonical_model_type(model_type: str) -> str:
+    """예전 이름이면 지금 이름으로. 없는 이름은 그대로 둔다(`model_class`가 ValueError를 낸다)."""
+    return MODEL_TYPE_ALIASES.get(model_type, model_type)
 
 
 def model_class(model_type: str) -> type[nn.Module]:
-    if model_type not in MODEL_TYPES:
+    name = canonical_model_type(model_type)
+    if name not in MODEL_TYPES:
         raise ValueError(f"model_type은 {tuple(MODEL_TYPES)} 가운데 하나여야 한다: {model_type}")
-    target = MODEL_TYPES[model_type]
+    target = MODEL_TYPES[name]
     if isinstance(target, str):
         module, name = target.split(":")
         target = getattr(importlib.import_module(module), name)
@@ -48,6 +69,12 @@ def model_class(model_type: str) -> type[nn.Module]:
 def config_fields(model_type: str) -> tuple[str, ...]:
     """그 모델 설정의 필드 이름."""
     return tuple(f.name for f in fields(model_class(model_type).config_class))
+
+
+def info_fields(model_type: str) -> tuple[str, ...]:
+    """그 모델 설정에서 가중치 모양과 상관없는 필드 (설정 클래스의 `INFO_FIELDS`). checkpoint를
+    이어 학습할 때 비교하지 않고 학습 run의 모델 구조에도 넣지 않는다."""
+    return tuple(getattr(model_class(model_type).config_class, "INFO_FIELDS", ()))
 
 
 def config_dict(config: Any) -> dict:
@@ -98,7 +125,7 @@ def state_weights(state: dict) -> dict:
 def model_from_state(state: dict) -> tuple[nn.Module, torch.Tensor | None]:
     """모델 설정(`state_config`)이 든 checkpoint에서 (모델, 회귀 구간 경계). `save_checkpoint`
     파일과 학습 중 checkpoint 모두 읽는다. 모델 종류는 파일에 남긴 `model_type`을 따르고, 없는
-    이전 파일은 v2다."""
+    이전 파일은 cell_transformer(v2)다."""
     config = state_config(state)
     if config is None:
         raise ValueError("checkpoint에 모델 설정이 없다 (설정을 남기기 전의 학습 중 checkpoint)")

@@ -5,21 +5,21 @@ import pytest
 import torch
 from sklearn.datasets import load_breast_cancer, load_diabetes
 
-from minipfn.inference.tabpfn_v2 import (
+from minipfn.inference.preprocessing import RobustSoftClip
+from minipfn.models.cell_transformer import CellTransformer, CellTransformerConfig
+from minipfn.recipes import tabpfn_v2 as recipe
+from minipfn.recipes.tabpfn_v2 import (
+    ARCHITECTURES,
     MEMBER_KINDS_V2_5,
-    RobustSoftClip,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
 )
-from minipfn.models.tabpfn_v2 import TabPFNv2, TabPFNv2Config
-from minipfn.recipes import tabpfn_v2 as recipe
-from minipfn.recipes.tabpfn_v2 import ARCHITECTURES
 from minipfn.training.config import TrainConfig
 
 
-def _tiny(n_out: int = 10, **kw) -> TabPFNv2:
+def _tiny(n_out: int = 10, **kw) -> CellTransformer:
     torch.manual_seed(0)
-    model = TabPFNv2(TabPFNv2Config(emsize=16, nlayers=2, nhead=2, n_out=n_out, **kw))
+    model = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2, n_out=n_out, **kw))
     for p in model.parameters():  # 0으로 초기화한 출력층이 있으면 attention이 일을 안 한다
         torch.nn.init.normal_(p, std=0.3)
     return model.eval()
@@ -27,7 +27,7 @@ def _tiny(n_out: int = 10, **kw) -> TabPFNv2:
 
 def test_default_config_keeps_v2_state_dict():
     # 2.5 설정이 꺼져 있으면 parameter 이름·모양이 v2와 같다 (v2 checkpoint를 그대로 읽는다)
-    keys = {k: v.shape for k, v in TabPFNv2().state_dict().items()}
+    keys = {k: v.shape for k, v in CellTransformer().state_dict().items()}
     assert "thinking_rows" not in keys
     assert keys["feature_embedder.weight"] == (192, 4)
 
@@ -35,8 +35,8 @@ def test_default_config_keeps_v2_state_dict():
 def test_default_forward_is_unchanged_by_new_options():
     # thinking 행 0개·linear encoder는 이 변경 전 forward와 같은 계산이다: 같은 가중치면 같은 출력
     torch.manual_seed(0)
-    a = TabPFNv2(TabPFNv2Config(emsize=16, nlayers=2, nhead=2))
-    b = TabPFNv2(TabPFNv2Config(emsize=16, nlayers=2, nhead=2, n_thinking_rows=0))
+    a = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2))
+    b = CellTransformer(CellTransformerConfig(emsize=16, nlayers=2, nhead=2, n_thinking_rows=0))
     b.load_state_dict(a.state_dict())
     x, y = torch.randn(2, 20, 5), torch.randint(0, 2, (2, 12)).float()
     with torch.no_grad():
@@ -81,9 +81,9 @@ def test_thinking_rows_work_with_a_single_train_row():
 
 def test_bad_options_raise():
     with pytest.raises(ValueError):
-        TabPFNv2Config(encoder="conv")
+        CellTransformerConfig(encoder="conv")
     with pytest.raises(ValueError):
-        TabPFNv2Config(n_thinking_rows=-1)
+        CellTransformerConfig(n_thinking_rows=-1)
     with pytest.raises(ValueError):
         recipe.with_architecture(recipe.paper("classification"), "v3")
 
@@ -159,7 +159,7 @@ def test_default_member_kinds_are_v2():
 
 
 def test_member_kinds_parse_names_and_lists():
-    from minipfn.inference.tabpfn_v2 import resolve_member_kinds
+    from minipfn.recipes.tabpfn_v2 import resolve_member_kinds
 
     assert resolve_member_kinds("v2.5") == MEMBER_KINDS_V2_5
     assert resolve_member_kinds("v2") == ("quantile", "power")
@@ -202,7 +202,7 @@ def test_regressor_halves_the_target_power_within_each_member_kind():
 
 
 def test_one_hot_kinds_tell_which_members_expand():
-    from minipfn.inference.tabpfn_v2 import one_hot_kinds
+    from minipfn.inference.preprocessing import one_hot_kinds
 
     assert one_hot_kinds("power", ("quantile", "robust")) == {"robust"}
     assert one_hot_kinds("all", ("quantile", "robust")) == {"quantile", "robust"}

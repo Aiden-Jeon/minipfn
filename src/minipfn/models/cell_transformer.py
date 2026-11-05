@@ -1,7 +1,8 @@
-"""TabPFN v2 Transformer (Nature 2025, Fig. 1b와 Methods "Details on the neural architecture").
+"""Cell Transformer — 셀 묶음 하나가 토큰이고 층마다 행·열 두 방향으로 attention하는 Transformer
+(TabPFN v2 논문 Nature 2025, Fig. 1b와 Methods "Details on the neural architecture"의 구조).
 
-논문 설명대로 만든 구조다. 각 부분은 `notebooks/03_tabpfn_v2/01_two_way_attention_primer`에서
-작은 예로 따라갔다.
+v2 논문 설명대로 만든 구조다. v2·2.5의 구조 설정은 `minipfn.recipes.tabpfn_v2.ARCHITECTURES`에
+있다. 각 부분은 `notebooks/03_tabpfn_v2/01_two_way_attention_primer`에서 작은 예로 따라갔다.
 
 - 입력: feature마다 학습 행의 평균·표준편차로 z-정규화하고, 결측 칸은 0으로 두고 표시를 따로 넣는다
 - 셀 2개를 묶어 토큰 하나로 만들고(Linear), 마지막 열에 y 토큰을 붙인다: (B, R, G + 1, E)
@@ -38,8 +39,8 @@ ENCODERS = ("linear", "mlp")
 
 
 @dataclass
-class TabPFNv2Config:
-    """모델 크기. 기본값은 논문 기본 모델의 크기(emsize 192, 12층, head 6, 셀 2개 묶기)."""
+class CellTransformerConfig:
+    """모델 크기. 기본값은 v2 논문 기본 모델의 크기(emsize 192, 12층, head 6, 셀 2개 묶기)."""
 
     emsize: int = 192
     nlayers: int = 12
@@ -50,11 +51,17 @@ class TabPFNv2Config:
     column_embedding_seed: int = 42
     n_thinking_rows: int = 0  # TabPFN-2.5: 64
     encoder: str = "linear"  # 셀 묶음 encoder. "linear"(v2) 또는 "mlp"(TabPFN-2.5 회귀)
+    # 학습 때 본 feature 수 상한 (`TrainConfig.max_features`). 구조와 상관없고 추론이 읽는다:
+    # one-hot으로 펼친 뒤 열 수를 이보다 늘리지 않는다(`minipfn.inference.ensemble`)
+    max_features: int = 160
 
     # v2 첫 공개 뒤에 더한 필드. 기본값이면 config.json·checkpoint에 적지 않는다
     # (`models.config_dict`). 예전 minipfn은 `TabPFNv2Config(**config["model"])`로 읽어서 모르는
     # 키가 있으면 깨진다
-    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("n_thinking_rows", "encoder")
+    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("n_thinking_rows", "encoder", "max_features")
+    # 가중치 모양과 상관없는 필드. checkpoint를 이어 학습할 때 비교하지 않고, 학습 run의 모델 구조
+    # (`minipfn.hub.run_architecture`)에도 넣지 않는다 (긴 표로 이어 학습하면 바뀐다)
+    INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features",)
 
     def __post_init__(self) -> None:
         if self.encoder not in ENCODERS:
@@ -91,7 +98,7 @@ class Attention(nn.Module):
         return self.out(out.transpose(1, 2).reshape(n, length, e))
 
 
-class TabPFNv2Layer(nn.Module):
+class CellTransformerLayer(nn.Module):
     def __init__(self, emsize: int, nhead: int, nhid: int) -> None:
         super().__init__()
         self.feature_attention = Attention(emsize, nhead)
@@ -120,14 +127,14 @@ class TabPFNv2Layer(nn.Module):
         return self.norms[2](h + self.mlp(h))
 
 
-class TabPFNv2(nn.Module):
-    # 모델 종류 (`registry.MODEL_TYPES`)
-    model_type = "tabpfn_v2"
-    config_class = TabPFNv2Config
+class CellTransformer(nn.Module):
+    # 모델 종류 (`minipfn.models.MODEL_TYPES`)
+    model_type = "cell_transformer"
+    config_class = CellTransformerConfig
 
-    def __init__(self, config: TabPFNv2Config | None = None) -> None:
+    def __init__(self, config: CellTransformerConfig | None = None) -> None:
         super().__init__()
-        self.config = config = config or TabPFNv2Config()
+        self.config = config = config or CellTransformerConfig()
         e, g = config.emsize, config.features_per_group
         # [값 g개, 결측 표시 g개] → 토큰
         if config.encoder == "mlp":
@@ -138,7 +145,7 @@ class TabPFNv2(nn.Module):
         self.column_embedder = nn.Linear(e // 4, e)
         nhid = e * config.nhid_factor
         self.layers = nn.ModuleList(
-            TabPFNv2Layer(e, config.nhead, nhid) for _ in range(config.nlayers)
+            CellTransformerLayer(e, config.nhead, nhid) for _ in range(config.nlayers)
         )
         self.decoder = nn.Sequential(nn.Linear(e, nhid), nn.GELU(), nn.Linear(nhid, config.n_out))
         if config.n_thinking_rows:

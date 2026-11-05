@@ -1,26 +1,40 @@
-"""TabPFN v2(Nature 2025)·TabPFN-2.5(arXiv 2511.08667) 학습 설정 (논문 = 4축 설정 조합).
+"""TabPFN v2(Nature 2025)·TabPFN-2.5(arXiv 2511.08667) recipe: 학습 설정과 추론 설정 (논문 = 각 축
+부품의 조합).
 
-- prior: `tabicl` (TabICLv2 graph prior + v2 논문 크기 규칙)
-- 모델: `tabpfn_v2` 클래스. 구조는 `ARCHITECTURES`의 v2 또는 v2.5
+- prior: `graph_scm` (TabICLv2 graph SCM + 표 크기 규칙. 크기 기본값이 v2 논문의 것이다)
+- 모델: `cell_transformer`. 구조는 `ARCHITECTURES`의 v2 또는 v2.5
 - 학습: `minipfn.training.loop.train`, 논문 규모 설정은 `paper`, 긴 표 이어 학습은 `long_tables`
-- 추론: `minipfn.inference.tabpfn_v2` (멤버 전처리 v2 또는 2.5)
+- 추론: `TabPFNv2Classifier`·`TabPFNv2Regressor` (`minipfn.inference.ensemble`에 논문 멤버 수와
+  멤버 종류 묶음 `MEMBER_KIND_PRESETS`의 v2 또는 v2.5)
 
     config = with_architecture(paper("regression"), "v2.5")
+    clf = TabPFNv2Classifier(model, member_kinds="v2.5").fit(x_train, y_train)
+
+학습 설정(`TrainConfig`)은 쓰는 함수 안에서 불러온다. Hub에서 받아 추론만 할 때 학습 스택을
+불러오지 않도록.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
-from minipfn.models import DEFAULT_MODEL_TYPE
-from minipfn.priors.base import MAX_CELLS
-from minipfn.training.config import TrainConfig
+import torch
+from torch import nn
+
+from minipfn.inference import ensemble
+from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
+from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
+from minipfn.priors.table_size import MAX_CELLS
+
+if TYPE_CHECKING:
+    from minipfn.training.config import TrainConfig
 
 # 모델 구조. v2는 Nature 논문 기본 모델, v2.5는 TabPFN-2.5(arXiv 2511.08667 "Architecture")가
 # 적은 변경: 층 수(회귀 18, 분류 24), 셀 3개 묶기, thinking 행 64개, 회귀 encoder를 2층 MLP로.
-# emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다. 둘 다 모델 클래스는 TabPFNv2다
+# emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다. 둘 다 모델 클래스는 CellTransformer다
 _V2 = {
-    "model_type": "tabpfn_v2",
+    "model_type": "cell_transformer",
     "nlayers": 12,
     "features_per_group": 2,
     "n_thinking_rows": 0,
@@ -53,6 +67,8 @@ def architecture_name(config: TrainConfig) -> str | None:
 
 
 def paper(task: str = "classification") -> TrainConfig:
+    from minipfn.training.config import TrainConfig
+
     # 분류는 2e-4에서 붕괴가 드물어(300k까지 rewind 1번) lr을 그대로 둔다.
     # 회귀의 QK-clip 250: 50k scratch 비교에서 250·500 모두 상한을 지켰고 val NLL도 비슷했다
     # (−1.08·−1.07, 끈 것 −1.04). 그중 logit을 더 낮게 묶는 쪽. 100은 10k부터 잘라 학습이 늦었다
@@ -95,7 +111,7 @@ def _model_changes(config: TrainConfig, arch: str, keep_size: bool) -> dict:
     if arch not in ARCHITECTURES:
         raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
     changes = dict(ARCHITECTURES[arch][config.task])
-    if config.model_type not in (DEFAULT_MODEL_TYPE, changes["model_type"]):
+    if canonical_model_type(config.model_type) not in (DEFAULT_MODEL_TYPE, changes["model_type"]):
         raise ValueError(
             f"arch {arch}는 {changes['model_type']} 모델이다"
             f" (설정의 model_type: {config.model_type})"
@@ -121,3 +137,60 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
     if config.max_cells > MAX_CELLS and arch in LONG_TABLES_MICRO_BATCH:
         changes["micro_batch"] = LONG_TABLES_MICRO_BATCH[arch]
     return replace(config, **changes)
+
+
+# ---------------------------------------------------------------------------
+# 추론 (Methods "Inference details", "Regression details")
+# ---------------------------------------------------------------------------
+N_ESTIMATORS = {"classification": 4, "regression": 8}  # 논문 기본 멤버 수
+MEMBER_KINDS_V2 = ("quantile", "power")  # 분위수 + SVD, Yeo-Johnson
+# TabPFN-2.5: "robust scaling과 soft clipping을 분위수·표준 변환과 함께"
+# (`minipfn.inference.ensemble` docstring)
+MEMBER_KINDS_V2_5 = ("quantile", "robust")
+# 이름으로 고르는 멤버 종류 묶음 (평가 스크립트의 `--member-kinds v2.5` 등)
+MEMBER_KIND_PRESETS = {"v2": MEMBER_KINDS_V2, "v2.5": MEMBER_KINDS_V2_5}
+
+
+def resolve_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """멤버 전처리 종류. `MEMBER_KIND_PRESETS`의 이름, 쉼표로 구분한 문자열, 종류 목록을 받는다."""
+    return ensemble.resolve_member_kinds(value, MEMBER_KIND_PRESETS)
+
+
+class TabPFNv2Classifier(EnsembleClassifier):
+    """논문 멤버 수(4개)와 멤버 종류 묶음(기본 v2)을 쓰는 `EnsembleClassifier`."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        n_estimators: int = N_ESTIMATORS["classification"],
+        member_kinds: str | tuple[str, ...] = "v2",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            model,
+            n_estimators=n_estimators,
+            member_kinds=resolve_member_kinds(member_kinds),
+            **kwargs,
+        )
+
+
+class TabPFNv2Regressor(EnsembleRegressor):
+    """논문 멤버 수(8개)와 멤버 종류 묶음(기본 v2)을 쓰는 `EnsembleRegressor`."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        borders: torch.Tensor,
+        *,
+        n_estimators: int = N_ESTIMATORS["regression"],
+        member_kinds: str | tuple[str, ...] = "v2",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            model,
+            borders,
+            n_estimators=n_estimators,
+            member_kinds=resolve_member_kinds(member_kinds),
+            **kwargs,
+        )
