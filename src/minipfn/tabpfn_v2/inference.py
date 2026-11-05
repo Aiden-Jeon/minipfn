@@ -20,6 +20,14 @@
   견줬을 때 분류는 suite 평균 ROC AUC(500k 0.9235 → 0.9238), 회귀는 one-hot으로 결과가 바뀌는
   11개에서 off 대비 RMSE 비율의 기하평균(QK-clip 200k, power 0.964, all 0.958)이 가장 좋았다.
   회귀의 neg RMSE 단순 평균은 RMSE가 수만인 MIP-2016 하나가 정해서 기준으로 쓰지 않았다
+- (`member_kinds`) 멤버 전처리 종류를 차례로 돌려 쓴다. 기본 `("quantile", "power")`는 위의 v2
+  두 가지다. TabPFN-2.5(arXiv 2511.08667)는 "robust scaling과 soft clipping을 분위수·표준 변환과
+  함께 쓴다"고만 적었다. `"robust"` 멤버는 RealMLP(Holzmüller et al. 2024)의 robust scaling +
+  smooth clipping이다: 열마다 (x − 중앙값) / (3사분위 − 1사분위)
+  (사분위 폭이 0이면 2 / (최대 − 최소)), 그다음 x / √(1 + (x/3)²). 표준 변환은 모델 안에서
+  학습 행으로 z-정규화하므로 따로 하지 않는다.
+  범주형 열은 power 멤버처럼 번호 그대로다. `MEMBER_KINDS_V2_5 = ("quantile", "robust")`
+  (2.5가 Yeo-Johnson을 계속 쓰는지는 적혀 있지 않다)
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
@@ -40,6 +48,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +72,10 @@ MAX_ONE_HOT_WIDTH = MAX_FEATURES  # 펼친 뒤 열 수의 상한: 학습 때 본
 ONE_HOT_MODES = ("off", "power", "all")
 DEFAULT_ONE_HOT = "all"
 SOFTMAX_TEMPERATURE = 0.9
+MEMBER_KINDS = ("quantile", "power", "robust")
+DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2
+MEMBER_KINDS_V2_5 = ("quantile", "robust")
+SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
 
 
 def _to_numeric(X: Any, categorical: list[int] | None) -> tuple[np.ndarray, list[int], Any]:
@@ -111,9 +124,31 @@ def _one_hot_sizes(n_categories: dict[int, int], n_features: int) -> dict[int, i
     return sizes
 
 
+class RobustSoftClip:
+    """RealMLP의 robust scaling + smooth clipping (열마다, 결측은 NaN 그대로)."""
+
+    def fit(self, X: np.ndarray) -> RobustSoftClip:
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # 모두 결측인 열
+            q1, median, q3 = np.nanquantile(X, [0.25, 0.5, 0.75], axis=0)
+            span = np.nanmax(X, axis=0) - np.nanmin(X, axis=0)
+        iqr = q3 - q1
+        self.scale_ = np.zeros(X.shape[1])
+        ok = iqr > 0
+        self.scale_[ok] = 1.0 / iqr[ok]
+        flat = ~ok & (span > 0)  # 사분위 폭이 0인 열(대부분 같은 값)
+        self.scale_[flat] = 2.0 / span[flat]
+        self.median_ = np.nan_to_num(median)
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        z = (X - self.median_) * self.scale_
+        return z / np.sqrt(1.0 + (z / SOFT_CLIP) ** 2)
+
+
 @dataclass
 class _Member:
-    kind: str  # "quantile" | "power"
+    kind: str  # "quantile" | "power" | "robust"
     class_permutation: np.ndarray | None
     target_power: bool
     seed: int
@@ -151,8 +186,10 @@ class _MemberPreprocessor:
             self.transformer = QuantileTransformer(
                 n_quantiles=n_quantiles, random_state=self.member.seed
             )
-        else:
+        elif self.member.kind == "power":
             self.transformer = PowerTransformer(method="yeo-johnson", standardize=True)
+        else:
+            self.transformer = RobustSoftClip()
         if num_ix:
             self.transformer.fit(X[:, num_ix])
         self.svd = None
@@ -221,12 +258,16 @@ class _Base:
         n_estimators: int,
         categorical_features_indices: list[int] | None = None,
         one_hot: str = DEFAULT_ONE_HOT,
+        member_kinds: tuple[str, ...] = DEFAULT_MEMBER_KINDS,
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
         if one_hot not in ONE_HOT_MODES:
             raise ValueError(f"one_hot은 {ONE_HOT_MODES} 가운데 하나여야 한다: {one_hot}")
+        if not member_kinds or set(member_kinds) - set(MEMBER_KINDS):
+            raise ValueError(f"member_kinds는 {MEMBER_KINDS}에서 고른다: {member_kinds}")
         self.one_hot = one_hot
+        self.member_kinds = tuple(member_kinds)
         self.model = model
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -235,7 +276,8 @@ class _Base:
 
     def _fit_members(self, X: Any, members: list[_Member]) -> None:
         for m in members:
-            m.one_hot = self.one_hot == "all" or (self.one_hot == "power" and m.kind == "power")
+            # "power" 모드는 분위수가 아닌 멤버(power·robust)만 펼친다
+            m.one_hot = self.one_hot == "all" or (self.one_hot == "power" and m.kind != "quantile")
         X_num, self.cat_ix_, self.encoder_ = _to_numeric(X, self.categorical_features_indices)
         self.preprocessors_ = [_MemberPreprocessor(m, self.cat_ix_).fit(X_num) for m in members]
         # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
@@ -243,6 +285,9 @@ class _Base:
             prep.transform(X_num, np.random.default_rng(prep.member.seed + 2))
             for prep in self.preprocessors_
         ]
+
+    def _kind(self, i: int) -> str:
+        return self.member_kinds[i % len(self.member_kinds)]
 
     def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
         X_test = _apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
@@ -278,7 +323,7 @@ class TabPFNv2Classifier(_Base):
             )
         members = [
             _Member(
-                kind="quantile" if i % 2 == 0 else "power",
+                kind=self._kind(i),
                 class_permutation=rng.permutation(n_classes),
                 target_power=False,
                 seed=int(rng.integers(0, 2**31 - 1)),
@@ -363,7 +408,7 @@ class TabPFNv2Regressor(_Base):
         z = (y - self.y_mean_) / self.y_std_
         members = [
             _Member(
-                kind="quantile" if i % 2 == 0 else "power",
+                kind=self._kind(i),
                 class_permutation=None,
                 target_power=(i // 2) % 2 == 1,
                 seed=int(rng.integers(0, 2**31 - 1)),

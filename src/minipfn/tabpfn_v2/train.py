@@ -49,16 +49,41 @@ from minipfn.utils import DistContext, lr_factor, setup_distributed
 
 N_BUCKETS = 5000
 
+# 모델 구조. v2는 Nature 논문 기본 모델, v2.5는 TabPFN-2.5(arXiv 2511.08667 "Architecture")가
+# 적은 변경: 층 수(회귀 18, 분류 24), 셀 3개 묶기, thinking 행 64개, 회귀 encoder를 2층 MLP로.
+# emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다
+_V2 = {"nlayers": 12, "features_per_group": 2, "n_thinking_rows": 0, "encoder": "linear"}
+ARCHITECTURES = {
+    "v2": {"classification": _V2, "regression": _V2},
+    "v2.5": {
+        "classification": {
+            "nlayers": 24,
+            "features_per_group": 3,
+            "n_thinking_rows": 64,
+            "encoder": "linear",
+        },
+        "regression": {
+            "nlayers": 18,
+            "features_per_group": 3,
+            "n_thinking_rows": 64,
+            "encoder": "mlp",
+        },
+    },
+}
+
 
 @dataclass
 class TabPFNv2TrainConfig:
     """모델·prior·최적화 설정. smoke(로컬 CPU), medium(짧은 실측), paper(논문 규모)."""
 
     task: Literal["classification", "regression"] = "classification"
-    # 모델 (논문 기본 모델 크기)
+    # 모델 (논문 기본 모델 크기). 아래 셋은 TabPFN-2.5가 바꾼 것(`with_architecture("v2.5")`)
     emsize: int = 192
     nlayers: int = 12
     nhead: int = 6
+    features_per_group: int = 2
+    n_thinking_rows: int = 0
+    encoder: str = "linear"
     # prior / 데이터셋 크기 (논문 Methods)
     max_train_rows: int = MAX_TRAIN_ROWS
     n_eval_rows: int = N_EVAL_ROWS
@@ -174,8 +199,25 @@ class TabPFNv2TrainConfig:
 
     def model_config(self) -> TabPFNv2Config:
         return TabPFNv2Config(
-            emsize=self.emsize, nlayers=self.nlayers, nhead=self.nhead, n_out=self.n_out
+            emsize=self.emsize,
+            nlayers=self.nlayers,
+            nhead=self.nhead,
+            features_per_group=self.features_per_group,
+            n_out=self.n_out,
+            n_thinking_rows=self.n_thinking_rows,
+            encoder=self.encoder,
         )
+
+    def with_architecture(self, arch: str) -> TabPFNv2TrainConfig:
+        """모델 구조를 `ARCHITECTURES`의 것으로. smoke처럼 층이 적은 설정은 층 수와 thinking 행 수를
+        그대로 두거나 줄여서 작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
+        if arch not in ARCHITECTURES:
+            raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
+        changes = dict(ARCHITECTURES[arch][self.task])
+        if self.nlayers < ARCHITECTURES["v2"][self.task]["nlayers"]:
+            changes["nlayers"] = self.nlayers
+            changes["n_thinking_rows"] = min(changes["n_thinking_rows"], 4)
+        return replace(self, **changes)
 
     def for_world_size(self, world_size: int) -> TabPFNv2TrainConfig:
         """GPU가 많아 micro_batch × world_size가 batch를 넘으면 GPU당 micro batch를 줄인다."""

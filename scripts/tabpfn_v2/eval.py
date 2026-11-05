@@ -19,6 +19,9 @@ test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint�
 데이터셋은 모드와 상관없이 결과가 같아 한 번만 평가하고, 그 결과를 다른 모드에도 `reused=True`로
 쓴다.
 
+앙상블 멤버의 전처리는 `--member-kinds`로 고른다(기본 v2의 quantile,power. `v2.5`는 TabPFN-2.5의
+robust scaling + soft clipping을 쓰는 quantile,robust).
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -40,7 +43,10 @@ import torch
 from minipfn.tabpfn_v2 import benchmark as bm
 from minipfn.tabpfn_v2.hub import load_model
 from minipfn.tabpfn_v2.inference import (
+    DEFAULT_MEMBER_KINDS,
     DEFAULT_ONE_HOT,
+    MEMBER_KINDS,
+    MEMBER_KINDS_V2_5,
     ONE_HOT_MODES,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
@@ -66,6 +72,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[DEFAULT_ONE_HOT],
         help=f"평가할 one-hot 모드, 쉼표로 구분 (기본: {DEFAULT_ONE_HOT}, 비교: off,power,all)",
     )
+    parser.add_argument(
+        "--member-kinds",
+        type=_member_kinds,
+        default=DEFAULT_MEMBER_KINDS,
+        help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: quantile,power = v2."
+        " v2.5는 quantile,robust)",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
     parser.add_argument("--mlflow", action="store_true", help="로컬에서도 MLflow에 기록한다")
@@ -78,6 +91,15 @@ def _one_hot_modes(value: str) -> list[str]:
     if unknown or not modes:
         raise argparse.ArgumentTypeError(f"one-hot 모드는 {ONE_HOT_MODES} 가운데서: {value}")
     return list(dict.fromkeys(modes))
+
+
+def _member_kinds(value: str) -> tuple[str, ...]:
+    if value == "v2.5":
+        return MEMBER_KINDS_V2_5
+    kinds = tuple(k.strip() for k in value.split(",") if k.strip())
+    if not kinds or set(kinds) - set(MEMBER_KINDS):
+        raise argparse.ArgumentTypeError(f"멤버 종류는 {MEMBER_KINDS} 가운데서: {value}")
+    return kinds
 
 
 def headline_mode(modes: list[str]) -> str:
@@ -126,6 +148,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         kw = {
             "categorical_features_indices": task.categorical_indices,
             "one_hot": one_hot,
+            "member_kinds": args.member_kinds,
             "device": args.device,
         }
         if suite == "classification":
@@ -169,6 +192,7 @@ def main(argv: list[str] | None = None) -> None:
                 "folds": args.folds,
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
+                "member_kinds": ",".join(args.member_kinds),
             }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}

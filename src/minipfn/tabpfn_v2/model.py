@@ -10,6 +10,18 @@
 - sample attention: 학습 행은 학습 행끼리 attend하고, 테스트 행은 학습 행에만 attend한다.
   테스트 행은 key·value의 첫 head만 쓴다(논문의 multi-query 변형)
 - 출력: 테스트 행의 y 토큰 → MLP → 분류는 클래스 logit 10개, 회귀는 bar distribution 구간 logit
+
+TabPFN-2.5(arXiv 2511.08667 "Architecture")가 바꾼 것은 설정으로 켠다. 기본값은 v2 그대로다
+(state_dict도 v2와 같아서 v2 checkpoint를 그대로 읽는다).
+
+- `features_per_group`: v2는 2, 2.5는 3
+- `nlayers`: v2는 12, 2.5는 회귀 18·분류 24
+- `n_thinking_rows`: 2.5는 학습되는 "thinking" 행 64개를 입력 표에 붙인다. 논문은 행 수와
+  "pretraining 때 학습된다", "attention sink 역할도 해서 다른 행을 무시하게 돕는다"만 적었다.
+  여기서 정한 것: 행마다 벡터 하나(E)를 그 행의 모든 열(토큰)에 쓰고, 학습 행 앞에 둬서 학습 행과
+  테스트 행 모두 key·value로 본다. 출력은 내지 않는다
+- `encoder`: 2.5 회귀는 v2의 linear encoder를 2층 MLP로 바꿨다. 논문은 어느 encoder인지 적지
+  않았는데, 여기서는 셀 묶음 encoder(`feature_embedder`)로 본다(hidden = E, GELU)
 """
 
 from __future__ import annotations
@@ -22,6 +34,7 @@ import torch.nn.functional as F
 from torch import nn
 
 NAN_INDICATOR = -2.0  # 결측 칸의 표시 값 (아닌 칸은 0)
+ENCODERS = ("linear", "mlp")
 
 
 @dataclass
@@ -35,6 +48,14 @@ class TabPFNv2Config:
     features_per_group: int = 2
     n_out: int = 10  # 분류: 최대 클래스 수, 회귀: bar distribution 구간 수
     column_embedding_seed: int = 42
+    n_thinking_rows: int = 0  # TabPFN-2.5: 64
+    encoder: str = "linear"  # 셀 묶음 encoder. "linear"(v2) 또는 "mlp"(TabPFN-2.5 회귀)
+
+    def __post_init__(self) -> None:
+        if self.encoder not in ENCODERS:
+            raise ValueError(f"encoder는 {ENCODERS} 가운데 하나여야 한다: {self.encoder}")
+        if self.n_thinking_rows < 0:
+            raise ValueError(f"n_thinking_rows는 0 이상이어야 한다: {self.n_thinking_rows}")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -77,7 +98,8 @@ class TabPFNv2Layer(nn.Module):
         self.norms = nn.ModuleList(nn.LayerNorm(emsize, elementwise_affine=False) for _ in range(3))
 
     def forward(self, h: torch.Tensor, n_train: int) -> torch.Tensor:
-        # h: (B, R, C, E), C = feature 묶음 수 + 1 (y 토큰)
+        # h: (B, R, C, E), C = feature 묶음 수 + 1 (y 토큰). n_train: 앞에서부터 key·value가 되는
+        # 행 수 (thinking 행이 있으면 그것까지)
         b, r, c, e = h.shape
 
         # 1) feature attention: 행 하나의 토큰 C개끼리
@@ -98,7 +120,11 @@ class TabPFNv2(nn.Module):
         super().__init__()
         self.config = config = config or TabPFNv2Config()
         e, g = config.emsize, config.features_per_group
-        self.feature_embedder = nn.Linear(2 * g, e)  # [값 g개, 결측 표시 g개] → 토큰
+        # [값 g개, 결측 표시 g개] → 토큰
+        if config.encoder == "mlp":
+            self.feature_embedder = nn.Sequential(nn.Linear(2 * g, e), nn.GELU(), nn.Linear(e, e))
+        else:
+            self.feature_embedder = nn.Linear(2 * g, e)
         self.target_embedder = nn.Linear(2, e)  # [y, 결측 표시] → 토큰
         self.column_embedder = nn.Linear(e // 4, e)
         nhid = e * config.nhid_factor
@@ -106,6 +132,9 @@ class TabPFNv2(nn.Module):
             TabPFNv2Layer(e, config.nhead, nhid) for _ in range(config.nlayers)
         )
         self.decoder = nn.Sequential(nn.Linear(e, nhid), nn.GELU(), nn.Linear(nhid, config.n_out))
+        if config.n_thinking_rows:
+            # 처음 값은 여기서 정함: 작은 무작위 값 (층마다 잔차 뒤 LayerNorm이 크기를 맞춘다)
+            self.thinking_rows = nn.Parameter(0.02 * torch.randn(config.n_thinking_rows, e))
         self._column_noise: dict[tuple, torch.Tensor] = {}  # state_dict에 넣지 않는 캐시
 
     def num_parameters(self) -> int:
@@ -178,9 +207,16 @@ class TabPFNv2(nn.Module):
         x_tokens = x_tokens + self.column_embeddings(x_tokens.shape[2], x_tokens)
         y_tokens = self._embed_target(y_train.to(x_tokens.dtype), x.shape[1])
         h = torch.cat([x_tokens, y_tokens.unsqueeze(2)], dim=2)  # (B, R, G + 1, E)
+        n_context = n_train
+        if self.config.n_thinking_rows:
+            # thinking 행 T개를 맨 앞에: (B, T + R, G + 1, E). 학습 행처럼 key·value가 된다
+            b, _, c, e = h.shape
+            thinking = self.thinking_rows.to(h.dtype)[None, :, None].expand(b, -1, c, e)
+            h = torch.cat([thinking, h], dim=1)
+            n_context += self.config.n_thinking_rows
         for layer in self.layers:
-            h = layer(h, n_train)
-        return self.decoder(h[:, n_train:, -1])
+            h = layer(h, n_context)
+        return self.decoder(h[:, n_context:, -1])
 
 
 def save_checkpoint(path: str | Path, model: TabPFNv2, borders: torch.Tensor | None = None) -> None:

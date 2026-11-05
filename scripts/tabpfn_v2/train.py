@@ -7,6 +7,9 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
   GPU당 micro batch는 batch / GPU 수를 넘지 않게 자동으로 줄어든다.
 - 로컬: `uv run python scripts/tabpfn_v2/train.py --config-name smoke --task regression`
 
+모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
+(arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
+회귀 MLP encoder)이다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
 `TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
@@ -42,6 +45,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
 from minipfn.tabpfn_v2.train import (  # noqa: E402
+    ARCHITECTURES,
     TabPFNv2TrainConfig,
     checkpoint_lr,
     train_tabpfn_v2,
@@ -67,6 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config-name",
         choices=CONFIG_NAMES,
         default=os.environ.get("TABPFN_V2_CONFIG_NAME", "smoke"),
+    )
+    parser.add_argument(
+        "--arch",
+        choices=tuple(ARCHITECTURES),
+        default=os.environ.get("TABPFN_V2_ARCH", "v2"),
+        help="모델 구조: v2(Nature 2025) 또는 v2.5(TabPFN-2.5)",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
     parser.add_argument("--micro-batch", type=int, default=_env("TABPFN_V2_MICRO_BATCH", int))
@@ -98,7 +108,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
-    config = getattr(TabPFNv2TrainConfig, args.config_name)(args.task)
+    config = getattr(TabPFNv2TrainConfig, args.config_name)(args.task).with_architecture(args.arch)
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,
@@ -171,7 +181,8 @@ def main(argv: list[str] | None = None) -> None:
         # 새 run에 쓴다
         resume_into = args.resume_run_id if args.resume_step is None else None
         run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
-        run_name = None if run_id else f"tabpfn-v2-{config.task}-{args.config_name}"
+        prefix = "tabpfn-v2" if args.arch == "v2" else "tabpfn-v2-5"
+        run_name = None if run_id else f"{prefix}-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)
         log_run_source(__file__, env_prefix="TABPFN_V2_")

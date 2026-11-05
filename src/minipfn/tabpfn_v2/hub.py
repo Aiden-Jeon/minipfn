@@ -75,7 +75,7 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.T
     - `save_pretrained`로 만든 로컬 폴더, `model.save_checkpoint`로 저장한 파일
 
     학습 중에 남긴 checkpoint(`checkpoints/step_XXXXXXX.pt`, `latest.pt`)에는 모델 설정이 없어서
-    그 run에 기록된 param(task·emsize·nlayers·nhead)으로 모델을 만든다.
+    그 run에 기록된 param(task·emsize·nlayers·nhead, 2.5 구조 설정)으로 모델을 만든다.
     """
     if spec.startswith(HUB_PREFIX):
         repo_id, _, revision = spec.removeprefix(HUB_PREFIX).partition("@")
@@ -103,6 +103,10 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.T
         emsize=int(params["emsize"]),
         nlayers=int(params["nlayers"]),
         nhead=int(params["nhead"]),
+        # TabPFN-2.5 구조 설정 (이전 run에는 없으므로 v2 값)
+        features_per_group=int(params.get("features_per_group", 2)),
+        n_thinking_rows=int(params.get("n_thinking_rows", 0)),
+        encoder=params.get("encoder", "linear"),
     )
     model = TabPFNv2(config.model_config())
     model.load_state_dict(state["model"])
