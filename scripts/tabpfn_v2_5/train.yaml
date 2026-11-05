@@ -35,7 +35,8 @@ code_source:
 env_variables:
   TABPFN_V2_ARCH: v2.5
   TABPFN_V2_TASK: classification
-  TABPFN_V2_CONFIG_NAME: paper
+  # v2 실측(scripts/tabpfn_v2/train.yaml)과 같은 medium으로 재서 step 시간·메모리를 견준다
+  TABPFN_V2_CONFIG_NAME: medium
   TABPFN_V2_STEPS: "300"
   # GPU당 prior 생성 worker 수. 노드의 CPU 수에 맞춰 조정한다.
   TABPFN_V2_NUM_WORKERS: "8"

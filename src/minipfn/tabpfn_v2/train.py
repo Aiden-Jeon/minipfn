@@ -54,21 +54,12 @@ N_BUCKETS = 5000
 # 적은 변경: 층 수(회귀 18, 분류 24), 셀 3개 묶기, thinking 행 64개, 회귀 encoder를 2층 MLP로.
 # emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다
 _V2 = {"nlayers": 12, "features_per_group": 2, "n_thinking_rows": 0, "encoder": "linear"}
+_V2_5 = {"features_per_group": 3, "n_thinking_rows": 64, "encoder": "linear"}  # 두 task 공통
 ARCHITECTURES = {
     "v2": {"classification": _V2, "regression": _V2},
     "v2.5": {
-        "classification": {
-            "nlayers": 24,
-            "features_per_group": 3,
-            "n_thinking_rows": 64,
-            "encoder": "linear",
-        },
-        "regression": {
-            "nlayers": 18,
-            "features_per_group": 3,
-            "n_thinking_rows": 64,
-            "encoder": "mlp",
-        },
+        "classification": {**_V2_5, "nlayers": 24},
+        "regression": {**_V2_5, "nlayers": 18, "encoder": "mlp"},
     },
 }
 
@@ -242,13 +233,13 @@ class TabPFNv2TrainConfig:
             encoder=self.encoder,
         )
 
-    def with_architecture(self, arch: str) -> TabPFNv2TrainConfig:
-        """모델 구조를 `ARCHITECTURES`의 것으로. smoke처럼 층이 적은 설정은 층 수와 thinking 행 수를
-        그대로 두거나 줄여서 작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
+    def with_architecture(self, arch: str, keep_size: bool = False) -> TabPFNv2TrainConfig:
+        """모델 구조를 `ARCHITECTURES`의 것으로. `keep_size`(smoke)면 층 수는 그대로 두고 thinking
+        행은 4개까지만 써서 작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
         if arch not in ARCHITECTURES:
             raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
         changes = dict(ARCHITECTURES[arch][self.task])
-        if self.nlayers < ARCHITECTURES["v2"][self.task]["nlayers"]:
+        if keep_size:
             changes["nlayers"] = self.nlayers
             changes["n_thinking_rows"] = min(changes["n_thinking_rows"], 4)
         return replace(self, **changes)

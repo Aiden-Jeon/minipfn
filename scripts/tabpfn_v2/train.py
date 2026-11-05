@@ -112,11 +112,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--init-step은 --init-run-id와 같이 줘야 한다")
     if args.init_run_id and args.resume_run_id:
         parser.error("--init-run-id와 --resume-run-id는 함께 줄 수 없다")
+    if args.config_name == "long_tables" and not (args.init_run_id or args.resume_run_id):
+        # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나오고, 회귀 구간 경계도
+        # 가져올 checkpoint가 없어 긴 표 prior와 맞지 않는 기본 prior로 계산된다
+        parser.error("long_tables는 --init-run-id(paper run)나 --resume-run-id와 같이 줘야 한다")
     return args
 
 
 def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
-    config = getattr(TabPFNv2TrainConfig, args.config_name)(args.task).with_architecture(args.arch)
+    config = getattr(TabPFNv2TrainConfig, args.config_name)(args.task)
+    config = config.with_architecture(args.arch, keep_size=args.config_name == "smoke")
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,

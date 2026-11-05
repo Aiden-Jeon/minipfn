@@ -87,7 +87,9 @@ def sample_table_size(
     # feature 수는 Beta(0.95, 8)을 [1, feature_scale]로 편 것 (논문은 160). feature_scale은 논문에
     # 없음: TabPFN-2.5처럼 feature가 많은 표로 학습할 때 분포 자체를 넓힌다
     n_features = 1 + int(round(rng.beta(*FEATURE_BETA) * (feature_scale - 1)))
-    n_features = min(n_features, max_features)
+    # 학습 행 하한(min_train_rows)을 채워도 셀 제한을 넘지 않도록 feature 수를 줄인다
+    # (논문 설정에서는 상한이 581개라 걸리지 않는다)
+    n_features = min(n_features, max_features, (max_cells - 1) // (min_train_rows + n_eval_rows))
     max_train = max(1, (max_cells - 1) // n_features - n_eval_rows)
     return min(n_train, max_train), n_features
 

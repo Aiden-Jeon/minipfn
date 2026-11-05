@@ -104,9 +104,12 @@ def test_v2_5_paper_architecture(task):
 
 
 def test_smoke_v2_5_stays_small():
-    config = TabPFNv2TrainConfig.smoke("regression").with_architecture("v2.5")
+    config = TabPFNv2TrainConfig.smoke("regression").with_architecture("v2.5", keep_size=True)
     assert config.nlayers == 2 and config.n_thinking_rows == 4
     assert config.features_per_group == 3 and config.encoder == "mlp"
+    # keep_size를 주지 않으면 층 수와 상관없이 2.5 구조 그대로다
+    full = TabPFNv2TrainConfig.smoke("regression").with_architecture("v2.5")
+    assert full.nlayers == 18 and full.n_thinking_rows == 64
 
 
 def test_robust_soft_clip():

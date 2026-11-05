@@ -14,6 +14,7 @@ Hub에서 받을 때는 `hf://owner/name`처럼 적는다(오타 난 로컬 경�
 from __future__ import annotations
 
 import json
+from dataclasses import fields, replace
 from pathlib import Path
 
 import mlflow
@@ -29,6 +30,12 @@ WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 BORDERS_KEY = "borders"
 HUB_PREFIX = "hf://"
+# 학습 run의 param으로 남는 모델 구조 설정 (TabPFNv2Config와 TabPFNv2TrainConfig에 모두 있는 것)
+_MODEL_PARAMS = tuple(
+    f.name
+    for f in fields(TabPFNv2Config)
+    if f.name in {g.name for g in fields(TabPFNv2TrainConfig)}
+)
 
 
 def save_pretrained(
@@ -98,16 +105,14 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[TabPFNv2, torch.T
     params = mlflow.MlflowClient().get_run(run_id).data.params
     if params["task"] != task:
         raise SystemExit(f"{spec}는 {params['task']} 모델이다 ({task} 모델이 필요하다).")
-    config = TabPFNv2TrainConfig(
-        task=params["task"],
-        emsize=int(params["emsize"]),
-        nlayers=int(params["nlayers"]),
-        nhead=int(params["nhead"]),
-        # TabPFN-2.5 구조 설정 (이전 run에는 없으므로 v2 값)
-        features_per_group=int(params.get("features_per_group", 2)),
-        n_thinking_rows=int(params.get("n_thinking_rows", 0)),
-        encoder=params.get("encoder", "linear"),
-    )
+    # 모델 구조 param. run에 없는 값(TabPFN-2.5 이전 run의 구조 설정)은 설정 기본값(v2)을 쓴다
+    defaults = TabPFNv2TrainConfig(task=params["task"])
+    arch = {
+        name: type(getattr(defaults, name))(params[name])
+        for name in _MODEL_PARAMS
+        if name in params
+    }
+    config = replace(defaults, **arch)
     model = TabPFNv2(config.model_config())
     model.load_state_dict(state["model"])
     return model.eval(), state["borders"]

@@ -130,8 +130,8 @@ class RobustSoftClip:
     def fit(self, X: np.ndarray) -> RobustSoftClip:
         with np.errstate(all="ignore"), warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)  # 모두 결측인 열
-            q1, median, q3 = np.nanquantile(X, [0.25, 0.5, 0.75], axis=0)
-            span = np.nanmax(X, axis=0) - np.nanmin(X, axis=0)
+            low, q1, median, q3, high = np.nanquantile(X, [0, 0.25, 0.5, 0.75, 1], axis=0)
+            span = high - low
         iqr = q3 - q1
         self.scale_ = np.zeros(X.shape[1])
         ok = iqr > 0

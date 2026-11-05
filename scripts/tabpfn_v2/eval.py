@@ -20,7 +20,8 @@ test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint�
 쓴다.
 
 앙상블 멤버의 전처리는 `--member-kinds`로 고른다(기본 v2의 quantile,power. `v2.5`는 TabPFN-2.5의
-robust scaling + soft clipping을 쓰는 quantile,robust).
+robust scaling + soft clipping을 쓰는 quantile,robust). TabPFN-2.5 checkpoint를 로컬에서
+`--mlflow`로 평가하면 `TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
@@ -76,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--member-kinds",
         type=_member_kinds,
         default=DEFAULT_MEMBER_KINDS,
-        help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: quantile,power = v2."
+        help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: v2 = quantile,power."
         " v2.5는 quantile,robust)",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -94,6 +95,8 @@ def _one_hot_modes(value: str) -> list[str]:
 
 
 def _member_kinds(value: str) -> tuple[str, ...]:
+    if value == "v2":
+        return DEFAULT_MEMBER_KINDS
     if value == "v2.5":
         return MEMBER_KINDS_V2_5
     kinds = tuple(k.strip() for k in value.split(",") if k.strip())

@@ -96,3 +96,14 @@ def test_feature_scale_widens_the_feature_distribution():
     ]
     assert max(paper) <= 160 and max(wide) > 160 and max(wide) <= 500
     assert np.mean(wide) > 2.5 * np.mean(paper)
+
+
+def test_min_train_rows_fit_in_the_cell_budget():
+    # 학습 행 하한 512개를 채워도 셀 제한을 넘지 않도록 feature 수가 줄어든다
+    rng = np.random.default_rng(0)
+    kw = {"min_train_rows": 512, "log_uniform_rows": True, "max_cells": 400_000}
+    kw |= {"max_features": 1000, "feature_scale": 1000}
+    sizes = np.array([P.sample_table_size(rng, 8192, **kw) for _ in range(5000)])
+    n_train, n_features = sizes[:, 0], sizes[:, 1]
+    assert n_train.min() >= 512
+    assert ((n_train + P.N_EVAL_ROWS) * n_features < 400_000).all()
