@@ -7,7 +7,7 @@ v1 코드의 평가 절차를 따른다(github.com/automl/TabPFN `tabpfn_v1`, Ap
 - 예측(`scripts/transformer_prediction_interface.py` transformer_predict): 학습 행 기준 표준화,
   상수 feature 제거, power transform 유무, 이상치 누르기, feature 수 보정,
   클래스·feature 회전 앙상블, logits / 0.8을 평균한 뒤 softmax. 구현은
-  `minipfn.inference.rotation_ensemble`, 논문 설정은 `minipfn.recipes.tabpfn_v1.TabPFNClassifier`.
+  `minipfn.inference.rotation_ensemble`, 논문 설정은 `minipfn.recipes.tabpfn_v1.TabPFNv1Classifier`.
 - 지표(`scripts/tabular_metrics.py`): 다중 클래스 ROC AUC는 OVO
 """
 

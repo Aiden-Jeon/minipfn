@@ -5,7 +5,7 @@
 
 - `pfn`: PFN(arXiv 2112.10510). GP prior + `PointTransformer`, Algorithm 1 학습 루프
 - `tabpfn_v1`: TabPFN v1(arXiv 2207.01848)의 수치와 출처. prior bag 설정, `RowTransformer` 크기,
-  v1 학습 루프, 회전 앙상블 설정(`TabPFNClassifier`)
+  v1 학습 루프, 회전 앙상블 설정(`TabPFNv1Classifier`)
 - `tabpfn_v2`: TabPFN v2·2.5의 학습 설정(`graph_scm` prior + `CellTransformer` + 공용 학습 루프)과
   구조, 전처리 멤버 앙상블 설정(`TabPFNv2Classifier`·`TabPFNv2Regressor`)
 """

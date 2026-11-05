@@ -8,7 +8,10 @@
   멤버 종류 묶음 `MEMBER_KIND_PRESETS`의 v2 또는 v2.5)
 
     config = with_architecture(paper("regression"), "v2.5")
-    clf = TabPFNv2Classifier(model, member_kinds="v2.5").fit(x_train, y_train)
+    clf = TabPFNv2Classifier(model).fit(x_train, y_train)  # 추론 설정은 모델이 정한다
+
+추론 설정(멤버 수와 멤버 종류)은 weight와 함께 온다(`default_inference`). Hub config.json에 적힌
+값이 있으면 그것, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2다. 인자로 주면 그 값을 쓴다(실험용).
 
 학습 설정(`TrainConfig`)은 쓰는 함수 안에서 불러온다. Hub에서 받아 추론만 할 때 학습 스택을
 불러오지 않도록.
@@ -17,6 +20,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -53,7 +58,8 @@ LONG_TABLES_MICRO_BATCH = {"v2": 2, "v2.5": 1}
 
 def architecture_name(config: TrainConfig) -> str | None:
     """`config`의 모델 구조가 `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 층 수를
-    줄인 설정(`with_architecture(..., keep_size=True)`로 만든 것)도 그 구조로 본다."""
+    줄인 설정(`with_architecture(..., keep_size=True)`로 만든 것)도 그 구조로 본다. `task`,
+    `model_type`과 구조 필드가 있으면 학습 설정이 아니어도 된다(`model_architecture`)."""
     for name in ARCHITECTURES:
         for keep_size in (False, True):
             try:
@@ -63,6 +69,17 @@ def architecture_name(config: TrainConfig) -> str | None:
             if all(getattr(config, k) == v for k, v in changes.items()):
                 return name
     return None
+
+
+def model_architecture(model: nn.Module, task: str) -> str | None:
+    """만든 모델(checkpoint·Hub에서 읽은 것)의 구조가 `ARCHITECTURES`의 어느 것인지
+    (없으면 None)."""
+    config = getattr(model, "config", None)
+    if config is None or not hasattr(model, "model_type"):
+        return None
+    return architecture_name(
+        SimpleNamespace(**config.to_dict(), task=task, model_type=model.model_type)
+    )
 
 
 def paper(task: str = "classification") -> TrainConfig:
@@ -151,41 +168,95 @@ def resolve_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str,
     return ensemble.resolve_member_kinds(value, MEMBER_KIND_PRESETS)
 
 
+def default_inference(model: nn.Module, task: str) -> dict:
+    """그 모델의 추론 설정 `{"n_estimators": int, "member_kinds": tuple}`. weight와 함께 온 설정
+    (`model.inference_config`: Hub config.json의 `inference`. `minipfn.hub.from_pretrained`가
+    붙인다)이 있으면 그 값을 쓴다. 없으면(그 키가 없는 repo, 학습 checkpoint) 멤버 수는 논문
+    기본값이고 멤버 종류는 모델 구조로 정한다: 2.5 구조면 v2.5, 그 밖은 v2."""
+    saved = getattr(model, "inference_config", None) or {}
+    kinds = saved.get("member_kinds") or model_architecture(model, task) or "v2"
+    return {
+        "n_estimators": int(saved.get("n_estimators", N_ESTIMATORS[task])),
+        "member_kinds": resolve_member_kinds(kinds),
+    }
+
+
+def _inference_kwargs(model: nn.Module, task: str, n_estimators, member_kinds) -> dict:
+    # 인자로 준 값이 먼저, 없으면 모델의 추론 설정 (`default_inference`)
+    defaults = default_inference(model, task)
+    return {
+        "n_estimators": defaults["n_estimators"] if n_estimators is None else n_estimators,
+        "member_kinds": defaults["member_kinds"]
+        if member_kinds is None
+        else resolve_member_kinds(member_kinds),
+    }
+
+
+# 공개 가중치 (`TabPFNv2Classifier()`·`TabPFNv2Regressor()`의 기본값)
+HUB_REPOS = {
+    "classification": "aiden-jeon/minipfn-tabpfn-v2-classifier",
+    "regression": "aiden-jeon/minipfn-tabpfn-v2-regressor",
+}
+
+
+def _load(model, task: str) -> tuple[nn.Module, torch.Tensor | None]:
+    # 모델이 아니면 Hub repo id·로컬 폴더(None이면 공개 가중치)에서 받는다
+    if isinstance(model, nn.Module):
+        return model, None
+    from minipfn.hub import model_or_pretrained
+
+    loaded, borders = model_or_pretrained(model, HUB_REPOS[task], task)
+    if not hasattr(loaded, "model_type"):
+        raise ValueError(f"{model or HUB_REPOS[task]}는 TabPFN v2·2.5 모델이 아니다")
+    return loaded, borders
+
+
 class TabPFNv2Classifier(EnsembleClassifier):
-    """논문 멤버 수(4개)와 멤버 종류 묶음(기본 v2)을 쓰는 `EnsembleClassifier`."""
+    """v2·2.5 분류 `EnsembleClassifier`. `model`을 주지 않으면 공개 가중치
+    (`HUB_REPOS["classification"]`)를 받는다. 다른 가중치는 Hub repo id(`owner/name`,
+    `owner/name@branch`), 로컬 폴더, 또는 모델로 준다. 멤버 수와 멤버 종류의 기본값은 모델이
+    정한다(`default_inference`). 인자로 주면 그 값을 쓴다.
+
+        clf = TabPFNv2Classifier().fit(x_train, y_train)
+    """
 
     def __init__(
         self,
-        model: nn.Module,
+        model: nn.Module | str | Path | None = None,
         *,
-        n_estimators: int = N_ESTIMATORS["classification"],
-        member_kinds: str | tuple[str, ...] = "v2",
+        n_estimators: int | None = None,
+        member_kinds: str | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(
-            model,
-            n_estimators=n_estimators,
-            member_kinds=resolve_member_kinds(member_kinds),
-            **kwargs,
-        )
+        model, _ = _load(model, "classification")
+        inference = _inference_kwargs(model, "classification", n_estimators, member_kinds)
+        super().__init__(model, **inference, **kwargs)
 
 
 class TabPFNv2Regressor(EnsembleRegressor):
-    """논문 멤버 수(8개)와 멤버 종류 묶음(기본 v2)을 쓰는 `EnsembleRegressor`."""
+    """v2·2.5 회귀 `EnsembleRegressor`. `model`을 주지 않으면 공개 가중치
+    (`HUB_REPOS["regression"]`)와 그 구간 경계를 받는다. 다른 가중치는 Hub repo id, 로컬 폴더(경계도
+    거기서), 또는 모델과 `borders`로 준다. 멤버 수와 멤버 종류의 기본값은 모델이 정한다
+    (`default_inference`). 인자로 주면 그 값을 쓴다.
+
+        reg = TabPFNv2Regressor().fit(x_train, y_train)
+    """
 
     def __init__(
         self,
-        model: nn.Module,
-        borders: torch.Tensor,
+        model: nn.Module | str | Path | None = None,
+        borders: torch.Tensor | None = None,
         *,
-        n_estimators: int = N_ESTIMATORS["regression"],
-        member_kinds: str | tuple[str, ...] = "v2",
+        n_estimators: int | None = None,
+        member_kinds: str | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(
-            model,
-            borders,
-            n_estimators=n_estimators,
-            member_kinds=resolve_member_kinds(member_kinds),
-            **kwargs,
-        )
+        if isinstance(model, nn.Module):
+            if borders is None:
+                raise ValueError("모델을 직접 줄 때는 회귀 구간 경계 borders도 준다")
+        else:
+            if borders is not None:
+                raise ValueError("borders는 모델을 직접 줄 때만 준다 (받는 가중치에 경계가 있다)")
+            model, borders = _load(model, "regression")
+        inference = _inference_kwargs(model, "regression", n_estimators, member_kinds)
+        super().__init__(model, borders, **inference, **kwargs)

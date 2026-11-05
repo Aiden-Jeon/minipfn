@@ -87,12 +87,11 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 ```
 
 ```python
-from minipfn.hub import from_pretrained
-from minipfn.recipes.tabpfn_v2 import TabPFNv2Regressor
+from minipfn import TabPFNv2Regressor
 
-model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-regressor")
+# downloads aiden-jeon/minipfn-tabpfn-v2-regressor (weights and bucket borders)
 # x_train can be a pandas DataFrame with categorical columns
-reg = TabPFNv2Regressor(model, borders).fit(x_train, y_train)
+reg = TabPFNv2Regressor().fit(x_train, y_train)
 pred = reg.predict(x_test)  # (n_test,), mean of the predicted distribution
 ```
 
@@ -118,7 +117,7 @@ The checkpoints from the Results table are kept as branches of this repo. Each b
 | `main` (500k) | `runs:/0b8800ff3ff741f59996c6265e2d8771/checkpoints/step_0500000.pt` | 1.118 |
 
 ```python
-model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-regressor", revision="step-100k")
+reg = TabPFNv2Regressor("aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k")
 ```
 
 In the benchmark script, write the branch after `@`: `--regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k`.

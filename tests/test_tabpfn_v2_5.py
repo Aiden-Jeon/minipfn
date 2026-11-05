@@ -158,6 +158,38 @@ def test_default_member_kinds_are_v2():
         TabPFNv2Classifier(_tiny(), member_kinds=("quantile", "box-cox"))
 
 
+def test_member_kinds_default_comes_from_the_model():
+    # 사용자는 weight를 받아 쓰므로 추론 설정은 weight가 정한다 (default_inference)
+    from minipfn.recipes.tabpfn_v2 import MEMBER_KINDS_V2, N_ESTIMATORS, default_inference
+
+    X, y = load_breast_cancer(return_X_y=True)
+    v2, v2_5 = _tiny(), _tiny(n_thinking_rows=4, features_per_group=3)
+    # 1) Hub에 추론 설정이 없으면 구조로: 2.5 구조(층 수를 줄인 것 포함)면 v2.5, 아니면 v2
+    assert default_inference(v2, "classification") == {
+        "n_estimators": N_ESTIMATORS["classification"],
+        "member_kinds": MEMBER_KINDS_V2,
+    }
+    assert default_inference(v2_5, "classification")["member_kinds"] == MEMBER_KINDS_V2_5
+    reg = _tiny(n_out=20, n_thinking_rows=4, features_per_group=3, encoder="mlp")
+    assert default_inference(reg, "regression") == {
+        "n_estimators": N_ESTIMATORS["regression"],
+        "member_kinds": MEMBER_KINDS_V2_5,
+    }
+    # 2.5 구조 일부만 바꾼 모델은 어느 구조도 아니라 v2
+    assert default_inference(_tiny(features_per_group=3), "classification")["member_kinds"] == (
+        MEMBER_KINDS_V2
+    )
+    clf = TabPFNv2Classifier(v2_5).fit(X[:60], y[:60])
+    assert [p.member.kind for p in clf.preprocessors_] == list(MEMBER_KINDS_V2_5) * 2
+    # 2) weight와 함께 온 설정(Hub config.json의 inference)이 구조보다 먼저
+    v2_5.inference_config = {"member_kinds": ["robust"], "n_estimators": 3}
+    clf = TabPFNv2Classifier(v2_5)
+    assert clf.member_kinds == ("robust",) and clf.n_estimators == 3
+    # 3) 인자로 주면 그 값 (실험용)
+    clf = TabPFNv2Classifier(v2_5, member_kinds="v2", n_estimators=2)
+    assert clf.member_kinds == MEMBER_KINDS_V2 and clf.n_estimators == 2
+
+
 def test_member_kinds_parse_names_and_lists():
     from minipfn.recipes.tabpfn_v2 import resolve_member_kinds
 

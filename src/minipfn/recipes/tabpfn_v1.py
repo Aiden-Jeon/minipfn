@@ -3,7 +3,7 @@
 - prior: `minipfn.priors.prior_bag.PriorBag` + 여기의 `PRIOR` 설정 → `TabPFNPrior`
 - 모델: `minipfn.models.row_transformer.RowTransformer` (논문 크기 `PAPER_MODEL`)
 - 학습: 여기의 `train_tabpfn` (v1 `train.py`의 루프, 설정은 `TabPFNConfig`)
-- 추론: `minipfn.inference.rotation_ensemble` + 논문 앙상블 설정 → `TabPFNClassifier`
+- 추론: `minipfn.inference.rotation_ensemble` + 논문 앙상블 설정 → `TabPFNv1Classifier`
 - 평가: `minipfn.benchmarks.cc18` (Table 1)
 
 값은 논문 본문·부록과 공식 v1 코드(github.com/automl/TabPFN, `tabpfn_v1` 브랜치, commit bef0cf2,
@@ -675,17 +675,21 @@ def train_tabpfn(
 # ---------------------------------------------------------------------------
 # 추론 (논문 5.2절, v1 transformer_predict)
 # ---------------------------------------------------------------------------
-class TabPFNClassifier(RotationEnsembleClassifier):
-    """v1 논문 앙상블(멤버 `N_ENSEMBLE`개, 온도 `SOFTMAX_TEMPERATURE`)을 기본값으로 둔
-    `RotationEnsembleClassifier`.
+HUB_REPO = "aiden-jeon/minipfn-tabpfn-v1"  # 공개 가중치 (`TabPFNv1Classifier()`의 기본값)
 
-        clf = TabPFNClassifier(model).fit(x_train, y_train)
+
+class TabPFNv1Classifier(RotationEnsembleClassifier):
+    """v1 논문 앙상블(멤버 `N_ENSEMBLE`개, 온도 `SOFTMAX_TEMPERATURE`)을 기본값으로 둔
+    `RotationEnsembleClassifier`. `model`을 주지 않으면 공개 가중치(`HUB_REPO`)를 받는다. 다른
+    가중치는 Hub repo id(`owner/name`, `owner/name@branch`), 로컬 폴더, 또는 모델로 준다.
+
+        clf = TabPFNv1Classifier().fit(x_train, y_train)
         proba = clf.predict_proba(x_test)
     """
 
     def __init__(
         self,
-        model: RowTransformer,
+        model: RowTransformer | str | Path | None = None,
         *,
         n_ensemble: int = N_ENSEMBLE,
         softmax_temperature: float = SOFTMAX_TEMPERATURE,
@@ -694,6 +698,13 @@ class TabPFNClassifier(RotationEnsembleClassifier):
         batch_size: int = 16,
         device: torch.device | str | None = None,
     ) -> None:
+        if not isinstance(model, torch.nn.Module):
+            from minipfn.hub import model_or_pretrained
+
+            spec = model
+            model, _ = model_or_pretrained(model, HUB_REPO, "classification")
+            if not isinstance(model, RowTransformer):
+                raise ValueError(f"{spec or HUB_REPO}는 TabPFN v1 모델이 아니다")
         super().__init__(
             model,
             n_ensemble=n_ensemble,
@@ -703,6 +714,10 @@ class TabPFNClassifier(RotationEnsembleClassifier):
             batch_size=batch_size,
             device=device,
         )
+
+
+# 예전 이름 (예전 Hub 카드와 `minipfn.tabpfn.inference`가 썼다)
+TabPFNClassifier = TabPFNv1Classifier
 
 
 def tabpfn_predict_proba(
@@ -716,7 +731,7 @@ def tabpfn_predict_proba(
     device: torch.device | str | None = None,
 ) -> np.ndarray:
     """테스트 행의 클래스 확률 (m, C). context(학습 행)가 호출마다 바뀔 때 쓰는 stateless 버전
-    (`TabPFNClassifier.predict_proba`와 같은 앙상블). 열 순서는 정렬한 레이블 순서다."""
+    (`TabPFNv1Classifier.predict_proba`와 같은 앙상블). 열 순서는 정렬한 레이블 순서다."""
     return rotation_ensemble.predict_proba(
         model,
         x_train,

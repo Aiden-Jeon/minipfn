@@ -12,8 +12,16 @@
 - `recipes`: 논문별 수치와 조합 (`pfn`, `tabpfn_v1`, `tabpfn_v2`). 논문에만 있는 학습 루프
   (PFN, TabPFN v1)도 여기에 있다
 
-여기서는 PFN 챕터 노트북이 쓰는 이름을 바로 내보낸다.
+여기서는 PFN 챕터 노트북이 쓰는 이름을 바로 내보낸다. TabPFN 추론에 쓰는 이름(`from_pretrained`와
+논문 기본값을 붙인 추론 클래스)도 여기서 쓸 수 있다. 정의는 `hub`·`recipes`에 있고, 처음 쓸 때
+불러온다(`import minipfn`이 Hub·추론 코드까지 불러오지 않도록).
+
+    from minipfn import TabPFNv1Classifier
+
+    clf = TabPFNv1Classifier().fit(x_train, y_train)  # 공개 가중치를 받는다
 """
+
+from typing import TYPE_CHECKING
 
 from minipfn.benchmarks.gp import evaluate_against_gp
 from minipfn.models.bar_distribution import (
@@ -37,7 +45,35 @@ from minipfn.recipes.pfn import (
 )
 from minipfn.utils import get_device, log_run_source, set_seed
 
+if TYPE_CHECKING:
+    from minipfn.hub import from_pretrained
+    from minipfn.recipes.tabpfn_v1 import TabPFNv1Classifier
+    from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
+
 PFNTransformer = PointTransformer  # 예전 이름
+
+# 처음 쓸 때 불러오는 이름 → 정의한 모듈
+_LAZY = {
+    "from_pretrained": "minipfn.hub",
+    "TabPFNv1Classifier": "minipfn.recipes.tabpfn_v1",
+    "TabPFNv2Classifier": "minipfn.recipes.tabpfn_v2",
+    "TabPFNv2Regressor": "minipfn.recipes.tabpfn_v2",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY:
+        import importlib
+
+        value = getattr(importlib.import_module(_LAZY[name]), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY))
+
 
 __all__ = [
     "get_device",
@@ -65,4 +101,8 @@ __all__ = [
     "to_classes",
     "sample_random_scm",
     "sample_scm_dataset",
+    "from_pretrained",
+    "TabPFNv1Classifier",
+    "TabPFNv2Classifier",
+    "TabPFNv2Regressor",
 ]

@@ -47,3 +47,60 @@ def test_hub_inference_imports_do_not_load_the_training_stack():
         "assert not loaded, loaded\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_generic_from_pretrained_reads_v1_folders(tmp_path):
+    # `minipfn.from_pretrained`(= `minipfn.hub.from_pretrained`)가 v1 repo도 읽는다. v1
+    # config.json은 학습 설정을 평평하게 적은 형식 그대로다 (예전 minipfn도 읽도록 Hub 파일은 바꾸지
+    # 않는다)
+    from minipfn import from_pretrained as top_level
+    from minipfn.hub import from_pretrained as generic
+    from minipfn.models.row_transformer import RowTransformer
+
+    assert top_level is generic
+    config = TabPFNConfig.smoke()
+    torch.manual_seed(0)
+    model = build_tabpfn_model(config)
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.2)
+    save_pretrained(model, config, tmp_path)
+
+    loaded, borders = generic(tmp_path)
+    assert isinstance(loaded, RowTransformer) and borders is None and not loaded.training
+    for (name, a), b in zip(model.state_dict().items(), loaded.state_dict().values(), strict=True):
+        assert torch.equal(a, b), name
+    x = torch.randn(2, 12, config.num_features)
+    y = torch.randint(0, 2, (2, 8)).float()
+    model.eval()
+    with torch.no_grad():
+        assert torch.equal(model(x[:, :8], y, x[:, 8:]), loaded(x[:, :8], y, x[:, 8:]))
+
+
+def test_top_level_inference_names_load_lazily():
+    # `from minipfn import TabPFNv1Classifier, from_pretrained`: 정의는 recipes·hub에 있고, `import
+    # minipfn`만으로는 Hub·추론 코드를 불러오지 않는다 (새 프로세스에서 확인)
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, minipfn\n"
+        "lazy = ('minipfn.hub', 'minipfn.recipes.tabpfn_v1', 'minipfn.recipes.tabpfn_v2')\n"
+        "assert not [m for m in lazy if m in sys.modules]\n"
+        "from minipfn import TabPFNv1Classifier, TabPFNv2Classifier, TabPFNv2Regressor\n"
+        "from minipfn import from_pretrained\n"
+        "from minipfn.hub import from_pretrained as f\n"
+        "from minipfn.recipes import tabpfn_v1 as v1, tabpfn_v2 as v2\n"
+        "assert from_pretrained is f and TabPFNv1Classifier is v1.TabPFNv1Classifier\n"
+        "from minipfn.tabpfn.inference import TabPFNClassifier as old_name\n"
+        "assert old_name is TabPFNv1Classifier  # 예전 Hub 카드의 이름\n"
+        "assert TabPFNv2Classifier is v2.TabPFNv2Classifier\n"
+        "assert TabPFNv2Regressor is v2.TabPFNv2Regressor\n"
+        "assert set(minipfn.__all__) <= set(dir(minipfn))\n"
+        "try:\n"
+        "    minipfn.no_such_name\n"
+        "except AttributeError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise AssertionError\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

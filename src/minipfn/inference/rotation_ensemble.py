@@ -7,7 +7,7 @@
 `model`은 행 하나가 토큰인 `minipfn.models.row_transformer.RowTransformer`다. 앙상블 멤버는
 (클래스 번호 회전, feature 순서 회전) × 전처리 2가지(그대로, 열별 Yeo-Johnson)에서 앞의
 `n_ensemble`개이고, 멤버의 logit을 온도로 나눠 평균한 뒤 softmax한다. v1 논문 설정(멤버 32개, 온도
-0.8)을 기본값으로 둔 것은 `minipfn.recipes.tabpfn_v1.TabPFNClassifier`다.
+0.8)을 기본값으로 둔 것은 `minipfn.recipes.tabpfn_v1.TabPFNv1Classifier`다.
 
 `fit`은 가중치를 학습하지 않고 학습 행을 context로 준비한다. `fit_mode`는 그 준비를 `fit`에서
 어디까지 해 둘지 정한다. 결과는 같고 비용만 다르다(공식 TabPFN v2의 `fit_mode`와 같은 이름).

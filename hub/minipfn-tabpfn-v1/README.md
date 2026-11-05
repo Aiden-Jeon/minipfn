@@ -51,11 +51,9 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 ```
 
 ```python
-from minipfn.hub.tabpfn_v1 import from_pretrained
-from minipfn.recipes.tabpfn_v1 import TabPFNClassifier
+from minipfn import TabPFNv1Classifier
 
-model, config = from_pretrained("aiden-jeon/minipfn-tabpfn-v1")
-clf = TabPFNClassifier(model).fit(x_train, y_train)
+clf = TabPFNv1Classifier().fit(x_train, y_train)  # downloads aiden-jeon/minipfn-tabpfn-v1
 proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes_ order
 ```
 

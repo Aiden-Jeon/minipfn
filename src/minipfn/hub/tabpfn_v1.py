@@ -21,9 +21,9 @@ from safetensors.torch import load_file, save_file
 
 from minipfn.hub import _is_local_path
 from minipfn.models.row_transformer import RowTransformer
-from minipfn.recipes.tabpfn_v1 import TabPFNConfig, tabpfn_from_state
+from minipfn.recipes.tabpfn_v1 import HUB_REPO, TabPFNConfig, tabpfn_from_state
 
-HUB_REPO_ID = "aiden-jeon/minipfn-tabpfn-v1"
+HUB_REPO_ID = HUB_REPO
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 SOURCE_NAME = "source.json"

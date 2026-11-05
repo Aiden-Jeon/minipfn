@@ -20,9 +20,11 @@ test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint�
 쓴다. 펼칠 열이 있는지는 fold마다 그 fold의 학습 행으로 본다
 (추론이 멤버 전처리를 학습 행으로 맞추므로).
 
-앙상블 멤버의 전처리는 `--member-kinds`로 고른다(기본 v2의 quantile,power. `v2.5`는 TabPFN-2.5의
-robust scaling + soft clipping을 쓰는 quantile,robust). TabPFN-2.5 checkpoint를 로컬에서
-`--mlflow`로 평가하면 `TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
+앙상블 멤버의 전처리는 기본으로 모델이 정한다(`recipes.tabpfn_v2.default_inference`: Hub
+config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2). `--member-kinds`로 주면 그
+값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust scaling + soft clipping을 쓰는
+quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
+`TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
@@ -53,9 +55,9 @@ from minipfn.inference.preprocessing import (
 )
 from minipfn.priors.table_size import MAX_FEATURES
 from minipfn.recipes.tabpfn_v2 import (
-    MEMBER_KINDS_V2,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
+    default_inference,
     resolve_member_kinds,
 )
 from minipfn.utils import log_run_source
@@ -81,9 +83,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--member-kinds",
         type=_member_kinds,
-        default=MEMBER_KINDS_V2,
-        help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: v2 = quantile,power."
-        " v2.5는 quantile,robust)",
+        default=None,
+        help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
+        " v2 = quantile,power, v2.5 = quantile,robust)",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
@@ -174,12 +176,14 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         raise SystemExit(f"{suite} 평가에는 {flag}가 필요하다.")
     # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
     model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
+    # 주지 않으면 모델의 추론 설정 (Hub config.json의 inference, 없으면 모델 구조로)
+    member_kinds = args.member_kinds or default_inference(model, suite)["member_kinds"]
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
             "categorical_features_indices": task.categorical_indices,
             "one_hot": one_hot,
-            "member_kinds": args.member_kinds,
+            "member_kinds": member_kinds,
             "device": args.device,
         }
         if suite == "classification":
@@ -187,6 +191,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         return TabPFNv2Regressor(model, borders, **kw)
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
+    make.member_kinds = member_kinds
     return make
 
 
@@ -224,20 +229,27 @@ def main(argv: list[str] | None = None) -> None:
                 "folds": args.folds,
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
-                "member_kinds": ",".join(args.member_kinds),
             }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
 
     factories = {suite: make_estimator_factory(suite, args) for suite in {s for s, _ in tasks}}
+    kinds = {suite: ",".join(make.member_kinds) for suite, make in sorted(factories.items())}
+    print("member kinds:", kinds, flush=True)
+    if use_mlflow:
+        # suite마다 모델이 정하므로 다를 수 있다. 같으면 예전처럼 member_kinds 하나로 남긴다
+        if len(set(kinds.values())) == 1:
+            mlflow.log_param("member_kinds", next(iter(kinds.values())))
+        else:
+            mlflow.log_params({f"member_kinds_{suite}": v for suite, v in kinds.items()})
     rows = []
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()
         task = bm.load_openml_task(task_id)
         scores = {}
         expands = expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
-        for group in same_result_modes(args.one_hot, args.member_kinds, expands):
+        for group in same_result_modes(args.one_hot, factories[suite].member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
             make = functools.partial(factories[suite], one_hot=group[0])
             task_rows = bm.evaluate_task(task, make, n_folds=args.folds)

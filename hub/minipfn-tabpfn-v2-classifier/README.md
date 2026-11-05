@@ -83,12 +83,11 @@ uv pip install "minipfn @ git+https://github.com/Aiden-Jeon/minipfn"
 ```
 
 ```python
-from minipfn.hub import from_pretrained
-from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier
+from minipfn import TabPFNv2Classifier
 
-model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier")
+# downloads aiden-jeon/minipfn-tabpfn-v2-classifier
 # x_train can be a pandas DataFrame with categorical columns
-clf = TabPFNv2Classifier(model).fit(x_train, y_train)
+clf = TabPFNv2Classifier().fit(x_train, y_train)
 proba = clf.predict_proba(x_test)  # (n_test, n_classes), columns in clf.classes_ order
 ```
 
@@ -114,7 +113,7 @@ The checkpoints from the Results table are kept as branches of this repo. Each b
 | `main` (500k) | `runs:/a1df9e34774d49e7869eb381bf65509b/checkpoints/step_0500000.pt` | 0.9238 |
 
 ```python
-model, _ = from_pretrained("aiden-jeon/minipfn-tabpfn-v2-classifier", revision="step-100k")
+clf = TabPFNv2Classifier("aiden-jeon/minipfn-tabpfn-v2-classifier@step-100k")
 ```
 
 In the benchmark script, write the branch after `@`: `--classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier@step-100k`.
