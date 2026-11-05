@@ -33,6 +33,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# 읽기는 모델 종류마다 같으므로 registry에 하나만 둔다 (`model_type`을 보고 클래스를 고른다)
+from minipfn.tabpfn_v2.registry import load_checkpoint  # noqa: F401
+
 NAN_INDICATOR = -2.0  # 결측 칸의 표시 값 (아닌 칸은 0)
 ENCODERS = ("linear", "mlp")
 
@@ -247,13 +250,3 @@ def save_checkpoint(
         "borders": borders,
     }
     torch.save(payload, path)
-
-
-def load_checkpoint(
-    path: str | Path, map_location: str | torch.device = "cpu"
-) -> tuple[nn.Module, torch.Tensor | None]:
-    """`save_checkpoint`로 저장한 파일을 읽는다. 모델 종류는 파일에 남긴 `model_type`을 따른다
-    (`registry.load_checkpoint`. 이전 파일에는 없어서 v2로 읽는다)."""
-    from minipfn.tabpfn_v2.registry import load_checkpoint as _load
-
-    return _load(path, map_location)

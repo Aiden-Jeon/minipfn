@@ -42,8 +42,10 @@ from minipfn.tabpfn_v2.prior import (
     MAX_CLASSES,
     MAX_FEATURES,
     MAX_TRAIN_ROWS,
+    MIN_CLASSIFICATION_TRAIN_ROWS,
     N_EVAL_ROWS,
     TabPFNv2Prior,
+    check_table_size,
     regression_borders,
 )
 from minipfn.tabpfn_v2.registry import (
@@ -67,6 +69,8 @@ _V2 = {
     "encoder": "linear",
 }
 _V2_5 = {**_V2, "features_per_group": 3, "n_thinking_rows": 64}  # 두 task 공통
+# long_tables의 GPU당 micro batch. v2(12층)는 2에서 GPU 메모리 52.6GB였다. 2.5는 층이 두 배라 1
+LONG_TABLES_MICRO_BATCH = {"v2": 2, "v2.5": 1}
 ARCHITECTURES = {
     "v2": {"classification": _V2, "regression": _V2},
     "v2.5": {
@@ -153,6 +157,10 @@ class TabPFNv2TrainConfig:
 
     def __post_init__(self) -> None:
         model_class(self.model_type)  # 없는 이름이면 ValueError
+        min_rows = self.min_train_rows
+        if self.task == "classification":
+            min_rows = max(min_rows, MIN_CLASSIFICATION_TRAIN_ROWS)
+        check_table_size(min_rows, self.max_train_rows, self.n_eval_rows, self.max_cells)
         if not 0.0 < self.rewind_lr_factor <= 1.0:
             raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
         if self.qk_clip is not None and self.qk_clip <= 0:
@@ -174,25 +182,30 @@ class TabPFNv2TrainConfig:
         return cls(task=task)
 
     @classmethod
-    def long_tables(cls, task: str = "classification") -> TabPFNv2TrainConfig:
+    def long_tables(cls, task: str = "classification", arch: str = "v2") -> TabPFNv2TrainConfig:
         """paper로 학습한 모델을 더 긴·넓은 표로 짧게 이어 학습한다 (논문에 없음, 값은 여기서 정함).
 
         TabPFN-2.5는 prior를 "더 많은 행과 feature로 키웠다"고만 적었다(추론 권장 크기는 행 50,000,
         feature 2,000). 그 크기로 처음부터 학습하는 대신 TabICL처럼 짧은 표로 오래 학습한 뒤 긴 표로
         잠깐 더 학습한다: 학습 행 512~8,192개 log 균등, feature 수 분포를 500까지 펴고, 셀은
         400,000개까지. 가중치만 가져와(`init_from`) 새 optimizer로 lr 5e-5, warmup 1k + cosine
-        20k step. v2(12층)는 GPU당 micro batch 2에서 GPU 메모리 52.6GB였는데 2.5는 층이 두 배라
-        micro batch 1로 둔다. 검증 batch는 데이터셋 4개다.
+        20k step. GPU당 micro batch는 구조마다 다르므로(`LONG_TABLES_MICRO_BATCH`) 구조를 여기서
+        `arch`로 받는다(나중에 `with_architecture`로 바꾸면 micro batch는 따라 바뀌지 않는다).
+        검증 batch는 데이터셋 4개다.
         """
+        if arch not in LONG_TABLES_MICRO_BATCH:
+            raise ValueError(
+                f"long_tables의 arch는 {tuple(LONG_TABLES_MICRO_BATCH)} 가운데서: {arch}"
+            )
         return replace(
-            cls.paper(task),
+            cls.paper(task).with_architecture(arch),
             min_train_rows=512,
             max_train_rows=8192,
             log_uniform_rows=True,
             max_features=500,
             feature_scale=500,
             max_cells=400_000,
-            micro_batch=1,
+            micro_batch=LONG_TABLES_MICRO_BATCH[arch],
             val_batch=4,
             steps=20_000,
             warmup_steps=1_000,
@@ -248,11 +261,18 @@ class TabPFNv2TrainConfig:
         return build_model(self.model_type, self.model_config())
 
     def with_architecture(self, arch: str, keep_size: bool = False) -> TabPFNv2TrainConfig:
-        """모델 구조를 `ARCHITECTURES`의 것으로. `keep_size`(smoke)면 층 수는 그대로 두고 thinking
-        행은 4개까지만 써서 작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
+        """모델 구조를 `ARCHITECTURES`의 것으로. 구조가 모델 클래스(`model_type`)도 정한다. 이미
+        기본값이 아닌 다른 모델 클래스로 정한 설정은 바꾸지 않고 에러를 낸다(다른 모델을 v2로
+        조용히 바꿔 학습하지 않도록). `keep_size`(smoke)면 층 수는 그대로 두고 thinking 행은
+        4개까지만 써서 작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
         if arch not in ARCHITECTURES:
             raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
         changes = dict(ARCHITECTURES[arch][self.task])
+        if self.model_type not in (DEFAULT_MODEL_TYPE, changes["model_type"]):
+            raise ValueError(
+                f"arch {arch}는 {changes['model_type']} 모델이다 (설정의 model_type:"
+                f" {self.model_type})"
+            )
         if keep_size:
             changes["nlayers"] = self.nlayers
             if "n_thinking_rows" in changes:
@@ -274,18 +294,24 @@ class TabPFNv2TrainConfig:
             )
         return self.batch_size // per_forward
 
+    def table_sizes(self) -> dict:
+        """prior의 표 크기 설정 (학습 prior와 회귀 구간 경계의 prior가 같이 쓴다)."""
+        return {
+            "min_train_rows": self.min_train_rows,
+            "max_train_rows": self.max_train_rows,
+            "n_eval_rows": self.n_eval_rows,
+            "max_features": self.max_features,
+            "log_uniform_rows": self.log_uniform_rows,
+            "max_cells": self.max_cells,
+            "feature_scale": self.feature_scale,
+        }
+
     def make_prior(self, seed: int) -> TabPFNv2Prior:
         return TabPFNv2Prior(
             self.task,
             seed=seed,
             missing_dataset_prob=self.missing_dataset_prob,
-            min_train_rows=self.min_train_rows,
-            max_train_rows=self.max_train_rows,
-            n_eval_rows=self.n_eval_rows,
-            max_features=self.max_features,
-            log_uniform_rows=self.log_uniform_rows,
-            max_cells=self.max_cells,
-            feature_scale=self.feature_scale,
+            **self.table_sizes(),
         )
 
 
@@ -371,9 +397,7 @@ def _borders(
             config.border_datasets,
             seed=20_000_000 + config.seed,
             n_jobs=max(1, min(32, (os.cpu_count() or 1) // 2)),
-            max_train_rows=config.max_train_rows,
-            n_eval_rows=config.n_eval_rows,
-            max_features=config.max_features,
+            **config.table_sizes(),
         ).to(device)
         print(f"regression borders: {config.border_datasets} datasets, {time.time() - start:.0f}s")
     if d.world_size > 1:
@@ -425,21 +449,16 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
         print(f"lr: 기준 {old:.2e} → {lr:.2e} (step {step}부터 {lr * factor:.3e})", flush=True)
 
 
-def _qk_weights(model) -> list[tuple[str, torch.Tensor]]:
-    # (종류, qkv weight). 어느 attention을 볼지는 모델이 정한다 (`qk_clip_weights`)
-    return model.qk_clip_weights()
-
-
 @torch.no_grad()
 def qk_logit_bounds(model) -> torch.Tensor:
     """attention마다 head별 logit 상한 σ_max(Wq_hᵀ Wk_h) · E / √d. 모양 (attention 수, head 수).
 
-    attention 순서는 `_qk_weights`와 같다. 층 입력은 affine 없는 LayerNorm 뒤라 토큰 크기가 √E로
-    같으므로 |q·k| / √d ≤ σ_max · E / √d이다. 논문 규모 회귀 checkpoint에서 이 값은 실제 최대
-    logit과 거의 같았다(678k vs 676k). Wq_hᵀ = Q_q R_q, Wk_hᵀ = Q_k R_k로 QR 분해하면
+    attention 순서는 `model.qk_clip_weights()`와 같다. 층 입력은 affine 없는 LayerNorm 뒤라 토큰
+    크기가 √E로 같으므로 |q·k| / √d ≤ σ_max · E / √d이다. 논문 규모 회귀 checkpoint에서 이 값은
+    실제 최대 logit과 거의 같았다(678k vs 676k). Wq_hᵀ = Q_q R_q, Wk_hᵀ = Q_k R_k로 QR 분해하면
     σ_max(Wq_hᵀ Wk_h) = σ_max(R_q R_kᵀ)라 E×E 대신 d×d에서 계산한다.
     """
-    weights = _qk_weights(model)
+    weights = model.qk_clip_weights()
     if not weights:
         return torch.zeros(0, model.config.nhead)
     nhead = model.config.nhead
@@ -456,7 +475,7 @@ def qk_logit_bounds(model) -> torch.Tensor:
 
 def _sample_rows(model) -> list[int]:
     # qk_logit_bounds의 행 가운데 sample attention인 것
-    return [i for i, (kind, _) in enumerate(_qk_weights(model)) if kind == "sample_attention"]
+    return [i for i, (kind, _) in enumerate(model.qk_clip_weights()) if kind == "sample_attention"]
 
 
 @torch.no_grad()
@@ -472,12 +491,35 @@ def apply_qk_clip(model, tau: float, world_size: int = 1) -> tuple[torch.Tensor,
     if world_size > 1:
         dist.all_reduce(scale, op=dist.ReduceOp.MIN)
     nhead = model.config.nhead
-    for (_, w), s in zip(_qk_weights(model), scale, strict=True):
+    for (_, w), s in zip(model.qk_clip_weights(), scale, strict=True):
         e = w.shape[1]
         head = s.to(w.dtype).repeat_interleave(e // nhead)[:, None]  # (E, 1): 행마다 그 head의 배율
         w[:e].mul_(head)
         w[e : 2 * e].mul_(head)
     return (scale < 1).sum(), bounds.max()
+
+
+def check_checkpoint(state: dict, config: TabPFNv2TrainConfig, name: str) -> None:
+    """`state`(학습 중 checkpoint 또는 `save_checkpoint` 파일)가 `config`와 같은 task·모델인지.
+
+    모양이 같은 다른 설정(head 수 등)은 `load_state_dict`가 그대로 읽어 버리므로 미리 맞춰 본다.
+    모델 설정을 남기기 전의 학습 중 checkpoint는 task만 본다.
+    """
+    regression = state.get("borders") is not None
+    if regression != (config.task == "regression"):
+        got = "regression" if regression else "classification"
+        raise ValueError(f"{name}은 {got} checkpoint다 (설정의 task: {config.task})")
+    if "config" not in state:
+        return
+    saved_type = state.get("model_type", DEFAULT_MODEL_TYPE)
+    if saved_type != config.model_type:
+        raise ValueError(f"{name}은 {saved_type} 모델이다 (설정의 model_type: {config.model_type})")
+    # 저장한 뒤에 생긴 설정 필드는 그 기본값으로 채워 비교한다
+    saved = model_class(saved_type).config_class(**state["config"]).to_dict()
+    expected = config.model_config().to_dict()
+    diff = {k: (saved.get(k), v) for k, v in expected.items() if saved.get(k) != v}
+    if diff:
+        raise ValueError(f"{name}의 모델 설정이 이번 설정과 다르다 (저장된 값, 설정): {diff}")
 
 
 def checkpoint_lr(path: str | Path) -> float:
@@ -564,7 +606,7 @@ def train_tabpfn_v2(
 
     torch.manual_seed(config.seed)  # 모든 GPU가 같은 초기 가중치에서 시작한다
     model = config.build_model().to(device)
-    if config.qk_clip is not None and not _qk_weights(model):
+    if config.qk_clip is not None and not model.qk_clip_weights():
         raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
     opt = torch.optim.Adam(model.parameters(), lr=config.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -576,11 +618,13 @@ def train_tabpfn_v2(
         raise ValueError("resume_from과 init_from은 함께 줄 수 없다")
     if init_from is not None:
         state = torch.load(init_from, map_location=device, weights_only=True)
+        check_checkpoint(state, config, "init_from")
         # 학습 중 checkpoint는 "model", `save_checkpoint`로 저장한 파일은 "state_dict"
         model.load_state_dict(state["model"] if "model" in state else state["state_dict"])
         borders = state["borders"]
     if resume_from is not None:
         state = torch.load(resume_from, map_location=device, weights_only=True)
+        check_checkpoint(state, config, "resume_from")
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         sched.load_state_dict(state["scheduler"])
@@ -838,6 +882,9 @@ def train_tabpfn_v2(
         suspect = guard is not None and guard.suspect  # 무너지는 중일 수 있는 상태는 남기지 않는다
         if d.is_main and (done % config.checkpoint_every == 0 or keep or last) and not suspect:
             state = {
+                # 모델 종류와 설정 (학습 run param 없이도 이 파일만으로 모델을 만든다)
+                "model_type": config.model_type,
+                "config": model.config.to_dict(),
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),

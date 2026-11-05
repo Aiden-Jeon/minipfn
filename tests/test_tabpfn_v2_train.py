@@ -61,12 +61,14 @@ def test_init_from_takes_only_the_weights(tmp_path):
 def test_long_tables_preset_keeps_the_paper_model_and_batch():
     paper, long = TabPFNv2TrainConfig.paper(), TabPFNv2TrainConfig.long_tables()
     assert long.model_config() == paper.model_config() and long.batch_size == paper.batch_size
-    assert long.grad_accumulation(8) == 8 and long.max_train_rows == 8192
-    assert long.max_features == long.feature_scale == 500
+    # v2(12층)는 GPU당 micro batch 2 (batch 64 = 2 × 4 × GPU 8)
+    assert long.micro_batch == 2 and long.grad_accumulation(8) == 4
+    assert long.max_train_rows == 8192 and long.max_features == long.feature_scale == 500
     assert TabPFNv2TrainConfig.long_tables("regression").rewind_lr_factor == 0.5
-    # 2.5 구조와 함께 쓸 수 있다 (init_from은 같은 구조의 가중치여야 한다)
-    v25 = TabPFNv2TrainConfig.long_tables("regression").with_architecture("v2.5")
+    # 2.5 구조는 층이 두 배라 micro batch 1 (init_from은 같은 구조의 가중치여야 한다)
+    v25 = TabPFNv2TrainConfig.long_tables("regression", arch="v2.5")
     assert v25.nlayers == 18 and v25.n_thinking_rows == 64 and v25.max_train_rows == 8192
+    assert v25.micro_batch == 1 and v25.grad_accumulation(8) == 8
 
 
 def test_regression_training_stores_borders(tmp_path):

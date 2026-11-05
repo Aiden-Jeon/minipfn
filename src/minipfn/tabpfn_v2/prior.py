@@ -62,6 +62,27 @@ def _graph_scm_classes():
     return GraphSCM, PriorConfig
 
 
+# 분류 데이터셋의 학습 행 하한 (클래스가 2개 이상 학습 행에 나오려면)
+MIN_CLASSIFICATION_TRAIN_ROWS = 2
+
+
+def check_table_size(
+    min_train_rows: int, max_train_rows: int, n_eval_rows: int, max_cells: int
+) -> None:
+    """`sample_table_size`가 뽑을 수 있는 크기인지. 학습 행 하한과 검증 행을 채우고도 feature가
+    1개 이상 들어가야 한다."""
+    if not 1 <= min_train_rows <= max_train_rows:
+        raise ValueError(
+            f"학습 행 수 범위가 잘못됐다: min_train_rows {min_train_rows}, "
+            f"max_train_rows {max_train_rows}"
+        )
+    if min_train_rows + n_eval_rows >= max_cells:
+        raise ValueError(
+            f"셀 제한 {max_cells}개로는 학습 행 {min_train_rows}개 + 검증 행 {n_eval_rows}개에"
+            " feature 하나도 넣을 수 없다"
+        )
+
+
 def sample_table_size(
     rng: np.random.Generator,
     max_train_rows: int = MAX_TRAIN_ROWS,
@@ -127,7 +148,8 @@ class TabPFNv2Prior:
     ) -> None:
         self.task = task
         if task == "classification":
-            min_train_rows = max(min_train_rows, 2)  # 클래스가 2개 이상 학습 행에 나오려면
+            min_train_rows = max(min_train_rows, MIN_CLASSIFICATION_TRAIN_ROWS)
+        check_table_size(min_train_rows, max_train_rows, n_eval_rows, max_cells)
         self.rng = np.random.default_rng(seed)
         self.missing_dataset_prob = missing_dataset_prob
         self.max_missing_rate = max_missing_rate
@@ -220,17 +242,10 @@ def _train_rows_cover_classes(
     return torch.from_numpy(np.concatenate([train, rest[n_more:]]))
 
 
-def _border_targets(args: tuple[int, int, int, int, int]) -> torch.Tensor:
-    # 회귀 데이터셋 n개의 고유한 target 값 (결측값은 넣지 않는다)
-    n_datasets, seed, max_train_rows, n_eval_rows, max_features = args
-    prior = TabPFNv2Prior(
-        "regression",
-        seed=seed,
-        missing_dataset_prob=0.0,
-        max_train_rows=max_train_rows,
-        n_eval_rows=n_eval_rows,
-        max_features=max_features,
-    )
+def _border_targets(args: tuple[int, int, dict]) -> torch.Tensor:
+    # 회귀 데이터셋 n개의 고유한 target 값 (결측값은 넣지 않는다). sizes는 학습과 같은 크기 설정
+    n_datasets, seed, sizes = args
+    prior = TabPFNv2Prior("regression", seed=seed, missing_dataset_prob=0.0, **sizes)
     values = []
     for _ in range(n_datasets):
         n_train, n_features = prior.sample_size()
@@ -248,17 +263,31 @@ def regression_borders(
     max_train_rows: int = MAX_TRAIN_ROWS,
     n_eval_rows: int = N_EVAL_ROWS,
     max_features: int = MAX_FEATURES,
+    min_train_rows: int = 1,
+    log_uniform_rows: bool = False,
+    max_cells: int = MAX_CELLS,
+    feature_scale: int = MAX_FEATURES,
 ) -> torch.Tensor:
     """회귀 출력 구간의 경계 (Methods "Regression details").
 
     prior에서 데이터셋을 많이 뽑아 z-정규화한 target을 모으고, 그 분포의 1/n_buckets 분위수들을
     경계로 쓴다. 양 끝은 half-normal 꼬리가 맡는다(`FullSupportBarDistribution`).
     같은 값이 많은 데이터셋(이산화한 target, 4σ에서 잘린 값)이 분위수를 끌어당겨 폭이 0에 가까운
-    구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함).
+    구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함). 표 크기 설정은 학습
+    prior(`TabPFNv2Prior`)와 같은 뜻이고, 학습과 같은 값을 줘야 같은 target 분포에서 경계를 정한다.
     """
     # n_jobs개 프로세스로 나눠 만든다 (프로세스마다 시드가 다르다)
     sizes = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]
-    jobs = [(n, seed + i, max_train_rows, n_eval_rows, max_features) for i, n in enumerate(sizes)]
+    table = {
+        "max_train_rows": max_train_rows,
+        "n_eval_rows": n_eval_rows,
+        "max_features": max_features,
+        "min_train_rows": min_train_rows,
+        "log_uniform_rows": log_uniform_rows,
+        "max_cells": max_cells,
+        "feature_scale": feature_scale,
+    }
+    jobs = [(n, seed + i, table) for i, n in enumerate(sizes)]
     if n_jobs == 1:
         targets = _border_targets(jobs[0])
     else:

@@ -29,7 +29,8 @@
   범주형 열은 power 멤버처럼 번호 그대로다. `MEMBER_KINDS_V2_5 = ("quantile", "robust")`
   (2.5가 Yeo-Johnson을 계속 쓰는지는 적혀 있지 않다)
 - 분류: logit을 온도 0.9로 나눠 softmax한 뒤 멤버 평균
-- 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 예측 분포는 구간 경계만
+- 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다(전처리 종류마다 절반씩:
+  종류를 한 바퀴 돌 때마다 켜고 끈다). 예측 분포는 구간 경계만
   역변환해 공통 경계로 옮긴 뒤 평균한다
 
 회귀 예측값(평균)에는 논문에 없는 것을 정했다 (여기서 정함).
@@ -75,7 +76,32 @@ SOFTMAX_TEMPERATURE = 0.9
 MEMBER_KINDS = ("quantile", "power", "robust")
 DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2
 MEMBER_KINDS_V2_5 = ("quantile", "robust")
+MEMBER_KIND_PRESETS = {"v2": DEFAULT_MEMBER_KINDS, "v2.5": MEMBER_KINDS_V2_5}
 SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
+
+
+def resolve_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """멤버 전처리 종류. 쉼표로 이은 문자열, 프리셋 이름(`MEMBER_KIND_PRESETS`), 종류의 목록을
+    받는다. 모르는 종류가 있거나 비어 있으면 ValueError."""
+    if isinstance(value, str):
+        if value in MEMBER_KIND_PRESETS:
+            return MEMBER_KIND_PRESETS[value]
+        value = [k.strip() for k in value.split(",") if k.strip()]
+    kinds = tuple(value)
+    if not kinds or set(kinds) - set(MEMBER_KINDS):
+        raise ValueError(
+            f"멤버 종류는 {MEMBER_KINDS}(또는 {tuple(MEMBER_KIND_PRESETS)})에서: {value}"
+        )
+    return kinds
+
+
+def one_hot_kinds(one_hot: str, member_kinds: tuple[str, ...]) -> frozenset[str]:
+    """`one_hot` 모드에서 범주형 열을 펼치는 멤버 종류. 이 집합이 같은 두 모드는 결과도 같다."""
+    if one_hot == "all":
+        return frozenset(member_kinds)
+    if one_hot == "power":  # 분위수가 아닌 멤버(power·robust)만
+        return frozenset(k for k in member_kinds if k != "quantile")
+    return frozenset()
 
 
 def _to_numeric(X: Any, categorical: list[int] | None) -> tuple[np.ndarray, list[int], Any]:
@@ -258,16 +284,14 @@ class _Base:
         n_estimators: int,
         categorical_features_indices: list[int] | None = None,
         one_hot: str = DEFAULT_ONE_HOT,
-        member_kinds: tuple[str, ...] = DEFAULT_MEMBER_KINDS,
+        member_kinds: tuple[str, ...] | str = DEFAULT_MEMBER_KINDS,
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
         if one_hot not in ONE_HOT_MODES:
             raise ValueError(f"one_hot은 {ONE_HOT_MODES} 가운데 하나여야 한다: {one_hot}")
-        if not member_kinds or set(member_kinds) - set(MEMBER_KINDS):
-            raise ValueError(f"member_kinds는 {MEMBER_KINDS}에서 고른다: {member_kinds}")
         self.one_hot = one_hot
-        self.member_kinds = tuple(member_kinds)
+        self.member_kinds = resolve_member_kinds(member_kinds)
         self.model = model
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -275,9 +299,9 @@ class _Base:
         self.random_state = random_state
 
     def _fit_members(self, X: Any, members: list[_Member]) -> None:
+        expanded = one_hot_kinds(self.one_hot, self.member_kinds)
         for m in members:
-            # "power" 모드는 분위수가 아닌 멤버(power·robust)만 펼친다
-            m.one_hot = self.one_hot == "all" or (self.one_hot == "power" and m.kind != "quantile")
+            m.one_hot = m.kind in expanded
         X_num, self.cat_ix_, self.encoder_ = _to_numeric(X, self.categorical_features_indices)
         self.preprocessors_ = [_MemberPreprocessor(m, self.cat_ix_).fit(X_num) for m in members]
         # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
@@ -410,7 +434,8 @@ class TabPFNv2Regressor(_Base):
             _Member(
                 kind=self._kind(i),
                 class_permutation=None,
-                target_power=(i // 2) % 2 == 1,
+                # 종류를 한 바퀴 돌 때마다 켜고 끈다: 종류마다 y power 변환이 절반씩
+                target_power=(i // len(self.member_kinds)) % 2 == 1,
                 seed=int(rng.integers(0, 2**31 - 1)),
             )
             for i in range(self.n_estimators)

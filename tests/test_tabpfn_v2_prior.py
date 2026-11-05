@@ -1,9 +1,12 @@
 """TabPFN v2 학습 데이터(TabICL prior + 논문 크기 규칙) 테스트."""
 
 import numpy as np
+import pytest
 import torch
 
 from minipfn.tabpfn_v2 import prior as P
+from minipfn.tabpfn_v2 import train as T
+from minipfn.utils import DistContext
 
 
 def test_table_size_follows_paper_rules():
@@ -107,3 +110,39 @@ def test_min_train_rows_fit_in_the_cell_budget():
     n_train, n_features = sizes[:, 0], sizes[:, 1]
     assert n_train.min() >= 512
     assert ((n_train + P.N_EVAL_ROWS) * n_features < 400_000).all()
+
+
+def test_table_sizes_that_cannot_be_drawn_raise():
+    # 학습 행 하한 + 검증 행이 셀 제한을 채우면 feature가 하나도 안 들어간다
+    with pytest.raises(ValueError, match="셀 제한"):
+        P.check_table_size(60_000, 60_000, 128, 50_000)
+    with pytest.raises(ValueError, match="학습 행 수 범위"):
+        P.check_table_size(4096, 2048, 128, 400_000)
+    with pytest.raises(ValueError, match="셀 제한"):
+        P.TabPFNv2Prior(
+            "regression", min_train_rows=60_000, max_train_rows=60_000, max_cells=50_000
+        )
+
+
+def test_borders_use_the_training_table_sizes(monkeypatch):
+    seen = {}
+
+    def fake_borders(n_buckets, n_datasets, seed, **kw):
+        seen.update(kw)
+        return torch.linspace(-3, 3, n_buckets + 1)
+
+    monkeypatch.setattr(T, "regression_borders", fake_borders)
+    config = T.TabPFNv2TrainConfig.long_tables("regression")
+    T._borders(config, DistContext(), torch.device("cpu"))
+    assert {k: seen[k] for k in config.table_sizes()} == config.table_sizes()
+    assert (
+        seen["min_train_rows"] == 512 and seen["log_uniform_rows"] and seen["max_cells"] == 400_000
+    )
+
+
+def test_border_prior_with_default_sizes_is_the_paper_prior():
+    # 크기 설정을 기본값으로 주면 예전(크기 설정 없이 만든 prior)과 같은 경계다
+    explicit = P.regression_borders(
+        50, 4, seed=3, **T.TabPFNv2TrainConfig("regression").table_sizes()
+    )
+    assert torch.equal(explicit, P.regression_borders(50, 4, seed=3))

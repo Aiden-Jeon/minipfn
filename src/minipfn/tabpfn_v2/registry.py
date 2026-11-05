@@ -57,12 +57,17 @@ def build_model(model_type: str, config: Any) -> nn.Module:
     return cls(config)
 
 
+def model_from_state(state: dict) -> tuple[nn.Module, torch.Tensor | None]:
+    """모델 설정(`config`)이 든 checkpoint에서 (모델, 회귀 구간 경계). `model.save_checkpoint` 파일
+    (가중치 `state_dict`)과 학습 중 checkpoint(가중치 `model`) 모두 읽는다. `model_type`이 없는
+    이전 파일은 v2다."""
+    model = build_model(state.get("model_type", DEFAULT_MODEL_TYPE), state["config"])
+    model.load_state_dict(state["state_dict"] if "state_dict" in state else state["model"])
+    return model.eval(), state["borders"]
+
+
 def load_checkpoint(
     path: str | Path, map_location: str | torch.device = "cpu"
 ) -> tuple[nn.Module, torch.Tensor | None]:
-    """`model.save_checkpoint`로 저장한 파일을 읽는다."""
-    checkpoint = torch.load(path, map_location=map_location, weights_only=True)
-    model_type = checkpoint.get("model_type", DEFAULT_MODEL_TYPE)
-    model = build_model(model_type, checkpoint["config"])
-    model.load_state_dict(checkpoint["state_dict"])
-    return model.eval(), checkpoint["borders"]
+    """`model.save_checkpoint`로 저장한 파일, 또는 모델 설정을 남긴 학습 중 checkpoint를 읽는다."""
+    return model_from_state(torch.load(path, map_location=map_location, weights_only=True))

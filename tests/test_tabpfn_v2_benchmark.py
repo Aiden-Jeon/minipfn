@@ -68,3 +68,22 @@ def test_expands_one_hot_needs_a_small_categorical_column():
     assert not script.expands_one_hot(task({"a": many}, []))  # 범주가 많으면 번호로 둔다
     wide = {f"c{i}": [0, 1, 2] * 10 for i in range(200)}
     assert not script.expands_one_hot(task(wide, list(range(200))))  # 폭 상한에 걸려 펼치지 않는다
+
+
+def test_modes_with_the_same_result_are_evaluated_once():
+    script = _eval_script()
+    modes = ["off", "power", "all"]
+    # 분위수 멤버만 쓰면 power는 아무 열도 펼치지 않아 off와 같다
+    assert script.same_result_modes(modes, ("quantile",), True) == [["all"], ["off", "power"]]
+    assert script.same_result_modes(modes, ("quantile", "power"), True) == [
+        ["all"],
+        ["off"],
+        ["power"],
+    ]
+    # 펼칠 열이 없으면 모두 같다 (headline이 맨 앞)
+    assert script.same_result_modes(modes, ("quantile", "power"), False) == [
+        ["all", "off", "power"]
+    ]
+    assert script.parse_args(["--member-kinds", "v2.5"]).member_kinds == ("quantile", "robust")
+    with pytest.raises(SystemExit):
+        script.parse_args(["--member-kinds", "quantile,box-cox"])
