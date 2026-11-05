@@ -3,12 +3,14 @@
 코드는 네 축과 그 조합으로 나눈다. 축의 모듈은 무엇인지로 이름을 붙인 부품이고(일반 명사), 논문
 이름은 recipe에만 쓴다. 논문 하나는 각 축의 부품을 논문 수치로 묶은 것(recipe)이다.
 
-- `priors`: 학습 데이터 (GP, 단순 SCM, MLP SCM, prior bag, graph SCM, 표 크기 규칙)
+- `priors`: 학습 데이터 (조립기, 생성기, 후처리, 표 크기 규칙과 그것을 묶은 prior bag·graph SCM,
+  1D GP)
 - `models`: 모델과 registry (point / row / cell Transformer, bar distribution)
 - `training`: 학습 설정과 공용 학습 루프, 데이터 공급, 손실, 안정화
 - `inference`: sklearn 형식 추론 (회전 앙상블, 전처리 멤버 앙상블)
 - `benchmarks`: 평가 (AMLB·CTR23, OpenML-CC18, GP 비교)
 - `hub`: Hugging Face Hub에 올리고 받기
+- `tabular`: 표 표준화·이상치 누르기 (prior 후처리와 v1 추론 전처리가 같이 쓴다)
 - `recipes`: 논문별 수치와 조합 (`pfn`, `tabpfn_v1`, `tabpfn_v2`). 논문에만 있는 학습 루프
   (PFN, TabPFN v1)도 여기에 있다
 
@@ -31,7 +33,6 @@ from minipfn.models.bar_distribution import (
 )
 from minipfn.models.point_transformer import PointTransformer, build_attention_mask
 from minipfn.priors.gp import GPPriorSampler, analytic_gp_posterior, rbf_kernel
-from minipfn.priors.simple_scm import sample_random_scm, sample_scm_dataset, to_classes
 from minipfn.recipes.pfn import (
     PFNConfig,
     build_criterion,
@@ -98,9 +99,6 @@ __all__ = [
     "load_checkpoint",
     "load_logged_model",
     "evaluate_against_gp",
-    "to_classes",
-    "sample_random_scm",
-    "sample_scm_dataset",
     "from_pretrained",
     "TabPFNv1Classifier",
     "TabPFNv2Classifier",

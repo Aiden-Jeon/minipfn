@@ -3,11 +3,9 @@ from functools import partial
 import numpy as np
 import torch
 
-from minipfn.priors.prior_bag import (
-    sample_gp_tables,
-    sample_group_hyperparameters,
-    sample_hyperparameter,
-)
+from minipfn.priors.generators.gp import sample_gp_tables
+from minipfn.priors.hyperparameters import sample_hyperparameter
+from minipfn.priors.prior_bag import sample_group_hyperparameters
 from minipfn.recipes import tabpfn_v1 as spec
 from minipfn.recipes.tabpfn_v1 import TabPFNPrior
 from minipfn.training.data import PriorGroups
