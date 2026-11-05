@@ -172,6 +172,7 @@ uv run python hub/push_to_hub.py --paper tabpfn_v2 --task regression --repo-id <
 - [`notebooks/01_pfn/`](notebooks/01_pfn) — Müller et al., *[Transformers Can Do Bayesian Inference](https://arxiv.org/pdf/2112.10510)*, ICLR 2022
 - [`notebooks/02_tabpfn/`](notebooks/02_tabpfn) — Hollmann et al., *[TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second](https://arxiv.org/pdf/2207.01848)*, ICLR 2023
 - [`notebooks/03_tabpfn_v2/`](notebooks/03_tabpfn_v2) — Hollmann et al., *[Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6)*, Nature 2025
+- [`notebooks/04_tabpfn_v2_5/`](notebooks/04_tabpfn_v2_5) — Grinsztajn et al., *[TabPFN-2.5: Advancing the State of the Art in Tabular Foundation Models](https://arxiv.org/pdf/2511.08667)*, 2025
 
 공식 구현은 [automl/PFNs](https://github.com/automl/PFNs), [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)입니다.
 
