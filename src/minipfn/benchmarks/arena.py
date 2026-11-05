@@ -2,7 +2,8 @@
 leaderboard와 같은 방식으로 점수를 낸다.
 
 데이터, split, 지표, 집계는 TabArena 공식 패키지 `tabarena`(extra `arena`:
-`uv sync --extra arena`)를 쓴다. 직접 만드는 것은 estimator를 그 패키지의 system
+`uv sync --no-dev --extra arena --group arena-dev`. pandas 2.3이 필요해 dev group과 따로 설치한다)를
+쓴다. 직접 만드는 것은 estimator를 그 패키지의 system
 (`ExternalSystemModel`, 전처리·검증을 스스로 하는 방법)으로 감싸는 부분, 모델이 다룰 수 없는
 데이터셋을 고르는 규칙, 결과를 저장하는 형식이다.
 
@@ -103,7 +104,8 @@ def make_context(suite: Suite):
         from tabarena import contexts
     except ImportError as e:  # pragma: no cover - extra가 없을 때만
         raise ImportError(
-            "TabArena·BeyondArena 평가에는 tabarena 패키지가 필요하다: uv sync --extra arena"
+            "TabArena·BeyondArena 평가에는 tabarena 패키지가 필요하다: "
+            "uv sync --no-dev --extra arena --group arena-dev"
         ) from e
     return getattr(contexts, suite.context)(backend="native")
 
@@ -149,11 +151,15 @@ def run(
     bagging: int = 0,
     datasets: list[str] | None = None,
     breakdown: bool = True,
+    fingerprint: str = "",
 ) -> dict:
     """suite의 split을 돌리고 점수를 낸다. 결과는 `out_dir`에 쓰고 요약을 돌려준다.
 
-    split 결과는 `out_dir/runs`에 split마다 저장해 두므로, 같은 `out_dir`로 다시 부르면 끝난
-    split은 다시 돌리지 않는다. `datasets`를 주면 그 데이터셋만 돌린다(나머지는 imputed).
+    split 결과는 `out_dir/runs/<id>`에 split마다 저장해 두고, 같은 `out_dir`로 다시 부르면 끝난
+    split은 다시 돌리지 않는다. `<id>`는 `fingerprint`(estimator를 정하는 것: 체크포인트, 추론
+    설정 등. 부르는 쪽이 준다)와 `method`·`bagging`으로 만든다. 그래서 다른 체크포인트의 결과를
+    다시 쓰지 않는다. `datasets`를 주면 그 데이터셋만 돌린다(나머지는 imputed). 돌린 split이
+    없거나 모두 실패하면 점수는 비우고(None) 나머지 파일은 그대로 쓴다.
 
     쓰는 파일:
     - `tasks.csv`: split마다 돌렸는지(`skip_reason`, 돌렸는데 실패한 split은 "failed")
@@ -161,7 +167,8 @@ def run(
     - `leaderboard.csv`: baseline과 함께 낸 leaderboard (`tabarena` 형식, 모든 방법)
     - `leaderboard_<이름>.csv`: subset별 leaderboard (`breakdown`)
     - `comparison.csv`: 공개 leaderboard(같은 split)와 이 실행의 점수를 방법마다 나란히
-    - `summary.json`: 이 방법의 점수, imputed 비율, 승률, 설정
+    - `summary.json`: 이 방법의 점수, imputed 비율, 승률, 설정 (공개 CSV를 못 받으면
+      `comparison.csv`의 공개 쪽 열은 비어 있다)
     - `compare.log`: `tabarena` 집계의 출력
     """
     from minipfn.benchmarks import _arena_system as system
@@ -183,6 +190,11 @@ def run(
         flush=True,
     )
 
+    run_id = _run_id(fingerprint, method, bagging)
+    run_dir = out_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "fingerprint.txt").write_text(f"{method}\nbagging={bagging}\n{fingerprint}\n")
+
     results = []
     if len(todo):
         key = system.register_factory(make_estimator)
@@ -197,7 +209,7 @@ def run(
         # split 하나가 실패해도 멈추지 않는다: 그 split은 결과가 없어 imputed가 된다(`failed`)
         results = context.run_jobs(
             jobs,
-            expname=str(out_dir / "runs"),
+            expname=str(run_dir),
             register=False,
             debug_mode=True,
             raise_on_failure=False,
@@ -215,31 +227,35 @@ def run(
         ta_results=pool,
         return_results=True,
     )
-    name = _new_method_name(context, leaderboard, method)
+    name = _new_method_name(leaderboard, method)
+    if name is None:
+        print(f"{method}: 결과가 있는 split이 없어 점수를 내지 않는다", file=sys.stderr)
     fillna = context.fillna_method
     leaderboard.to_csv(out_dir / "leaderboard.csv", index=False)
-    ours = with_imputed(per_split, name, fillna)
+    ours = with_imputed(per_split, name or method, fillna)
     ours.drop(columns=["method_metadata"], errors="ignore").to_csv(
         out_dir / "results_per_split.csv", index=False
     )
     # 돌렸는데 결과가 없는 split (results의 fold는 split 번호다)
     filled = ours[ours["imputed"]]
     imputed = set(zip(filled["dataset"], filled["fold"], strict=True))
-    failed = grid["skip_reason"].isna() & [
-        (d, s) in imputed for d, s in zip(grid["dataset"], grid["split"], strict=True)
-    ]
+    was_imputed = pd.Series(
+        [(d, s) in imputed for d, s in zip(grid["dataset"], grid["split"], strict=True)],
+        index=grid.index,
+    )
+    failed = grid["skip_reason"].isna() & was_imputed
     grid.loc[failed, "skip_reason"] = "failed"
     grid.to_csv(out_dir / "tasks.csv", index=False)
     if failed.any():
         print(f"실패한 split {int(failed.sum())}개 (imputed): tasks.csv", file=sys.stderr)
     website = context.leaderboard_to_website_format(leaderboard=leaderboard)
-    public = load_public_leaderboard(suite.public_csv)
-    comparison = compare_with_public(website, public, name)
+    comparison = compare_with_public(website, try_public_leaderboard(suite.public_csv), name)
     comparison.to_csv(out_dir / "comparison.csv", index=False)
 
     summary = {
         "suite": suite.name,
-        "method": name,
+        "method": name or method,
+        "run_id": run_id,
         "bagging": bagging,
         "limits": _limits_dict(limits),
         "splits": len(grid),
@@ -248,11 +264,11 @@ def run(
         "failed_splits": int(failed.sum()),
         "imputed_pct": 100.0 * float(ours["imputed"].mean()),
         "skip_reasons": _reason_counts(grid["skip_reason"]),
-        **_scores(leaderboard, name),
+        **(_scores(leaderboard, name) if name else dict.fromkeys(SCORE_KEYS)),
         "winrate": winrates(per_split, ours),
         "breakdown": {},
     }
-    if breakdown:
+    if breakdown and name:
         for label, (subset, public_csv) in suite.breakdown.items():
             part = _quiet(_breakdown, log, context, pool, subset, name, public_csv)
             if part is None:
@@ -264,6 +280,13 @@ def run(
         json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
     )
     return summary
+
+
+def _run_id(fingerprint: str, method: str, bagging: int) -> str:
+    import hashlib
+
+    text = json.dumps([method, bagging, fingerprint])
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
 
 
 def _reason_counts(reasons: pd.Series) -> dict:
@@ -304,12 +327,26 @@ def _job_split(job) -> tuple[str, int, int]:
     return (task.dataset, int(task.fold), int(task.repeat))
 
 
-def _new_method_name(context, leaderboard: pd.DataFrame, method: str) -> str:
-    # 등록한 방법의 leaderboard 이름 (system 설정 이름이 붙는다)
+def _new_method_name(leaderboard: pd.DataFrame, method: str) -> str | None:
+    # 등록한 방법의 leaderboard 이름 (system 설정 이름이 붙는다). 결과가 없으면 None
     names = [m for m in leaderboard["method"] if str(m).startswith(method)]
-    if len(names) != 1:
-        raise RuntimeError(f"leaderboard에서 {method}를 찾지 못했다: {names}")
-    return names[0]
+    if len(names) > 1:
+        raise RuntimeError(f"leaderboard에 {method}로 시작하는 방법이 여럿이다: {names}")
+    return names[0] if names else None
+
+
+SCORE_KEYS = (
+    "elo",
+    "elo_ci_plus",
+    "elo_ci_minus",
+    "score",
+    "improvability",
+    "rank",
+    "harmonic_rank",
+    "imputed_pct_leaderboard",
+    "n_methods",
+    "position",
+)
 
 
 def _scores(leaderboard: pd.DataFrame, name: str) -> dict:
@@ -392,12 +429,7 @@ def _breakdown(context, pool, subset: tuple[str, ...], name: str, public_csv: st
     }
     if public_csv:
         website = context.leaderboard_to_website_format(leaderboard=board)
-        try:
-            public = load_public_leaderboard(public_csv)
-        except Exception as e:  # 공개 CSV가 없는 조합
-            print(f"공개 leaderboard {public_csv}: {e}", file=sys.stderr, flush=True)
-        else:
-            board = compare_with_public(website, public, name)
+        board = compare_with_public(website, try_public_leaderboard(public_csv), name)
     return board, scores
 
 
@@ -409,6 +441,16 @@ def load_public_leaderboard(path: str) -> pd.DataFrame:
     return df
 
 
+def try_public_leaderboard(path: str) -> pd.DataFrame | None:
+    """`load_public_leaderboard`, 받지 못하면(네트워크, 없는 조합) None. 몇 시간 돌린 결과를
+    공개 CSV 하나 때문에 잃지 않도록."""
+    try:
+        return load_public_leaderboard(path)
+    except Exception as e:
+        print(f"공개 leaderboard {path}를 받지 못했다: {e}", file=sys.stderr, flush=True)
+        return None
+
+
 def display_name(model: str) -> str:
     """leaderboard의 Model 칸(`[이름 (default)](링크) [x% IMPUTED]`)에서 이름만."""
     model = str(model)
@@ -417,9 +459,12 @@ def display_name(model: str) -> str:
     return model.split(" [")[0].strip()
 
 
-def compare_with_public(website: pd.DataFrame, public: pd.DataFrame, name: str) -> pd.DataFrame:
+def compare_with_public(
+    website: pd.DataFrame, public: pd.DataFrame | None, name: str | None
+) -> pd.DataFrame:
     """방법마다 공개 leaderboard의 Elo·점수와 이 실행에서 다시 낸 값을 나란히 둔다.
-    이 실행의 방법(`name`)은 공개 쪽 값이 비어 있다. Elo 순."""
+    이 실행의 방법(`name`)은 공개 쪽 값이 비어 있다. `public`이 None이면 공개 쪽 열이 모두
+    비어 있다. Elo 순."""
     cols = {
         "Elo [⬆️]": "elo",
         "Elo 95% CI": "elo_ci",
@@ -429,8 +474,11 @@ def compare_with_public(website: pd.DataFrame, public: pd.DataFrame, name: str) 
     }
     ours = website.copy()
     ours["name"] = ours["Model"].map(display_name)
-    ours.loc[ours["Model"].astype(str).str.contains(name, regex=False), "name"] = name
+    if name is not None:
+        ours.loc[ours["Model"].astype(str).str.contains(name, regex=False), "name"] = name
     ours = ours[["name", *[c for c in cols if c in ours]]].rename(columns=cols)
+    if public is None:
+        public = pd.DataFrame({"name": pd.Series(dtype=str), **{c: [] for c in cols}})
     theirs = public[["name", *[c for c in cols if c in public]]].rename(columns=cols)
     merged = ours.merge(theirs, on="name", how="outer", suffixes=("", "_public"))
     merged["is_new"] = merged["name"] == name

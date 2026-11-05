@@ -53,7 +53,8 @@ def prepare_frame(X: pd.DataFrame) -> tuple[pd.DataFrame, list[int]]:
         s = X[col]
         if pd.api.types.is_datetime64_any_dtype(s):
             s = s.dt.tz_localize(None) if getattr(s.dt, "tz", None) is not None else s
-            X[col] = s.astype("int64").where(s.notna()) / 1e9
+            # 단위(datetime64[ns]·[us]·[s])와 상관없이 1970-01-01부터의 초. NaT는 NaN
+            X[col] = (s - pd.Timestamp(0)) / pd.Timedelta(seconds=1)
         elif pd.api.types.is_bool_dtype(s):
             X[col] = s.astype(float)
         elif not pd.api.types.is_numeric_dtype(s):
@@ -104,8 +105,12 @@ class EstimatorSystem(ExternalSystemModel):
     def _predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         Xp, _ = prepare_frame(X)
         Xp = Xp.reset_index(drop=True)
-        # bag마다 본 클래스가 다를 수 있다: 모든 bag의 클래스로 열을 맞추고 없는 클래스는 0
-        classes = sorted({c for e in self.estimators_ for c in e.classes_}, key=str)
+        # bag마다 본 클래스가 다를 수 있다: 모든 bag의 클래스로 열을 맞추고 없는 클래스는 0.
+        # 열 순서는 라벨의 자연 순서(np.unique, estimator의 LabelEncoder와 같다)여야 한다.
+        # TabArena가 이진 분류는 둘째 열을, 다중 분류는 열을 위치로 읽기 때문이다
+        classes = list(
+            np.unique(np.concatenate([np.asarray(e.classes_) for e in self.estimators_]))
+        )
         total = pd.DataFrame(0.0, index=range(len(Xp)), columns=classes)
         for e in self.estimators_:
             proba = pd.DataFrame(np.asarray(e.predict_proba(Xp)), columns=list(e.classes_))

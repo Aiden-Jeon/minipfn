@@ -100,6 +100,34 @@ def test_comparison_puts_public_and_recomputed_scores_side_by_side():
     assert np.isnan(out.loc[2, "elo"])  # 이 실행의 pool에 없는 방법
 
 
+def test_comparison_without_public_table_or_new_method():
+    website = pd.DataFrame({"Model": ["[XGBoost (default)](u)"], "Elo [⬆️]": [1180.0]})
+    out = arena.compare_with_public(website, None, None)
+    assert list(out["name"]) == ["XGBoost (default)"]
+    assert np.isnan(out.loc[0, "elo_public"]) and not out["is_new"].any()
+
+
+def test_public_table_failure_does_not_raise(monkeypatch):
+    def fail(path):
+        raise OSError("HTTP 503")
+
+    monkeypatch.setattr(arena, "load_public_leaderboard", fail)
+    assert arena.try_public_leaderboard("data/x.csv") is None
+
+
+def test_run_id_changes_with_the_estimator_fingerprint():
+    a = arena._run_id("clf=step_100k", "minipfn", 0)
+    assert a == arena._run_id("clf=step_100k", "minipfn", 0)
+    assert a != arena._run_id("clf=step_200k", "minipfn", 0)
+    assert a != arena._run_id("clf=step_100k", "minipfn", 8)
+
+
+def test_method_without_results_has_no_name():
+    board = pd.DataFrame({"method": ["RF (default)", "minipfn_c1"]})
+    assert arena._new_method_name(board, "minipfn") == "minipfn_c1"
+    assert arena._new_method_name(board.iloc[:1], "minipfn") is None
+
+
 def test_suites_point_at_the_official_splits_and_public_tables():
     assert tabarena.SUITE.subset == ("lite",)
     assert "splits_lite" in tabarena.SUITE.public_csv
@@ -147,8 +175,31 @@ def test_prepare_frame_turns_dates_into_numbers_and_strings_into_categoricals():
     out, categorical = system.prepare_frame(X)
     assert categorical == [2]
     assert out["when"].iloc[0] == pytest.approx(1577836800.0) and np.isnan(out["when"].iloc[1])
+    # parquet에서 읽은 datetime64[us]·[s]도 같은 초 단위
+    for unit in ("us", "s"):
+        coarse, _ = system.prepare_frame(X.assign(when=X["when"].astype(f"datetime64[{unit}]")))
+        assert coarse["when"].iloc[0] == pytest.approx(1577836800.0)
     assert out["flag"].tolist() == [1.0, 0.0]
     assert X["when"].dtype.kind == "M"  # 원래 frame은 그대로
+
+
+def test_probability_columns_follow_the_natural_label_order():
+    # 정수 라벨 2와 10: 문자열 순서("10" < "2")로 두면 TabArena가 둘째 열을 클래스 10으로 읽는다
+    system = _system()
+    key = system.register_factory(lambda problem_type, categorical: _Constant())
+    model = object.__new__(system.EstimatorSystem)
+    model.factory, model.bagging = key, 0
+    X = pd.DataFrame({"x": np.arange(10.0)})
+    y = pd.Series([2] * 8 + [10] * 2)
+    model._fit_system(X, y, problem_type="binary", random_state=0)
+    proba = model._predict_proba(X)
+    assert list(proba.columns) == [2, 10]
+    np.testing.assert_allclose(proba.iloc[:, 1], 0.2)
+    labels = pd.Series(list(range(12)) * 2)  # 다중 분류 0..11
+    model._fit_system(
+        pd.DataFrame({"x": np.arange(24.0)}), labels, problem_type="multiclass", random_state=0
+    )
+    assert list(model._predict_proba(X).columns) == list(range(12))
 
 
 def test_bagging_fits_k_estimators_and_aligns_their_classes():

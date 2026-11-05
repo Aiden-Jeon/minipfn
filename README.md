@@ -90,11 +90,11 @@ uv run python scripts/tabpfn_v2/eval.py \
 
 평가 스크립트도 멤버 전처리 종류를 가중치에서 정합니다. 다른 종류로 재려면 `--member-kinds v2.5`처럼 줍니다.
 
-[TabArena](https://huggingface.co/spaces/TabArena/leaderboard) 공개 leaderboard와 같은 split·지표로도 잽니다. `--suite tabarena-lite`(데이터셋 51개의 첫 split), `--suite beyondarena`(데이터셋 142개, 공식 split 2,000개), `--suite beyondarena-lite`(데이터셋마다 첫 split)입니다. 데이터와 다른 방법 약 100개의 결과는 TabArena 공식 패키지 `tabarena`가 받으므로 extra를 먼저 설치합니다. 이 패키지가 쓰는 autogluon 때문에 pandas는 2.3이 됩니다.
+[TabArena](https://huggingface.co/spaces/TabArena/leaderboard) 공개 leaderboard와 같은 split·지표로도 잽니다. `--suite tabarena-lite`(데이터셋 51개의 첫 split), `--suite beyondarena`(데이터셋 142개, 공식 split 2,000개), `--suite beyondarena-lite`(데이터셋마다 첫 split)입니다. 데이터와 다른 방법 약 100개의 결과는 TabArena 공식 패키지 `tabarena`가 받으므로 extra `arena`를 설치합니다. 이 패키지가 쓰는 autogluon은 pandas 2.3이 필요해서, pandas 3을 쓰는 개발 환경(dev group)과는 따로 설치합니다. 그 환경에서는 `uv run`에도 같은 옵션을 붙입니다.
 
 ```bash
-uv sync --extra arena
-uv run python scripts/tabpfn_v2/eval.py --suite tabarena-lite \
+uv sync --no-dev --extra arena --group arena-dev
+uv run --no-dev --extra arena --group arena-dev python scripts/tabpfn_v2/eval.py --suite tabarena-lite \
   --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
   --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
 ```

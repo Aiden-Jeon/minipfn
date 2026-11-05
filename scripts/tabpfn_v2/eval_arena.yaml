@@ -1,12 +1,14 @@
 # TabPFN v2·2.5 TabArena-Lite·BeyondArena 평가 (scripts/tabpfn_v2/eval.py --suite tabarena-lite 등).
 # 공식 split을 돌리고 공개 leaderboard(Hugging Face Space TabArena/leaderboard)와 같은 방식으로
-# Elo·정규화 점수·improvability·승률을 낸다. suite와 체크포인트는 TABPFN_V2_EXTRA_ARGS로 준다:
+# Elo·정규화 점수·improvability·승률을 낸다. suite는 TABPFN_V2_SUITE, 체크포인트는
+# TABPFN_V2_CHECKPOINTS(기본: Hub의 v2 공개 분류·회귀 가중치)로 준다. 통째로 바꾸므로 분류나 회귀
+# 하나만 주면 다른 쪽 split은 imputed가 된다(공개 가중치가 섞이지 않는다):
 #   databricks air run -f scripts/tabpfn_v2/eval_arena.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
 #     --override "env_variables.TABPFN_V2_SUITE=beyondarena" \
-#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--classifier-path runs:/<run_id>/checkpoints/step_0500000.pt"
-# 기본 체크포인트는 Hub의 v2 공개 가중치다. 2.5 checkpoint를 평가할 때는 experiment_name을
-# tabpfn-v2-5-reproduction으로 바꾸고 --method-name minipfn-tabpfn-v2.5를 준다(멤버 전처리와 크기
-# 상한은 모델 구조로 정해진다).
+#     --override "env_variables.TABPFN_V2_CHECKPOINTS=--classifier-path runs:/<run_id>/checkpoints/step_0500000.pt" \
+#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--method-name minipfn-tabpfn-v2.5"
+# 2.5 checkpoint를 평가할 때는 experiment_name도 tabpfn-v2-5-reproduction으로 바꾼다(멤버 전처리와
+# 크기 상한은 모델 구조로 정해진다).
 experiment_name: tabpfn-v2-reproduction
 mlflow_run_name: tabpfn-v2-eval-arena
 environment:
@@ -34,8 +36,9 @@ code_source:
       - scripts/tabpfn_v2/eval.py
 env_variables:
   TABPFN_V2_SUITE: tabarena-lite
-  TABPFN_V2_CLASSIFIER: hf://aiden-jeon/minipfn-tabpfn-v2-classifier
-  TABPFN_V2_REGRESSOR: hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+  TABPFN_V2_CHECKPOINTS: >-
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
   TABPFN_V2_EXTRA_ARGS: ""
 max_retries: 0
 # BeyondArena core2k(split 2,000개)는 v2 크기 상한 안의 1,685개를 돌린다
@@ -43,5 +46,4 @@ timeout_minutes: 480
 command: >-
   PYTHONPATH=$CODE_SOURCE_PATH/src
   python $CODE_SOURCE_PATH/scripts/tabpfn_v2/eval.py --suite $TABPFN_V2_SUITE
-  --classifier-path $TABPFN_V2_CLASSIFIER --regressor-path $TABPFN_V2_REGRESSOR
-  $TABPFN_V2_EXTRA_ARGS
+  $TABPFN_V2_CHECKPOINTS $TABPFN_V2_EXTRA_ARGS
