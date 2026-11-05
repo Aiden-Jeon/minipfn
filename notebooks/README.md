@@ -36,3 +36,14 @@
 재현 결과(이 prior로 500k step 학습한 뒤 논문 benchmark 숫자와 비교)는 노트북 대신 Hub 모델 카드에 정리했습니다. 분류는 [`hub/minipfn-tabpfn-v2-classifier`](../hub/minipfn-tabpfn-v2-classifier/README.md)로 평균 ROC AUC 0.924(논문 0.932), 회귀는 [`hub/minipfn-tabpfn-v2-regressor`](../hub/minipfn-tabpfn-v2-regressor/README.md)로 논문 대비 RMSE 비율 중앙값 1.023입니다.
 
 실행 파일: `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`, `scripts/tabpfn_v2/plot_card.py`, `scripts/tabpfn_v2/train.yaml`, `scripts/tabpfn_v2/eval.yaml` (Hub: `hub/minipfn-tabpfn-v2-classifier/README.md`·`hub/minipfn-tabpfn-v2-regressor/README.md` 카드, `hub/push_to_hub.py`)
+
+## `04_tabpfn_v2_5/` — Grinsztajn et al., *TabPFN-2.5: Advancing the State of the Art in Tabular Foundation Models* (arXiv 2511.08667, 2025)
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [v2에서 바뀐 구조 4가지](04_tabpfn_v2_5/01_architecture_changes.ipynb) | 층 수, 셀 3개 묶기, thinking 행, 회귀 MLP encoder는 모델의 무엇을 바꾸는가? |
+| 02 | [긴 표 학습과 추론 전처리](04_tabpfn_v2_5/02_long_tables_and_preprocessing.ipynb) | 논문이 공개하지 않은 학습 표 크기와 robust 전처리를 어떻게 정했고, 무엇을 여기서 정했는가? |
+
+재현 결과(v2와 같은 benchmark와 TabArena-Lite에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
+
+실행 파일: `scripts/tabpfn_v2_5/train.yaml`, `scripts/tabpfn_v2_5/eval.yaml` (스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`)
