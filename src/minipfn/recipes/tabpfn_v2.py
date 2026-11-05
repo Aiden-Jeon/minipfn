@@ -27,9 +27,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
-from minipfn.inference import ensemble
 from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
+from minipfn.recipes import resolve_member_kinds
 
 if TYPE_CHECKING:
     from minipfn.training.config import TrainConfig
@@ -37,8 +37,9 @@ if TYPE_CHECKING:
 # 모델 구조. v2는 Nature 논문 기본 모델, v2.5는 TabPFN-2.5(arXiv 2511.08667 "Architecture")가
 # 적은 변경: 층 수(회귀 18, 분류 24), 셀 3개 묶기, thinking 행 64개, 회귀 encoder를 2층 MLP로.
 # emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다. 둘 다 모델 클래스는 CellTransformer다
+MODEL_TYPE = "cell_transformer"
 _V2 = {
-    "model_type": "cell_transformer",
+    "model_type": MODEL_TYPE,
     "nlayers": 12,
     "features_per_group": 2,
     "n_thinking_rows": 0,
@@ -159,13 +160,9 @@ MEMBER_KINDS_V2 = ("quantile", "power")  # 분위수 + SVD, Yeo-Johnson
 # TabPFN-2.5: "robust scaling과 soft clipping을 분위수·표준 변환과 함께"
 # (`minipfn.inference.ensemble` docstring)
 MEMBER_KINDS_V2_5 = ("quantile", "robust")
-# 이름으로 고르는 멤버 종류 묶음 (평가 스크립트의 `--member-kinds v2.5` 등)
+# 이름으로 고르는 멤버 종류 묶음 (평가 스크립트의 `--member-kinds v2.5` 등). 이름은 모든 recipe의
+# 묶음을 합친 것으로 읽는다(`minipfn.recipes.resolve_member_kinds`: v3·v3.5도 받는다)
 MEMBER_KIND_PRESETS = {"v2": MEMBER_KINDS_V2, "v2.5": MEMBER_KINDS_V2_5}
-
-
-def resolve_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
-    """멤버 전처리 종류. `MEMBER_KIND_PRESETS`의 이름, 쉼표로 구분한 문자열, 종류 목록을 받는다."""
-    return ensemble.resolve_member_kinds(value, MEMBER_KIND_PRESETS)
 
 
 def default_inference(model: nn.Module, task: str) -> dict:

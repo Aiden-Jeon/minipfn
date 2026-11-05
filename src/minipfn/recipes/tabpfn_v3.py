@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING
 
 from torch import nn
 
-from minipfn.inference import ensemble
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
+from minipfn.recipes import resolve_member_kinds
 
 if TYPE_CHECKING:
     from minipfn.training.config import TrainConfig
@@ -79,11 +79,9 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
     클래스로 정한 설정은 바꾸지 않고 에러를 낸다. `keep_size`(smoke)면 폭·층 수·head 수는 그대로
     두고 inducing point만 줄인다(구조가 바뀌는 코드 경로만 확인한다).
 
-    q·k에 RMSNorm을 쓰는 구조(v3.5)는 QK-clip이 볼 attention이 없어서 QK-clip을 끈다."""
-    changes = _model_changes(config, arch, keep_size)
-    if changes["qk_norm"]:
-        changes["qk_clip"] = None
-    return replace(config, **changes)
+    QK-clip은 끈다. 이 모델의 attention logit은 가중치만으로 묶이지 않아서 QK-clip이 볼 attention이
+    없다(`ColumnRowTransformer.qk_clip_weights`)."""
+    return replace(config, **_model_changes(config, arch, keep_size), qk_clip=None)
 
 
 def architecture_name(config) -> str | None:
@@ -110,8 +108,9 @@ def model_architecture(model: nn.Module, task: str) -> str | None:
 
 
 def paper(task: str = "classification", arch: str = "v3") -> TrainConfig:
-    """논문 규모 학습 설정. 보고서에 학습 설정이 없어서 prior·표 크기·batch 64·step·lr·붕괴 규칙·
-    (회귀) QK-clip 250은 v2 paper 그대로이고 구조만 `arch`로 바꾼다."""
+    """논문 규모 학습 설정. 보고서에 학습 설정이 없어서 prior·표 크기·batch 64·step·lr·붕괴 규칙은
+    v2 paper 그대로이고 구조만 `arch`로 바꾼다. v2 회귀의 QK-clip 250은 이 모델에 쓸 수 없어 끈다
+    (`with_architecture`)."""
     from minipfn.recipes import tabpfn_v2
 
     return with_architecture(tabpfn_v2.paper(task), arch)
@@ -129,12 +128,8 @@ INFERENCE = {
     },
     "v3.5": {"n_estimators": {"classification": 8, "regression": 8}, "member_kinds": ("standard",)},
 }
+# 이름으로 고르는 멤버 종류 묶음 (`minipfn.recipes.resolve_member_kinds`가 v2·v2.5와 합쳐 읽는다)
 MEMBER_KIND_PRESETS = {name: v["member_kinds"] for name, v in INFERENCE.items()}
-
-
-def resolve_member_kinds(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
-    """멤버 전처리 종류. `MEMBER_KIND_PRESETS`의 이름, 쉼표로 구분한 문자열, 종류 목록을 받는다."""
-    return ensemble.resolve_member_kinds(value, MEMBER_KIND_PRESETS)
 
 
 def default_inference(model: nn.Module, task: str) -> dict:

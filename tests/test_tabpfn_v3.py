@@ -65,9 +65,10 @@ def test_paper_architecture_and_names():
     config = recipe.paper("regression")
     assert config.model_type == "column_row_transformer"
     assert recipe.architecture_name(config) == "v3"
-    assert config.qk_clip == tabpfn_v2.paper("regression").qk_clip  # v2 학습 설정 그대로
+    assert tabpfn_v2.paper("regression").qk_clip is not None and config.qk_clip is None
+    assert config.lr == tabpfn_v2.paper("regression").lr  # 그 밖의 학습 설정은 v2 그대로
     v35 = recipe.paper("regression", "v3.5")
-    assert recipe.architecture_name(v35) == "v3.5" and v35.qk_clip is None  # q·k RMSNorm이라 끔
+    assert recipe.architecture_name(v35) == "v3.5" and v35.qk_clip is None
     smoke = recipe.with_architecture(TrainConfig.smoke(), "v3.5", keep_size=True)
     assert recipe.architecture_name(smoke) == "v3.5" and smoke.n_inducing == 8
     # 다른 recipe의 구조 이름과 섞이지 않는다
@@ -125,13 +126,60 @@ def test_every_parameter_gets_a_gradient(arch):
         assert [n for n, p in model.named_parameters() if p.grad is None] == []
 
 
-def test_qk_clip_sees_the_icl_attention_only_without_qk_norm():
+def test_qk_clip_is_not_offered(tmp_path):
+    # QASSMax의 학습 배율과 테스트 행 multi-query 때문에 가중치 상한이 logit을 묶지 못한다
+    assert _model().qk_clip_weights() == [] and _model(arch="v3.5").qk_clip_weights() == []
+    config = recipe.with_architecture(TrainConfig.smoke(), "v3", keep_size=True)
+    with pytest.raises(ValueError, match="QK-clip"):
+        train(replace(config, qk_clip=50.0), tmp_path, mlflow_log=False)
+
+
+def test_test_row_multi_query_matches_expanded_heads():
+    # 테스트 행은 head를 query 길이로 접어 계산한다. key·value를 head 수만큼 늘린 것과 같다
+    import torch.nn.functional as F
+
+    attention = _model().icl_layers[0].attention
+    x = torch.randn(2, 30, attention.qkv.in_features)
+    n = 20
+    out = attention(x, n_context=n)
+    d = x.shape[-1]
+    w = attention.qkv.weight
+    q = attention._heads(F.linear(x, w[:d]))
+    k = attention._heads(F.linear(x[:, :n], w[d : 2 * d]))
+    v = attention._heads(F.linear(x[:, :n], w[2 * d :]))
+    q = attention.qassmax(q, n)
+    test = F.scaled_dot_product_attention(q[:, :, n:], k[:, :1].expand_as(k), v[:, :1].expand_as(v))
+    expected = attention.out(test.transpose(1, 2).reshape(2, 10, d))
+    assert torch.allclose(out[:, n:], expected, atol=1e-5)
+
+
+def test_retrieval_decoder_projects_only_what_it_uses():
     model = _model()
-    weights = model.qk_clip_weights()
-    assert len(weights) == model.config.nlayers
-    assert all(kind == "sample_attention" for kind, _ in weights)
-    assert weights[0][1].shape == (3 * model.config.icl_dim, model.config.icl_dim)
-    assert _model(arch="v3.5").qk_clip_weights() == []
+    h = torch.randn(2, 30, model.config.icl_dim)
+    y = torch.randint(0, 3, (2, 20)).float()
+    heads, dh = model.config.decoder_heads, model.config.decoder_head_dim
+    q, k = model.decoder(h).split(heads * dh, dim=-1)  # 행마다 둘 다 만든 것
+    q = model.decoder_qassmax(q[:, 20:].reshape(2, -1, heads, dh).transpose(1, 2), 20)
+    k = k[:, :20].reshape(2, -1, heads, dh).transpose(1, 2)
+    weights = torch.softmax((q @ k.transpose(-1, -2)).float() / dh**0.5, dim=-1)
+    onehot = torch.nn.functional.one_hot(y.long(), model.config.n_out).float()
+    expected = (weights @ onehot[:, None]).mean(1).clamp_min(1e-6).log()
+    assert torch.allclose(model._retrieve(h, y, 20), expected, atol=1e-5)
+
+
+def test_ecdf_of_columns_constant_on_train_rows_is_flat():
+    # 학습 행에서 상수인 열은 z처럼 ECDF도 모든 행에서 같은 값이라 테스트 행에만 있는 신호가 없다
+    model = _model(arch="v3.5")
+    x = torch.randn(1, 30, 4)
+    x[0, :20, 1] = 3.0  # 학습 행 20개에서 상수, 테스트 행에서는 다르다
+    x[0, 20:, 1] = torch.linspace(-5, 5, 10)
+    seen = {}
+    hook = model.cell_encoder.register_forward_hook(lambda m, args, out: seen.update(u=args[2]))
+    model._embed_cells(x, 20)
+    hook.remove()
+    # feature j의 묶음 자리 0은 열 j 자신이다
+    assert torch.equal(seen["u"][0, :, 1, 0], torch.full((30,), 0.5))
+    assert not torch.equal(seen["u"][0, :, 0, 0], torch.full((30,), 0.5))
 
 
 def test_bad_options_raise():
@@ -148,7 +196,6 @@ def test_train_save_load_and_hub(tmp_path, arch):
     config = replace(
         recipe.with_architecture(TrainConfig.smoke("regression"), arch, keep_size=True),
         steps=3,
-        qk_clip=None if arch == "v3.5" else 50.0,
     )
     result = train(config, tmp_path, mlflow_log=False)
     model, borders = registry.load_checkpoint(result["final_path"])
@@ -261,3 +308,41 @@ def test_fresh_model_reads_its_input(arch):
     out[..., 0].sum().backward()
     assert model.row_blocks[0].attention.qkv.weight.grad.norm() > 1e-4
     assert model.decoder.weight.grad.norm() > 1e-4
+
+
+def test_one_recipe_lookup_serves_every_model():
+    from minipfn import recipes
+
+    assert recipes.recipe_for_model_type("column_row_transformer") is recipe
+    assert recipes.recipe_for_model_type("tabpfn_v2") is tabpfn_v2  # 예전 이름
+    assert recipes.recipe_for_architecture("v3.5") is recipe
+    assert recipes.architectures() == ("v2", "v2.5", "v3", "v3.5")
+    assert recipes.architecture_name(recipe.paper()) == "v3"
+    assert recipes.default_inference(_model(arch="v3.5"), "regression")["member_kinds"] == (
+        "standard",
+    )
+    # 묶음 이름은 recipe와 상관없이 다 받는다
+    assert tabpfn_v2.resolve_member_kinds("v3.5") == ("standard",)
+    assert recipes.resolve_member_kinds("v2") == tabpfn_v2.MEMBER_KINDS_V2
+
+
+def test_train_script_stops_long_tables_from_a_v3_run(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _script("train")
+    params = {k: str(v) for k, v in vars(recipe.paper()).items()}
+    args = script.parse_args(["--config-name", "long_tables", "--resume-run-id", "r"])
+    with pytest.raises(SystemExit, match="long_tables"):
+        script.build_config(args, hub.run_architecture(params))
+
+
+def test_eval_member_kinds_do_not_change_the_member_count(monkeypatch, tmp_path):
+    script = _script("eval")
+    model = _model(arch="v3")
+    monkeypatch.setattr(script, "load_model", lambda path, suite, dst: (model, None))
+    args = script.parse_args(["--classifier-path", "x.pt", "--member-kinds", "v3.5"])
+    make = script.make_estimator_factory("classification", args)
+    assert make.member_kinds == ("standard",) and make.n_estimators == 4
+    args = script.parse_args(["--classifier-path", "x.pt", "--n-estimators", "8"])
+    make = script.make_estimator_factory("classification", args)
+    assert make.member_kinds == ("quantile", "robust") and make.n_estimators == 8

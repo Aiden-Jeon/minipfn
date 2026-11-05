@@ -328,3 +328,23 @@ def test_hub_source_reads_v2_config_or_v1_source_json(tmp_path):
     v1 = _SourceApi(tmp_path, {"config.json": {"emsize": 512}, "source.json": {"source": "s"}})
     assert sync_hub_card.hub_source(v1, "a/b") == "s"
     assert sync_hub_card.hub_source(_SourceApi(tmp_path, {"config.json": {}}), "a/b") is None
+
+
+def test_v3_inference_comes_from_its_recipe(tmp_path):
+    # TabPFN-3·3.5 모델은 v2 recipe가 아니라 자기 recipe의 추론 설정을 적는다 (3.5: standard 8개)
+    from minipfn.models import save_checkpoint
+    from minipfn.recipes import tabpfn_v3
+    from minipfn.training.config import TrainConfig
+
+    config = tabpfn_v3.with_architecture(TrainConfig.smoke(), "v3.5", keep_size=True)
+    checkpoint = str(tmp_path / "model.pt")
+    save_checkpoint(checkpoint, config.build_model().eval(), None)
+    out = tmp_path / "out"
+    push.main(
+        ["--paper", "tabpfn_v2", "--task", "classification", "--checkpoint", checkpoint]
+        + ["--repo-id", "a/b", "--model-card", str(_card(tmp_path, checkpoint))]
+        + ["--out-dir", str(out), "--dry-run"]
+    )
+    config = json.loads((out / "upload" / "config.json").read_text())
+    assert config["model_type"] == "column_row_transformer"
+    assert config["inference"] == {"n_estimators": 8, "member_kinds": ["standard"]}

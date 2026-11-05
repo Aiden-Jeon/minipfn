@@ -197,7 +197,7 @@ def test_member_kinds_parse_names_and_lists():
     assert resolve_member_kinds("v2") == ("quantile", "power")
     assert resolve_member_kinds("robust, power") == ("robust", "power")
     assert resolve_member_kinds(["quantile"]) == ("quantile",)
-    for bad in ("", "v3", "quantile,box-cox"):
+    for bad in ("", "v9", "quantile,box-cox"):
         with pytest.raises(ValueError, match="member_kinds"):
             resolve_member_kinds(bad)
     # 평가 스크립트도 같은 규칙을 쓴다 (모델 클래스와 따로 목록을 두지 않는다)

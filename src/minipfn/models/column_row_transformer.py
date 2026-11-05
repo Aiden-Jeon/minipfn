@@ -28,8 +28,12 @@ Report arXiv 2605.13986 Fig. 5, Appendix C 표 2~7의 구조. TabICL 계열의 �
   항을 붙여 q ← q · log(n) · (s_h + MLP(q_h))로 둔다(n은 key 수, s_h는 head마다 학습, MLP 마지막
   층은 0으로 시작해 처음에는 SSMax다). 열 단계·행 ICL·retrieval decoder에 쓴다(보고서대로)
 - RMSNorm 위치: pre-norm(attention·MLP 앞), 모든 단계 마지막에도 하나. 학습 파라미터 없는
-  RMSNorm으로 둬서 ICL attention 입력의 크기가 √D로 같다(QK-clip의 logit 상한이 성립. 상한은
-  QASSMax 배율 전의 것이다)
+  RMSNorm이다
+- QK-clip(`training.stability`)은 쓰지 않는다(`qk_clip_weights`가 빈 목록). QK-clip은 head마다
+  σ(Wq_hᵀ Wk_h)로 logit 상한을 잡는데, 여기서는 그 상한이 실제 logit을 묶지 못한다: QASSMax가
+  q에 학습되는 배율 log(n) · (s_h + MLP(q))를 곱하고(가중치로 묶이지 않는다), 테스트 행은
+  multi-query라 head h의 query가 head 0의 key를 본다(q_h · k_0). logit 폭주를 막는 것은 3.5의
+  `qk_norm`이다
 - 정답 embedding 위치: 보고서대로 학습 행의 셀 토큰(feature마다)에 더한다. 행 ICL 입력에는 따로
   더하지 않는다
 - 묶음 offset: 2^j − 1 (j = 0..G−1). G=3이면 보고서의 0, 1, 3이다
@@ -37,11 +41,11 @@ Report arXiv 2605.13986 Fig. 5, Appendix C 표 2~7의 구조. TabICL 계열의 �
 TabPFN-3.5(arXiv 2609.17895)가 바꾼 것은 설정으로 켠다 (recipe `ARCHITECTURES["v3.5"]`).
 
 - 폭: `n_cls` 4 → 8 (행 벡터 512 → 1024), `nhead` 8 → 16 (head dim 64)
-- `qk_norm`: attention의 q·k에 RMSNorm(head dim마다 학습되는 gain, 여기서 정함). 켜면 logit이
-  gain으로 묶여 QK-clip이 볼 attention이 없다
+- `qk_norm`: attention의 q·k에 RMSNorm(head dim마다 학습되는 gain, 여기서 정함)
 - `encoder="fourier"`: 셀 encoder. z값에 학습되는 주파수 32개를 곱한 sin·cos(묶음 위치마다)를
   Linear한 것과, [z값, 결측 표시, 열 안 ECDF midrank u의 sin·cos(πku), k = 1..4] 묶음을 Linear한
-  것을 더해 LayerNorm. 주파수의 처음 값(log 간격 0.1~10)은 여기서 정함
+  것을 더해 LayerNorm. 주파수의 처음 값(log 간격 0.1~10)은 여기서 정함. 학습 행에서 상수인 열은
+  z처럼 u도 모든 행에서 0.5로 둔다(테스트 행에만 있는 신호가 되지 않도록)
 - 분류·회귀를 한 checkpoint로(task를 입력으로) 학습하는 것은 아직 없다. 이 클래스는 `task` 하나만
   가진다
 """
@@ -80,7 +84,7 @@ class ColumnRowTransformerConfig:
     row_heads: int = 8
     rope_base: float = 100_000.0
     nlayers: int = 24  # 행 ICL 층 수
-    nhead: int = 8  # 행 ICL head 수 (QK-clip이 보는 head)
+    nhead: int = 8  # 행 ICL head 수
     ff_factor: int = 2
     decoder_heads: int = 6  # 분류 retrieval decoder
     decoder_head_dim: int = 64
@@ -158,7 +162,7 @@ def _rope(t: torch.Tensor, base: float) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """multi-head attention. q·k·v를 한 weight(`qkv`, (3D, D))로 둔다 (QK-clip이 읽는 모양).
+    """multi-head attention. q·k·v를 한 weight(`qkv`, (3D, D))로 둔다.
 
     - `context`를 주면 key·value는 거기서(cross-attention), 아니면 query와 같은 입력에서
     - `n_context`를 주면(self-attention) 앞의 n_context개만 key·value가 되고, 그 뒤 query(테스트
@@ -220,9 +224,13 @@ class Attention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v)
         else:
             train = F.scaled_dot_product_attention(q[:, :, :n_context], k, v)
-            # 테스트 행: 모든 query head가 첫 head의 key·value를 본다
-            first_k, first_v = k[:, :1].expand_as(k), v[:, :1].expand_as(v)
-            test = F.scaled_dot_product_attention(q[:, :, n_context:], first_k, first_v)
+            # 테스트 행: 모든 query head가 첫 head의 key·value를 본다. head를 query 길이로 접어
+            # key·value head 하나로 계산한다(key·value를 head 수만큼 늘리지 않도록)
+            test_q = q[:, :, n_context:]
+            h, t, d = test_q.shape[1:]
+            test = F.scaled_dot_product_attention(
+                test_q.reshape(n, 1, h * t, d), k[:, :1], v[:, :1]
+            ).view(n, h, t, d)
             out = torch.cat([train, test], dim=2)
         return self.out(out.transpose(1, 2).reshape(n, length, dim))
 
@@ -379,12 +387,10 @@ class ColumnRowTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def qk_clip_weights(self) -> list[tuple[str, torch.Tensor]]:
-        """QK-clip이 보는 (종류, qkv weight): 행 ICL attention (입력이 파라미터 없는 RMSNorm 뒤).
-        열·행 단계는 폭(E)과 head 수가 달라 넣지 않는다. q·k에 RMSNorm을 쓰면(`qk_norm`) logit이
-        이미 묶이므로 빈 목록."""
-        if self.config.qk_norm:
-            return []
-        return [("sample_attention", layer.attention.qkv.weight) for layer in self.icl_layers]
+        """빈 목록: QK-clip의 가중치 상한이 이 모델의 logit을 묶지 못한다 (QASSMax의 학습 배율,
+        테스트 행의 multi-query. 모듈 docstring). 상한을 지표로 남기면 실제보다 안전해 보이므로
+        지표도 내지 않는다."""
+        return []
 
     def decoder_weight(self) -> torch.Tensor:
         return (
@@ -393,10 +399,13 @@ class ColumnRowTransformer(nn.Module):
 
     def _embed_cells(self, x: torch.Tensor, n_train: int) -> torch.Tensor:
         # x: (B, R, C) → 토큰 (B, R, C, E). feature j의 토큰은 열 j + offset들의 셀
-        z, indicator, _ = standardize_cells(x, n_train)
+        z, indicator, used = standardize_cells(x, n_train)
         zg, ig = _group(z, self.offsets), _group(indicator, self.offsets)
         if self.config.encoder == "fourier":
             u = ecdf_midrank(x.float(), n_train).to(z.dtype)
+            # 학습 행에서 상수인 열: z를 0으로 둔 것처럼 u도 모든 행에서 0.5 (학습 행은 모두 0.5이고
+            # 테스트 행만 0이나 1이 되어 테스트 행에만 있는 신호가 되지 않도록)
+            u = torch.where(used > 0, u, 0.5)
             return self.cell_encoder(zg, ig, _group(u, self.offsets))
         return self.cell_encoder(torch.cat([zg, ig], dim=-1))
 
@@ -411,9 +420,10 @@ class ColumnRowTransformer(nn.Module):
         # 분류 retrieval decoder: (B, R, D) → 테스트 행 logit (B, T, n_out)
         b = h.shape[0]
         heads, dh = self.config.decoder_heads, self.config.decoder_head_dim
-        q, k = self.decoder(h).split(heads * dh, dim=-1)
-        q = q[:, n_train:].reshape(b, -1, heads, dh).transpose(1, 2)  # (B, H, T, dh)
-        k = k[:, :n_train].reshape(b, -1, heads, dh).transpose(1, 2)  # (B, H, N, dh)
+        # query는 테스트 행에서만, key는 학습 행에서만 만든다 (weight는 [W_Q; W_K] 하나)
+        w_q, w_k = self.decoder.weight.split(heads * dh)
+        q = F.linear(h[:, n_train:], w_q).reshape(b, -1, heads, dh).transpose(1, 2)  # (B, H, T, dh)
+        k = F.linear(h[:, :n_train], w_k).reshape(b, -1, heads, dh).transpose(1, 2)  # (B, H, N, dh)
         q = self.decoder_qassmax(q, n_train)
         # 확률·log는 float32로 (bf16이면 clip 값 근처가 뭉개진다)
         weights = torch.softmax((q @ k.transpose(-1, -2)).float() / math.sqrt(dh), dim=-1)

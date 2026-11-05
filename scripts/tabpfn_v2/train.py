@@ -48,9 +48,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
+from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
-from minipfn.recipes import tabpfn_v3  # noqa: E402
 from minipfn.training.config import TrainConfig  # noqa: E402
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
@@ -63,11 +63,6 @@ PRESETS = {
     "long_tables": recipe.long_tables,
 }
 CONFIG_NAMES = tuple(PRESETS)
-# 구조 이름 → 그 구조의 recipe (`with_architecture`, `architecture_name`)
-ARCH_RECIPES = {
-    **{name: recipe for name in recipe.ARCHITECTURES},
-    **{name: tabpfn_v3 for name in tabpfn_v3.ARCHITECTURES},
-}
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
@@ -91,7 +86,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--arch",
-        choices=tuple(ARCH_RECIPES),
+        choices=recipes.architectures(),
         default=os.environ.get("TABPFN_V2_ARCH"),
         help="모델 구조: v2(Nature 2025), v2.5(TabPFN-2.5), v3(TabPFN-3), v3.5(TabPFN-3.5)."
         " 기본: 새로 학습하면 v2,"
@@ -133,17 +128,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나온다. 회귀 구간 경계는
         # 가져온 checkpoint의 것을 이어 써서 paper 모델의 출력과 맞춘다
         parser.error("long_tables는 --init-run-id(paper run)나 --resume-run-id와 같이 줘야 한다")
-    if args.config_name == "long_tables" and args.arch in tabpfn_v3.ARCHITECTURES:
-        parser.error("long_tables는 v2·2.5 구조만 쓴다")
+    if (
+        args.config_name == "long_tables"
+        and args.arch is not None
+        and args.arch not in recipe.LONG_TABLES_MICRO_BATCH
+    ):
+        parser.error(f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다")
     return args
-
-
-def architecture_of(config: TrainConfig) -> str | None:
-    """`config`의 구조 이름 (어느 recipe의 `ARCHITECTURES`와도 맞지 않으면 None)."""
-    for module in (recipe, tabpfn_v3):
-        if (name := module.architecture_name(config)) is not None:
-            return name
-    return None
 
 
 def build_config(
@@ -157,15 +148,16 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
-        return ARCH_RECIPES[arch].with_architecture(
+        return recipes.recipe_for_architecture(arch).with_architecture(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
 
     if source is None:
         arch = args.arch or "v2"
         return _overrides(preset(arch), args), arch
-    arch = args.arch or architecture_of(replace(TrainConfig(task=args.task), **source))
-    if arch is None and args.config_name == "long_tables":
+    arch = args.arch or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
+    # 원래 run이 긴 표 학습을 하지 않는 구조(TabPFN-3·3.5 등)여도 run을 열기 전에 멈춘다
+    if args.config_name == "long_tables" and arch not in recipe.LONG_TABLES_MICRO_BATCH:
         raise SystemExit(
             f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
         )

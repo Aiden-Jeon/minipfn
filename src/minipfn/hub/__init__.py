@@ -129,7 +129,7 @@ def from_pretrained(
     model.load_state_dict(tensors)
     if "inference" in config:
         # 이 weight로 추론할 때의 설정 (멤버 수, 멤버 전처리 종류). recipe의 추론 클래스가
-        # 기본값으로 읽는다 (`recipes.tabpfn_v2.default_inference`)
+        # 기본값으로 읽는다 (`minipfn.recipes.default_inference`)
         model.inference_config = config["inference"]
     return model.eval(), borders
 

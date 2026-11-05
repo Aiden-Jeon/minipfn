@@ -20,11 +20,12 @@ test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint�
 쓴다. 펼칠 열이 있는지는 fold마다 그 fold의 학습 행으로 본다
 (추론이 멤버 전처리를 학습 행으로 맞추므로).
 
-앙상블 멤버 수와 전처리는 기본으로 모델이 정한다(`recipes.tabpfn_v2.default_inference`: Hub
-config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2. TabPFN-3·3.5 모델은
-`recipes.tabpfn_v3.default_inference`: 3은 quantile,robust, 3.5는 standard 멤버 8개).
-`--member-kinds`로 주면 그 값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust scaling
-+ soft clipping을 쓰는 quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
+앙상블 멤버 수와 전처리는 기본으로 모델이 정한다(`minipfn.recipes.default_inference`: 모델 종류의
+recipe가 정한다. Hub config.json의 `inference`가 먼저이고, 없으면 v2·2.5 모델은 구조가 2.5면 v2.5,
+아니면 v2. TabPFN-3·3.5 모델은 3이면 quantile,robust, 3.5면 standard 멤버 8개).
+`--member-kinds`로 주면 멤버 종류만 그 값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust
+scaling + soft clipping을 쓰는 quantile,robust). 멤버 수는 `--n-estimators`로 따로 준다.
+TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
 `TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
@@ -47,8 +48,12 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
-from minipfn.inference.ensemble import DEFAULT_ONE_HOT, max_features_of
-from minipfn.inference.ensemble import resolve_member_kinds as _resolve
+from minipfn.inference.ensemble import (
+    DEFAULT_ONE_HOT,
+    EnsembleClassifier,
+    EnsembleRegressor,
+    max_features_of,
+)
 from minipfn.inference.preprocessing import (
     ONE_HOT_MODES,
     one_hot_kinds,
@@ -56,13 +61,7 @@ from minipfn.inference.preprocessing import (
     to_numeric,
 )
 from minipfn.priors.table_size import MAX_FEATURES
-from minipfn.recipes import tabpfn_v3
-from minipfn.recipes.tabpfn_v2 import (
-    MEMBER_KIND_PRESETS,
-    TabPFNv2Classifier,
-    TabPFNv2Regressor,
-)
-from minipfn.recipes.tabpfn_v2 import default_inference as _v2_inference
+from minipfn.recipes import default_inference, resolve_member_kinds
 from minipfn.utils import log_run_source
 
 
@@ -88,7 +87,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_member_kinds,
         default=None,
         help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
-        " v2 = quantile,power, v2.5·v3 = quantile,robust, v3.5 = standard)",
+        " v2 = quantile,power, v2.5·v3 = quantile,robust, v3.5 = standard)."
+        " 멤버 수는 바꾸지 않는다",
+    )
+    parser.add_argument(
+        "--n-estimators", type=int, default=None, help="앙상블 멤버 수 (기본: 모델이 정한다)"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
@@ -102,22 +105,6 @@ def _one_hot_modes(value: str) -> list[str]:
     if unknown or not modes:
         raise argparse.ArgumentTypeError(f"one-hot 모드는 {ONE_HOT_MODES} 가운데서: {value}")
     return list(dict.fromkeys(modes))
-
-
-# 이름으로 고르는 멤버 종류 묶음: v2·v2.5(`recipes.tabpfn_v2`), v3·v3.5(`recipes.tabpfn_v3`)
-PRESETS = {**MEMBER_KIND_PRESETS, **tabpfn_v3.MEMBER_KIND_PRESETS}
-
-
-def resolve_member_kinds(value) -> tuple[str, ...]:
-    return _resolve(value, PRESETS)
-
-
-def default_inference(model, task: str) -> dict:
-    """모델의 추론 설정 (멤버 수, 멤버 종류). TabPFN-3·3.5 모델(`column_row_transformer`)은
-    `recipes.tabpfn_v3`, 그 밖은 `recipes.tabpfn_v2`가 정한다."""
-    if getattr(model, "model_type", None) == tabpfn_v3.MODEL_TYPE:
-        return tabpfn_v3.default_inference(model, task)
-    return _v2_inference(model, task)
 
 
 def _member_kinds(value: str) -> tuple[str, ...]:
@@ -198,21 +185,23 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     # 주지 않으면 모델의 추론 설정 (Hub config.json의 inference, 없으면 모델 구조로)
     inference = default_inference(model, suite)
     member_kinds = args.member_kinds or inference["member_kinds"]
+    n_estimators = args.n_estimators or inference["n_estimators"]
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
-            "n_estimators": inference["n_estimators"],
+            "n_estimators": n_estimators,
             "categorical_features_indices": task.categorical_indices,
             "one_hot": one_hot,
             "member_kinds": member_kinds,
             "device": args.device,
         }
         if suite == "classification":
-            return TabPFNv2Classifier(model, **kw)
-        return TabPFNv2Regressor(model, borders, **kw)
+            return EnsembleClassifier(model, **kw)
+        return EnsembleRegressor(model, borders, **kw)
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
+    make.n_estimators = n_estimators
     return make
 
 
@@ -264,6 +253,9 @@ def main(argv: list[str] | None = None) -> None:
             mlflow.log_param("member_kinds", next(iter(kinds.values())))
         else:
             mlflow.log_params({f"member_kinds_{suite}": v for suite, v in kinds.items()})
+        mlflow.log_params(
+            {f"n_estimators_{suite}": make.n_estimators for suite, make in factories.items()}
+        )
     rows = []
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()
