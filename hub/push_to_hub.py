@@ -25,6 +25,11 @@
 체크포인트의 것이 되지 않도록, 카드에 `--checkpoint`가 `` `...` ``로 그대로 적혀 있어야 올린다
 (그림은 `scripts/<paper>/plot_card.py`로 다시 만든다). 이미 있는 repo의 공개 여부는 바꾸지
 않으므로, `--private`인데 repo가 공개면 올리지 않는다.
+
+학습 중간 checkpoint는 `--revision step-100k`처럼 같은 repo의 branch로 올린다. `main`(모델 카드가
+설명하는 최종 가중치)을 먼저 올려 repo가 있어야 한다. branch는 repo의 첫 commit에서 만들어
+`main`의 카드와 그림을 물려받지 않고, 가중치·설정과 함께 그 step을 설명하는 짧은 README를 둔다.
+이때도 `main`의 카드에 `--checkpoint`가 적혀 있어야 한다(카드의 중간 checkpoint 표).
 """
 
 from __future__ import annotations
@@ -60,6 +65,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Hub README로 올릴 모델 카드 (기본: hub/<repo 이름>/README.md)",
     )
+    parser.add_argument(
+        "--revision", help="중간 checkpoint를 올릴 branch (예: step-100k). 없으면 main"
+    )
     parser.add_argument("--out-dir", default="hub_upload")
     parser.add_argument("--private", action="store_true", help="새로 만드는 repo를 비공개로")
     parser.add_argument("--dry-run", action="store_true")
@@ -68,6 +76,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--paper tabpfn_v2에는 --task가 필요합니다")
     if args.paper == "tabpfn" and args.task is not None:
         parser.error("--task는 --paper tabpfn_v2에서만 씁니다 (v1은 분류만)")
+    if args.revision == "main":
+        args.revision = None
     return args
 
 
@@ -143,6 +153,34 @@ def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path)
 PREPARE = {"tabpfn": prepare_tabpfn, "tabpfn_v2": prepare_tabpfn_v2}
 
 
+def revision_card(model_card: Path, repo_id: str, revision: str, checkpoint: str) -> str:
+    """중간 checkpoint branch의 README. main 카드의 front matter를 그대로 쓰고 본문은 짧게 둔다."""
+    text = model_card.read_text()
+    front = ""
+    if text.startswith("---\n"):
+        end = text.index("\n---\n", 4) + len("\n---\n")
+        front = text[:end] + "\n"
+    url = f"https://huggingface.co/{repo_id}"
+    return (
+        f"{front}# {repo_id} @ `{revision}`\n\n"
+        f"An intermediate training checkpoint, kept for comparison. The model card, benchmark"
+        f" numbers for every checkpoint, and usage are on the [main branch]({url}).\n\n"
+        f"Weights come from checkpoint `{checkpoint}`.\n\n"
+        "```python\n"
+        "from minipfn.tabpfn_v2.hub import from_pretrained\n\n"
+        f'model, borders = from_pretrained("{repo_id}", revision="{revision}")\n'
+        "```\n"
+    )
+
+
+def create_revision(api: HfApi, repo_id: str, revision: str) -> None:
+    """repo의 첫 commit에서 branch를 만든다(이미 있으면 그대로). main을 먼저 올려야 한다."""
+    if not api.repo_exists(repo_id):
+        raise SystemExit(f"{repo_id}가 없습니다. --revision 없이 main을 먼저 올려 주세요.")
+    first = api.list_repo_commits(repo_id)[-1].commit_id
+    api.create_branch(repo_id, branch=revision, revision=first, exist_ok=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     # 큰 artifact를 받기 전에 카드부터 확인한다.
@@ -165,20 +203,28 @@ def main(argv: list[str] | None = None) -> None:
     ):
         if not torch.equal(a.cpu(), b.cpu()):
             raise RuntimeError(f"변환한 가중치가 원본과 다릅니다: {name}")
-    shutil.copy(model_card, upload_dir / "README.md")
-    for rel in images:
-        (upload_dir / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(model_card.parent / rel, upload_dir / rel)
+    if args.revision is None:
+        shutil.copy(model_card, upload_dir / "README.md")
+        for rel in images:
+            (upload_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(model_card.parent / rel, upload_dir / rel)
+    else:
+        card = revision_card(model_card, args.repo_id, args.revision, args.checkpoint)
+        (upload_dir / "README.md").write_text(card)
     prepared = sorted(str(p.relative_to(upload_dir)) for p in upload_dir.rglob("*") if p.is_file())
     print("prepared:", prepared)
     if api is None:
         return
 
-    api.create_repo(args.repo_id, repo_type="model", private=args.private, exist_ok=True)
+    if args.revision is None:
+        api.create_repo(args.repo_id, repo_type="model", private=args.private, exist_ok=True)
+    else:
+        create_revision(api, args.repo_id, args.revision)
     # 같은 commit에서 다시 올리는 파일은 지우지 않으므로, 카드가 더는 쓰지 않는 그림만 지워진다.
     commit = api.upload_folder(
         repo_id=args.repo_id,
         folder_path=upload_dir,
+        revision=args.revision,
         commit_message=f"Upload {TITLE[args.paper]} weights from {args.checkpoint}",
         delete_patterns=["images/*"],
     )

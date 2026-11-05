@@ -91,12 +91,20 @@ def test_training_checkpoint_from_run_uses_run_params(tmp_path, monkeypatch):
 
 def test_hub_needs_the_hf_prefix_and_missing_local_paths_fail(tmp_path, monkeypatch, chdir_tmp):
     seen = []
-    monkeypatch.setattr(hub, "from_pretrained", lambda spec: seen.append(spec) or (_model(), None))
+    monkeypatch.setattr(
+        hub,
+        "from_pretrained",
+        lambda spec, revision=None: seen.append((spec, revision)) or (_model(), None),
+    )
     hub.load_model("hf://owner/name", "classification", tmp_path)
-    assert seen == ["owner/name"]
+    assert seen == [("owner/name", None)]
+    hub.load_model(
+        "hf://owner/name@step-100k", "classification", tmp_path
+    )  # 중간 checkpoint branch
+    assert seen[-1] == ("owner/name", "step-100k")
     with pytest.raises(SystemExit, match="hf://"):
         hub.load_model("models/clf", "classification", tmp_path)  # 오타 난 로컬 경로
-    assert seen == ["owner/name"]
+    assert len(seen) == 2
 
 
 def test_borders_keep_their_dtype(tmp_path):

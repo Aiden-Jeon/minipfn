@@ -156,6 +156,60 @@ def test_v2_dry_run_writes_source_in_config(tmp_path, task):
     assert (loaded_borders is None) == (borders is None)
 
 
+def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
+    from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
+    from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
+
+    model = TabPFNv2(TabPFNv2TrainConfig.smoke("classification").model_config()).eval()
+    checkpoint = str(tmp_path / "model.pt")
+    save_checkpoint(checkpoint, model, None)
+    card = _card(tmp_path, checkpoint)
+    card.write_text(
+        "---\nlicense: apache-2.0\n---\n\n# Card\n\n![x](images/x.png)\n" + card.read_text()
+    )
+    (card.parent / "images").mkdir()
+    (card.parent / "images" / "x.png").write_bytes(b"png")
+    out = tmp_path / "out"
+    push.main(
+        ["--paper", "tabpfn_v2", "--task", "classification", "--checkpoint", checkpoint]
+        + ["--repo-id", "a/b", "--revision", "step-100k"]
+        + ["--model-card", str(card), "--out-dir", str(out), "--dry-run"]
+    )
+    upload = out / "upload"
+    # branch에는 main 카드의 그림을 올리지 않는다
+    assert {p.name for p in upload.iterdir()} == {"model.safetensors", "config.json", "README.md"}
+    readme = (upload / "README.md").read_text()
+    assert readme.startswith("---\nlicense: apache-2.0\n---\n")
+    assert "`step-100k`" in readme and f"`{checkpoint}`" in readme
+    assert 'revision="step-100k"' in readme
+
+
+class _RevisionApi:
+    def __init__(self, exists):
+        self.exists, self.branches = exists, []
+
+    def repo_exists(self, repo_id):
+        return self.exists
+
+    def list_repo_commits(self, repo_id):
+        class C:
+            def __init__(self, commit_id):
+                self.commit_id = commit_id
+
+        return [C("latest"), C("first")]
+
+    def create_branch(self, repo_id, branch, revision, exist_ok):
+        self.branches.append((branch, revision, exist_ok))
+
+
+def test_revision_branches_from_the_first_commit_and_needs_main():
+    api = _RevisionApi(exists=True)
+    push.create_revision(api, "a/b", "step-100k")
+    assert api.branches == [("step-100k", "first", True)]
+    with pytest.raises(SystemExit, match="main을 먼저"):
+        push.create_revision(_RevisionApi(exists=False), "a/b", "step-100k")
+
+
 class _Info:
     def __init__(self, private):
         self.private = private
