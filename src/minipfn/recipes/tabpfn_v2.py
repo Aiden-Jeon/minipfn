@@ -53,6 +53,13 @@ ARCHITECTURES = {
         "regression": {**_V2_5, "nlayers": 18, "encoder": "mlp"},
     },
 }
+# 논문이 권장하는 표 크기 (TabArena·BeyondArena 평가에서 이보다 크면 돌리지 않고 imputed로 둔다).
+# v2는 Nature 논문의 학습 행 10,000·feature 500·클래스 10, 2.5는 arXiv 2511.08667의 행 50,000·
+# feature 2,000. 클래스 수 상한은 모델 출력 수(`config.n_out`)다
+SUPPORTED_SIZE = {
+    "v2": {"max_train_rows": 10_000, "max_features": 500},
+    "v2.5": {"max_train_rows": 50_000, "max_features": 2_000},
+}
 # long_tables의 GPU당 micro batch. v2(12층)는 2에서 GPU 메모리 52.6GB였다. 2.5는 층이 두 배라 1
 LONG_TABLES_MICRO_BATCH = {"v2": 2, "v2.5": 1}
 

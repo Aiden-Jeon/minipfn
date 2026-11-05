@@ -55,6 +55,14 @@ ARCHITECTURES = {
     "v3": {"classification": _V3, "regression": _V3},
     "v3.5": {"classification": _V3_5, "regression": _V3_5},
 }
+# 논문 권장 크기 (TabArena·BeyondArena에서 이보다 큰 split은 돌리지 않는다,
+# `minipfn.recipes.supported_size`).
+# 3은 검증 범위를 "1M행·200 feature, 100k행·2,000 feature, 1k행·20,000 feature"로 적어서, 상한
+# 하나씩으로 둘 수 있는 가운데 점을 쓴다. 3.5는 보고서의 권장 한계
+SUPPORTED_SIZE = {
+    "v3": {"max_train_rows": 100_000, "max_features": 2_000},
+    "v3.5": {"max_train_rows": 1_000_000, "max_features": 6_000},
+}
 # smoke(`keep_size`)에서 줄이는 값: 층 수·폭·head는 smoke 설정 그대로, inducing point는 8개까지
 SMOKE_MAX_INDUCING = 8
 

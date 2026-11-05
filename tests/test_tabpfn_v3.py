@@ -346,3 +346,21 @@ def test_eval_member_kinds_do_not_change_the_member_count(monkeypatch, tmp_path)
     args = script.parse_args(["--classifier-path", "x.pt", "--n-estimators", "8"])
     make = script.make_estimator_factory("classification", args)
     assert make.member_kinds == ("quantile", "robust") and make.n_estimators == 8
+
+
+def test_arena_limits_follow_the_model_recipe():
+    # TabArena·BeyondArena의 크기 상한은 모델 종류의 recipe가 정한다 (v2 크기로 자르지 않는다)
+    import argparse as _argparse
+
+    from minipfn import recipes
+
+    assert (
+        recipes.supported_size(_model(arch="v3"), "classification") == recipe.SUPPORTED_SIZE["v3"]
+    )
+    assert (
+        recipes.supported_size(_model("regression", "v3.5"), "regression")["max_features"] == 6_000
+    )
+    script = _script("eval")
+    args = _argparse.Namespace(max_train_rows=None, max_features=None)
+    limits = script.arena_limits({"classification": (_model(arch="v3"), None)}, args)
+    assert limits["binary"].max_train_rows == 100_000 and limits["binary"].max_classes == 10

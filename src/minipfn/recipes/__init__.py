@@ -18,9 +18,10 @@ import importlib
 from types import ModuleType
 from typing import Any
 
-# 공용 학습 루프(`minipfn.training.loop`)와 전처리 멤버 앙상블을 쓰는 recipe. 모듈마다 `MODEL_TYPE`,
-# `ARCHITECTURES`, `architecture_name`, `with_architecture`, `default_inference`,
-# `MEMBER_KIND_PRESETS`가 있다. 스크립트·Hub 업로드는 recipe를 직접 고르지 않고 아래 함수로 찾는다
+# 공용 학습 루프(`minipfn.training.loop`)와 전처리 멤버 앙상블을 쓰는 recipe. 모듈마다
+# `MODEL_TYPE`, `ARCHITECTURES`, `architecture_name`, `model_architecture`, `with_architecture`,
+# `default_inference`, `MEMBER_KIND_PRESETS`, `SUPPORTED_SIZE`가 있다. 스크립트·Hub 업로드는
+# recipe를 직접 고르지 않고 아래 함수로 찾는다
 TABLE_RECIPES = ("tabpfn_v2", "tabpfn_v3")
 
 
@@ -64,6 +65,14 @@ def architecture_name(config: Any) -> str | None:
 def default_inference(model: Any, task: str) -> dict:
     """모델의 추론 설정 `{"n_estimators", "member_kinds"}`. 모델 종류의 recipe가 정한다."""
     return recipe_for_model_type(model.model_type).default_inference(model, task)
+
+
+def supported_size(model: Any, task: str) -> dict:
+    """모델의 논문 권장 크기 `{"max_train_rows", "max_features"}` (recipe의 `SUPPORTED_SIZE`).
+    구조를 모르면 그 recipe의 첫 구조(v2, v3)의 것."""
+    recipe = recipe_for_model_type(model.model_type)
+    arch = recipe.model_architecture(model, task) or next(iter(recipe.ARCHITECTURES))
+    return dict(recipe.SUPPORTED_SIZE[arch])
 
 
 def member_kind_presets() -> dict[str, tuple[str, ...]]:

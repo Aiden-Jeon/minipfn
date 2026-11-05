@@ -90,6 +90,17 @@ uv run python scripts/tabpfn_v2/eval.py \
 
 평가 스크립트도 멤버 전처리 종류를 가중치에서 정합니다. 다른 종류로 재려면 `--member-kinds v2.5`처럼 줍니다.
 
+[TabArena](https://huggingface.co/spaces/TabArena/leaderboard) 공개 leaderboard와 같은 split·지표로도 잽니다. `--suite tabarena-lite`(데이터셋 51개의 첫 split), `--suite beyondarena`(데이터셋 142개, 공식 split 2,000개), `--suite beyondarena-lite`(데이터셋마다 첫 split)입니다. 데이터와 다른 방법 약 100개의 결과는 TabArena 공식 패키지 `tabarena`가 받으므로 extra `arena`를 설치합니다. 이 패키지가 쓰는 autogluon은 pandas 2.3이 필요해서, pandas 3을 쓰는 개발 환경(dev group)과는 따로 설치합니다. 그 환경에서는 `uv run`에도 같은 옵션을 붙입니다.
+
+```bash
+uv sync --no-dev --extra arena --group arena-dev
+uv run --no-dev --extra arena --group arena-dev python scripts/tabpfn_v2/eval.py --suite tabarena-lite \
+  --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
+  --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+```
+
+점수는 공개 leaderboard와 같은 방식으로 냅니다. Elo(기준 방법을 1000에 맞춘 값: TabArena는 RandomForest (default), BeyondArena는 XGBoost (default)), 정규화 점수, improvability, 그리고 XGBoost 같은 방법에 대한 split별 승률입니다. 모델의 권장 크기를 넘는 split(v2는 학습 행 10,000·feature 500·클래스 10, 2.5는 행 50,000·feature 2,000)은 돌리지 않습니다. leaderboard처럼 그 split은 RandomForest (default)의 결과로 채우고(imputed) 비율을 함께 적습니다. `tabpfn_v2_eval/<suite>/comparison.csv`에는 공개 leaderboard의 값과 이 실행에서 다시 낸 값이 방법마다 나란히 있습니다. 공개 leaderboard는 모든 방법을 학습 split 안에서 8-fold bagging해 돌립니다. 여기서는 기본으로 한 번만 fit하고, `--bagging 8`을 주면 8-fold로 나눠 예측을 평균합니다. AI Runtime에서는 `scripts/tabpfn_v2/eval_arena.yaml`을 씁니다.
+
 `main`에는 500k 가중치가 있고, 학습 중간의 100k~400k 가중치는 같은 repo의 branch `step-100k`~`step-400k`에 있습니다. `TabPFNv2Regressor("aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k")`처럼 repo 뒤에 `@`와 branch를 적고, 평가 스크립트에서는 `hf://aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k`처럼 `@` 뒤에 branch를 적습니다.
 
 ## 3. 바닥부터 학습하기
