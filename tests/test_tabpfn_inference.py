@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 import torch
 
-from minipfn.tabpfn.inference import TabPFNClassifier, _Preprocessor, tabpfn_predict_proba
-from minipfn.tabpfn.model import TabPFNTransformer
+from minipfn.inference.tabpfn_v1 import TabPFNClassifier, _Preprocessor, tabpfn_predict_proba
+from minipfn.models.tabpfn_v1 import TabPFNTransformer
 
 
 def _tiny_model():

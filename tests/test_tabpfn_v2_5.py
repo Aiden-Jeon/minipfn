@@ -5,14 +5,16 @@ import pytest
 import torch
 from sklearn.datasets import load_breast_cancer, load_diabetes
 
-from minipfn.tabpfn_v2.inference import (
+from minipfn.inference.tabpfn_v2 import (
     MEMBER_KINDS_V2_5,
     RobustSoftClip,
     TabPFNv2Classifier,
     TabPFNv2Regressor,
 )
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config
-from minipfn.tabpfn_v2.train import ARCHITECTURES, TabPFNv2TrainConfig
+from minipfn.models.tabpfn_v2 import TabPFNv2, TabPFNv2Config
+from minipfn.recipes import tabpfn_v2 as recipe
+from minipfn.recipes.tabpfn_v2 import ARCHITECTURES
+from minipfn.training.config import TrainConfig
 
 
 def _tiny(n_out: int = 10, **kw) -> TabPFNv2:
@@ -83,12 +85,12 @@ def test_bad_options_raise():
     with pytest.raises(ValueError):
         TabPFNv2Config(n_thinking_rows=-1)
     with pytest.raises(ValueError):
-        TabPFNv2TrainConfig.paper("classification").with_architecture("v3")
+        recipe.with_architecture(recipe.paper("classification"), "v3")
 
 
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_v2_5_paper_architecture(task):
-    config = TabPFNv2TrainConfig.paper(task).with_architecture("v2.5")
+    config = recipe.with_architecture(recipe.paper(task), "v2.5")
     expected = ARCHITECTURES["v2.5"][task]
     for key, value in expected.items():
         assert getattr(config, key) == value
@@ -97,18 +99,16 @@ def test_v2_5_paper_architecture(task):
     assert model_config.features_per_group == 3 and model_config.n_thinking_rows == 64
     assert model_config.encoder == ("mlp" if task == "regression" else "linear")
     # 학습 설정은 v2 paper 그대로 (회귀 QK-clip 250 등)
-    assert config.qk_clip == TabPFNv2TrainConfig.paper(task).qk_clip
-    assert TabPFNv2TrainConfig.paper(task).with_architecture("v2") == TabPFNv2TrainConfig.paper(
-        task
-    )
+    assert config.qk_clip == recipe.paper(task).qk_clip
+    assert recipe.with_architecture(recipe.paper(task), "v2") == recipe.paper(task)
 
 
 def test_smoke_v2_5_stays_small():
-    config = TabPFNv2TrainConfig.smoke("regression").with_architecture("v2.5", keep_size=True)
+    config = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5", keep_size=True)
     assert config.nlayers == 2 and config.n_thinking_rows == 4
     assert config.features_per_group == 3 and config.encoder == "mlp"
     # keep_size를 주지 않으면 층 수와 상관없이 2.5 구조 그대로다
-    full = TabPFNv2TrainConfig.smoke("regression").with_architecture("v2.5")
+    full = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5")
     assert full.nlayers == 18 and full.n_thinking_rows == 64
 
 

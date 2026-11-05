@@ -12,8 +12,8 @@
 
 - `tabpfn`: `save_tabpfn`으로 저장한 `tabpfn_final.pt`(파일 또는
   `runs:/<run_id>/model/tabpfn_final.pt`). 저장소 루트의 `NOTICE`(공식 TabPFN v1 코드의 저작권
-  표기)를 함께 올리고, 체크포인트는 `source.json`에 적는다(`minipfn.tabpfn.hub` 참고).
-- `tabpfn_v2`: `minipfn.tabpfn_v2.hub.load_model`이 읽는 체크포인트면 무엇이든. `--task`가 필요하다.
+  표기)를 함께 올리고, 체크포인트는 `source.json`에 적는다(`minipfn.hub.tabpfn_v1` 참고).
+- `tabpfn_v2`: `minipfn.hub.load_model`이 읽는 체크포인트면 무엇이든. `--task`가 필요하다.
   체크포인트는 `config.json`의 `source`에 적는다.
 
 체크포인트를 `model.safetensors` + `config.json`으로 바꾸고 모델 카드를 붙여 올린다. 모델 카드는
@@ -119,8 +119,8 @@ def check_visibility(api: HfApi, repo_id: str, private: bool) -> None:
 
 def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
     """v1: `tabpfn_final.pt`를 변환하고, 원본 모델과 변환한 파일에서 다시 읽은 모델을 돌려준다."""
-    from minipfn.tabpfn.hub import from_pretrained, save_pretrained
-    from minipfn.tabpfn.train import tabpfn_from_state
+    from minipfn.hub.tabpfn_v1 import from_pretrained, save_pretrained
+    from minipfn.training.tabpfn_v1 import tabpfn_from_state
 
     path = args.checkpoint
     if path.startswith("runs:/"):
@@ -142,7 +142,7 @@ def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
 
 def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
     """v2: 체크포인트를 변환하고 원본과 다시 읽은 모델을 돌려준다. 회귀 구간 경계도 확인한다."""
-    from minipfn.tabpfn_v2.hub import from_pretrained, load_model, save_pretrained
+    from minipfn.hub import from_pretrained, load_model, save_pretrained
 
     model, borders = load_model(args.checkpoint, args.task, out_dir / "checkpoint")
     save_pretrained(model, borders, upload_dir, source=args.checkpoint)
@@ -181,7 +181,7 @@ def revision_card(model_card: Path, repo_id: str, revision: str, checkpoint: str
         f" numbers for every checkpoint, and usage are on the [main branch]({url}).\n\n"
         f"Weights come from checkpoint `{checkpoint}`.\n\n"
         "```python\n"
-        "from minipfn.tabpfn_v2.hub import from_pretrained\n\n"
+        "from minipfn.hub import from_pretrained\n\n"
         f'model, borders = from_pretrained("{repo_id}", revision="{revision}")\n'
         "```\n"
     )

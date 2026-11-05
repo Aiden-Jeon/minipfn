@@ -1,4 +1,5 @@
-"""TabPFN v2 학습 데이터: TabICL prior + 논문의 데이터셋 크기 규칙과 결측값.
+"""TabICL prior (prior 축, `prior_type="tabicl"`): TabICLv2 graph prior + TabPFN v2 논문의
+데이터셋 크기 규칙과 결측값.
 
 v2 논문의 prior 코드는 공개되지 않았으므로, 같은 계열의 공개 prior인 TabICLv2 graph prior
 (soda-inria/tabicl, BSD-3-Clause)로 데이터셋 하나하나를 만든다. TabICL prior는 무작위 DAG 위의
@@ -22,11 +23,12 @@ from __future__ import annotations
 
 import sys
 import types
-from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import torch
+
+from minipfn.priors.base import PriorBatch
 
 # 논문 Methods "Training details"의 수치
 MAX_TRAIN_ROWS = 2048
@@ -92,21 +94,6 @@ def sample_table_size(
     n_features = min(n_features, max_features, (max_cells - 1) // (min_train_rows + n_eval_rows))
     max_train = max(1, (max_cells - 1) // n_features - n_eval_rows)
     return min(n_train, max_train), n_features
-
-
-@dataclass
-class PriorBatch:
-    x: torch.Tensor  # (B, R, F), 결측은 NaN
-    y: torch.Tensor  # (B, R). 분류: 클래스 번호, 회귀: z-정규화한 값
-    n_train: int  # 앞의 n_train행이 학습 행, 나머지가 정답을 가린 행
-
-    @property
-    def y_train(self) -> torch.Tensor:
-        return self.y[:, : self.n_train]
-
-    @property
-    def y_eval(self) -> torch.Tensor:
-        return self.y[:, self.n_train :]
 
 
 class TabPFNv2Prior:
@@ -199,6 +186,22 @@ class TabPFNv2Prior:
             xs.append(self._add_missing(x.float()))
             ys.append(y.float())
         return PriorBatch(torch.stack(xs), torch.stack(ys), n_train)
+
+
+def make_prior(config, seed: int) -> TabPFNv2Prior:
+    """학습 설정(`minipfn.training.config.TrainConfig`)의 데이터셋 크기로 prior를 만든다."""
+    return TabPFNv2Prior(
+        config.task,
+        seed=seed,
+        missing_dataset_prob=config.missing_dataset_prob,
+        min_train_rows=config.min_train_rows,
+        max_train_rows=config.max_train_rows,
+        n_eval_rows=config.n_eval_rows,
+        max_features=config.max_features,
+        log_uniform_rows=config.log_uniform_rows,
+        max_cells=config.max_cells,
+        feature_scale=config.feature_scale,
+    )
 
 
 def _train_rows_cover_classes(

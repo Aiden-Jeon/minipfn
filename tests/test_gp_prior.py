@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from minipfn import GPPriorSampler, analytic_gp_posterior, rbf_kernel
-from minipfn.gp_prior import DEFAULT_VARIANCE
+from minipfn.priors.gp import DEFAULT_VARIANCE
 from minipfn.utils import set_seed
 
 

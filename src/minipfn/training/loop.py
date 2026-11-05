@@ -25,274 +25,33 @@ import math
 import os
 import shutil
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from minipfn.bar_distribution import FullSupportBarDistribution
-from minipfn.tabpfn_v2.model import save_checkpoint
-from minipfn.tabpfn_v2.prior import (
-    MAX_CELLS,
-    MAX_CLASSES,
-    MAX_FEATURES,
-    MAX_TRAIN_ROWS,
-    N_EVAL_ROWS,
-    TabPFNv2Prior,
-    regression_borders,
-)
-from minipfn.tabpfn_v2.registry import (
-    DEFAULT_MODEL_TYPE,
-    build_model,
-    config_fields,
-    model_class,
+from minipfn.models import save_checkpoint
+from minipfn.models.bar_distribution import FullSupportBarDistribution
+from minipfn.priors import prior_module
+from minipfn.training.config import N_BUCKETS, TrainConfig
+from minipfn.training.losses import dequantize_targets, prior_loss
+from minipfn.training.stability import (
+    CollapseGuard,
+    _qk_weights,
+    _sample_rows,
+    apply_qk_clip,
+    qk_logit_bounds,
 )
 from minipfn.utils import DistContext, lr_factor, setup_distributed
-
-N_BUCKETS = 5000
-
-# 모델 구조. v2는 Nature 논문 기본 모델, v2.5는 TabPFN-2.5(arXiv 2511.08667 "Architecture")가
-# 적은 변경: 층 수(회귀 18, 분류 24), 셀 3개 묶기, thinking 행 64개, 회귀 encoder를 2층 MLP로.
-# emsize·head 수는 2.5 논문에 없어서 v2 그대로 둔다. 둘 다 모델 클래스는 TabPFNv2다
-_V2 = {
-    "model_type": "tabpfn_v2",
-    "nlayers": 12,
-    "features_per_group": 2,
-    "n_thinking_rows": 0,
-    "encoder": "linear",
-}
-_V2_5 = {**_V2, "features_per_group": 3, "n_thinking_rows": 64}  # 두 task 공통
-ARCHITECTURES = {
-    "v2": {"classification": _V2, "regression": _V2},
-    "v2.5": {
-        "classification": {**_V2_5, "nlayers": 24},
-        "regression": {**_V2_5, "nlayers": 18, "encoder": "mlp"},
-    },
-}
-
-
-@dataclass
-class TabPFNv2TrainConfig:
-    """모델·prior·최적화 설정. smoke(로컬 CPU), medium(짧은 실측), paper(논문 규모),
-    long_tables(paper로 학습한 모델을 긴·넓은 표로 이어 학습)."""
-
-    task: Literal["classification", "regression"] = "classification"
-    # 모델 클래스 (`registry.MODEL_TYPES`). 아래 모델 설정 가운데 그 클래스의 설정에 있는 것만 쓴다
-    model_type: str = DEFAULT_MODEL_TYPE
-    # 모델 (논문 기본 모델 크기). 아래 셋은 TabPFN-2.5가 바꾼 것(`with_architecture("v2.5")`)
-    emsize: int = 192
-    nlayers: int = 12
-    nhead: int = 6
-    features_per_group: int = 2
-    n_thinking_rows: int = 0
-    encoder: str = "linear"
-    # prior / 데이터셋 크기 (논문 Methods)
-    max_train_rows: int = MAX_TRAIN_ROWS
-    n_eval_rows: int = N_EVAL_ROWS
-    max_features: int = MAX_FEATURES
-    # 아래 넷은 논문에 없음 (long_tables에서 쓴다). 기본값이면 논문 크기 규칙 그대로다
-    min_train_rows: int = 1
-    log_uniform_rows: bool = False  # 학습 행 수를 [min, max]에서 log 균등으로
-    max_cells: int = MAX_CELLS  # 표 하나의 셀 수 상한 (검증 행 포함)
-    feature_scale: int = MAX_FEATURES  # feature 수 분포를 펼 최대값 (sample_table_size)
-    missing_dataset_prob: float = 0.3
-    border_datasets: int = 20_000  # 회귀 구간 경계를 정할 때 뽑는 데이터셋 수 (여기서 정함)
-    # 최적화 (논문: 약 200만 step × batch 64. warmup 길이와 lr은 여기서 정함)
-    batch_size: int = 64
-    micro_batch: int = 8
-    steps: int = 2_000_000  # 학습률 스케줄의 전체 길이
-    stop_step: int | None = None  # 이번 실행을 멈출 step (None이면 steps까지). 나눠 학습할 때 쓴다
-    deadline: float | None = None  # 이 시각(Unix time)을 넘기면 checkpoint를 남기고 멈춘다
-    warmup_steps: int = 10_000
-    # 회귀는 200k 언저리부터 이 lr에서 붕괴가 되풀이됐다. 낮추는 건 rewind_lr_factor 규칙이 맡는다
-    lr: float = 2e-4
-    grad_clip: float = 1.0
-    # 회귀에서 반복되는 target 값의 정답을 이웃 구간 몇 개에 흩을지 (0이면 끔, dequantize_targets).
-    # 25k step 비교에서 100이어야 grad norm 증가가 멈췄다(10은 거의 효과 없음)
-    dequantize_buckets: float = 100.0
-    # 실행
-    seed: int = 0
-    num_workers: int = 8
-    log_every: int = 100
-    val_every: int = 5_000
-    val_batch: int = 8  # 검증 batch의 데이터셋 수. micro_batch와 따로 둬서 검증 세트가 늘 같다
-    checkpoint_every: int = 5_000
-    # latest.pt는 덮어써지므로 이 step마다 `step_XXXXXXX.pt`로 따로 남긴다(되돌아갈 지점)
-    keep_every: int | None = 25_000
-    # 붕괴 감지 (CollapseGuard): log_every마다 낸 train loss 평균이 최근 건강한 평균보다
-    # collapse_threshold 넘게 높은 채로 collapse_patience번 이어지면, 메모리에 둔 건강한 상태로
-    # 되돌리고 데이터 시드를 바꿔 다시 간다. None이면 끈다. 값은 여기서 정함(논문 규모 run에서
-    # 붕괴는 분류 0.8 → 2.0, 회귀 −1.0 → +1.1로 뛰었고, 평소 흔들림은 0.1 안팎이었다)
-    collapse_threshold: float | None = 0.5
-    collapse_patience: int = 3
-    snapshot_every: int = 2_000  # 이 step마다 건강하면 상태를 메모리에 남긴다 (최근 2개)
-    max_rewinds: int = 10  # 한 번 실행에서 이보다 많이 되돌려야 하면 멈춘다
-    # 붕괴로 되돌릴 때마다 기준 lr에 곱하는 값 (1이면 lr 그대로). 되돌려도 같은 lr이면 붕괴가
-    # 되풀이됐고(회귀 run에서 rewind 8~10번), 같은 checkpoint에서 lr만 낮추면 멈췄다(275k에서
-    # 35k step 비교: 1e-4는 weight decay를 더해도 3번씩, 5e-5는 0번). 사람이 중간에 lr을 고치는 대신
-    # 미리 정한 규칙으로 낮춘다. warmup·cosine 모양은 그대로이고 다음 chunk에도 이어진다
-    rewind_lr_factor: float = 1.0
-    # 규칙으로는 기준 lr을 이보다 낮추지 않는다(그 뒤로는 되돌리기만 한다). 2e-4에서 세 번 절반,
-    # 5e-5가 안정했던 것의 절반까지. 이어서 학습할 때 TABPFN_V2_LR로 준 lr은 이 값과 상관없다
-    rewind_min_lr: float = 2.5e-5
-    # QK-clip (논문에 없음, 여기서 정함. Kimi K2의 MuonClip과 같은 생각): optimizer step마다
-    # head별 attention logit의 상한(`qk_logit_bounds`)이 이 값을 넘으면 그 head의 Wq·Wk를 줄여
-    # 상한을 이 값에 맞춘다. 학습 절차만 바뀌고 모델 구조·추론은 그대로다. None이면 끈다.
-    # 논문 규모 회귀에서 sample attention의 상한이 수만~수십만으로 커지며(정상 수백 이하) 행 하나에
-    # 몰리는 attention sink가 됐고, 그 뒤 학습이 불안정해져 benchmark가 크게 나빠졌다
-    qk_clip: float | None = None
-    # 상한 계산(head마다 작은 QR·SVD)은 GPU와 CPU를 맞추느라 step마다 하면 step 시간이 1.7배가 된다.
-    # 그래서 이 step마다만 한다. 폭주할 때도 상한은 수천 step에 걸쳐 커져서 50 step 사이에 넘는 양은
-    # 몇 % 안팎이다
-    qk_clip_every: int = 50
-
-    def __post_init__(self) -> None:
-        model_class(self.model_type)  # 없는 이름이면 ValueError
-        if not 0.0 < self.rewind_lr_factor <= 1.0:
-            raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
-        if self.qk_clip is not None and self.qk_clip <= 0:
-            raise ValueError(f"qk_clip은 0보다 커야 한다: {self.qk_clip}")
-        if self.qk_clip_every < 1:
-            raise ValueError(f"qk_clip_every는 1 이상이어야 한다: {self.qk_clip_every}")
-
-    @property
-    def n_out(self) -> int:
-        return MAX_CLASSES if self.task == "classification" else N_BUCKETS
-
-    @classmethod
-    def paper(cls, task: str = "classification") -> TabPFNv2TrainConfig:
-        # 분류는 2e-4에서 붕괴가 드물어(300k까지 rewind 1번) lr을 그대로 둔다.
-        # 회귀의 QK-clip 250: 50k scratch 비교에서 250·500 모두 상한을 지켰고 val NLL도 비슷했다
-        # (−1.08·−1.07, 끈 것 −1.04). 그중 logit을 더 낮게 묶는 쪽. 100은 10k부터 잘라 학습이 늦었다
-        if task == "regression":
-            return cls(task=task, rewind_lr_factor=0.5, qk_clip=250.0)
-        return cls(task=task)
-
-    @classmethod
-    def long_tables(cls, task: str = "classification") -> TabPFNv2TrainConfig:
-        """paper로 학습한 모델을 더 긴·넓은 표로 짧게 이어 학습한다 (논문에 없음, 값은 여기서 정함).
-
-        TabPFN-2.5는 prior를 "더 많은 행과 feature로 키웠다"고만 적었다(추론 권장 크기는 행 50,000,
-        feature 2,000). 그 크기로 처음부터 학습하는 대신 TabICL처럼 짧은 표로 오래 학습한 뒤 긴 표로
-        잠깐 더 학습한다: 학습 행 512~8,192개 log 균등, feature 수 분포를 500까지 펴고, 셀은
-        400,000개까지. 가중치만 가져와(`init_from`) 새 optimizer로 lr 5e-5, warmup 1k + cosine
-        20k step. v2(12층)는 GPU당 micro batch 2에서 GPU 메모리 52.6GB였는데 2.5는 층이 두 배라
-        micro batch 1로 둔다. 검증 batch는 데이터셋 4개다.
-        """
-        return replace(
-            cls.paper(task),
-            min_train_rows=512,
-            max_train_rows=8192,
-            log_uniform_rows=True,
-            max_features=500,
-            feature_scale=500,
-            max_cells=400_000,
-            micro_batch=1,
-            val_batch=4,
-            steps=20_000,
-            warmup_steps=1_000,
-            lr=5e-5,
-            keep_every=5_000,
-        )
-
-    @classmethod
-    def medium(cls, task: str = "classification") -> TabPFNv2TrainConfig:
-        """논문 모델·prior·batch 그대로, step만 1/100. step 시간과 학습 곡선을 재는 용도."""
-        return cls(
-            task=task,
-            steps=20_000,
-            warmup_steps=1_000,
-            val_every=1_000,
-            checkpoint_every=1_000,
-            keep_every=5_000,
-            border_datasets=5_000,
-        )
-
-    @classmethod
-    def smoke(cls, task: str = "classification") -> TabPFNv2TrainConfig:
-        """로컬 CPU에서 1분 안에 끝나는 크기. 코드 경로 확인용."""
-        return cls(
-            task=task,
-            emsize=32,
-            nlayers=2,
-            nhead=2,
-            max_train_rows=64,
-            n_eval_rows=16,
-            max_features=8,
-            border_datasets=40,
-            batch_size=8,
-            micro_batch=4,
-            steps=20,
-            warmup_steps=2,
-            lr=1e-3,
-            num_workers=0,
-            log_every=5,
-            val_every=10,
-            checkpoint_every=10,
-            keep_every=10,
-        )
-
-    def model_config(self):
-        """`model_type` 모델의 설정. 그 설정에 있는 필드 가운데 여기에도 있는 것을 옮기고, 나머지는
-        그 설정의 기본값이다."""
-        mine = {f.name for f in fields(self)}
-        values = {n: getattr(self, n) for n in config_fields(self.model_type) if n in mine}
-        return model_class(self.model_type).config_class(n_out=self.n_out, **values)
-
-    def build_model(self):
-        return build_model(self.model_type, self.model_config())
-
-    def with_architecture(self, arch: str, keep_size: bool = False) -> TabPFNv2TrainConfig:
-        """모델 구조를 `ARCHITECTURES`의 것으로. `keep_size`(smoke)면 층 수는 그대로 두고 thinking
-        행은 4개까지만 써서 작은 크기를 유지한다(구조가 바뀌는 코드 경로만 확인한다)."""
-        if arch not in ARCHITECTURES:
-            raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
-        changes = dict(ARCHITECTURES[arch][self.task])
-        if keep_size:
-            changes["nlayers"] = self.nlayers
-            if "n_thinking_rows" in changes:
-                changes["n_thinking_rows"] = min(changes["n_thinking_rows"], 4)
-        return replace(self, **changes)
-
-    def for_world_size(self, world_size: int) -> TabPFNv2TrainConfig:
-        """GPU가 많아 micro_batch × world_size가 batch를 넘으면 GPU당 micro batch를 줄인다."""
-        if self.micro_batch * world_size <= self.batch_size:
-            return self
-        return replace(self, micro_batch=self.batch_size // world_size)
-
-    def grad_accumulation(self, world_size: int) -> int:
-        per_forward = self.micro_batch * world_size
-        if self.batch_size % per_forward:
-            raise ValueError(
-                f"batch_size {self.batch_size}가 micro_batch × world_size = {per_forward}로"
-                " 나눠떨어지지 않는다"
-            )
-        return self.batch_size // per_forward
-
-    def make_prior(self, seed: int) -> TabPFNv2Prior:
-        return TabPFNv2Prior(
-            self.task,
-            seed=seed,
-            missing_dataset_prob=self.missing_dataset_prob,
-            min_train_rows=self.min_train_rows,
-            max_train_rows=self.max_train_rows,
-            n_eval_rows=self.n_eval_rows,
-            max_features=self.max_features,
-            log_uniform_rows=self.log_uniform_rows,
-            max_cells=self.max_cells,
-            feature_scale=self.feature_scale,
-        )
 
 
 class PriorBatches(IterableDataset):
     """DataLoader worker마다 다른 시드로 prior batch를 끝없이 만든다."""
 
-    def __init__(self, config: TabPFNv2TrainConfig, seed: tuple[int, ...]) -> None:
+    def __init__(self, config: TrainConfig, seed: tuple[int, ...]) -> None:
         self.config = config
         self.seed = seed
 
@@ -307,81 +66,33 @@ class PriorBatches(IterableDataset):
             yield batch.x, batch.y, batch.n_train
 
 
-def prior_loss(
-    logits: torch.Tensor,
-    y_eval: torch.Tensor,
-    task: str,
-    bar: FullSupportBarDistribution | None,
-) -> torch.Tensor:
-    """검증 행의 평균 손실. 분류: cross-entropy, 회귀: bar distribution NLL."""
-    logits = logits.float()
-    if task == "classification":
-        return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y_eval.reshape(-1).long())
-    return bar(logits, y_eval.float()).mean()
-
-
-def dequantize_targets(
-    y: torch.Tensor, n_train: int, bar: FullSupportBarDistribution, n_buckets: float
-) -> torch.Tensor:
-    """데이터셋 안에서 반복되는 target 값의 검증 행 정답을 이웃 구간 `n_buckets`개에 흩는다.
-
-    같은 값이 반복되는 이산 target은 늘 같은 구간에 떨어지므로, 그 구간에 확률을 몰수록 NLL이
-    끝없이 낮아진다(최적 logit이 무한대). 그러면 출력층이 계속 커지고 gradient가 연속 target의
-    수백 배가 되어 학습이 무너진다(논문 규모 회귀 run에서 겪음). 구간 번호 좌표에서 균일 noise를
-    더해 정답을 이웃 구간에 퍼뜨리면 최적이 유한해진다. 연속 target, 양 끝 꼬리 구간의 값, 결측은
-    그대로 둔다(여기서 정함). 반환은 검증 행 정답 `(batch, n_eval)`이다.
-    """
-    y_eval = y[:, n_train:]
-    # 데이터셋마다 정렬해 이웃과 같은 값이면 반복 (GPU 동기화 없이 batch 전체를 한 번에)
-    y_sorted, order = y.sort(dim=1)
-    same = y_sorted[:, 1:] == y_sorted[:, :-1]
-    dup = torch.zeros_like(y_sorted, dtype=torch.bool)
-    dup[:, 1:] |= same
-    dup[:, :-1] |= same
-    repeated = torch.zeros_like(dup).scatter_(1, order, dup)[:, n_train:]
-    borders, widths, last = bar.borders, bar.widths, bar.num_buckets - 1
-    nan = torch.isnan(y_eval)
-    y_safe = torch.where(nan, borders[1], y_eval)  # 결측은 바꾸지 않지만 index 계산은 유한하게
-    idx = bar._bucket_index(y_safe.contiguous())
-    interior = (idx >= 1) & (idx <= last - 1) & ~nan
-    coord = idx + (y_safe - borders[idx]) / widths[idx]  # 구간 번호 좌표 (k ~ k+1이 구간 k)
-    moved = coord + (torch.rand_like(y_eval) - 0.5) * n_buckets
-    # 꼬리 구간으로는 보내지 않는다. 잘라내면 경계에 점 질량이 다시 생기므로 경계에서 반사한다
-    lo, hi = 1.0, float(last)
-    moved = torch.where(moved < lo, 2 * lo - moved, moved)
-    moved = torch.where(moved > hi, 2 * hi - moved, moved).clamp(lo, hi)
-    j = moved.floor().long().clamp(1, last - 1)
-    shifted = borders[j] + (moved - j) * widths[j]
-    # float 반올림으로 오른쪽 꼬리 경계(borders[-2])에 닿지 않게 그 바로 아래 값까지만
-    shifted = torch.minimum(shifted, torch.nextafter(borders[-2], borders[-3]))
-    return torch.where(repeated & interior, shifted, y_eval)
-
-
-def _borders(
-    config: TabPFNv2TrainConfig, d: DistContext, device: torch.device
-) -> torch.Tensor | None:
+def _borders(config: TrainConfig, d: DistContext, device: torch.device) -> torch.Tensor | None:
     """회귀면 rank 0에서 구간 경계를 계산해 모든 GPU에 나눠 준다."""
     if config.task != "regression":
         return None
     borders = torch.empty(N_BUCKETS + 1, device=device)
     if d.is_main:
         start = time.time()
-        borders = regression_borders(
-            N_BUCKETS,
-            config.border_datasets,
-            seed=20_000_000 + config.seed,
-            n_jobs=max(1, min(32, (os.cpu_count() or 1) // 2)),
-            max_train_rows=config.max_train_rows,
-            n_eval_rows=config.n_eval_rows,
-            max_features=config.max_features,
-        ).to(device)
+        borders = (
+            prior_module(config.prior_type)
+            .regression_borders(
+                N_BUCKETS,
+                config.border_datasets,
+                seed=20_000_000 + config.seed,
+                n_jobs=max(1, min(32, (os.cpu_count() or 1) // 2)),
+                max_train_rows=config.max_train_rows,
+                n_eval_rows=config.n_eval_rows,
+                max_features=config.max_features,
+            )
+            .to(device)
+        )
         print(f"regression borders: {config.border_datasets} datasets, {time.time() - start:.0f}s")
     if d.world_size > 1:
         dist.broadcast(borders, src=0)
     return borders
 
 
-def _make_val_batches(config: TabPFNv2TrainConfig, n_batches: int = 8):
+def _make_val_batches(config: TrainConfig, n_batches: int = 8):
     """학습과 겹치지 않는 시드로 검증용 prior batch를 고정해 둔다 (val_batch × n_batches개)."""
     prior = config.make_prior(10_000_000 + config.seed)
     return [prior.sample_batch(config.val_batch) for _ in range(n_batches)]
@@ -425,61 +136,6 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
         print(f"lr: 기준 {old:.2e} → {lr:.2e} (step {step}부터 {lr * factor:.3e})", flush=True)
 
 
-def _qk_weights(model) -> list[tuple[str, torch.Tensor]]:
-    # (종류, qkv weight). 어느 attention을 볼지는 모델이 정한다 (`qk_clip_weights`)
-    return model.qk_clip_weights()
-
-
-@torch.no_grad()
-def qk_logit_bounds(model) -> torch.Tensor:
-    """attention마다 head별 logit 상한 σ_max(Wq_hᵀ Wk_h) · E / √d. 모양 (attention 수, head 수).
-
-    attention 순서는 `_qk_weights`와 같다. 층 입력은 affine 없는 LayerNorm 뒤라 토큰 크기가 √E로
-    같으므로 |q·k| / √d ≤ σ_max · E / √d이다. 논문 규모 회귀 checkpoint에서 이 값은 실제 최대
-    logit과 거의 같았다(678k vs 676k). Wq_hᵀ = Q_q R_q, Wk_hᵀ = Q_k R_k로 QR 분해하면
-    σ_max(Wq_hᵀ Wk_h) = σ_max(R_q R_kᵀ)라 E×E 대신 d×d에서 계산한다.
-    """
-    weights = _qk_weights(model)
-    if not weights:
-        return torch.zeros(0, model.config.nhead)
-    nhead = model.config.nhead
-    e = weights[0][1].shape[1]
-    d = e // nhead
-    w = torch.stack([w for _, w in weights]).double()  # (A, 3E, E)
-    q = w[:, :e].reshape(len(weights), nhead, d, e)
-    k = w[:, e : 2 * e].reshape(len(weights), nhead, d, e)
-    r_q = torch.linalg.qr(q.transpose(-1, -2)).R  # (A, H, d, d)
-    r_k = torch.linalg.qr(k.transpose(-1, -2)).R
-    sigma = torch.linalg.matrix_norm(r_q @ r_k.transpose(-1, -2), ord=2)
-    return (sigma * e / math.sqrt(d)).float()
-
-
-def _sample_rows(model) -> list[int]:
-    # qk_logit_bounds의 행 가운데 sample attention인 것
-    return [i for i, (kind, _) in enumerate(_qk_weights(model)) if kind == "sample_attention"]
-
-
-@torch.no_grad()
-def apply_qk_clip(model, tau: float, world_size: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
-    """logit 상한이 tau를 넘는 head의 Wq_h·Wk_h를 각각 √(tau / 상한)배로 줄인다.
-
-    반환: (줄인 head 수, 줄이기 전 가장 큰 상한). 매 step 부르므로 GPU에 둔 채 돌려준다(값을 읽는
-    것은 기록할 때만). GPU마다 계산이 아주 조금 다를 수 있어 배율은 모든 GPU의 최솟값으로
-    맞춘다(가중치가 GPU마다 같게 남도록).
-    """
-    bounds = qk_logit_bounds(model)
-    scale = (tau / bounds).clamp(max=1.0).sqrt()
-    if world_size > 1:
-        dist.all_reduce(scale, op=dist.ReduceOp.MIN)
-    nhead = model.config.nhead
-    for (_, w), s in zip(_qk_weights(model), scale, strict=True):
-        e = w.shape[1]
-        head = s.to(w.dtype).repeat_interleave(e // nhead)[:, None]  # (E, 1): 행마다 그 head의 배율
-        w[:e].mul_(head)
-        w[e : 2 * e].mul_(head)
-    return (scale < 1).sum(), bounds.max()
-
-
 def checkpoint_lr(path: str | Path) -> float:
     """checkpoint가 쓰던 기준 lr. 이어서 학습할 때 lr을 따로 주지 않으면 이 값을 이어 간다."""
     state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
@@ -497,45 +153,8 @@ def _to_cpu(obj):
     return obj
 
 
-class CollapseGuard:
-    """train loss가 갑자기 뛰어 돌아오지 않는 붕괴를 알아챈다.
-
-    논문 규모 run에서 분류·회귀 모두 grad spike 없이도 수백 step 안에 상수 출력으로 무너진 적이
-    있다. 같은 시드로 다시 돌리면 무너지지 않아서(GPU 비결정성), 막기보다 알아채고 되돌린다.
-    log_every마다 window 평균 loss를 받아, 최근 건강한 window들의 중앙값보다 `threshold` 넘게
-    높은 window가 `patience`번 이어지면 붕괴로 본다. 모든 GPU가 같은 평균(all-reduce 뒤)을 보므로
-    판단도 같다.
-    """
-
-    def __init__(self, threshold: float, patience: int, n_windows: int = 20, min_windows: int = 5):
-        self.threshold, self.patience, self.min_windows = threshold, patience, min_windows
-        self.healthy: list[float] = []  # 최근 건강한 window 평균
-        self.n_windows = n_windows
-        self.bad = 0  # 이어진 나쁜 window 수
-
-    def update(self, window_mean: float) -> bool:
-        """window 평균을 넣고, 붕괴로 판단하면 True.
-
-        유한한 loss가 하나도 없던 window(inf)는 나쁜 window로 센다.
-        """
-        bad = not math.isfinite(window_mean)
-        if not bad and len(self.healthy) >= self.min_windows:
-            ref = sorted(self.healthy)[len(self.healthy) // 2]
-            bad = window_mean > ref + self.threshold
-        if bad:
-            self.bad += 1
-            return self.bad >= self.patience
-        self.bad = 0
-        self.healthy = (self.healthy + [window_mean])[-self.n_windows :]
-        return False
-
-    @property
-    def suspect(self) -> bool:
-        return self.bad > 0
-
-
-def train_tabpfn_v2(
-    config: TabPFNv2TrainConfig,
+def train(
+    config: TrainConfig,
     out_dir: str | Path,
     resume_from: str | Path | None = None,
     mlflow_log: bool = True,

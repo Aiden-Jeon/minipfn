@@ -1,14 +1,14 @@
 import numpy as np
 import torch
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.prior import (
+from minipfn.priors.tabpfn_v1 import (
     TabPFNPrior,
     TabPFNPriorDataset,
     _sample_gp_group,
     sample_group_hyperparameters,
     sample_hyperparameter,
 )
+from minipfn.recipes import tabpfn_v1 as spec
 
 
 def _small_prior(seed=0, seq_len=128):

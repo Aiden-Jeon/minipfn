@@ -28,16 +28,16 @@ import mlflow
 import pandas as pd
 import torch
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.evaluate import (
+from minipfn.benchmarks.cc18 import (
     evaluate_methods,
     load_openml_dataset,
     sklearn_baselines,
     tabpfn_predict_proba,
 )
-from minipfn.tabpfn.hub import from_pretrained
-from minipfn.tabpfn.model import TabPFNTransformer, configure_attention_backends
-from minipfn.tabpfn.train import TabPFNConfig, build_tabpfn_model, tabpfn_from_state
+from minipfn.hub.tabpfn_v1 import from_pretrained
+from minipfn.models.tabpfn_v1 import TabPFNTransformer, configure_attention_backends
+from minipfn.recipes import tabpfn_v1 as spec
+from minipfn.training.tabpfn_v1 import TabPFNConfig, build_tabpfn_model, tabpfn_from_state
 from minipfn.utils import log_run_source
 
 # 학습 run의 param 중 모델 구조를 정하는 것 (학습 중 checkpoint에는 config가 없다)

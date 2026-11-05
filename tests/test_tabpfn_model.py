@@ -1,7 +1,7 @@
 import torch
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.model import TabPFNTransformer, classification_loss
+from minipfn.models.tabpfn_v1 import TabPFNTransformer, classification_loss
+from minipfn.recipes import tabpfn_v1 as spec
 
 
 def _tiny_model():

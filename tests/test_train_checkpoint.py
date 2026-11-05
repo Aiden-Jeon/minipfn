@@ -15,7 +15,7 @@ from minipfn import (
     save_checkpoint,
     train_pfn,
 )
-from minipfn.train import alias_legacy_package
+from minipfn.training.pfn import alias_legacy_package
 from minipfn.utils import set_seed
 
 
@@ -76,12 +76,12 @@ def test_train_logs_best_final_and_loads(tmp_path):
 
 
 def test_legacy_package_alias_unpickles_old_module_paths():
-    # 이름을 바꾸기 전에 pickle로 로깅한 모델은 pfn_cookbook.* 경로로 클래스를 찾는다.
+    # 이름을 바꾸기 전에 pickle로 로깅한 모델은 pfn_cookbook.model 경로로 클래스를 찾고, 4축으로
+    # 나누기 전 모델은 minipfn.model을 찾는다(MLflow pickle에는 모델 객체만 들어간다).
     # protocol 0은 모듈 경로를 텍스트로 쓰므로 바이트 치환으로 옛 pickle을 만들 수 있다.
-    old = pickle.dumps((PFNTransformer, PFNConfig()), protocol=0).replace(
-        b"minipfn.", b"pfn_cookbook."
-    )
-    assert b"pfn_cookbook.model" in old
+    new = pickle.dumps(PFNTransformer, protocol=0)
+    assert b"minipfn.models.pfn" in new
     alias_legacy_package()
-    cls, config = pickle.loads(old)
-    assert cls is PFNTransformer and config == PFNConfig()
+    for old_module in (b"pfn_cookbook.model", b"minipfn.model"):
+        old = new.replace(b"minipfn.models.pfn", old_module)
+        assert pickle.loads(old) is PFNTransformer

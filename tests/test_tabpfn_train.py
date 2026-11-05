@@ -9,8 +9,8 @@ import mlflow
 import pytest
 import torch
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.train import TabPFNConfig, load_tabpfn, lr_factor, train_tabpfn
+from minipfn.recipes import tabpfn_v1 as spec
+from minipfn.training.tabpfn_v1 import TabPFNConfig, load_tabpfn, lr_factor, train_tabpfn
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tabpfn" / "train.py"
 
@@ -86,8 +86,8 @@ def test_train_script_logs_to_mlflow(tmp_path):
         # 실제로 돈 스크립트와 src가 run에 남는다
         code = {a.path for a in client.list_artifacts(run_id, "code")}
         assert {"code/train.py", "code/minipfn"} <= code
-        tabpfn_code = {a.path for a in client.list_artifacts(run_id, "code/minipfn/tabpfn")}
-        assert "code/minipfn/tabpfn/train.py" in tabpfn_code
+        training_code = {a.path for a in client.list_artifacts(run_id, "code/minipfn/training")}
+        assert "code/minipfn/training/tabpfn_v1.py" in training_code
         tags = runs.iloc[0]
         assert tags["tags.command"] == "train.py " + " ".join(args)
         assert tags["tags.git_commit"]

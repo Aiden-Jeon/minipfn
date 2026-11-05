@@ -3,7 +3,7 @@ import math
 import torch
 
 from minipfn import FullSupportBarDistribution, get_bucket_borders
-from minipfn.bar_distribution import BarDistribution
+from minipfn.models.bar_distribution import BarDistribution
 
 
 def test_uniform_logits_give_log_width_nll():

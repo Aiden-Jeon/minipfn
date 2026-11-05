@@ -95,8 +95,8 @@ def test_paper_specific_flags(extra):
 
 
 def test_v1_dry_run_writes_source_json_and_notice(tmp_path):
-    from minipfn.tabpfn.hub import from_pretrained
-    from minipfn.tabpfn.train import TabPFNConfig, build_tabpfn_model, save_tabpfn
+    from minipfn.hub.tabpfn_v1 import from_pretrained
+    from minipfn.training.tabpfn_v1 import TabPFNConfig, build_tabpfn_model, save_tabpfn
 
     config = TabPFNConfig.smoke()
     torch.manual_seed(0)
@@ -132,12 +132,13 @@ def test_v1_training_checkpoint_without_config_is_rejected(tmp_path):
 
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_v2_dry_run_writes_source_in_config(tmp_path, task):
-    from minipfn.tabpfn_v2.hub import from_pretrained
-    from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
-    from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
+    from minipfn.hub import from_pretrained
+    from minipfn.models import save_checkpoint
+    from minipfn.models.tabpfn_v2 import TabPFNv2
+    from minipfn.training.config import TrainConfig
 
     torch.manual_seed(0)
-    model = TabPFNv2(TabPFNv2TrainConfig.smoke(task).model_config()).eval()
+    model = TabPFNv2(TrainConfig.smoke(task).model_config()).eval()
     borders = None
     if task == "regression":
         borders = torch.linspace(-3, 3, model.config.n_out + 1)
@@ -157,10 +158,11 @@ def test_v2_dry_run_writes_source_in_config(tmp_path, task):
 
 
 def test_v2_revision_dry_run_writes_a_short_card(tmp_path):
-    from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
-    from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
+    from minipfn.models import save_checkpoint
+    from minipfn.models.tabpfn_v2 import TabPFNv2
+    from minipfn.training.config import TrainConfig
 
-    model = TabPFNv2(TabPFNv2TrainConfig.smoke("classification").model_config()).eval()
+    model = TabPFNv2(TrainConfig.smoke("classification").model_config()).eval()
     checkpoint = str(tmp_path / "model.pt")
     save_checkpoint(checkpoint, model, None)
     card = _card(tmp_path, checkpoint)

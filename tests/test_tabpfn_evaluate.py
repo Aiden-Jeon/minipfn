@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from minipfn.tabpfn.evaluate import (
+from minipfn.benchmarks.cc18 import (
     OpenMLDataset,
     evaluate_methods,
     generate_split,
@@ -9,7 +9,7 @@ from minipfn.tabpfn.evaluate import (
     sklearn_baselines,
     tabpfn_predict_proba,
 )
-from minipfn.tabpfn.model import TabPFNTransformer
+from minipfn.models.tabpfn_v1 import TabPFNTransformer
 
 
 def _toy(n=300, n_classes=3, seed=0):

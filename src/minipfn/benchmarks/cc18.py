@@ -19,8 +19,8 @@ import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.inference import tabpfn_predict_proba as tabpfn_predict_proba  # 예전 경로
+from minipfn.inference.tabpfn_v1 import tabpfn_predict_proba as tabpfn_predict_proba  # 예전 경로
+from minipfn.recipes import tabpfn_v1 as spec
 
 
 @dataclass

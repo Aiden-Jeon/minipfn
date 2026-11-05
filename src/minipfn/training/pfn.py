@@ -17,14 +17,14 @@ from dataclasses import asdict, dataclass
 import torch
 from torch import nn
 
-from minipfn.bar_distribution import FullSupportBarDistribution, get_bucket_borders
-from minipfn.gp_prior import (
+from minipfn.models.bar_distribution import FullSupportBarDistribution, get_bucket_borders
+from minipfn.models.pfn import PFNTransformer
+from minipfn.priors.gp import (
     DEFAULT_LENGTHSCALE,
     DEFAULT_NOISE,
     DEFAULT_VARIANCE,
     GPPriorSampler,
 )
-from minipfn.model import PFNTransformer
 
 
 @dataclass

@@ -30,8 +30,8 @@ import mlflow
 import numpy as np
 import pandas as pd
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.train import VAL_GROUPS, TabPFNConfig
+from minipfn.recipes import tabpfn_v1 as spec
+from minipfn.training.tabpfn_v1 import VAL_GROUPS, TabPFNConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINES = [

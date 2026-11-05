@@ -1,6 +1,6 @@
 """TabPFN Transformer (논문 3절·부록 E.1, v1 `transformer.py`·`layer.py` 구조).
 
-GP 재현용 `minipfn.model.PFNTransformer`와 다른 점은 v1을 따른 것이다.
+GP 재현용 `minipfn.models.pfn.PFNTransformer`와 다른 점은 v1을 따른 것이다.
 - post-norm 층(잔차 더한 뒤 LayerNorm), GELU, attention 출력과 FFN 두 번째 Linear를 0으로 초기화
 - 테스트 행 토큰은 x 임베딩만 쓴다(마스크 토큰 없음)
 - 출력은 Linear → GELU → Linear decoder, logit 10개(최대 클래스 수)
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from minipfn.tabpfn import spec
+from minipfn.recipes import tabpfn_v1 as spec
 
 
 class TabPFNLayer(nn.Module):

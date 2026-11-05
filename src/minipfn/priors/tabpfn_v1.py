@@ -27,7 +27,7 @@ import torch
 from scipy import stats
 from torch.utils.data import IterableDataset, get_worker_info
 
-from minipfn.tabpfn import spec
+from minipfn.recipes import tabpfn_v1 as spec
 
 ACTIVATIONS = {"tanh": torch.tanh, "identity": lambda z: z, "relu": torch.relu}
 

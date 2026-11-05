@@ -46,15 +46,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
-from minipfn.tabpfn_v2.train import (  # noqa: E402
-    ARCHITECTURES,
-    TabPFNv2TrainConfig,
-    checkpoint_lr,
-    train_tabpfn_v2,
-)
+from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
+from minipfn.training.config import TrainConfig  # noqa: E402
+from minipfn.training.loop import checkpoint_lr, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
-CONFIG_NAMES = ("smoke", "medium", "paper", "long_tables")
+# 일반 크기(smoke, medium)는 TrainConfig에, 논문 설정(paper, long_tables)은 recipe에 있다
+PRESETS = {
+    "smoke": TrainConfig.smoke,
+    "medium": TrainConfig.medium,
+    "paper": recipe.paper,
+    "long_tables": recipe.long_tables,
+}
+CONFIG_NAMES = tuple(PRESETS)
 
 
 def _env(name: str, cast=str):
@@ -76,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--arch",
-        choices=tuple(ARCHITECTURES),
+        choices=tuple(recipe.ARCHITECTURES),
         default=os.environ.get("TABPFN_V2_ARCH", "v2"),
         help="모델 구조: v2(Nature 2025) 또는 v2.5(TabPFN-2.5)",
     )
@@ -119,9 +123,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def build_config(args: argparse.Namespace) -> TabPFNv2TrainConfig:
-    config = getattr(TabPFNv2TrainConfig, args.config_name)(args.task)
-    config = config.with_architecture(args.arch, keep_size=args.config_name == "smoke")
+def build_config(args: argparse.Namespace) -> TrainConfig:
+    config = PRESETS[args.config_name](args.task)
+    config = recipe.with_architecture(config, args.arch, keep_size=args.config_name == "smoke")
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,
@@ -209,7 +213,7 @@ def main(argv: list[str] | None = None) -> None:
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)
         log_run_source(__file__, env_prefix="TABPFN_V2_")
 
-    result = train_tabpfn_v2(
+    result = train(
         config, out_dir, resume_from=resume_path, mlflow_log=is_main, init_from=init_path
     )
 

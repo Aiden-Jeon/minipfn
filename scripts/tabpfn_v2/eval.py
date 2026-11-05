@@ -1,9 +1,9 @@
 """TabPFN v2를 논문 benchmark에서 평가하고 논문 수치와 비교한다.
 
 benchmark는 AMLB 분류 29개와 AMLB·CTR23 회귀 28개다. 데이터셋마다 OpenML task의 10-fold 교차검증
-평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `model.save_checkpoint`로 저장한 체크포인트,
-학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`), Hub repo id
-(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
+평균을 낸다(분류 ROC AUC, 회귀 negative RMSE). 모델은 `minipfn.models.save_checkpoint`로 저장한
+체크포인트, 학습 run이 MLflow에 남긴 checkpoint(`runs:/<run_id>/checkpoints/step_XXXXXXX.pt`),
+Hub repo id(`hf://owner/name`, `hub.save_pretrained`로 올린 것) 가운데 하나다.
 
 예) 저장소 루트에서 `EVAL=scripts/tabpfn_v2/eval.py`라고 두면
   uv run python $EVAL --classifier-path clf.pt --regressor-path reg.pt            # 57개 × 10 fold
@@ -41,9 +41,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from minipfn.tabpfn_v2 import benchmark as bm
-from minipfn.tabpfn_v2.hub import load_model
-from minipfn.tabpfn_v2.inference import (
+from minipfn.benchmarks import amlb as bm
+from minipfn.hub import load_model
+from minipfn.inference.tabpfn_v2 import (
     DEFAULT_MEMBER_KINDS,
     DEFAULT_ONE_HOT,
     MEMBER_KINDS,

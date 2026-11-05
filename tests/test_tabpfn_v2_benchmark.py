@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from minipfn.tabpfn_v2.benchmark import score_fold
+from minipfn.benchmarks.amlb import score_fold
 
 
 def test_test_rows_of_classes_unseen_in_training_are_ignored():

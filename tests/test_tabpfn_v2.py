@@ -6,8 +6,9 @@ import pytest
 import torch
 from sklearn.datasets import load_breast_cancer, load_diabetes
 
-from minipfn.tabpfn_v2.inference import TabPFNv2Classifier, TabPFNv2Regressor, _probs_on_borders
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, load_checkpoint, save_checkpoint
+from minipfn.inference.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor, _probs_on_borders
+from minipfn.models import load_checkpoint, save_checkpoint
+from minipfn.models.tabpfn_v2 import TabPFNv2, TabPFNv2Config
 
 
 def _tiny_model(n_out: int = 10) -> TabPFNv2:
@@ -97,7 +98,7 @@ def test_regressor_runs():
 
 
 def test_regressor_tail_bucket_uses_training_target_range():
-    from minipfn.tabpfn_v2.inference import _bucket_values
+    from minipfn.inference.tabpfn_v2 import _bucket_values
 
     # 맨 바깥 구간이 넓은 경계: half-normal 꼬리 평균이면 z 30 근처가 된다
     borders = torch.tensor([-30.0, -4.0, -1.0, 1.0, 4.0, 30.0])
@@ -111,7 +112,7 @@ def test_regressor_tail_bucket_uses_training_target_range():
 def test_clipped_inverse_stays_in_training_range_on_both_sides():
     from sklearn.preprocessing import PowerTransformer
 
-    from minipfn.tabpfn_v2.inference import _clipped_inverse
+    from minipfn.inference.tabpfn_v2 import _clipped_inverse
 
     rng = np.random.default_rng(0)
     # λ > 2: 왼쪽 끝에 몰린 값 + 오른쪽 덩어리 (역변환이 왼쪽에서 끝난다)
@@ -166,7 +167,7 @@ def test_nearly_constant_training_column_does_not_blow_up():
 
 
 def test_outlier_clip_leaves_categorical_codes_alone():
-    from minipfn.tabpfn_v2.inference import _Member, _MemberPreprocessor
+    from minipfn.inference.tabpfn_v2 import _Member, _MemberPreprocessor
 
     x = np.zeros((1000, 2))
     x[:3, 0] = 50.0  # 드문 범주 번호 50
@@ -179,7 +180,7 @@ def test_outlier_clip_leaves_categorical_codes_alone():
 
 
 def test_one_hot_expands_small_categorical_columns_only():
-    from minipfn.tabpfn_v2.inference import _Member, _MemberPreprocessor
+    from minipfn.inference.tabpfn_v2 import _Member, _MemberPreprocessor
 
     rng = np.random.default_rng(0)
     x = np.stack(
@@ -206,7 +207,7 @@ def test_one_hot_expands_small_categorical_columns_only():
 
 
 def test_one_hot_width_is_capped_by_reverting_the_widest_columns():
-    from minipfn.tabpfn_v2.inference import MAX_ONE_HOT_WIDTH, _one_hot_sizes
+    from minipfn.inference.tabpfn_v2 import MAX_ONE_HOT_WIDTH, _one_hot_sizes
 
     # 범주 20개 열 8개 + 범주 2개 열 10개 + 수치 열 2개: 펼치면 2 + 160 + 10 = 172열
     n_categories = {i: 20 for i in range(8)} | {i: 2 for i in range(8, 18)}
@@ -219,7 +220,7 @@ def test_one_hot_width_is_capped_by_reverting_the_widest_columns():
 
 
 def test_one_hot_out_of_range_codes_are_missing():
-    from minipfn.tabpfn_v2.inference import _MemberPreprocessor
+    from minipfn.inference.tabpfn_v2 import _MemberPreprocessor
 
     block = _MemberPreprocessor._one_hot(np.array([0.0, 2.0, 3.0, np.nan, -1.0]), 3)
     assert np.array_equal(block[:2], [[1, 0, 0], [0, 0, 1]])

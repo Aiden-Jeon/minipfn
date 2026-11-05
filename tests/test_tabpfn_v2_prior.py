@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from minipfn.tabpfn_v2 import prior as P
+from minipfn.priors import tabicl as P
 
 
 def test_table_size_follows_paper_rules():

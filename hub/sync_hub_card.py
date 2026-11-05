@@ -57,7 +57,7 @@ def names_checkpoint(card: Path, checkpoint: str) -> bool:
 def hub_source(api: HfApi, repo_id: str) -> str | None:
     """Hub에 올라가 있는 가중치를 만든 체크포인트. v2는 `config.json`, v1은 `source.json`에 있다.
 
-    v1이 `config.json`에 두지 않는 까닭은 `minipfn.tabpfn.hub`에 적었다. 둘 다 없으면 None."""
+    v1이 `config.json`에 두지 않는 까닭은 `minipfn.hub.tabpfn_v1`에 적었다. 둘 다 없으면 None."""
     for name in ("config.json", "source.json"):
         if not api.file_exists(repo_id, name):
             continue

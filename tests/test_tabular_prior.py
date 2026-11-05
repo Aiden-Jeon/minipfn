@@ -1,6 +1,6 @@
 import numpy as np
 
-from minipfn.tabular_prior import sample_random_scm, sample_scm_dataset, to_classes
+from minipfn.priors.scm import sample_random_scm, sample_scm_dataset, to_classes
 
 
 def test_to_classes_range_and_count():

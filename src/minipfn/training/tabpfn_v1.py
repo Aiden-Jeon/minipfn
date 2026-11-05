@@ -25,13 +25,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from minipfn.tabpfn import spec
-from minipfn.tabpfn.model import (
+from minipfn.models.tabpfn_v1 import (
     TabPFNTransformer,
     classification_loss,
     configure_attention_backends,
 )
-from minipfn.tabpfn.prior import TabPFNPrior, TabPFNPriorDataset
+from minipfn.priors.tabpfn_v1 import TabPFNPrior, TabPFNPriorDataset
+from minipfn.recipes import tabpfn_v1 as spec
 from minipfn.utils import lr_factor, setup_distributed
 
 

@@ -5,18 +5,14 @@ from dataclasses import replace
 import pytest
 import torch
 
-from minipfn.tabpfn_v2.model import TabPFNv2, load_checkpoint
-from minipfn.tabpfn_v2.train import (
-    CollapseGuard,
-    TabPFNv2TrainConfig,
-    _make_val_batches,
-    apply_qk_clip,
-    checkpoint_lr,
-    dequantize_targets,
-    lr_factor,
-    qk_logit_bounds,
-    train_tabpfn_v2,
-)
+from minipfn.models import load_checkpoint
+from minipfn.models.tabpfn_v2 import TabPFNv2
+from minipfn.recipes import tabpfn_v2 as recipe
+from minipfn.training.config import TrainConfig
+from minipfn.training.loop import _make_val_batches, checkpoint_lr, train
+from minipfn.training.losses import dequantize_targets
+from minipfn.training.stability import CollapseGuard, apply_qk_clip, qk_logit_bounds
+from minipfn.utils import lr_factor
 
 
 def test_lr_schedule_warms_up_then_decays_to_zero():
@@ -27,14 +23,14 @@ def test_lr_schedule_warms_up_then_decays_to_zero():
 
 
 def test_classification_training_writes_checkpoint_and_resumes(tmp_path):
-    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=4, val_every=2)
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=4, val_every=2)
+    result = train(config, tmp_path, mlflow_log=False)
     model, borders = load_checkpoint(result["final_path"])
     assert borders is None and model.config.n_out == 10
     assert result["history"]["step"][-1] == 4
 
     longer = replace(config, steps=6)
-    resumed = train_tabpfn_v2(
+    resumed = train(
         longer, tmp_path / "resumed", resume_from=tmp_path / "latest.pt", mlflow_log=False
     )
     assert resumed["history"]["step"][-1] == 6
@@ -42,14 +38,14 @@ def test_classification_training_writes_checkpoint_and_resumes(tmp_path):
 
 
 def test_init_from_takes_only_the_weights(tmp_path):
-    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=4, val_every=2)
-    train_tabpfn_v2(config, tmp_path / "first", mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=4, val_every=2)
+    train(config, tmp_path / "first", mlflow_log=False)
     init = tmp_path / "first" / "latest.pt"
     with pytest.raises(ValueError, match="init_from"):
-        train_tabpfn_v2(config, tmp_path / "x", resume_from=init, init_from=init, mlflow_log=False)
+        train(config, tmp_path / "x", resume_from=init, init_from=init, mlflow_log=False)
     # step 0으로 학습하면 가중치가 그대로 남는다 (warmup 첫 step의 lr이 0)
     frozen = replace(config, steps=1, warmup_steps=1, stop_step=1, collapse_threshold=None)
-    result = train_tabpfn_v2(frozen, tmp_path / "second", init_from=init, mlflow_log=False)
+    result = train(frozen, tmp_path / "second", init_from=init, mlflow_log=False)
     assert result["history"]["step"] == [1]  # 이전 기록은 이어 붙이지 않는다
     before = torch.load(init, weights_only=True)["model"]
     after = torch.load(tmp_path / "second" / "latest.pt", weights_only=True)
@@ -59,19 +55,19 @@ def test_init_from_takes_only_the_weights(tmp_path):
 
 
 def test_long_tables_preset_keeps_the_paper_model_and_batch():
-    paper, long = TabPFNv2TrainConfig.paper(), TabPFNv2TrainConfig.long_tables()
+    paper, long = recipe.paper(), recipe.long_tables()
     assert long.model_config() == paper.model_config() and long.batch_size == paper.batch_size
     assert long.grad_accumulation(8) == 8 and long.max_train_rows == 8192
     assert long.max_features == long.feature_scale == 500
-    assert TabPFNv2TrainConfig.long_tables("regression").rewind_lr_factor == 0.5
+    assert recipe.long_tables("regression").rewind_lr_factor == 0.5
     # 2.5 구조와 함께 쓸 수 있다 (init_from은 같은 구조의 가중치여야 한다)
-    v25 = TabPFNv2TrainConfig.long_tables("regression").with_architecture("v2.5")
+    v25 = recipe.with_architecture(recipe.long_tables("regression"), "v2.5")
     assert v25.nlayers == 18 and v25.n_thinking_rows == 64 and v25.max_train_rows == 8192
 
 
 def test_regression_training_stores_borders(tmp_path):
-    config = replace(TabPFNv2TrainConfig.smoke("regression"), steps=2, border_datasets=10)
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    config = replace(TrainConfig.smoke("regression"), steps=2, border_datasets=10)
+    result = train(config, tmp_path, mlflow_log=False)
     model, borders = load_checkpoint(result["final_path"])
     assert model.config.n_out == 5000
     assert borders.shape == (5001,)
@@ -80,8 +76,8 @@ def test_regression_training_stores_borders(tmp_path):
 
 
 def test_chunked_training_continues_the_full_schedule(tmp_path):
-    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=10, log_every=1)
-    first = train_tabpfn_v2(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=10, log_every=1)
+    first = train(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
     assert first["history"]["step"][-1] == 4
     state = torch.load(tmp_path / "a" / "latest.pt", weights_only=True)
     assert state["step"] == 4
@@ -89,30 +85,28 @@ def test_chunked_training_continues_the_full_schedule(tmp_path):
     expected = config.lr * lr_factor(4, config.warmup_steps, config.steps)
     assert abs(state["scheduler"]["_last_lr"][0] - expected) < 1e-12
 
-    second = train_tabpfn_v2(
+    second = train(
         config, tmp_path / "b", resume_from=tmp_path / "a" / "latest.pt", mlflow_log=False
     )
     assert second["history"]["step"] == list(range(1, 11))
 
 
 def test_kept_checkpoints_are_not_overwritten(tmp_path):
-    config = replace(
-        TabPFNv2TrainConfig.smoke("classification"), steps=6, checkpoint_every=2, keep_every=4
-    )
-    train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=6, checkpoint_every=2, keep_every=4)
+    train(config, tmp_path, mlflow_log=False)
     assert sorted(p.name for p in tmp_path.glob("step_*.pt")) == ["step_0000004.pt"]
     assert torch.load(tmp_path / "step_0000004.pt", weights_only=True)["step"] == 4
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 6
 
     # 남긴 step에서 이어 가면 그 step부터 다시 학습한다
-    resumed = train_tabpfn_v2(
+    resumed = train(
         config, tmp_path / "b", resume_from=tmp_path / "step_0000004.pt", mlflow_log=False
     )
     assert resumed["history"]["step"][-1] == 6
 
     # keep_every가 checkpoint_every의 배수가 아니어도 그 step에 남긴다
     odd = replace(config, checkpoint_every=4, keep_every=3)
-    train_tabpfn_v2(odd, tmp_path / "c", mlflow_log=False)
+    train(odd, tmp_path / "c", mlflow_log=False)
     assert sorted(p.name for p in (tmp_path / "c").glob("step_*.pt")) == [
         "step_0000003.pt",
         "step_0000006.pt",
@@ -120,7 +114,7 @@ def test_kept_checkpoints_are_not_overwritten(tmp_path):
 
 
 def test_dequantize_moves_only_repeated_interior_targets():
-    from minipfn.bar_distribution import FullSupportBarDistribution
+    from minipfn.models.bar_distribution import FullSupportBarDistribution
 
     bar = FullSupportBarDistribution(torch.linspace(-4.0, 4.0, 101))  # 구간 100개, 폭 0.08
     n_train = 4
@@ -146,14 +140,14 @@ def test_dequantize_moves_only_repeated_interior_targets():
 
 def test_regression_training_with_dequantize(tmp_path):
     config = replace(
-        TabPFNv2TrainConfig.smoke("regression"), steps=2, border_datasets=10, dequantize_buckets=10
+        TrainConfig.smoke("regression"), steps=2, border_datasets=10, dequantize_buckets=10
     )
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    result = train(config, tmp_path, mlflow_log=False)
     assert torch.isfinite(torch.tensor(result["history"]["train_loss"])).all()
 
 
 def test_val_batches_do_not_depend_on_micro_batch():
-    config = TabPFNv2TrainConfig.smoke("classification")
+    config = TrainConfig.smoke("classification")
     a = _make_val_batches(replace(config, micro_batch=4), n_batches=2)
     b = _make_val_batches(replace(config, micro_batch=1), n_batches=2)
     for batch_a, batch_b in zip(a, b, strict=True):
@@ -163,16 +157,14 @@ def test_val_batches_do_not_depend_on_micro_batch():
 
 
 def test_deadline_in_the_past_stops_at_the_next_log_step(tmp_path):
-    config = replace(
-        TabPFNv2TrainConfig.smoke("classification"), steps=10, log_every=2, deadline=0.0
-    )
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=10, log_every=2, deadline=0.0)
+    result = train(config, tmp_path, mlflow_log=False)
     assert result["history"]["step"][-1] == 2
     assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 2
 
 
 def test_micro_batch_shrinks_when_gpus_exceed_the_batch():
-    config = TabPFNv2TrainConfig.paper("classification")  # batch 64, micro 8
+    config = recipe.paper("classification")  # batch 64, micro 8
     for world_size, micro, accumulation in [(1, 8, 8), (8, 8, 1), (16, 4, 1), (32, 2, 1)]:
         scaled = config.for_world_size(world_size)
         assert scaled.batch_size == 64
@@ -201,10 +193,8 @@ def test_training_rewinds_after_a_collapse(tmp_path, monkeypatch):
         return original(self, window_mean)
 
     monkeypatch.setattr(CollapseGuard, "update", fake_update)
-    config = replace(
-        TabPFNv2TrainConfig.smoke("classification"), steps=50, log_every=5, snapshot_every=10
-    )
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=50, log_every=5, snapshot_every=10)
+    result = train(config, tmp_path, mlflow_log=False)
     steps = result["history"]["step"]
     assert steps[-1] == 50
     assert steps == sorted(set(steps))  # 되돌린 구간의 기록은 지우고 다시 쓴다
@@ -229,14 +219,14 @@ def test_each_collapse_lowers_the_lr_by_the_rewind_factor(
 
     monkeypatch.setattr(CollapseGuard, "update", fake_update)
     config = replace(
-        TabPFNv2TrainConfig.smoke("classification"),
+        TrainConfig.smoke("classification"),
         steps=50,
         log_every=5,
         snapshot_every=10,
         rewind_lr_factor=0.5,
     )
     config = replace(config, rewind_min_lr=config.lr * min_scale)
-    train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    train(config, tmp_path, mlflow_log=False)
     state = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert state["rewinds"] == 2
     # 두 번째로 되돌아간 snapshot(20 step)은 첫 인하 전 상태지만 lr은 두 번 모두 반영된다.
@@ -249,16 +239,16 @@ def test_each_collapse_lowers_the_lr_by_the_rewind_factor(
 
 
 def test_paper_preset_clips_qk_only_for_regression():
-    assert TabPFNv2TrainConfig.paper("regression").qk_clip == 250.0
-    assert TabPFNv2TrainConfig.paper("classification").qk_clip is None
+    assert recipe.paper("regression").qk_clip == 250.0
+    assert recipe.paper("classification").qk_clip is None
 
 
 def test_paper_preset_lowers_the_lr_on_collapse_only_for_regression():
-    assert TabPFNv2TrainConfig.paper("regression").rewind_lr_factor == 0.5
-    assert TabPFNv2TrainConfig.paper("classification").rewind_lr_factor == 1.0
+    assert recipe.paper("regression").rewind_lr_factor == 0.5
+    assert recipe.paper("classification").rewind_lr_factor == 1.0
     for bad in (0.0, -0.5, 5.0):
         with pytest.raises(ValueError, match="rewind_lr_factor"):
-            TabPFNv2TrainConfig(rewind_lr_factor=bad)
+            TrainConfig(rewind_lr_factor=bad)
 
 
 def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, monkeypatch):
@@ -274,13 +264,13 @@ def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, mon
 
     monkeypatch.setattr(CollapseGuard, "update", fake_update)
     config = replace(
-        TabPFNv2TrainConfig.smoke("classification"),
+        TrainConfig.smoke("classification"),
         steps=50,
         log_every=5,
         snapshot_every=10,
         rewind_lr_factor=0.5,
     )
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    result = train(config, tmp_path, mlflow_log=False)
     state = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert state["step"] == 40  # 오래된 30이 아니라 가장 최근 건강한 40
     assert state["scheduler"]["base_lrs"][0] == config.lr  # 붕괴가 아니니 lr은 그대로
@@ -289,7 +279,7 @@ def test_training_that_ends_suspect_saves_the_newest_healthy_state(tmp_path, mon
 
 def test_training_stops_after_too_many_rewinds(tmp_path):
     config = replace(
-        TabPFNv2TrainConfig.smoke("classification"),
+        TrainConfig.smoke("classification"),
         steps=200,
         log_every=5,
         snapshot_every=10,
@@ -297,7 +287,7 @@ def test_training_stops_after_too_many_rewinds(tmp_path):
         max_rewinds=2,
     )
     with pytest.raises(RuntimeError, match="되돌렸다"):
-        train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+        train(config, tmp_path, mlflow_log=False)
 
 
 def test_collapse_guard_counts_windows_without_finite_loss():
@@ -307,11 +297,11 @@ def test_collapse_guard_counts_windows_without_finite_loss():
 
 
 def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
-    config = replace(TabPFNv2TrainConfig.smoke("classification"), steps=10, log_every=1)
-    train_tabpfn_v2(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
+    config = replace(TrainConfig.smoke("classification"), steps=10, log_every=1)
+    train(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
     assert checkpoint_lr(tmp_path / "a" / "latest.pt") == config.lr  # lr을 안 주면 이 값을 쓴다
     lower = replace(config, lr=config.lr / 2)
-    train_tabpfn_v2(
+    train(
         replace(lower, stop_step=6),
         tmp_path / "b",
         resume_from=tmp_path / "a" / "latest.pt",
@@ -325,7 +315,7 @@ def test_resume_with_a_different_lr_rescales_the_rest_of_the_schedule(tmp_path):
 
 
 def test_qk_logit_bounds_match_the_spectral_norm():
-    model = TabPFNv2(TabPFNv2TrainConfig.smoke("regression").model_config())
+    model = TabPFNv2(TrainConfig.smoke("regression").model_config())
     torch.manual_seed(0)
     for layer in model.layers:
         torch.nn.init.normal_(layer.sample_attention.qkv.weight, std=0.5)
@@ -341,7 +331,7 @@ def test_qk_logit_bounds_match_the_spectral_norm():
 
 
 def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
-    model = TabPFNv2(TabPFNv2TrainConfig.smoke("regression").model_config())
+    model = TabPFNv2(TrainConfig.smoke("regression").model_config())
     attention = model.layers[0].sample_attention
     with torch.no_grad():
         attention.qkv.weight.normal_(std=0.5)
@@ -359,24 +349,22 @@ def test_qk_clip_caps_the_bound_and_leaves_small_heads_alone():
 
 def test_training_with_qk_clip_keeps_bounds_under_tau(tmp_path):
     config = replace(
-        TabPFNv2TrainConfig.smoke("regression"),
+        TrainConfig.smoke("regression"),
         steps=4,
         border_datasets=10,
         qk_clip=5.0,
         qk_clip_every=2,  # 마지막 step(4)에서 clip한다
     )
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    result = train(config, tmp_path, mlflow_log=False)
     model, _ = load_checkpoint(result["final_path"])
     assert qk_logit_bounds(model).max() <= 5.0 * (1 + 1e-4)
     with pytest.raises(ValueError, match="qk_clip"):
-        TabPFNv2TrainConfig(qk_clip=0.0)
+        TrainConfig(qk_clip=0.0)
 
 
 def test_resuming_with_qk_clip_clips_before_the_first_snapshot(tmp_path, monkeypatch):
-    config = replace(
-        TabPFNv2TrainConfig.smoke("regression"), steps=10, log_every=1, border_datasets=10
-    )
-    train_tabpfn_v2(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
+    config = replace(TrainConfig.smoke("regression"), steps=10, log_every=1, border_datasets=10)
+    train(replace(config, stop_step=4), tmp_path / "a", mlflow_log=False)
     tau = 1.0  # clip 없이 학습한 checkpoint의 상한보다 훨씬 작다
     state = torch.load(tmp_path / "a" / "latest.pt", weights_only=True)
     plain = TabPFNv2(config.model_config())
@@ -385,7 +373,7 @@ def test_resuming_with_qk_clip_clips_before_the_first_snapshot(tmp_path, monkeyp
 
     # 마지막 step에서 무너졌다고 보면 첫 snapshot(이어 받은 상태)으로 되돌린 채 끝난다
     monkeypatch.setattr(CollapseGuard, "update", lambda self, window_mean: True)
-    train_tabpfn_v2(
+    train(
         replace(config, stop_step=5, qk_clip=tau),
         tmp_path / "b",
         resume_from=tmp_path / "a" / "latest.pt",

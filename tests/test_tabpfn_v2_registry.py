@@ -8,9 +8,13 @@ import pytest
 import torch
 from torch import nn
 
-from minipfn.tabpfn_v2 import hub, registry
-from minipfn.tabpfn_v2.model import TabPFNv2, TabPFNv2Config, save_checkpoint
-from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig, train_tabpfn_v2
+from minipfn import hub
+from minipfn import models as registry
+from minipfn.models import save_checkpoint
+from minipfn.models.tabpfn_v2 import TabPFNv2, TabPFNv2Config
+from minipfn.recipes import tabpfn_v2 as recipe
+from minipfn.training.config import TrainConfig
+from minipfn.training.loop import train
 
 
 @dataclass
@@ -70,13 +74,13 @@ def test_build_model_from_dataclass_or_dict():
     with pytest.raises(ValueError, match="model_type"):
         registry.build_model("tabpfn_v9", config)
     with pytest.raises(ValueError, match="model_type"):
-        TabPFNv2TrainConfig(model_type="tabpfn_v9")
+        TrainConfig(model_type="tabpfn_v9")
 
 
 @pytest.mark.parametrize("arch", ["v2", "v2.5"])
 def test_v2_model_config_is_unchanged(arch):
     # registry를 거쳐도 v2·2.5 설정은 예전처럼 학습 설정의 필드에서 옮긴다
-    config = TabPFNv2TrainConfig.paper("regression").with_architecture(arch)
+    config = recipe.with_architecture(recipe.paper("regression"), arch)
     assert config.model_type == "tabpfn_v2"
     assert config.model_config() == TabPFNv2Config(
         emsize=config.emsize,
@@ -91,7 +95,7 @@ def test_v2_model_config_is_unchanged(arch):
 
 
 def test_checkpoint_records_the_model_type_and_old_files_read_as_v2(tmp_path):
-    model = TabPFNv2TrainConfig.smoke().build_model()
+    model = TrainConfig.smoke().build_model()
     save_checkpoint(tmp_path / "new.pt", model)
     payload = torch.load(tmp_path / "new.pt", weights_only=True)
     assert payload["model_type"] == "tabpfn_v2"
@@ -104,7 +108,7 @@ def test_checkpoint_records_the_model_type_and_old_files_read_as_v2(tmp_path):
 
 
 def test_hub_config_records_the_model_type_and_old_repos_read_as_v2(tmp_path):
-    model = TabPFNv2TrainConfig.smoke().build_model()
+    model = TrainConfig.smoke().build_model()
     out = hub.save_pretrained(model, None, tmp_path / "clf")
     config = json.loads((out / hub.CONFIG_NAME).read_text())
     # 예전 from_pretrained는 config["model"]만 읽으므로 model_type은 그 밖에 둔다
@@ -117,9 +121,9 @@ def test_hub_config_records_the_model_type_and_old_repos_read_as_v2(tmp_path):
 
 
 def test_other_model_types_train_save_and_load(tmp_path, tiny):
-    config = replace(TabPFNv2TrainConfig.smoke("classification"), model_type="tiny", steps=4)
+    config = replace(TrainConfig.smoke("classification"), model_type="tiny", steps=4)
     assert config.model_config() == TinyConfig(emsize=config.emsize, nhead=config.nhead, n_out=10)
-    result = train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+    result = train(config, tmp_path, mlflow_log=False)
     model, borders = registry.load_checkpoint(result["final_path"])
     # 출력층 가중치·QK-clip attention이 없어도 학습 지표 계산을 건너뛰고 끝까지 간다
     assert isinstance(model, TinyModel) and borders is None
@@ -131,13 +135,13 @@ def test_other_model_types_train_save_and_load(tmp_path, tiny):
 
 
 def test_qk_clip_needs_attention_weights(tmp_path, tiny):
-    config = replace(TabPFNv2TrainConfig.smoke(), model_type="tiny", qk_clip=10.0)
+    config = replace(TrainConfig.smoke(), model_type="tiny", qk_clip=10.0)
     with pytest.raises(ValueError, match="QK-clip"):
-        train_tabpfn_v2(config, tmp_path, mlflow_log=False)
+        train(config, tmp_path, mlflow_log=False)
 
 
 def test_training_checkpoint_from_run_uses_the_run_model_type(tmp_path, monkeypatch, tiny):
-    config = replace(TabPFNv2TrainConfig.smoke(), model_type="tiny")
+    config = replace(TrainConfig.smoke(), model_type="tiny")
     model = config.build_model()
     path = tmp_path / "step_0000100.pt"
     torch.save({"model": model.state_dict(), "step": 100, "borders": None}, path)

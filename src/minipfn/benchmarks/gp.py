@@ -14,9 +14,9 @@ import torch
 from matplotlib.figure import Figure
 from torch import nn
 
-from minipfn.bar_distribution import FullSupportBarDistribution
-from minipfn.gp_prior import DEFAULT_NOISE, analytic_gp_posterior
-from minipfn.train import pfn_predict
+from minipfn.models.bar_distribution import FullSupportBarDistribution
+from minipfn.priors.gp import DEFAULT_NOISE, analytic_gp_posterior
+from minipfn.training.pfn import pfn_predict
 from minipfn.utils import set_seed
 
 

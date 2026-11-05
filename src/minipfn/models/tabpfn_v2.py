@@ -27,7 +27,6 @@ TabPFN-2.5(arXiv 2511.08667 "Architecture")가 바꾼 것은 설정으로 켠다
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -234,26 +233,3 @@ class TabPFNv2(nn.Module):
         for layer in self.layers:
             h = layer(h, n_context)
         return self.decoder(h[:, n_context:, -1])
-
-
-def save_checkpoint(
-    path: str | Path, model: nn.Module, borders: torch.Tensor | None = None
-) -> None:
-    """가중치, 설정, (회귀면) bar distribution 경계를 저장한다."""
-    payload = {
-        "model_type": model.model_type,
-        "config": model.config.to_dict(),
-        "state_dict": model.state_dict(),
-        "borders": borders,
-    }
-    torch.save(payload, path)
-
-
-def load_checkpoint(
-    path: str | Path, map_location: str | torch.device = "cpu"
-) -> tuple[nn.Module, torch.Tensor | None]:
-    """`save_checkpoint`로 저장한 파일을 읽는다. 모델 종류는 파일에 남긴 `model_type`을 따른다
-    (`registry.load_checkpoint`. 이전 파일에는 없어서 v2로 읽는다)."""
-    from minipfn.tabpfn_v2.registry import load_checkpoint as _load
-
-    return _load(path, map_location)

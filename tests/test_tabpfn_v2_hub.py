@@ -6,9 +6,10 @@ import types
 import pytest
 import torch
 
-from minipfn.tabpfn_v2 import hub
-from minipfn.tabpfn_v2.model import TabPFNv2, save_checkpoint
-from minipfn.tabpfn_v2.train import TabPFNv2TrainConfig
+from minipfn import hub
+from minipfn.models import save_checkpoint
+from minipfn.models.tabpfn_v2 import TabPFNv2
+from minipfn.training.config import TrainConfig
 
 
 @pytest.fixture
@@ -18,7 +19,7 @@ def chdir_tmp(tmp_path, monkeypatch):
 
 def _model(task="classification"):
     torch.manual_seed(0)
-    return TabPFNv2(TabPFNv2TrainConfig.smoke(task).model_config()).eval()
+    return TabPFNv2(TrainConfig.smoke(task).model_config()).eval()
 
 
 def _same_weights(a, b):
@@ -65,7 +66,7 @@ def test_training_checkpoint_needs_a_run_uri(tmp_path):
 
 
 def test_training_checkpoint_from_run_uses_run_params(tmp_path, monkeypatch):
-    config = TabPFNv2TrainConfig.smoke()
+    config = TrainConfig.smoke()
     model = _model()
     path = _training_state(tmp_path, model)
     params = {"task": "classification", "emsize": str(config.emsize)}

@@ -3,8 +3,8 @@ import json
 import pytest
 import torch
 
-from minipfn.tabpfn.hub import CONFIG_NAME, WEIGHTS_NAME, from_pretrained, save_pretrained
-from minipfn.tabpfn.train import TabPFNConfig, build_tabpfn_model
+from minipfn.hub.tabpfn_v1 import CONFIG_NAME, WEIGHTS_NAME, from_pretrained, save_pretrained
+from minipfn.training.tabpfn_v1 import TabPFNConfig, build_tabpfn_model
 
 
 def test_save_and_load_pretrained_roundtrip(tmp_path):
