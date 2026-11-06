@@ -101,6 +101,18 @@ uv run --no-dev --extra arena --group arena-dev python scripts/tabpfn_v2/eval.py
 
 점수는 공개 leaderboard와 같은 방식으로 냅니다. Elo(기준 방법을 1000에 맞춘 값: TabArena는 RandomForest (default), BeyondArena는 XGBoost (default)), 정규화 점수, improvability, 그리고 XGBoost 같은 방법에 대한 split별 승률입니다. 모델의 권장 크기를 넘는 split(v2는 학습 행 10,000·feature 500·클래스 10, 2.5는 행 50,000·feature 2,000)은 돌리지 않습니다. leaderboard처럼 그 split은 RandomForest (default)의 결과로 채우고(imputed) 비율을 함께 적습니다. `tabpfn_v2_eval/<suite>/comparison.csv`에는 공개 leaderboard의 값과 이 실행에서 다시 낸 값이 방법마다 나란히 있습니다. 공개 leaderboard는 모든 방법을 학습 split 안에서 8-fold bagging해 돌립니다. 여기서는 기본으로 한 번만 fit하고, `--bagging 8`을 주면 8-fold로 나눠 예측을 평균합니다. AI Runtime에서는 `scripts/tabpfn_v2/eval_arena.yaml`을 씁니다.
 
+학습한 TFM을 데이터셋마다 GBDT 학생으로 증류하면 GPU 없이 CPU에서 예측할 수 있습니다(`minipfn.inference.distillation`). `fit`에서 teacher가 학습 행과 synthetic 행에 낸 예측을 XGBoost·LightGBM 학생이 배우고, `predict`는 학생만 씁니다. teacher 라벨은 두 가지입니다. `oof`는 학습 행을 5-fold로 나눠 각 fold를 나머지 fold로 예측합니다(teacher가 자기 행을 보고 정답을 베끼지 않도록). `synthetic`은 학습 행 전체를 context로 두고 학습 행과 CutMix로 만든 synthetic 행을 예측합니다. 학생 라이브러리는 extra `distill`로 설치합니다(macOS에서는 `brew install libomp`도 필요합니다).
+
+```python
+from minipfn import TabPFNv2Classifier
+from minipfn.inference.distillation import DistilledClassifier
+
+clf = DistilledClassifier(TabPFNv2Classifier(device="cuda"), method="synthetic", student="xgboost")
+proba = clf.fit(X_train, y_train).predict_proba(X_test)  # 예측은 CPU의 XGBoost
+```
+
+평가 스크립트에서는 `--distill oof|synthetic --student xgboost`를 줍니다. `--distill labels`는 teacher 없이 정답만 배운 같은 학생입니다(비교용).
+
 `main`에는 500k 가중치가 있고, 학습 중간의 100k~400k 가중치는 같은 repo의 branch `step-100k`~`step-400k`에 있습니다. `TabPFNv2Regressor("aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k")`처럼 repo 뒤에 `@`와 branch를 적고, 평가 스크립트에서는 `hf://aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k`처럼 `@` 뒤에 branch를 적습니다.
 
 ## 3. 바닥부터 학습하기

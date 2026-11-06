@@ -53,6 +53,19 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
     --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
 
+`--distill`은 teacher(위의 추론 estimator)를 데이터셋마다 GBDT 학생으로 증류해 학생으로만 예측한다
+(issue #44, `minipfn.inference.distillation`, extra `distill`). `oof`는 out-of-fold teacher 라벨
+(arXiv 2605.18654), `synthetic`은 학습 행 전체를 context로 학습 행 + CutMix synthetic 행을 라벨링
+(arXiv 2610.01435), `labels`는 teacher 없이 정답 라벨만 배운 같은 학생(기본 GBDT 비교용)이다.
+학생은 `--student`(xgboost, lightgbm, hist)이고 CPU에서 예측한다. fit마다 teacher·학생 학습 시간과
+나무 수를 `<out-dir>/distill.jsonl`에 남긴다. `--latency`는 fit마다 학습 행 하나의 예측 시간
+(`LATENCY_REPEATS`번의 중앙값)도 남긴다(teacher만 쓸 때도).
+
+  uv run --no-dev --extra arena --extra distill --group arena-dev python $EVAL \
+    --suite tabarena-lite --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor \
+    --distill synthetic --student xgboost --method-name minipfn-tabpfn-v2-kd-xgb
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -63,6 +76,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import json
 import os
 import time
 from pathlib import Path
@@ -74,6 +88,12 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
+from minipfn.inference.distillation import (
+    METHODS,
+    STUDENTS,
+    DistilledClassifier,
+    DistilledRegressor,
+)
 from minipfn.inference.ensemble import (
     DEFAULT_ONE_HOT,
     EnsembleClassifier,
@@ -91,6 +111,7 @@ from minipfn.recipes import default_inference, resolve_member_kinds, supported_s
 from minipfn.utils import log_run_source
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
+LATENCY_REPEATS = 5
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -127,6 +148,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--uncertainty",
         action="store_true",
         help="AMLB: 예측 분포·불확실성 지표도 낸다 (회귀 CRPS·coverage·PIT, 분류 ECE·conformal)",
+    )
+    parser.add_argument(
+        "--distill",
+        choices=["none", *METHODS],
+        default="none",
+        help="teacher를 GBDT 학생으로 증류해 학생으로 예측한다 (oof, synthetic, labels: 정답만)",
+    )
+    parser.add_argument(
+        "--student", choices=STUDENTS, default="xgboost", help="--distill의 학생 (CPU)"
+    )
+    parser.add_argument(
+        "--synthetic-ratio",
+        type=float,
+        default=None,
+        help="--distill: synthetic 행 수 / 학습 행 수 (기본: 방법이 정한다. oof 0, synthetic 2)",
+    )
+    parser.add_argument(
+        "--distill-alpha",
+        type=float,
+        default=None,
+        help="--distill: teacher target의 비중, 나머지는 정답 라벨 (기본: oof 0.7, synthetic 1)",
+    )
+    parser.add_argument(
+        "--latency", action="store_true", help="fit마다 한 행 예측 시간을 distill.jsonl에 남긴다"
     )
     parser.add_argument(
         "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
@@ -237,6 +282,8 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     member_kinds = args.member_kinds or inference["member_kinds"]
     n_estimators = args.n_estimators or inference["n_estimators"]
 
+    log_path = Path(args.out_dir) / "distill.jsonl"
+
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
             "n_estimators": n_estimators,
@@ -246,14 +293,72 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "device": args.device,
         }
         if suite == "classification":
-            return EnsembleClassifier(model, **kw)
-        return EnsembleRegressor(model, borders, **kw)
+            estimator = EnsembleClassifier(model, **kw)
+        else:
+            estimator = EnsembleRegressor(model, borders, **kw)
+        if args.distill != "none":
+            distilled = DistilledClassifier if suite == "classification" else DistilledRegressor
+            estimator = distilled(
+                estimator,
+                method=args.distill,
+                student=args.student,
+                synthetic_ratio=args.synthetic_ratio,
+                alpha=args.distill_alpha,
+                categorical_features_indices=task.categorical_indices,
+            )
+        if args.distill != "none" or args.latency:
+            record_fits(estimator, suite, log_path, latency=args.latency)
+        return estimator
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
     make.n_estimators = n_estimators
     make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
+
+
+def record_fits(estimator, suite: str, path: Path, latency: bool) -> None:
+    """fit할 때마다 표 크기, fit 시간, 증류 기록(`fit_record_`: teacher·학생 학습 시간, 나무 수)을
+    `path`(JSONL)에 한 줄씩 덧붙인다. `latency`면 학습 행 하나의 예측 시간(ms,
+    `LATENCY_REPEATS`번의 중앙값)도 잰다."""
+    fit = estimator.fit
+
+    def fit_and_record(X, y):
+        start = time.perf_counter()
+        fitted = fit(X, y)
+        record = {
+            "suite": suite,
+            "rows": len(X),
+            "features": int(np.shape(X)[1]),
+            "fit_seconds": time.perf_counter() - start,
+            **getattr(fitted, "fit_record_", {}),
+        }
+        if latency:
+            row = X.iloc[:1] if isinstance(X, pd.DataFrame) else X[:1]
+            predict = fitted.predict_proba if suite == "classification" else fitted.predict
+            times = []
+            for _ in range(LATENCY_REPEATS):
+                t = time.perf_counter()
+                predict(row)
+                times.append(time.perf_counter() - t)
+            record["latency_ms"] = 1000 * float(np.median(times))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=float) + "\n")
+        return fitted
+
+    estimator.fit = fit_and_record
+
+
+def distill_params(args: argparse.Namespace) -> dict:
+    """증류를 정하는 인자 (MLflow param, arena 결과를 다시 쓸지 정하는 값)."""
+    params = {"distill": args.distill}
+    if args.distill != "none":
+        params["student"] = args.student
+        for key in ("synthetic_ratio", "distill_alpha"):
+            if getattr(args, key) is not None:
+                params[key] = getattr(args, key)
+    return params
 
 
 def arena_suite(name: str):
@@ -288,7 +393,6 @@ def arena_limits(models: dict, args: argparse.Namespace) -> dict:
 def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
     """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다. estimator는
     AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔 넘긴다)."""
-    import json
     import types
 
     from minipfn.benchmarks import arena
@@ -314,6 +418,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
             "paths": {t: paths[t] for t in factories},
             "member_kinds": {t: list(k) for t, k in kinds.items()},
             "one_hot": one_hot,
+            # 증류하지 않으면 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
+            **({} if args.distill == "none" else distill_params(args)),
         },
         sort_keys=True,
     )
@@ -340,12 +446,15 @@ def print_arena_summary(summary: dict) -> None:
         if s.get("elo") is None:
             return f"{label:24s} 결과가 있는 split이 없다 (imputed {s['imputed_pct']:.1f}%)"
         xgb = s.get("winrate", {}).get("XGBoost (default)", {})
+        t = s.get("time", {})  # split 평균
         return (
             f"{label:24s} elo {s['elo']:.0f} (+{s['elo_ci_plus']:.0f}/-{s['elo_ci_minus']:.0f}) "
             f"score {s['score']:.3f} improvability {s['improvability']:.2f}% "
             f"imputed {s['imputed_pct_leaderboard']:.1f}% "
             f"win vs XGB(default) {xgb.get('all', float('nan')):.3f} "
-            f"position {s['position']}/{s['n_methods']}"
+            f"position {s['position']}/{s['n_methods']} "
+            f"time train {t.get('time_train_s_mean', float('nan')):.1f}s "
+            f"infer {t.get('time_infer_s_mean', float('nan')):.1f}s"
         )
 
     print(line(summary["suite"], summary))
@@ -362,6 +471,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "method_name": args.method_name,
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
+            **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
         }
     )
@@ -372,6 +482,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
         keys = ("elo", "score", "improvability", "rank", "imputed_pct_leaderboard")
         out = {f"{p}_{k}": s[k] for k in keys if s.get(k) is not None}
         out[f"{p}_imputed_pct_splits"] = s["imputed_pct"]
+        out.update({f"{p}_{k}": v for k, v in s.get("time", {}).items()})
         for baseline, w in s.get("winrate", {}).items():
             key = baseline.split(" (")[0].lower().replace("-", "").replace(".", "")
             sub = baseline.split("(")[-1].rstrip(")").replace(" + ", "_").replace(" ", "_")
@@ -384,6 +495,13 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
         mlflow.log_metrics(metrics(f"{prefix}_{label.replace('-', '_')}", s))
     for path in sorted(out_dir.glob("*.csv")) + [out_dir / "summary.json"]:
         mlflow.log_artifact(str(path), f"eval/{summary['suite']}")
+    log_distill_artifact(args)
+
+
+def log_distill_artifact(args: argparse.Namespace) -> None:
+    path = Path(args.out_dir) / "distill.jsonl"
+    if path.exists():
+        mlflow.log_artifact(str(path), "eval")
 
 
 def summarize(rows: list[dict]) -> pd.DataFrame:
@@ -443,6 +561,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "folds": args.folds,
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
+                **distill_params(args),
             }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
@@ -520,6 +639,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
     if use_mlflow:
         for name in artifacts:
             mlflow.log_artifact(str(out_dir / name), "eval")
+        log_distill_artifact(args)
 
 
 def summarize_uncertainty(rows: list[dict], headline: str) -> pd.DataFrame:

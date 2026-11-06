@@ -5,6 +5,8 @@
 - `preprocessing`: 앙상블 멤버의 전처리 (분위수, power, robust, one-hot)
 - `ensemble`: 전처리 멤버 앙상블 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train)`
   모델이면 클래스와 상관없이 쓴다 (TabPFN v2 recipe의 `TabPFNv2Classifier`·`TabPFNv2Regressor`)
+- `distillation`: 추론 estimator(teacher)를 데이터셋마다 GBDT 학생으로 증류하는
+  `DistilledClassifier`·`DistilledRegressor` (예측은 CPU의 학생만 쓴다)
 
 논문의 기본 설정(멤버 수, 온도, 멤버 종류 묶음)을 붙인 클래스는 `minipfn.recipes`에 있다.
 """
