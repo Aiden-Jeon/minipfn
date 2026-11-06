@@ -28,3 +28,4 @@ notebooks/05_tabpfn_v3/01_overview_and_cell_encoder.ipynb !filter
 notebooks/05_tabpfn_v3/02_column_row_icl_stages.ipynb !filter
 notebooks/06_tabpfn_v3_5/01_changes_and_multitask.ipynb !filter
 notebooks/axes/01_architecture_evolution.ipynb !filter
+notebooks/axes/02_prior_evolution.ipynb !filter
