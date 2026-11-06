@@ -167,7 +167,8 @@ def run(
     - `leaderboard.csv`: baseline과 함께 낸 leaderboard (`tabarena` 형식, 모든 방법)
     - `leaderboard_<이름>.csv`: subset별 leaderboard (`breakdown`)
     - `comparison.csv`: 공개 leaderboard(같은 split)와 이 실행의 점수를 방법마다 나란히
-    - `summary.json`: 이 방법의 점수, imputed 비율, 승률, 설정 (공개 CSV를 못 받으면
+    - `summary.json`: 이 방법의 점수, imputed 비율, 승률, 직접 돌린 split의 학습·추론 시간,
+      설정 (공개 CSV를 못 받으면
       `comparison.csv`의 공개 쪽 열은 비어 있다)
     - `compare.log`: `tabarena` 집계의 출력
     """
@@ -266,6 +267,7 @@ def run(
         "skip_reasons": _reason_counts(grid["skip_reason"]),
         **(_scores(leaderboard, name) if name else dict.fromkeys(SCORE_KEYS)),
         "winrate": winrates(per_split, ours),
+        "time": run_times(ours),
         "breakdown": {},
     }
     if breakdown and name:
@@ -381,6 +383,21 @@ def with_imputed(per_split: pd.DataFrame, name: str, fillna: str) -> pd.DataFram
     return out.sort_values(["dataset", "fold"]).reset_index(drop=True)
 
 
+TIME_COLUMNS = ("time_train_s", "time_infer_s")
+
+
+def run_times(ours: pd.DataFrame) -> dict:
+    """직접 돌린 split(imputed가 아닌 것)의 학습·추론 시간(초)의 평균과 합. `ours`는
+    `with_imputed`의 결과다. 시간 열이 없으면 빈 dict."""
+    run = ours[~ours["imputed"].astype(bool)]
+    out = {}
+    for col in TIME_COLUMNS:
+        if col in run and len(run):
+            out[f"{col}_mean"] = float(run[col].mean())
+            out[f"{col}_total"] = float(run[col].sum())
+    return out
+
+
 def winrates(per_split: pd.DataFrame, ours: pd.DataFrame) -> dict:
     """`WINRATE_BASELINES`마다 split별로 오차가 작으면 1, 같으면 0.5로 센 승률. `ours`는
     `with_imputed`의 결과다. `all`은 imputed split까지(leaderboard와 같은 범위), `run`은 직접 돌린
@@ -426,6 +443,7 @@ def _breakdown(context, pool, subset: tuple[str, ...], name: str, public_csv: st
         "splits": int(len(ours)),
         "imputed_pct": 100.0 * float(ours["imputed"].mean()),
         "winrate": winrates(per_split, ours),
+        "time": run_times(ours),
     }
     if public_csv:
         website = context.leaderboard_to_website_format(leaderboard=board)
