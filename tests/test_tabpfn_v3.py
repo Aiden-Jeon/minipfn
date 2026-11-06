@@ -1,6 +1,7 @@
 """TabPFN-3·3.5 (`column_row_transformer` 모델, `recipes.tabpfn_v3`) 테스트."""
 
 import importlib.util
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -50,14 +51,14 @@ def _data(task, b=2, r=40, c=7, n_train=25):
 
 @pytest.mark.parametrize(
     "arch,task,millions",
-    # 보고서: TabPFN-3 분류 53M·회귀 58M, TabPFN-3.5 220M
-    [("v3", "classification", 53), ("v3", "regression", 58), ("v3.5", "regression", 220)],
+    # 보고서: TabPFN-3 분류 53M·회귀 58M. TabPFN-3.5는 분류·회귀 한 모델로 219.0M(공개 checkpoint)
+    [("v3", "classification", 53), ("v3", "regression", 58), ("v3.5", "multitask", 219)],
 )
 def test_paper_size_matches_the_reports(arch, task, millions):
     config = recipe.paper(task, arch).model_config()
     with torch.device("meta"):
         model = ColumnRowTransformer(config)
-    assert abs(model.num_parameters() / 1e6 - millions) / millions < 0.1
+    assert abs(model.num_parameters() / 1e6 - millions) / millions < 0.02
     assert config.icl_dim == (512 if arch == "v3" else 1024)
 
 
@@ -109,10 +110,11 @@ def test_test_rows_do_not_see_each_other(arch, task):
 def test_retrieval_decoder_gives_probabilities_over_seen_classes():
     model = _model()
     x, y = _data("classification")
+    # logit은 log(max(p, 1e-5) + 3e-5)라 합이 1보다 조금 크다 (클래스 10개면 최대 1.0004)
     p = model(x, y).exp()
-    assert torch.allclose(p.sum(-1), torch.ones(2, 15), atol=1e-4)
+    assert torch.allclose(p.sum(-1), torch.ones(2, 15), atol=1e-3)
     # 학습 행에 없는 클래스는 clip 값만 남는다 (클래스 수에 따른 파라미터가 없다)
-    assert (p[..., 3:] < 1e-5).all()
+    assert (p[..., 3:] < 1e-4).all()
 
 
 @pytest.mark.parametrize("arch", ["v3", "v3.5"])
@@ -155,16 +157,18 @@ def test_test_row_multi_query_matches_expanded_heads():
 
 def test_retrieval_decoder_projects_only_what_it_uses():
     model = _model()
+    decoder = model.heads["classification"]
     h = torch.randn(2, 30, model.config.icl_dim)
     y = torch.randint(0, 3, (2, 20)).float()
     heads, dh = model.config.decoder_heads, model.config.decoder_head_dim
-    q, k = model.decoder(h).split(heads * dh, dim=-1)  # 행마다 둘 다 만든 것
-    q = model.decoder_qassmax(q[:, 20:].reshape(2, -1, heads, dh).transpose(1, 2), 20)
+    # 행마다 query·key를 둘 다 만든 것
+    q, k = decoder.q_projection(h), decoder.k_projection(h)
+    q = decoder.qassmax(q[:, 20:].reshape(2, -1, heads, dh).transpose(1, 2), 20)
     k = k[:, :20].reshape(2, -1, heads, dh).transpose(1, 2)
     weights = torch.softmax((q @ k.transpose(-1, -2)).float() / dh**0.5, dim=-1)
     onehot = torch.nn.functional.one_hot(y.long(), model.config.n_out).float()
-    expected = (weights @ onehot[:, None]).mean(1).clamp_min(1e-6).log()
-    assert torch.allclose(model._retrieve(h, y, 20), expected, atol=1e-5)
+    expected = torch.log((weights @ onehot[:, None]).mean(1).clamp_min(1e-5) + 3e-5)
+    assert torch.allclose(decoder(h, y, 20), expected, atol=1e-5)
 
 
 def test_ecdf_of_columns_constant_on_train_rows_is_flat():
@@ -307,7 +311,7 @@ def test_fresh_model_reads_its_input(arch):
     assert out.std(dim=1).mean() > 1e-3  # 테스트 행마다 다른 예측
     out[..., 0].sum().backward()
     assert model.row_blocks[0].attention.qkv.weight.grad.norm() > 1e-4
-    assert model.decoder.weight.grad.norm() > 1e-4
+    assert model.heads["classification"].q_projection.weight.grad.norm() > 1e-4
 
 
 def test_one_recipe_lookup_serves_every_model():
@@ -364,3 +368,132 @@ def test_arena_limits_follow_the_model_recipe():
     args = _argparse.Namespace(max_train_rows=None, max_features=None)
     limits = script.arena_limits({"classification": (_model(arch="v3"), None)}, args)
     assert limits["binary"].max_train_rows == 100_000 and limits["binary"].max_classes == 10
+
+
+# ---------------------------------------------------------------------------
+# TabPFN-3.5: 분류·회귀 한 모델 (multitask)
+# ---------------------------------------------------------------------------
+def _multitask(**changes):
+    return _model("multitask", "v3.5", **changes)
+
+
+def test_multitask_model_needs_a_task_and_shares_everything_but_targets_and_heads():
+    model = _multitask()
+    assert model.tasks == ("classification", "regression")
+    x, yc = _data("classification")
+    _, yr = _data("regression")
+    assert model(x, yc, task="classification").shape == (2, 15, 10)
+    assert model(x, yr, task="regression").shape == (2, 15, model.config.n_buckets)
+    with pytest.raises(ValueError, match="task"):
+        model(x, yc)
+    with pytest.raises(ValueError, match="task"):
+        _model()(x, yc, task="regression")  # 한 task 모델은 그 task만
+    # task마다 따로인 것은 정답 encoder(셀·ICL), 출력층 앞 MLP, 출력층뿐이다
+    per_task = {"cell_target", "icl_target", "pre_head", "heads"}
+    for task, other in (("classification", "regression"), ("regression", "classification")):
+        model.zero_grad()
+        y = yc if task == "classification" else yr
+        model(x, y, task=task)[..., 0].sum().backward()
+        unused = {n for n, p in model.named_parameters() if p.grad is None}
+        assert unused == {
+            n
+            for n, _ in model.named_parameters()
+            if n.split(".")[0] in per_task and f".{other}" in n
+        }
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_multitask_test_rows_do_not_see_each_other(task):
+    model = _multitask()
+    x, y = _data(task)
+    out = model(x, y, task=task)
+    changed = x.clone()
+    changed[:, 30] += 5.0
+    other = model(changed, y, task=task)
+    keep = [i for i in range(15) if i != 5]
+    assert torch.equal(other[:, keep], out[:, keep]) and not torch.equal(other[:, 5], out[:, 5])
+
+
+def test_labels_reach_the_icl_stage():
+    # 정답 embedding은 셀 단계와 행 ICL 입력 두 곳에 들어간다 (공개 추론 코드와 같은 구조)
+    model = _multitask()
+    assert set(model.icl_target) == {"classification", "regression"}
+    x, y = _data("regression")
+    out = model(x, y, task="regression")
+    with torch.no_grad():
+        model.icl_target["regression"].encode.weight.mul_(3.0)
+    assert not torch.allclose(model(x, y, task="regression"), out)
+
+
+def test_qassmax_starts_with_query_independent_scales():
+    from minipfn.models.column_row_transformer import QASSMax
+
+    qassmax = QASSMax(nhead=2, head_dim=4, hidden=8)
+    q = torch.randn(3, 2, 5, 4)
+    base = qassmax.base_mlp(torch.full((1, 1), math.log(7))).view(1, 2, 1, 4)
+    assert torch.allclose(qassmax(q, 7), q * base)  # query_mlp가 0에서 시작해 tanh 항이 1
+
+
+def test_multitask_recipe_and_config():
+    config = recipe.paper("multitask", "v3.5")
+    assert (
+        config.tasks == ("classification", "regression") and config.target_norm and config.head_mlp
+    )
+    assert config.rewind_lr_factor == tabpfn_v2.paper("regression").rewind_lr_factor
+    assert set(config.task_configs()) == {"classification", "regression"}
+    with pytest.raises(ValueError, match="multitask"):
+        recipe.paper("multitask", "v3")  # 3은 task마다 모델이 따로
+    with pytest.raises(ValueError, match="multitask"):
+        TrainConfig.smoke("multitask").build_model()  # cell_transformer는 한 task뿐
+    with pytest.raises(ValueError, match="task_configs"):
+        config.make_prior(0)
+
+
+def test_multitask_train_save_load_and_resume_checks(tmp_path):
+    config = replace(
+        recipe.with_architecture(TrainConfig.smoke("multitask"), "v3.5", keep_size=True),
+        steps=4,
+        val_every=2,
+        log_every=2,
+    )
+    result = train(config, tmp_path, mlflow_log=False)
+    model, borders = registry.load_checkpoint(result["final_path"])
+    assert model.tasks == ("classification", "regression") and borders is not None
+    state = torch.load(tmp_path / "latest.pt", weights_only=True)
+    check_checkpoint(state, config, "resume_from")
+    single = recipe.with_architecture(TrainConfig.smoke("classification"), "v3.5", keep_size=True)
+    with pytest.raises(ValueError):
+        check_checkpoint(state, single, "resume_from")  # 경계가 있는 checkpoint를 분류만으로
+    assert len(result["history"]["val_loss"]) == 2
+
+
+def test_multitask_ensembles_and_hub(tmp_path):
+    model = _multitask()
+    X, y = load_breast_cancer(return_X_y=True)
+    clf = EnsembleClassifier(model, **recipe.default_inference(model, "classification"))
+    proba = clf.fit(X[:80], y[:80]).predict_proba(X[80:100])
+    assert proba.shape == (20, 2) and np.allclose(proba.sum(1), 1, atol=1e-5)
+    Xr, yr = load_diabetes(return_X_y=True)
+    borders = torch.linspace(-3, 3, model.config.n_buckets + 1)
+    reg = EnsembleRegressor(model, borders, **recipe.default_inference(model, "regression"))
+    assert np.isfinite(reg.fit(Xr[:80], yr[:80]).predict(Xr[80:100])).all()
+
+    folder = hub.save_pretrained(model, borders, tmp_path / "pretrained")
+    import json
+
+    assert json.loads((folder / "config.json").read_text())["task"] == "multitask"
+    for task in ("classification", "regression"):
+        loaded, loaded_borders = hub.model_or_pretrained(str(folder), "unused", task)
+        assert loaded.tasks == model.tasks and torch.equal(loaded_borders, borders)
+    assert hub.served_tasks(model, None) == ("classification",)  # 경계 없이는 회귀를 못 낸다
+
+
+def test_train_script_takes_multitask(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _script("train")
+    args = script.parse_args(["--config-name", "paper", "--task", "multitask", "--arch", "v3.5"])
+    config, arch = script.build_config(args)
+    assert arch == "v3.5" and config == recipe.paper("multitask", "v3.5")
+    args = script.parse_args(["--config-name", "smoke", "--task", "multitask", "--arch", "v3.5"])
+    assert script.build_config(args)[0].task == "multitask"

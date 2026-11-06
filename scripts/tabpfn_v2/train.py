@@ -10,7 +10,9 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
 (arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
 회귀 MLP encoder)이다. `v3`·`v3.5`는 TabPFN-3(arXiv 2605.13986)·3.5(arXiv 2609.17895)의
-열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. 이어서 학습하거나
+열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. `--task multitask`는
+분류·회귀를 한 모델로 같이 학습한다(TabPFN-3.5, `--arch v3.5`만. step마다 task를 번갈아 쓴다).
+이어서 학습하거나
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
@@ -51,6 +53,7 @@ import mlflow  # noqa: E402
 from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
+from minipfn.recipes import tabpfn_v3  # noqa: E402
 from minipfn.training.config import TrainConfig  # noqa: E402
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
@@ -76,7 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--task",
-        choices=["classification", "regression"],
+        choices=["classification", "regression", "multitask"],
         default=os.environ.get("TABPFN_V2_TASK", "classification"),
     )
     parser.add_argument(
@@ -148,6 +151,8 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
+        if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
+            return tabpfn_v3.paper(args.task, arch)  # multitask의 학습 설정도 이 recipe가 정한다
         return recipes.recipe_for_architecture(arch).with_architecture(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
@@ -213,7 +218,8 @@ def plot_history(history: dict, task: str) -> plt.Figure:
     if history["val_step"]:
         ax.plot(history["val_step"], history["val_loss"], "o-", color="C1", label="val (prior)")
     ax.set_xlabel("optimizer step")
-    ax.set_ylabel("cross-entropy" if task == "classification" else "bar distribution NLL")
+    labels = {"classification": "cross-entropy", "regression": "bar distribution NLL"}
+    ax.set_ylabel(labels.get(task, "mean of classification CE and regression NLL"))
     ax.set_title(f"TabPFN prior-fitting loss ({task})")
     ax.legend()
     return fig

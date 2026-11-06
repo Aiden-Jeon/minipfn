@@ -134,6 +134,8 @@ def _model_changes(config: TrainConfig, arch: str, keep_size: bool) -> dict:
     # `arch` 구조로 바꿀 모델 설정 (with_architecture와 architecture_name이 같이 쓴다)
     if arch not in ARCHITECTURES:
         raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
+    if config.task not in ARCHITECTURES[arch]:  # multitask는 cell_transformer에 없다
+        raise ValueError(f"arch {arch}에는 {config.task} 구조가 없다")
     changes = dict(ARCHITECTURES[arch][config.task])
     if canonical_model_type(config.model_type) not in (DEFAULT_MODEL_TYPE, changes["model_type"]):
         raise ValueError(

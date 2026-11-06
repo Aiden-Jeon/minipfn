@@ -5,7 +5,8 @@
   적었지만 세부가 없어 지금 prior를 그대로 쓴다)
 - 모델: `column_row_transformer`. 구조는 `ARCHITECTURES`의 v3 또는 v3.5
 - 학습: `minipfn.training.loop.train`. 학습 step·lr·batch는 두 보고서 모두 공개하지 않아서 v2
-  paper 설정(`recipes.tabpfn_v2.paper`)에서 시작한다
+  paper 설정(`recipes.tabpfn_v2.paper`)에서 시작한다. 3은 task마다 모델이 따로이고, 3.5는
+  분류·회귀를 한 모델로 같이 학습한다(`task="multitask"`: 학습 루프가 step마다 task를 번갈아 쓴다)
 - 추론: `minipfn.inference.ensemble`의 `EnsembleClassifier`·`EnsembleRegressor`에
   `default_inference` (3은 2.5와 같은 전처리, 3.5는 standard 멤버 8개)
 
@@ -48,12 +49,23 @@ _V3 = {
     "n_cls": 4,
     "qk_norm": False,
     "encoder": "linear",
+    "target_norm": False,
+    "head_mlp": False,
 }
-_V3_5 = {**_V3, "n_cls": 8, "nhead": 16, "qk_norm": True, "encoder": "fourier"}
-# 3·3.5 모두 분류·회귀가 같은 구조다 (출력층만 다르다. 3.5의 한 checkpoint 학습은 아직 없다)
+# 3.5의 정답 LayerNorm·출력층 앞 MLP는 공개 추론 코드에서 확인했다 (모델 docstring)
+_V3_5 = {
+    **_V3,
+    "n_cls": 8,
+    "nhead": 16,
+    "qk_norm": True,
+    "encoder": "fourier",
+    "target_norm": True,
+    "head_mlp": True,
+}
+# task마다 구조가 같다(출력층만 다르다). 분류·회귀를 한 모델로(multitask) 학습하는 것은 3.5만
 ARCHITECTURES = {
     "v3": {"classification": _V3, "regression": _V3},
-    "v3.5": {"classification": _V3_5, "regression": _V3_5},
+    "v3.5": {"classification": _V3_5, "regression": _V3_5, "multitask": _V3_5},
 }
 # 논문 권장 크기 (TabArena·BeyondArena에서 이보다 큰 split은 돌리지 않는다,
 # `minipfn.recipes.supported_size`).
@@ -70,6 +82,10 @@ SMOKE_MAX_INDUCING = 8
 def _model_changes(config: TrainConfig, arch: str, keep_size: bool) -> dict:
     if arch not in ARCHITECTURES:
         raise ValueError(f"arch는 {tuple(ARCHITECTURES)} 가운데 하나여야 한다: {arch}")
+    if config.task not in ARCHITECTURES[arch]:
+        raise ValueError(
+            f"arch {arch}에는 {config.task} 구조가 없다 ({tuple(ARCHITECTURES[arch])})"
+        )
     changes = dict(ARCHITECTURES[arch][config.task])
     if canonical_model_type(config.model_type) not in (DEFAULT_MODEL_TYPE, MODEL_TYPE):
         raise ValueError(
@@ -98,6 +114,8 @@ def architecture_name(config) -> str | None:
     if canonical_model_type(config.model_type) != MODEL_TYPE:
         return None
     for name in ARCHITECTURES:
+        if config.task not in ARCHITECTURES[name]:
+            continue
         for keep_size in (False, True):
             changes = _model_changes(config, name, keep_size)
             if all(getattr(config, k) == v for k, v in changes.items()):
@@ -118,9 +136,12 @@ def model_architecture(model: nn.Module, task: str) -> str | None:
 def paper(task: str = "classification", arch: str = "v3") -> TrainConfig:
     """논문 규모 학습 설정. 보고서에 학습 설정이 없어서 prior·표 크기·batch 64·step·lr·붕괴 규칙은
     v2 paper 그대로이고 구조만 `arch`로 바꾼다. v2 회귀의 QK-clip 250은 이 모델에 쓸 수 없어 끈다
-    (`with_architecture`)."""
+    (`with_architecture`). multitask(3.5)는 붕괴 규칙을 v2 회귀의 것(되돌릴 때 lr 절반)으로 둔다
+    — 회귀가 더 자주 무너졌다 (여기서 정함)."""
     from minipfn.recipes import tabpfn_v2
 
+    if task == "multitask":
+        return with_architecture(replace(tabpfn_v2.paper("regression"), task=task), arch)
     return with_architecture(tabpfn_v2.paper(task), arch)
 
 

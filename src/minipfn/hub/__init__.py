@@ -90,7 +90,9 @@ def save_pretrained(
     if borders is not None:
         tensors[BORDERS_KEY] = borders.detach().cpu().contiguous()
     save_file(tensors, out_dir / WEIGHTS_NAME)
-    task = "classification" if borders is None else "regression"
+    # 여러 task를 내는 모델(multitask)은 그 이름, 아니면 회귀 구간 경계가 있는지로
+    task = getattr(model.config, "task", None) if len(getattr(model, "tasks", ())) > 1 else None
+    task = task or ("classification" if borders is None else "regression")
     config = {
         "task": task,
         "model_type": model.model_type,
@@ -144,10 +146,18 @@ def model_or_pretrained(
         return model, None
     spec = default_repo if model is None else model
     loaded = from_pretrained(spec)
-    got = "classification" if loaded[1] is None else "regression"
-    if got != task:
-        raise ValueError(f"{spec}는 {got} 모델이다 ({task} 모델이 필요하다)")
+    if task not in (served := served_tasks(*loaded)):
+        raise ValueError(f"{spec}는 {'·'.join(served)} 모델이다 ({task} 모델이 필요하다)")
     return loaded
+
+
+def served_tasks(model: nn.Module, borders: torch.Tensor | None) -> tuple[str, ...]:
+    """모델이 내는 task. 여러 task 모델(`model.tasks`, multitask)은 그것(회귀는 구간 경계가 있을
+    때만), 한 task 모델은 회귀 구간 경계가 있는지로."""
+    tasks = getattr(model, "tasks", ())
+    if len(tasks) > 1:
+        return tuple(t for t in tasks if t != "regression" or borders is not None)
+    return ("classification",) if borders is None else ("regression",)
 
 
 def _is_v1_config(config: dict) -> bool:
@@ -243,7 +253,6 @@ def run_architecture(params: dict[str, str]) -> dict:
 
 
 def _check_task(loaded: tuple[nn.Module, torch.Tensor | None], task: str, spec: str):
-    got = "classification" if loaded[1] is None else "regression"
-    if got != task:
-        raise SystemExit(f"{spec}는 {got} 모델이다 ({task} 모델이 필요하다).")
+    if task not in (served := served_tasks(*loaded)):
+        raise SystemExit(f"{spec}는 {'·'.join(served)} 모델이다 ({task} 모델이 필요하다).")
     return loaded

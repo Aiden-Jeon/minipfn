@@ -21,6 +21,8 @@ from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_modul
 from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 
 N_BUCKETS = 5000
+# 한 task 학습과, 분류·회귀를 한 모델로 같이 학습하는 multitask (`task_configs`)
+TASKS = ("classification", "regression", "multitask")
 
 
 @dataclass
@@ -28,7 +30,8 @@ class TrainConfig:
     """모델·prior·최적화 설정. 기본값은 TabPFN v2 논문 규모다. 일반 크기 smoke(로컬 CPU)·
     medium(짧은 실측)은 여기에, 논문별 설정(paper, long_tables, 구조)은 `minipfn.recipes`에 있다."""
 
-    task: Literal["classification", "regression"] = "classification"
+    # multitask: 분류·회귀를 한 모델로 (그런 모델 클래스만. 학습 루프가 step마다 task를 번갈아 쓴다)
+    task: Literal["classification", "regression", "multitask"] = "classification"
     # 학습 데이터 종류 (`minipfn.priors.PRIOR_TYPES`). 예전 이름(`PRIOR_TYPE_ALIASES`)은 지금
     # 이름으로 바꾼다
     prior_type: str = DEFAULT_PRIOR_TYPE
@@ -49,6 +52,8 @@ class TrainConfig:
     n_inducing: int = 128
     n_cls: int = 4
     qk_norm: bool = False
+    target_norm: bool = False
+    head_mlp: bool = False
     # prior / 표 크기 (논문 Methods, `minipfn.priors.table_size`). max_features는 모델 설정에도
     # 남아 추론이 읽는다(학습 때 본 feature 수)
     max_train_rows: int = MAX_TRAIN_ROWS
@@ -114,7 +119,10 @@ class TrainConfig:
         self.model_type = canonical_model_type(self.model_type)
         self.prior_type = canonical_prior_type(self.prior_type)
         model_class(self.model_type)  # 없는 이름이면 ValueError
-        prior_module(self.prior_type).check_config(self)  # 없는 이름이거나 크기 설정이 틀리면
+        if self.task not in TASKS:
+            raise ValueError(f"task는 {TASKS} 가운데 하나여야 한다: {self.task}")
+        for config in self.task_configs().values():
+            prior_module(self.prior_type).check_config(config)  # 없는 이름이거나 크기가 틀리면
         if not 0.0 < self.rewind_lr_factor <= 1.0:
             raise ValueError(f"rewind_lr_factor는 0 초과 1 이하여야 한다: {self.rewind_lr_factor}")
         if self.qk_clip is not None and self.qk_clip <= 0:
@@ -124,10 +132,23 @@ class TrainConfig:
 
     @property
     def n_out(self) -> int:
-        # 분류는 prior가 만드는 클래스 수 상한, 회귀는 bar distribution 구간 수
-        if self.task == "classification":
+        # 분류(multitask면 그 분류 쪽)는 prior가 만드는 클래스 수 상한, 회귀는 bar distribution
+        # 구간 수. multitask 모델의 회귀 구간 수는 모델 설정의 n_buckets(= N_BUCKETS)다
+        if self.task in ("classification", "multitask"):
             return prior_module(self.prior_type).MAX_CLASSES
         return N_BUCKETS
+
+    @property
+    def tasks(self) -> tuple[str, ...]:
+        """학습하는 task. multitask면 (분류, 회귀)."""
+        return ("classification", "regression") if self.task == "multitask" else (self.task,)
+
+    def task_configs(self) -> dict[str, TrainConfig]:
+        """task마다 그 task 하나의 설정 (prior·회귀 구간 경계·검증 batch를 만든다). 한 task면
+        자기 자신."""
+        if self.task != "multitask":
+            return {self.task: self}
+        return {task: replace(self, task=task) for task in self.tasks}
 
     @classmethod
     def medium(cls, task: str = "classification") -> TrainConfig:
@@ -169,6 +190,10 @@ class TrainConfig:
     def model_config(self):
         """`model_type` 모델의 설정. 그 설정에 있는 필드 가운데 여기에도 있는 것을 옮기고, 나머지는
         그 설정의 기본값이다."""
+        if self.task == "multitask" and "task" not in config_fields(self.model_type):
+            # 모델 설정에 task가 없는 모델(cell_transformer 등)은 한 task 출력뿐이다. 설정은 구조를
+            # 바꾸기 전(기본 cell_transformer)에도 만들 수 있게 두고, 모델을 만들 때 막는다
+            raise ValueError(f"{self.model_type} 모델은 multitask로 학습할 수 없다")
         mine = {f.name for f in fields(self)}
         values = {n: getattr(self, n) for n in config_fields(self.model_type) if n in mine}
         return model_class(self.model_type).config_class(n_out=self.n_out, **values)
@@ -192,5 +217,8 @@ class TrainConfig:
         return self.batch_size // per_forward
 
     def make_prior(self, seed: int):
-        """`prior_type` prior를 이 설정의 데이터셋 크기로 만든다."""
+        """`prior_type` prior를 이 설정의 데이터셋 크기로 만든다. multitask는 task마다 prior가
+        따로라 `task_configs()`의 설정으로 만든다."""
+        if self.task == "multitask":
+            raise ValueError("multitask 설정의 prior는 task_configs()의 task마다 만든다")
         return prior_module(self.prior_type).make_prior(self, seed)

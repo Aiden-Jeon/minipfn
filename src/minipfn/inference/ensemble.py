@@ -109,7 +109,16 @@ def max_features_of(model: nn.Module) -> int:
     return getattr(model.config, "max_features", MAX_FEATURES)
 
 
+def forward_kwargs(model: nn.Module, task: str) -> dict:
+    """모델 forward에 줄 task. 여러 task를 내는 모델(`model.tasks`, 예: TabPFN-3.5의 multitask
+    column_row_transformer)만 받고, 한 task 모델은 예전처럼 `model(x, y_train)`이다."""
+    return {"task": task} if len(getattr(model, "tasks", ())) > 1 else {}
+
+
 class _Base:
+    # 이 앙상블이 내는 task (여러 task 모델에 forward로 넘긴다)
+    task = ""
+
     def __init__(
         self,
         model: nn.Module,
@@ -168,13 +177,15 @@ class _Base:
                 torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
                 torch.inference_mode(),
             ):
-                logits = model(x, y)[0].float()
+                logits = model(x, y, **forward_kwargs(model, self.task))[0].float()
             # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
             yield i, logits
 
 
 class EnsembleClassifier(_Base):
     """분류: 멤버마다 클래스 번호를 섞고, logit을 온도로 나눠 softmax한 뒤 평균한다."""
+
+    task = "classification"
 
     def fit(self, X: Any, y: Any) -> EnsembleClassifier:
         rng = np.random.default_rng(self.random_state)
@@ -256,6 +267,8 @@ def _bucket_values(borders: torch.Tensor, u_train: np.ndarray) -> np.ndarray:
 
 class EnsembleRegressor(_Base):
     """회귀: 구간 확률을 멤버마다 자기 공간에서 계산해 평균한다 (모듈 docstring)."""
+
+    task = "regression"
 
     def __init__(self, model: nn.Module, borders: torch.Tensor, **kwargs: Any) -> None:
         super().__init__(model, **kwargs)
