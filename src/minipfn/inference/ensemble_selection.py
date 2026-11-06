@@ -21,7 +21,7 @@
 - 후보 하나는 멤버 하나(forward 한 번)와 softmax 온도 하나의 조합이다. 논문의 설정 하나는 멤버
   8개짜리 앙상블이다. 온도는 logit을 나누기만 하므로 forward를 더 하지 않는다
 - pool 멤버 `pool_size`개: 앞의 `n_estimators`개는 기본 앙상블과 같은 멤버(같은 seed)이고,
-  나머지는 무작위로 고른다. 전처리 종류(`pool_kinds`, 기본은 세 종류 모두), one-hot 여부
+  나머지는 무작위로 고른다. 전처리 종류(`pool_kinds`, 기본 `POOL_KINDS`), one-hot 여부
   (`one_hot`이 "off"면 펼치지 않는다), 이상값을 자르는 σ(`OUTLIER_SIGMAS`), (회귀) target power
   여부, 멤버 seed(feature 순서, 클래스 번호, 샘플 식별자 열)
 - 온도와 σ의 후보는 TabArena의 TabPFN-2.5 search space(`softmax_temperature`,
@@ -49,6 +49,9 @@ from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.inference.preprocessing import MEMBER_KINDS, Member
 
 POOL_SIZE = 24
+# pool 멤버의 전처리 종류. TabArena-Lite·BeyondArena-lite 판정(PR #49)은 이 세 종류로 했다
+# ("standard"는 그 뒤에 더한 종류라 넣지 않았다. 넣으면 pool의 무작위 멤버가 모두 바뀐다)
+POOL_KINDS = ("quantile", "power", "robust")
 N_FOLDS = 8
 N_ROUNDS = 40  # TabArena·AutoGluon ensemble selection의 기본값 (논문도 같다)
 SELECTIONS = ("greedy", "best", "uniform")
@@ -83,7 +86,7 @@ class _Selection:
         self,
         *args: Any,
         pool_size: int = POOL_SIZE,
-        pool_kinds: tuple[str, ...] = MEMBER_KINDS,
+        pool_kinds: tuple[str, ...] = POOL_KINDS,
         temperatures: tuple[float, ...] = TEMPERATURES,
         n_folds: int = N_FOLDS,
         n_rounds: int = N_ROUNDS,

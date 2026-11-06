@@ -273,7 +273,8 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     if "greedy" in args.test_time and args.pool_size < n_estimators:
         # 여기서 멈춘다: arena에서는 estimator를 만들 때 실패하면 모든 split이 조용히 imputed가 된다
         raise SystemExit(
-            f"--pool-size({args.pool_size})는 {suite} 앙상블의 멤버 수({n_estimators}) 이상이어야 한다."
+            f"--pool-size({args.pool_size})는 {suite} 앙상블의 멤버 수"
+            f"({n_estimators}) 이상이어야 한다."
         )
     log_path = Path(args.out_dir) / "test_time.jsonl"
     # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
