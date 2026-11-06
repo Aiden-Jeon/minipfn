@@ -37,8 +37,8 @@ MODEL_TYPE = "column_row_transformer"
 # 모델 구조. v3는 TabPFN-3 Appendix C 표 2~7: E 128, 셀 3개 묶기, inducing 128, CLS 4개 → 행 폭 512,
 # 행 ICL 24층·head 8. 열·행 단계 블록 3개·head 8, ff_factor 2, decoder 6 × 64는 모델 설정
 # 기본값이다. v3.5는 TabPFN-3.5가 적은 변경: CLS 8개(행 폭 1024), head 16(head dim 64), q·k RMSNorm,
-# Fourier + ECDF 셀 encoder. 3.5의 층 수는 공개되지 않아 3의 24층 그대로 둔다(그러면 약 215M으로
-# 보고서의 220M과 비슷하다)
+# Fourier + ECDF 셀 encoder. 3.5의 층 수는 공개되지 않아 3의 24층 그대로 둔다(그러면 multitask가
+# 약 219M으로 보고서의 220M과 비슷하다)
 _V3 = {
     "model_type": MODEL_TYPE,
     "emsize": 128,
