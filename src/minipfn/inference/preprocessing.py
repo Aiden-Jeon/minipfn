@@ -11,7 +11,8 @@
 - `"standard"`: 열 값을 바꾸지 않는다(이상치 자르기만). 표준화는 모델이 학습 행으로 한다. TabPFN-3.5
   추론이 이것 하나만 쓴다
 
-모든 멤버에서 수치형 열의 평균으로부터 표준편차 `OUTLIER_SIGMA`배 밖의 값은 그 경계로 자르고, 열
+모든 멤버에서 수치형 열의 평균으로부터 표준편차 `outlier_sigma`배(기본 `OUTLIER_SIGMA`) 밖의 값은
+그 경계로 자르고, 열
 순서를 섞고, 표준정규 난수로 된 샘플 식별자 열을 붙인다. `one_hot`인 멤버는 범주형 열을 one-hot으로
 펼친다(`one_hot_sizes`). 어느 멤버를 어떻게 섞는지는 `minipfn.inference.ensemble`에 있다.
 """
@@ -118,6 +119,7 @@ class Member:
     target_power: bool
     seed: int
     one_hot: bool = False
+    outlier_sigma: float = OUTLIER_SIGMA  # 평균에서 표준편차 몇 배 밖을 자르는지
 
 
 class MemberPreprocessor:
@@ -131,7 +133,8 @@ class MemberPreprocessor:
     def fit(self, X: np.ndarray) -> MemberPreprocessor:
         rng = np.random.default_rng(self.member.seed)
         mean, std = np.nanmean(X, axis=0), np.nanstd(X, axis=0)
-        self.lower, self.upper = mean - OUTLIER_SIGMA * std, mean + OUTLIER_SIGMA * std
+        sigma = self.member.outlier_sigma
+        self.lower, self.upper = mean - sigma * std, mean + sigma * std
         # 범주형 열은 자르지 않는다 (번호를 자르면 드문 범주가 다른 범주와 합쳐진다)
         self.lower[self.cat_ix], self.upper[self.cat_ix] = -np.inf, np.inf
         X = self._clip(X)

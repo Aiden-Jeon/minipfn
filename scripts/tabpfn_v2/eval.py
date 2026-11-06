@@ -53,6 +53,16 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
     --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
 
+`--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
+학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
+`--selection`·`--pool-size`), `diagscale`은 데이터셋마다 attention의 대각 scale만 학습한다
+(`minipfn.inference.diag_scale`). `diagscale+greedy`는 둘 다. fit마다의 선택·학습 기록은
+`<out-dir>/test_time.jsonl`에 남긴다.
+
+  uv run --no-dev --extra arena --group arena-dev python $EVAL --suite tabarena-lite \
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier --test-time greedy \
+    --method-name minipfn-tabpfn-v2-greedy
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -63,6 +73,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import json
 import os
 import time
 from pathlib import Path
@@ -74,11 +85,18 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
+from minipfn.inference.diag_scale import DiagScale
 from minipfn.inference.ensemble import (
     DEFAULT_ONE_HOT,
     EnsembleClassifier,
     EnsembleRegressor,
     max_features_of,
+)
+from minipfn.inference.ensemble_selection import (
+    POOL_SIZE,
+    SELECTIONS,
+    GreedyEnsembleClassifier,
+    GreedyEnsembleRegressor,
 )
 from minipfn.inference.preprocessing import (
     ONE_HOT_MODES,
@@ -91,6 +109,7 @@ from minipfn.recipes import default_inference, resolve_member_kinds, supported_s
 from minipfn.utils import log_run_source
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
+TEST_TIME = ("none", "greedy", "diagscale", "diagscale+greedy")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -127,6 +146,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--uncertainty",
         action="store_true",
         help="AMLB: 예측 분포·불확실성 지표도 낸다 (회귀 CRPS·coverage·PIT, 분류 ECE·conformal)",
+    )
+    parser.add_argument(
+        "--test-time",
+        choices=TEST_TIME,
+        default="none",
+        help="추론에 연산을 더 쓰는 방법: 멤버 pool greedy 선택, DiagScale, 또는 둘 다",
+    )
+    parser.add_argument(
+        "--selection",
+        choices=SELECTIONS,
+        default="greedy",
+        help="--test-time greedy의 선택 방식 (best: 하나, uniform: 균일 평균)",
+    )
+    parser.add_argument(
+        "--pool-size", type=int, default=POOL_SIZE, help="--test-time greedy의 pool 멤버 수"
     )
     parser.add_argument(
         "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
@@ -236,6 +270,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     inference = default_inference(model, suite)
     member_kinds = args.member_kinds or inference["member_kinds"]
     n_estimators = args.n_estimators or inference["n_estimators"]
+    log_path = Path(args.out_dir) / "test_time.jsonl"
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
@@ -245,15 +280,58 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "member_kinds": member_kinds,
             "device": args.device,
         }
-        if suite == "classification":
-            return EnsembleClassifier(model, **kw)
-        return EnsembleRegressor(model, borders, **kw)
+        if "greedy" in args.test_time:
+            # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
+            kw.update(selection=args.selection, pool_size=args.pool_size)
+            if suite == "classification":
+                estimator = GreedyEnsembleClassifier(model, **kw)
+            else:
+                estimator = GreedyEnsembleRegressor(model, borders, **kw)
+        elif suite == "classification":
+            estimator = EnsembleClassifier(model, **kw)
+        else:
+            estimator = EnsembleRegressor(model, borders, **kw)
+        if args.test_time.startswith("diagscale"):
+            estimator = DiagScale(estimator)
+        if args.test_time != "none":
+            record_fits(estimator, suite, log_path)
+        return estimator
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
     make.n_estimators = n_estimators
     make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
+
+
+def record_fits(estimator, suite: str, path: Path) -> None:
+    """fit할 때마다 test-time 방법의 기록(greedy 선택 `selection_`, DiagScale `adaptation_`)과
+    표 크기, fit 시간을 `path`(JSONL)에 한 줄씩 덧붙인다."""
+    fit = estimator.fit
+
+    def fit_and_record(X, y):
+        start = time.perf_counter()
+        fitted = fit(X, y)
+        record = {"suite": suite, "rows": len(X), "features": int(np.shape(X)[1])}
+        for key in ("selection_", "adaptation_"):
+            value = getattr(fitted, key, None)
+            if value is not None:
+                record[key.rstrip("_")] = value
+        record["fit_seconds"] = time.perf_counter() - start
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=float) + "\n")
+        return fitted
+
+    estimator.fit = fit_and_record
+
+
+def test_time_params(args: argparse.Namespace) -> dict:
+    """test-time 방법을 정하는 인자 (MLflow param, arena 결과를 다시 쓸지 정하는 값)."""
+    params = {"test_time": args.test_time}
+    if "greedy" in args.test_time:
+        params.update(selection=args.selection, pool_size=args.pool_size)
+    return params
 
 
 def arena_suite(name: str):
@@ -314,6 +392,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
             "paths": {t: paths[t] for t in factories},
             "member_kinds": {t: list(k) for t, k in kinds.items()},
             "one_hot": one_hot,
+            # 기본 추론(none)은 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
+            **({} if args.test_time == "none" else test_time_params(args)),
         },
         sort_keys=True,
     )
@@ -340,12 +420,15 @@ def print_arena_summary(summary: dict) -> None:
         if s.get("elo") is None:
             return f"{label:24s} 결과가 있는 split이 없다 (imputed {s['imputed_pct']:.1f}%)"
         xgb = s.get("winrate", {}).get("XGBoost (default)", {})
+        t = s.get("time", {})  # split 평균
         return (
             f"{label:24s} elo {s['elo']:.0f} (+{s['elo_ci_plus']:.0f}/-{s['elo_ci_minus']:.0f}) "
             f"score {s['score']:.3f} improvability {s['improvability']:.2f}% "
             f"imputed {s['imputed_pct_leaderboard']:.1f}% "
             f"win vs XGB(default) {xgb.get('all', float('nan')):.3f} "
-            f"position {s['position']}/{s['n_methods']}"
+            f"position {s['position']}/{s['n_methods']} "
+            f"time train {t.get('time_train_s_mean', float('nan')):.1f}s "
+            f"infer {t.get('time_infer_s_mean', float('nan')):.1f}s"
         )
 
     print(line(summary["suite"], summary))
@@ -362,6 +445,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "method_name": args.method_name,
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
+            **test_time_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
         }
     )
@@ -372,6 +456,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
         keys = ("elo", "score", "improvability", "rank", "imputed_pct_leaderboard")
         out = {f"{p}_{k}": s[k] for k in keys if s.get(k) is not None}
         out[f"{p}_imputed_pct_splits"] = s["imputed_pct"]
+        out.update({f"{p}_{k}": v for k, v in s.get("time", {}).items()})
         for baseline, w in s.get("winrate", {}).items():
             key = baseline.split(" (")[0].lower().replace("-", "").replace(".", "")
             sub = baseline.split("(")[-1].rstrip(")").replace(" + ", "_").replace(" ", "_")
@@ -384,6 +469,13 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
         mlflow.log_metrics(metrics(f"{prefix}_{label.replace('-', '_')}", s))
     for path in sorted(out_dir.glob("*.csv")) + [out_dir / "summary.json"]:
         mlflow.log_artifact(str(path), f"eval/{summary['suite']}")
+    log_test_time_artifact(args)
+
+
+def log_test_time_artifact(args: argparse.Namespace) -> None:
+    path = Path(args.out_dir) / "test_time.jsonl"
+    if path.exists():
+        mlflow.log_artifact(str(path), "eval")
 
 
 def summarize(rows: list[dict]) -> pd.DataFrame:
@@ -443,6 +535,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "folds": args.folds,
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
+                **test_time_params(args),
             }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
@@ -520,6 +613,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
     if use_mlflow:
         for name in artifacts:
             mlflow.log_artifact(str(out_dir / name), "eval")
+        log_test_time_artifact(args)
 
 
 def summarize_uncertainty(rows: list[dict], headline: str) -> pd.DataFrame:

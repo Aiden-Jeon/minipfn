@@ -7,6 +7,8 @@
 #     --override "env_variables.TABPFN_V2_SUITE=beyondarena" \
 #     --override "env_variables.TABPFN_V2_CHECKPOINTS=--classifier-path runs:/<run_id>/checkpoints/step_0500000.pt" \
 #     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--method-name minipfn-tabpfn-v2.5"
+# 추론에 연산을 더 쓰는 방법(issue #43)은 TABPFN_V2_EXTRA_ARGS에 `--test-time greedy`(diagscale,
+# diagscale+greedy)와 다른 --method-name을 준다. 기본보다 오래 걸리므로 timeout_minutes도 늘린다.
 # 2.5 checkpoint를 평가할 때는 experiment_name도 tabpfn-v2-5-reproduction으로 바꾼다(멤버 전처리와
 # 크기 상한은 모델 구조로 정해진다).
 experiment_name: tabpfn-v2-reproduction
