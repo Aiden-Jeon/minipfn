@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -145,6 +145,46 @@ class ColumnRowTransformerConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def tiny(cls, **changes: Any) -> ColumnRowTransformerConfig:
+        """손 계산으로 따라갈 만한 작은 설정 (노트북·테스트용): E 16, inducing 4개, 열 1블록,
+        CLS 2개, 행 2블록, 행 ICL 2층, head 2개씩, 클래스 상한 3. 바꿀 필드는 인자로 준다."""
+        values = {
+            "emsize": 16,
+            "n_inducing": 4,
+            "column_blocks": 1,
+            "column_heads": 2,
+            "n_cls": 2,
+            "row_blocks": 2,
+            "row_heads": 2,
+            "nlayers": 2,
+            "nhead": 2,
+            "decoder_heads": 2,
+            "decoder_head_dim": 8,
+            "qassmax_hidden": 8,
+            "n_out": 3,
+        }
+        return cls(**(values | changes))
+
+
+# 모델의 맨 앞 모듈 이름 → 단계 (`ColumnRowTransformer.num_parameters_by_stage`)
+STAGES: dict[str, str] = {
+    "cell_encoder": "cell_encoder",
+    "cell_target": "cell_encoder",
+    "cell_target_norm": "cell_encoder",
+    "column_blocks": "column_stage",
+    "cls_tokens": "row_stage",
+    "row_blocks": "row_stage",
+    "row_norm": "row_stage",
+    "icl_target": "row_icl",
+    "icl_target_norm": "row_icl",
+    "icl_layers": "row_icl",
+    "icl_norm": "row_icl",
+    "pre_head": "output",
+    "heads": "output",
+}
+STAGE_ORDER = ("cell_encoder", "column_stage", "row_stage", "row_icl", "output")
 
 
 def group_offsets(g: int) -> tuple[int, ...]:
@@ -510,6 +550,24 @@ class ColumnRowTransformer(nn.Module):
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def num_parameters_by_stage(self) -> dict[str, int]:
+        """단계마다 파라미터 수 (`STAGE_ORDER` 순서): 셀 encoder(정답 embedding 포함), 열 단계,
+        행 단계, 행 ICL(정답 embedding 포함), 출력."""
+        counts = dict.fromkeys(STAGE_ORDER, 0)
+        for name, p in self.named_parameters():
+            counts[STAGES[name.split(".")[0]]] += p.numel()
+        return counts
+
+    def num_parameters_by_task(self) -> dict[str, int]:
+        """두 task가 같이 쓰는 파라미터("shared")와 task마다 따로인 파라미터 수. 이름에 task가
+        들어간 부품(정답 encoder, 출력층 앞 MLP, 출력층)이 그 task 것이다."""
+        counts = {"shared": 0} | dict.fromkeys(self.config.tasks, 0)
+        for name, p in self.named_parameters():
+            parts = name.split(".")
+            task = next((t for t in self.config.tasks if t in parts), "shared")
+            counts[task] += p.numel()
+        return counts
 
     def qk_clip_weights(self) -> list[tuple[str, torch.Tensor]]:
         """빈 목록: QK-clip의 가중치 상한이 이 모델의 logit을 묶지 못한다 (QASSMax의 입력에 따른

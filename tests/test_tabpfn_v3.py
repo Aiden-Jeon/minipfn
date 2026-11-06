@@ -497,3 +497,30 @@ def test_train_script_takes_multitask(monkeypatch):
     assert arch == "v3.5" and config == recipe.paper("multitask", "v3.5")
     args = script.parse_args(["--config-name", "smoke", "--task", "multitask", "--arch", "v3.5"])
     assert script.build_config(args)[0].task == "multitask"
+
+
+@pytest.mark.parametrize("arch,task", [("v3", "classification"), ("v3.5", "multitask")])
+def test_parameter_counts_by_stage_and_task_add_up(arch, task):
+    config = recipe.paper(task, arch).model_config()
+    with torch.device("meta"):
+        model = ColumnRowTransformer(config)
+    by_stage = model.num_parameters_by_stage()
+    assert list(by_stage) == ["cell_encoder", "column_stage", "row_stage", "row_icl", "output"]
+    assert sum(by_stage.values()) == model.num_parameters()
+    by_task = model.num_parameters_by_task()
+    assert set(by_task) == {"shared", *config.tasks}
+    assert sum(by_task.values()) == model.num_parameters()
+    assert all(v > 0 for v in by_task.values())
+
+
+def test_tiny_config_and_randomize_zero_weights():
+    config = ColumnRowTransformerConfig.tiny(n_out=10)
+    assert (config.emsize, config.n_cls, config.nlayers, config.n_out) == (16, 2, 2, 10)
+    torch.manual_seed(0)
+    model = registry.randomize_zero_weights(ColumnRowTransformer(config))
+    assert not any(p.dim() > 1 and (p == 0).all() for p in model.parameters())
+    norms = [p for n, p in model.named_parameters() if n.endswith("row_norm.weight")]
+    assert norms and all((p == 1).all() for p in norms)  # 1차원 파라미터는 그대로
+    x, y = _data("classification")
+    with torch.no_grad():
+        assert model(x, y).shape == (2, 15, 10)

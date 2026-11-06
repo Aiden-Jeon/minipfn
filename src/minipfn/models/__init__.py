@@ -7,6 +7,8 @@
 - `column_row_transformer`: 열(inducing point) → 행(CLS) → 행 ICL 세 단계 (TabPFN-3·3.5 recipe)
 - `bar_distribution`: 회귀 출력을 구간 분류로 다루는 예측분포 (모델에 붙는 부품)
 
+학습하지 않은 모델로 경로를 따라갈 때(노트북·테스트) 쓰는 `randomize_zero_weights`도 여기 있다.
+
 공용 학습 루프·checkpoint·Hub 코드는 모델 클래스를 직접 부르지 않고 아래 registry로 만든다.
 TabPFN-3(arXiv 2605.13986)은 v2·2.5와 뼈대가 달라(셀 토큰의 2-way attention 대신 열 → 행 → 행
 ICL 3단계) 다른 클래스(`column_row_transformer`)로 둔다. 학습 루프·prior·추론 전처리·benchmark는
@@ -154,3 +156,15 @@ def save_checkpoint(
         "borders": borders,
     }
     torch.save(payload, path)
+
+
+def randomize_zero_weights(model: nn.Module, std: float = 0.3) -> nn.Module:
+    """0으로 시작한 가중치 행렬(잔차 가지의 마지막 Linear, attention 출력 투영 등)을 N(0, std²)로
+    채운다. 처음에는 그 가지가 출력에 아무것도 더하지 않으므로, 학습하지 않은 모델로 입력이 출력까지
+    닿는 경로를 보려면 채워야 한다(노트북·테스트). bias·정규화 같은 1차원 파라미터는 그대로 둔다.
+    난수는 torch 전역 난수를 쓴다(부르기 전에 `torch.manual_seed`로 고정한다)."""
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.dim() > 1 and (p == 0).all():
+                nn.init.normal_(p, std=std)
+    return model
