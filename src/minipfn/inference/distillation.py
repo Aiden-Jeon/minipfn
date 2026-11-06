@@ -218,8 +218,8 @@ class _Student:
 
 
 class _Distilled:
-    """teacher 라벨·synthetic 행·학생 학습의 공통 부분. 분류·회귀가 `_targets`·`_teacher_predict`를
-    정한다."""
+    """teacher 라벨·synthetic 행·학생 학습의 공통 부분. 분류·회귀가 정답과 teacher 예측의 형식
+    (`_prepare_y`·`_teacher_predict`·`_observed_targets`)과 학생 학습(`_fit_student`)을 정한다."""
 
     def __init__(
         self,
