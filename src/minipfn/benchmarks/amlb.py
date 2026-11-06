@@ -758,15 +758,23 @@ def load_openml_task(task_id: int) -> OpenMLTask:
     return OpenMLTask(task_id, dataset.name, X, y, cat_ix, task_type, task)
 
 
+def drop_unseen_classes(
+    y_true: np.ndarray, prediction: np.ndarray, classes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """학습 fold에 없던 클래스의 테스트 행은 모델이 예측할 수 없으므로 뺀다. ROC AUC
+    (`score_fold`)와 불확실성 지표(`uncertainty.classification_metrics`)가 같은 행을 쓰도록 둘 다
+    이 함수를 부른다."""
+    seen = np.isin(np.asarray(y_true), np.asarray(classes))
+    return np.asarray(y_true)[seen], np.asarray(prediction)[seen]
+
+
 def score_fold(
     task_type: str, y_true: np.ndarray, prediction: np.ndarray, classes: np.ndarray | None = None
 ) -> float:
     """분류: ROC AUC (이진은 양성 클래스 확률, 다중은 one-vs-rest 평균). 회귀: negative RMSE."""
     if task_type == "regression":
         return -float(mean_squared_error(y_true, prediction) ** 0.5)
-    # 학습 fold에 없던 클래스의 테스트 행은 모델이 예측할 수 없으므로 뺀다
-    seen = np.isin(y_true, classes)
-    y_true, prediction = y_true[seen], prediction[seen]
+    y_true, prediction = drop_unseen_classes(y_true, prediction, classes)
     if len(np.unique(y_true)) < 2:
         return float("nan")  # 클래스가 하나뿐이면 ROC AUC를 정의할 수 없다
     if prediction.shape[1] == 2:

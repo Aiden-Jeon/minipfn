@@ -15,55 +15,84 @@ def _random_histogram(n=5, buckets=12, seed=0):
     return probs, borders
 
 
-def _sample(probs, borders, size, g):
-    """히스토그램(구간 안은 균일)에서 행마다 size개를 뽑는다."""
+def _sample(probs, borders, size, g, tails):
+    """히스토그램(안쪽 구간은 균일, 양 끝은 tails)에서 행마다 size개를 뽑는다."""
+    h = unc.bar_histogram(probs, borders, tails)
     out = np.empty((len(probs), size))
-    for i, p in enumerate(probs):
+    for i, p in enumerate(h.probs):
         k = g.choice(len(p), size=size, p=p)
         out[i] = g.uniform(borders[k], borders[k + 1])
+        if tails == "half_normal":
+            d = np.abs(g.normal(size=size))
+            out[i] = np.where(k == 0, borders[1] - h.scale_left * d, out[i])
+            out[i] = np.where(k == len(p) - 1, borders[-2] + h.scale_right * d, out[i])
     return out
 
 
-def test_crps_matches_numerical_integration_of_the_cdf():
+@pytest.mark.parametrize("tails", unc.TAILS)
+def test_crps_matches_numerical_integration_of_the_cdf(tails):
     # CRPS = ∫ (F(t) − 1{t ≥ y})² dt를 촘촘한 격자에서 직접 적분한 값과 같다
     probs, borders = _random_histogram()
     y = np.array([-4.0, -1.0, 0.3, 2.9, 5.0])  # 경계 밖 두 개 포함
-    t = np.linspace(-6, 8, 200_001)
-    cdf = np.stack([unc.pit(np.repeat(p[None], len(t), 0), borders, t) for p in probs])
+    t = np.linspace(-25, 25, 500_001)
+    rows = [unc.bar_histogram(np.repeat(p[None], len(t), 0), borders, tails) for p in probs]
+    cdf = np.stack([unc.pit(row, t) for row in rows])
     step = (t[None, :] >= y[:, None]).astype(float)
     expected = np.trapezoid((cdf - step) ** 2, t, axis=1)
-    assert np.allclose(unc.crps(probs, borders, y), expected, atol=1e-4)
+    h = unc.bar_histogram(probs, borders, tails)
+    assert np.allclose(unc.crps(h, y), expected, atol=1e-4)
+
+
+def test_crps_is_computed_in_row_chunks(monkeypatch):
+    probs, borders = _random_histogram(n=7)
+    y = np.linspace(-4, 4, 7)
+    h = unc.bar_histogram(probs, borders)
+    full = unc.crps(h, y)
+    monkeypatch.setattr(unc, "CRPS_CHUNK_ROWS", 3)
+    assert np.array_equal(unc.crps(h, y), full)
 
 
 def test_crps_of_a_narrow_bucket_is_the_absolute_error():
     borders = np.array([-10.0, 0.999, 1.001, 10.0])
-    probs = np.array([[0.0, 1.0, 0.0]])
-    assert unc.crps(probs, borders, [3.0])[0] == pytest.approx(2.0, abs=1e-3)
+    h = unc.bar_histogram(np.array([[0.0, 1.0, 0.0]]), borders)
+    assert unc.crps(h, [3.0])[0] == pytest.approx(2.0, abs=1e-3)
 
 
-def test_quantile_inverts_the_cdf_and_pit_is_the_cdf():
+@pytest.mark.parametrize("tails", unc.TAILS)
+def test_quantile_inverts_the_cdf_and_pit_is_the_cdf(tails):
     probs, borders = _random_histogram(n=3)
-    for q in (0.05, 0.3, 0.5, 0.97):
-        x = unc.quantile(probs, borders, q)
-        assert np.allclose(unc.pit(probs, borders, x), q, atol=1e-9)
-    assert np.allclose(unc.pit(probs, borders, [-9, -9, 9]), [0, 0, 1])
+    probs[:, [0, -1]] = 0.1  # 양 끝 구간에도 확률을 둬서 꼬리 분위수를 확인한다
+    h = unc.bar_histogram(probs, borders, tails)
+    levels = np.array([0.01, 0.05, 0.3, 0.5, 0.97, 0.995])
+    x = unc.quantile(h, levels)
+    assert x.shape == (3, len(levels))
+    for j, q in enumerate(levels):
+        assert np.allclose(unc.pit(h, x[:, j]), q, atol=1e-9)
+    edge = unc.pit(h, [borders[0], borders[0], borders[-1]])
+    if tails == "uniform":
+        assert np.allclose(edge, [0, 0, 1])  # 맨 바깥 경계 밖에는 확률이 없다
+    else:
+        # half-normal: 꼬리 확률의 절반이 맨 바깥 경계 밖에 있다 (중앙값 = 구간 폭)
+        p_left, p_right = h.probs[:, 0], h.probs[:, -1]
+        assert np.allclose(edge, [p_left[0] / 2, p_left[1] / 2, 1 - p_right[2] / 2])
 
 
 def test_zero_width_buckets_are_atoms():
-    # float32로 옮긴 경계에서 폭이 0이 된 구간: 확률이 그 점에 몰린다
+    # 경계가 같은 값인 구간: 확률이 그 점에 몰린다
     borders = np.array([0.0, 1.0, 1.0, 2.0])
-    probs = np.array([[0.25, 0.5, 0.25]])
-    assert unc.pit(probs, borders, [1.0])[0] == pytest.approx(0.75)
-    assert unc.quantile(probs, borders, 0.5)[0] == pytest.approx(1.0)
-    assert np.isfinite(unc.crps(probs, borders, [1.0])).all()
+    h = unc.bar_histogram(np.array([[0.25, 0.5, 0.25]]), borders)
+    assert unc.pit(h, [1.0])[0] == pytest.approx(0.75)
+    assert unc.quantile(h, 0.5)[0, 0] == pytest.approx(1.0)
+    assert np.isfinite(unc.crps(h, [1.0])).all()
 
 
-def test_calibrated_forecasts_cover_at_the_nominal_level():
+@pytest.mark.parametrize("tails", unc.TAILS)
+def test_calibrated_forecasts_cover_at_the_nominal_level(tails):
     # 정답을 예측 분포 자신에서 뽑으면 PIT는 균일하고 coverage는 level과 같다
     g = np.random.default_rng(0)
     probs, borders = _random_histogram(n=4000, seed=2)
-    y = _sample(probs, borders, 1, g)[:, 0]
-    out = unc.regression_metrics(probs, borders, y, y_scale=2.0)
+    y = _sample(probs, borders, 1, g, tails)[:, 0]
+    out = unc.regression_metrics(probs, borders, y, y_scale=2.0, tails=tails)
     for level in unc.COVERAGE_LEVELS:
         name = round(level * 100)
         assert out[f"coverage_{name}"] == pytest.approx(level, abs=0.03)
@@ -71,8 +100,19 @@ def test_calibrated_forecasts_cover_at_the_nominal_level():
     assert out["pit_ks"] < 0.03
     assert out["crps_scaled"] == pytest.approx(out["crps"] / 2.0)
     # 분포를 한쪽으로 밀면 PIT가 균일에서 멀어지고 CRPS가 커진다
-    shifted = unc.regression_metrics(probs, borders + 1.0, y)
+    shifted = unc.regression_metrics(probs, borders + 1.0, y, tails=tails)
     assert shifted["pit_ks"] > 0.2 and shifted["crps"] > out["crps"]
+
+
+def test_min_coverage_by_width_does_not_depend_on_row_order():
+    # 폭이 모두 같으면 한 분위에 들어가 전체 coverage와 같다 (행 순서를 바꿔도)
+    g = np.random.default_rng(0)
+    covered = g.random(200) < 0.9
+    width = np.ones(200)
+    expected = covered.mean()
+    for _ in range(3):
+        perm = g.permutation(200)
+        assert unc.min_coverage_by_width(covered[perm], width[perm]) == pytest.approx(expected)
 
 
 def test_ece_is_zero_when_confidence_matches_accuracy():
@@ -110,6 +150,13 @@ def test_classification_metrics_ignore_classes_unseen_in_training():
     assert set(out) >= {"log_loss", "brier", "lac_coverage", "aps_sscs"}
 
 
+def test_classification_metrics_are_nan_when_no_row_is_left():
+    proba = np.tile([0.8, 0.2], (5, 1))
+    out = unc.classification_metrics(proba, np.array(["z"] * 5), np.array(["a", "b"]))
+    assert out and all(np.isnan(v) for v in out.values())
+    assert np.isnan(unc.ece(np.zeros((0, 2)), np.zeros(0, dtype=int)))
+
+
 def test_regressor_predict_full_matches_predict_and_distribution():
     from minipfn.models.cell_transformer import CellTransformer, CellTransformerConfig
     from minipfn.recipes.tabpfn_v2 import TabPFNv2Regressor
@@ -124,6 +171,9 @@ def test_regressor_predict_full_matches_predict_and_distribution():
     assert np.array_equal(mean, reg.predict(x[80:100]))
     log_probs2, borders2 = reg.predict_distribution(x[80:100])
     assert torch.equal(log_probs, log_probs2) and torch.equal(borders, borders2)
+    # 경계는 float64로 원래 단위로 옮긴다 (float32면 평균이 크고 퍼짐이 작을 때 뭉친다)
+    assert borders.dtype == torch.float64
+    assert torch.equal(borders, reg.borders.double() * reg.y_std_ + reg.y_mean_)
     out = unc.regression_metrics(log_probs.exp().numpy(), borders.numpy(), y[80:100])
     assert np.isfinite(out["crps"]) and 0.0 <= out["coverage_90"] <= 1.0
 
@@ -160,3 +210,17 @@ def test_evaluate_task_adds_uncertainty_columns():
     assert len(rows) == 2
     assert {"crps", "crps_scaled", "coverage_90", "pit_ks", "rmse_scaled"} <= set(rows[0])
     assert rows[0]["score"] == pytest.approx(-rows[0]["rmse_scaled"] * np.std(task.y[1::2]))
+
+
+def test_eval_script_rejects_uncertainty_for_arena_suites(tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "scripts" / "tabpfn_v2" / "eval.py"
+    spec = importlib.util.spec_from_file_location("eval_tabpfn_v2", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit, match="AMLB"):
+        script.main(["--suite", "tabarena-lite", "--uncertainty", "--out-dir", str(out)])
+    assert not out.exists()

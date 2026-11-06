@@ -403,6 +403,9 @@ def mlflow_run(use_mlflow: bool):
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.uncertainty and args.suite in ARENA_SUITES:
+        # arena는 공식 패키지의 지표만 낸다. 조용히 무시하지 않고 멈춘다
+        raise SystemExit("--uncertainty는 AMLB suite(classification, regression, all)에서만 쓴다.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
