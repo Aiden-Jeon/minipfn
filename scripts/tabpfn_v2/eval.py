@@ -53,6 +53,16 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
     --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
 
+`--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
+학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
+`--selection`·`--pool-size`), `diagscale`은 데이터셋마다 attention의 대각 scale만 학습한다
+(`minipfn.inference.diag_scale`). `diagscale+greedy`는 둘 다. fit마다의 선택·학습 기록은
+`<out-dir>/test_time.jsonl`에 남긴다.
+
+  uv run --no-dev --extra arena --group arena-dev python $EVAL --suite tabarena-lite \
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier --test-time greedy \
+    --method-name minipfn-tabpfn-v2-greedy
+
 `--distill`은 teacher(위의 추론 estimator)를 데이터셋마다 GBDT 학생으로 증류해 학생으로만 예측한다
 (issue #44, `minipfn.inference.distillation`, extra `distill`). `oof`는 out-of-fold teacher 라벨
 (arXiv 2605.18654), `synthetic`은 학습 행 전체를 context로 학습 행 + CutMix synthetic 행을 라벨링
@@ -91,6 +101,7 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
+from minipfn.inference.diag_scale import DiagScale
 from minipfn.inference.distillation import (
     METHODS,
     STUDENTS,
@@ -103,6 +114,12 @@ from minipfn.inference.ensemble import (
     EnsembleRegressor,
     max_features_of,
 )
+from minipfn.inference.ensemble_selection import (
+    POOL_SIZE,
+    SELECTIONS,
+    GreedyEnsembleClassifier,
+    GreedyEnsembleRegressor,
+)
 from minipfn.inference.preprocessing import (
     ONE_HOT_MODES,
     one_hot_kinds,
@@ -114,6 +131,7 @@ from minipfn.recipes import default_inference, resolve_member_kinds, supported_s
 from minipfn.utils import log_run_source
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
+TEST_TIME = ("none", "greedy", "diagscale", "diagscale+greedy")
 LATENCY_REPEATS = 5
 
 
@@ -151,6 +169,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--uncertainty",
         action="store_true",
         help="AMLB: 예측 분포·불확실성 지표도 낸다 (회귀 CRPS·coverage·PIT, 분류 ECE·conformal)",
+    )
+    parser.add_argument(
+        "--test-time",
+        choices=TEST_TIME,
+        default="none",
+        help="추론에 연산을 더 쓰는 방법: 멤버 pool greedy 선택, DiagScale, 또는 둘 다",
+    )
+    parser.add_argument(
+        "--selection",
+        choices=SELECTIONS,
+        default="greedy",
+        help="--test-time greedy의 선택 방식 (best: 하나, uniform: 균일 평균)",
+    )
+    parser.add_argument(
+        "--pool-size", type=int, default=POOL_SIZE, help="--test-time greedy의 pool 멤버 수"
     )
     parser.add_argument(
         "--distill",
@@ -286,8 +319,16 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     inference = default_inference(model, suite)
     member_kinds = args.member_kinds or inference["member_kinds"]
     n_estimators = args.n_estimators or inference["n_estimators"]
-
-    log_path = fits_path(args)
+    if "greedy" in args.test_time and args.pool_size < n_estimators:
+        # 여기서 멈춘다: arena에서는 estimator를 만들 때 실패하면 모든 split이 조용히 imputed가 된다
+        raise SystemExit(
+            f"--pool-size({args.pool_size})는 {suite} 앙상블의 멤버 수"
+            f"({n_estimators}) 이상이어야 한다."
+        )
+    log_path = Path(args.out_dir) / "test_time.jsonl"
+    # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
+    log_fields = {"suite": suite, "method": args.method_name, **test_time_params(args)}
+    fits_log = fits_path(args)
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
@@ -297,10 +338,24 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "member_kinds": member_kinds,
             "device": args.device,
         }
-        if suite == "classification":
+        if "greedy" in args.test_time:
+            # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
+            kw.update(selection=args.selection, pool_size=args.pool_size)
+            if suite == "classification":
+                estimator = GreedyEnsembleClassifier(model, **kw)
+            else:
+                estimator = GreedyEnsembleRegressor(model, borders, **kw)
+        elif suite == "classification":
             estimator = EnsembleClassifier(model, **kw)
         else:
             estimator = EnsembleRegressor(model, borders, **kw)
+        if args.test_time.startswith("diagscale"):
+            estimator = DiagScale(estimator)
+        if args.test_time != "none":
+            fields = dict(log_fields)
+            if getattr(task, "name", None):  # AMLB task만 이름이 있다
+                fields["dataset"] = task.name
+            record_fits(estimator, log_path, **fields)
         if args.distill != "none":
             distilled = DistilledClassifier if suite == "classification" else DistilledRegressor
             estimator = distilled(
@@ -313,7 +368,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             )
         if args.distill != "none" or args.latency:
             record = {"suite": args.suite, "task": suite, "dataset": getattr(task, "name", None)}
-            estimator = RecordedEstimator(estimator, record, log_path, latency=args.latency)
+            estimator = RecordedEstimator(estimator, record, fits_log, latency=args.latency)
         return estimator
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
@@ -321,6 +376,36 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     make.n_estimators = n_estimators
     make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
+
+
+def record_fits(estimator, path: Path, **fields) -> None:
+    """fit할 때마다 `fields`(suite, 방법, test-time 설정 등)와 test-time 방법의 기록(greedy 선택
+    `selection_`, DiagScale `adaptation_`), 표 크기, fit 시간을 `path`(JSONL)에 한 줄씩 덧붙인다."""
+    fit = estimator.fit
+
+    def fit_and_record(X, y):
+        start = time.perf_counter()
+        fitted = fit(X, y)
+        record = {**fields, "rows": len(X), "features": int(np.shape(X)[1])}
+        for key in ("selection_", "adaptation_"):
+            value = getattr(fitted, key, None)
+            if value is not None:
+                record[key.rstrip("_")] = value
+        record["fit_seconds"] = time.perf_counter() - start
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=float) + "\n")
+        return fitted
+
+    estimator.fit = fit_and_record
+
+
+def test_time_params(args: argparse.Namespace) -> dict:
+    """test-time 방법을 정하는 인자 (MLflow param, arena 결과를 다시 쓸지 정하는 값)."""
+    params = {"test_time": args.test_time}
+    if "greedy" in args.test_time:
+        params.update(selection=args.selection, pool_size=args.pool_size)
+    return params
 
 
 def fits_path(args: argparse.Namespace) -> Path:
@@ -453,6 +538,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
             "paths": {t: paths[t] for t in factories},
             "member_kinds": {t: list(k) for t, k in kinds.items()},
             "one_hot": one_hot,
+            # 기본 추론(none)은 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
+            **({} if args.test_time == "none" else test_time_params(args)),
             # 증류하지 않으면 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
             **({} if args.distill == "none" else distill_params(args)),
         },
@@ -506,6 +593,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "method_name": args.method_name,
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
+            **test_time_params(args),
             **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
         }
@@ -530,7 +618,14 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
         mlflow.log_metrics(metrics(f"{prefix}_{label.replace('-', '_')}", s))
     for path in sorted(out_dir.glob("*.csv")) + [out_dir / "summary.json"]:
         mlflow.log_artifact(str(path), f"eval/{summary['suite']}")
+    log_test_time_artifact(args)
     log_distill_artifact(args)
+
+
+def log_test_time_artifact(args: argparse.Namespace) -> None:
+    path = Path(args.out_dir) / "test_time.jsonl"
+    if path.exists():
+        mlflow.log_artifact(str(path), "eval")
 
 
 def log_distill_artifact(args: argparse.Namespace) -> None:
@@ -571,6 +666,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.uncertainty and args.distill != "none" and args.suite in ("regression", "all"):
         # 회귀 학생은 평균만 내고 예측 분포가 없다
         raise SystemExit("--distill은 회귀 --uncertainty와 같이 쓸 수 없다 (학생은 평균만 낸다).")
+    if args.test_time != "none" and args.distill != "none":
+        # test-time 기록(record_fits)이 fit을 덮어써서, 증류가 teacher를 복사하면 원래 객체를 쓴다
+        raise SystemExit("--distill은 --test-time none에서만 쓴다.")
     if args.latency and args.suite not in ARENA_SUITES:
         raise SystemExit("--latency는 TabArena·BeyondArena suite에서만 쓴다.")
     out_dir = Path(args.out_dir)
@@ -602,6 +700,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "folds": args.folds,
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
+                **test_time_params(args),
                 **distill_params(args),
             }
         )
@@ -680,6 +779,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
     if use_mlflow:
         for name in artifacts:
             mlflow.log_artifact(str(out_dir / name), "eval")
+        log_test_time_artifact(args)
         log_distill_artifact(args)
 
 

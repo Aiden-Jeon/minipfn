@@ -316,6 +316,8 @@ def test_eval_rejects_distilled_regression_uncertainty_and_amlb_latency():
         script.main(["--suite", "regression", "--distill", "oof", "--uncertainty"])
     with pytest.raises(SystemExit, match="latency"):
         script.main(["--suite", "classification", "--latency"])
+    with pytest.raises(SystemExit, match="test-time"):
+        script.main(["--suite", "tabarena-lite", "--distill", "oof", "--test-time", "greedy"])
 
 
 def test_fit_records_are_per_suite_and_cleared_each_run(tmp_path):
