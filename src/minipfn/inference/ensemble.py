@@ -299,22 +299,35 @@ class EnsembleRegressor(_Base):
         멤버를 공통 경계로 옮겨 섞은 분포다. 꼬리는 공통 경계의 half-normal 그대로라, 이 분포로 낸
         평균은 `predict`와 다르다 (평균은 `predict`를 쓴다).
         """
-        borders = self.borders.to(self.device)
-        probs = []
-        for i, logits in self._iter_logits(X, self.y_trains_):
-            p = torch.softmax(logits / self.softmax_temperature, dim=-1)
-            if self.border_maps_[i] is not None:
-                # power transform한 공간의 경계를 z 공간으로 되돌린 것 위에서 확률을 옮긴다
-                p = _probs_on_borders(p, self.border_maps_[i].to(self.device), borders)
-            probs.append(p)
-        log_probs = torch.stack(probs).mean(0).clamp_min(1e-12).log().cpu()
-        return log_probs, (self.borders * self.y_std_ + self.y_mean_)
+        _, log_probs, borders = self._predict(X, mean=False)
+        return log_probs, borders
 
     def predict(self, X: Any) -> np.ndarray:
         """예측분포의 평균. 멤버를 섞은 분포의 평균은 멤버 평균의 평균이라, 공통 경계로 옮기지 않고
         멤버마다 자기 구간 값(`bucket_values_`)으로 계산한다."""
-        means = []
+        return self._predict(X, distribution=False)[0]
+
+    def predict_full(self, X: Any) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        """(`predict`의 평균, `predict_distribution`의 log 확률과 경계)를 forward 한 번으로 낸다.
+        분포 품질을 평가할 때(`minipfn.benchmarks.uncertainty`) 점 예측과 분포를 같이 쓴다."""
+        return self._predict(X)
+
+    def _predict(self, X: Any, mean: bool = True, distribution: bool = True):
+        borders = self.borders.to(self.device)
+        means, probs = [], []
         for i, logits in self._iter_logits(X, self.y_trains_):
             p = torch.softmax(logits / self.softmax_temperature, dim=-1)
-            means.append(p @ self.bucket_values_[i].to(p.device))
-        return torch.stack(means).mean(0).cpu().numpy() * self.y_std_ + self.y_mean_
+            if mean:
+                means.append(p @ self.bucket_values_[i].to(p.device))
+            if distribution:
+                if self.border_maps_[i] is not None:
+                    # power transform한 공간의 경계를 z 공간으로 되돌린 것 위에서 확률을 옮긴다
+                    p = _probs_on_borders(p, self.border_maps_[i].to(self.device), borders)
+                probs.append(p)
+        out_mean = log_probs = out_borders = None
+        if mean:
+            out_mean = torch.stack(means).mean(0).cpu().numpy() * self.y_std_ + self.y_mean_
+        if distribution:
+            log_probs = torch.stack(probs).mean(0).clamp_min(1e-12).log().cpu()
+            out_borders = self.borders * self.y_std_ + self.y_mean_
+        return out_mean, log_probs, out_borders
