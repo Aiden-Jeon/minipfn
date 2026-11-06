@@ -33,11 +33,12 @@ checkpoint의 예측만으로 계산한다.
 - `ece`: top-label expected calibration error (같은 폭의 확신도 구간 15개), log loss, Brier.
 - `conformal`: split conformal prediction. 모델은 학습 fold로 이미 fit했으므로 테스트 fold 예측을
   calibration 절반과 평가 절반으로 무작위로 나눠(`n_repeats`번) 따로 학습하지 않는다(나눈 두 절반은
-  교환 가능하다). 비순응 점수는 LAC(1 − p_y, Sadinle et al. 2019)와 APS(p_y 이상인 확률의 합,
-  Romano et al. 2020, 무작위화 없이). 낸 값은 marginal coverage, 평균 집합 크기, SSCS
-  (size-stratified coverage, Angelopoulos et al. 2021: 집합 크기마다의 coverage 가운데 가장 낮은 값,
-  행이 `min_group`개 이상인 크기만), 클래스 조건부 coverage gap(클래스마다 |coverage − (1 − α)|의
-  평균, Ding et al. 2023). 반복한 평가 절반을 모두 모아 크기·클래스로 나눈다.
+  교환 가능하다). 비순응 점수는 LAC(1 − p_y, Sadinle et al. 2019)와 무작위화한 APS(p_y보다 큰
+  확률의 합 + u · p_y, Romano et al. 2020). 낸 값은 marginal coverage, 평균 집합 크기, SSCS
+  (size-stratified coverage, Angelopoulos et al. 2021: 집합 크기 묶음 0~1, 2~3, 4~10, …마다의
+  coverage 가운데 가장 낮은 값, 행이 `min_group`개 이상인 묶음만), 클래스 조건부 coverage
+  gap(클래스마다 |coverage − (1 − α)|의 평균, Ding et al. 2023). 반복한 평가 절반을 모두 모아
+  크기·클래스로 나눈다.
 
 `regression_metrics`, `classification_metrics`가 fold 하나의 지표를 dict로 모아 준다
 (`amlb.evaluate_task(..., uncertainty=True)`). 남는 행이 없으면 모두 NaN이다.
@@ -320,14 +321,35 @@ def ece(proba, labels, n_bins: int = 15) -> float:
     return float(total / len(labels))
 
 
-def conformal_scores(proba: np.ndarray, kind: str) -> np.ndarray:
-    """모든 클래스의 비순응 점수 (n, 클래스 수): 정답이 그 클래스일 때의 점수."""
+def conformal_scores(proba: np.ndarray, kind: str, u: np.ndarray | None = None) -> np.ndarray:
+    """모든 클래스의 비순응 점수 (n, 클래스 수): 정답이 그 클래스일 때의 점수.
+
+    APS는 무작위화한 원래 정의다: 클래스 k의 점수 = p_k보다 큰 확률의 합 + u · p_k
+    (u ~ Uniform(0, 1), 행마다 하나). 무작위화하지 않으면(u = 1) 이진 분류에서 정확도가 1 − α보다
+    낮을 때 threshold가 1이 되어 모든 집합이 클래스 전체가 된다.
+    """
     if kind == "lac":
         return 1.0 - proba
     if kind == "aps":
-        # 클래스 k의 점수 = p_k 이상인 확률의 합 (자기 자신 포함, 같은 확률도 포함)
-        return (proba[:, None, :] * (proba[:, None, :] >= proba[:, :, None])).sum(-1)
+        u = np.ones(len(proba)) if u is None else np.asarray(u, dtype=np.float64)
+        above = (proba[:, None, :] * (proba[:, None, :] > proba[:, :, None])).sum(-1)
+        return above + u[:, None] * proba
     raise ValueError(f"conformal 점수는 {CONFORMAL_SCORES} 가운데 하나: {kind}")
+
+
+# SSCS의 집합 크기 묶음 (Angelopoulos et al. 2021): 0~1, 2~3, 4~10, 11~100, 101 이상.
+# 0과 1을 한 묶음으로 두는 이유: 정확도가 1 − α보다 높으면 coverage를 1 − α로 맞추려고 빈 집합이
+# 생기는데, 빈 집합은 정의상 coverage가 0이라 따로 두면 SSCS가 늘 0이 된다
+SSCS_SIZE_BINS = (0, 2, 4, 11, 101)
+
+
+def size_stratified_coverage(covered: np.ndarray, sizes: np.ndarray, min_group: int = 10) -> float:
+    """집합 크기 묶음(`SSCS_SIZE_BINS`)마다의 coverage 가운데 최솟값 (행이 `min_group`개 이상만)."""
+    groups = np.searchsorted(SSCS_SIZE_BINS, sizes, side="right")
+    per_group = [
+        covered[groups == g].mean() for g in np.unique(groups) if (groups == g).sum() >= min_group
+    ]
+    return float(min(per_group)) if per_group else float("nan")
 
 
 def conformal_threshold(cal_scores: np.ndarray, alpha: float) -> float:
@@ -356,9 +378,9 @@ def conformal(
     n = len(labels)
     if n < 20:
         return dict.fromkeys(_CONFORMAL_NAMES, float("nan"))
-    scores = conformal_scores(proba, kind)
-    true_scores = scores[np.arange(n), labels]
     rng = np.random.default_rng(seed)
+    scores = conformal_scores(proba, kind, u=rng.random(n))
+    true_scores = scores[np.arange(n), labels]
     covered, sizes, eval_labels = [], [], []
     for _ in range(n_repeats):
         perm = rng.permutation(n)
@@ -370,13 +392,11 @@ def conformal(
         eval_labels.append(labels[ev])
     covered, sizes = np.concatenate(covered), np.concatenate(sizes)
     eval_labels = np.concatenate(eval_labels)
-    size_values, size_counts = np.unique(sizes, return_counts=True)
-    by_size = [covered[sizes == s].mean() for s in size_values[size_counts >= min_group]]
     by_class = [covered[eval_labels == c].mean() for c in np.unique(eval_labels)]
     return {
         "coverage": float(covered.mean()),
         "set_size": float(sizes.mean()),
-        "sscs": float(min(by_size)) if by_size else float("nan"),
+        "sscs": size_stratified_coverage(covered, sizes, min_group),
         "class_coverage_gap": float(np.mean(np.abs(np.array(by_class) - (1 - alpha)))),
     }
 

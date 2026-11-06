@@ -127,7 +127,27 @@ def test_conformal_threshold_and_scores():
     assert unc.conformal_threshold(np.arange(5.0), 0.1) == float("inf")
     proba = np.array([[0.6, 0.3, 0.1]])
     assert np.allclose(unc.conformal_scores(proba, "lac"), [[0.4, 0.7, 0.9]])
-    assert np.allclose(unc.conformal_scores(proba, "aps"), [[0.6, 0.9, 1.0]])
+    assert np.allclose(unc.conformal_scores(proba, "aps"), [[0.6, 0.9, 1.0]])  # u = 1
+    assert np.allclose(unc.conformal_scores(proba, "aps", u=[0.5]), [[0.3, 0.75, 0.95]])
+
+
+def test_sscs_puts_empty_and_singleton_sets_together():
+    # 정확한 모델: 빈 집합(coverage 0)과 크기 1 집합이 섞여도 묶음 0~1의 coverage가 나온다
+    sizes = np.array([0] * 10 + [1] * 90 + [2] * 20)
+    covered = np.r_[np.zeros(10, bool), np.ones(90, bool), np.r_[np.ones(18), np.zeros(2)] > 0]
+    assert unc.size_stratified_coverage(covered, sizes) == pytest.approx(0.9)
+    assert np.isnan(unc.size_stratified_coverage(covered[:5], sizes[:5]))
+
+
+def test_randomized_aps_does_not_return_every_class_on_hard_binary_data():
+    # 이진, 정확도 75%: 무작위화하지 않은 APS는 threshold가 1이라 모든 집합이 클래스 둘 다였다
+    g = np.random.default_rng(0)
+    p1 = g.uniform(0.5, 1.0, 2000)
+    proba = np.c_[p1, 1 - p1]
+    labels = (g.random(2000) > p1).astype(int)
+    out = unc.conformal(proba, labels, alpha=0.1, kind="aps")
+    assert out["coverage"] == pytest.approx(0.9, abs=0.02)
+    assert out["set_size"] < 1.9
 
 
 @pytest.mark.parametrize("kind", unc.CONFORMAL_SCORES)
