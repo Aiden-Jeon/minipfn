@@ -47,3 +47,13 @@
 재현 결과(v2와 같은 benchmark와 TabArena-Lite에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
 
 실행 파일: `scripts/tabpfn_v2_5/train.yaml`, `scripts/tabpfn_v2_5/eval.yaml` (스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`)
+
+## `05_tabpfn_v3/` — Prior Labs, *TabPFN-3: Technical Report* (arXiv 2605.13986, 2026), *TabPFN-3.5: Technical Report* (arXiv 2609.17895, 2026)
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [열 → 행 → 행 ICL 구조](05_tabpfn_v3/01_column_row_architecture.ipynb) | 셀 토큰의 2방향 attention을 열 요약 → 행 압축 → 행 ICL 세 단계로 바꾸면 무엇이 달라지고, 3.5는 무엇을 더 바꿨으며, 분류·회귀를 한 모델로 어떻게 학습하는가? |
+
+재현 결과(3.5 multitask 학습 뒤 benchmark와 TabArena-Lite·BeyondArena에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
+
+실행 파일: `scripts/tabpfn_v3/train.yaml`, `scripts/tabpfn_v3/eval.yaml` (스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`)

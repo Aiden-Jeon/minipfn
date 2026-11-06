@@ -16,3 +16,4 @@ notebooks/03_tabpfn_v2/03_tabpfn_v2_paper_walkthrough.ipynb !filter
 notebooks/03_tabpfn_v2/04_tabicl_prior.ipynb !filter
 notebooks/04_tabpfn_v2_5/01_architecture_changes.ipynb !filter
 notebooks/04_tabpfn_v2_5/02_long_tables_and_preprocessing.ipynb !filter
+notebooks/05_tabpfn_v3/01_column_row_architecture.ipynb !filter

@@ -185,6 +185,7 @@ uv run python hub/push_to_hub.py --paper tabpfn_v2 --task regression --repo-id <
 - [`notebooks/02_tabpfn/`](notebooks/02_tabpfn) — Hollmann et al., *[TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second](https://arxiv.org/pdf/2207.01848)*, ICLR 2023
 - [`notebooks/03_tabpfn_v2/`](notebooks/03_tabpfn_v2) — Hollmann et al., *[Accurate predictions on small data with a tabular foundation model](https://doi.org/10.1038/s41586-024-08328-6)*, Nature 2025
 - [`notebooks/04_tabpfn_v2_5/`](notebooks/04_tabpfn_v2_5) — Grinsztajn et al., *[TabPFN-2.5: Advancing the State of the Art in Tabular Foundation Models](https://arxiv.org/pdf/2511.08667)*, 2025
+- [`notebooks/05_tabpfn_v3/`](notebooks/05_tabpfn_v3) — Prior Labs, *[TabPFN-3: Technical Report](https://arxiv.org/pdf/2605.13986)*, *[TabPFN-3.5: Technical Report](https://arxiv.org/pdf/2609.17895)*, 2026
 
 공식 구현은 [automl/PFNs](https://github.com/automl/PFNs), [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)입니다.
 
