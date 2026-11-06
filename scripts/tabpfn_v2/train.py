@@ -16,7 +16,10 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
-`TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
+`TABPFN_V2_CHECKPOINT_EVERY`, `TABPFN_V2_VAL_EVERY`)로 정한다. 학습 가속 옵션(issue #46,
+`TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·`--weight-average K`
+(또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. 회귀에서 반복되는 target
+값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
@@ -108,6 +111,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--checkpoint-every", type=int, default=_env("TABPFN_V2_CHECKPOINT_EVERY", int)
     )
     parser.add_argument("--keep-every", type=int, default=_env("TABPFN_V2_KEEP_EVERY", int))
+    parser.add_argument("--val-every", type=int, default=_env("TABPFN_V2_VAL_EVERY", int))
+    # 학습 가속 (TrainConfig 주석). 켜기만 한다(이어 학습할 때 원래 run 설정을 따로 끄지 않는다)
+    for flag in ("compile", "fused-adam", "tf32", "schedule-free"):
+        env = "TABPFN_V2_" + flag.upper().replace("-", "_")
+        parser.add_argument(
+            f"--{flag}", action="store_true", default=os.environ.get(env, "") in ("1", "true")
+        )
+    parser.add_argument("--weight-average", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE", int))
+    parser.add_argument(
+        "--weight-average-every", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE_EVERY", int)
+    )
     parser.add_argument(
         "--collapse-threshold", default=os.environ.get("TABPFN_V2_COLLAPSE_THRESHOLD") or None
     )
@@ -187,6 +201,14 @@ def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
         "stop_step": args.stop_step,
         "checkpoint_every": args.checkpoint_every,
         "keep_every": args.keep_every,
+        "val_every": args.val_every,
+        "weight_average": args.weight_average,
+        "weight_average_every": args.weight_average_every,
+        **{
+            name: True
+            for name in ("compile", "fused_adam", "tf32", "schedule_free")
+            if getattr(args, name)
+        },
         "rewind_lr_factor": args.rewind_lr_factor,
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }

@@ -18,6 +18,7 @@ v1 재현에서 GPU로 학습하며 고친 세 가지를 그대로 둔다.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import copy
 import json
@@ -48,6 +49,7 @@ from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
 from minipfn.training.data import PriorBatches
 from minipfn.training.losses import dequantize_targets, prior_loss
+from minipfn.training.schedule_free import ScheduleFreeAdamW, warmup_factor
 from minipfn.training.stability import (
     CollapseGuard,
     apply_qk_clip,
@@ -125,6 +127,17 @@ def _validate_tasks(model, val_sets, device, autocast, config, bar) -> dict[str,
         val = _validate(model, batches, device, autocast, task, bar, _forward_kwargs(config, task))
         out.update({f"{k}_{task}": v for k, v in val.items()})
     out["val_loss"] = sum(out[f"val_loss_{t}"] for t in val_sets) / len(val_sets)
+    return out
+
+
+def _average_states(states) -> dict:
+    """state_dict 여러 개의 평균 (LAWA). 실수 텐서는 float32로 더해 원래 dtype으로 돌려준다."""
+    out = {}
+    for key, first in states[0].items():
+        if first.is_floating_point():
+            out[key] = (sum(s[key].float() for s in states) / len(states)).to(first.dtype)
+        else:
+            out[key] = first
     return out
 
 
@@ -280,15 +293,31 @@ def _train(
     use_cuda = device.type == "cuda"
     if use_cuda:
         torch.backends.cuda.enable_cudnn_sdp(False)
+    if config.tf32:  # 가속 옵션 (TrainConfig 주석). 끄면 PyTorch 기본값(highest) 그대로
+        torch.set_float32_matmul_precision("high")
 
     torch.manual_seed(config.seed)  # 모든 GPU가 같은 초기 가중치에서 시작한다
     model = config.build_model().to(device)
     if config.qk_clip is not None and not model.qk_clip_weights():
         raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
-    opt = torch.optim.Adam(model.parameters(), lr=config.lr)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: lr_factor(s, config.warmup_steps, config.steps)
-    )
+    if config.schedule_free:
+        # warmup 뒤 일정한 lr. 평균은 optimizer가 든다 (`training.schedule_free`)
+        opt = ScheduleFreeAdamW(model.parameters(), lr=config.lr)
+        schedule = lambda s: warmup_factor(s, config.warmup_steps)  # noqa: E731
+    else:
+        fused = {"fused": True} if config.fused_adam and use_cuda else {}
+        opt = torch.optim.Adam(model.parameters(), lr=config.lr, **fused)
+        schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, schedule)
+
+    def eval_state() -> dict:
+        # 검증·저장할 가중치. schedule-free면 평균 x (`ScheduleFreeAdamW.average`), 아니면 그대로
+        state = model.state_dict()
+        if config.schedule_free:
+            for name, p in model.named_parameters():
+                state[name] = opt.average(p)
+        return state
+
     start_step, skipped_steps, borders, rewinds = 0, 0, None, 0
     history: dict[str, list] = {"step": [], "train_loss": [], "val_step": [], "val_loss": []}
     if init_from is not None:
@@ -302,6 +331,8 @@ def _train(
         check_resume_step(state, config)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
+        if config.schedule_free:
+            opt.average_to_train_point()  # checkpoint에는 평균 x를 저장했다. 학습 점 y로
         sched.load_state_dict(state["scheduler"])
         start_step = int(state["step"])
         history = state["history"]
@@ -321,6 +352,31 @@ def _train(
         if d.world_size > 1
         else model
     )
+    # 학습 forward. 가속 옵션 compile이면 반복 블록마다 compile한다(모델 전체를 compile하면 표
+    # 크기에 따라 갈리는 Python 분기 때문에 batch마다 다시 compile된다). 블록 목록이 없는 모델은
+    # 전체를
+    train_forward = ddp_model
+    if config.compile:
+        # 폭이 다른 블록(TabPFN-3의 행 단계·ICL)이 같은 forward 코드를 써서 shape마다 한 벌씩
+        # compile된다. 기본 cache 한도(8)를 넘으면 조용히 eager로 돌아가므로 넉넉히 둔다
+        torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
+        blocks = model.repeated_blocks() if hasattr(model, "repeated_blocks") else []
+        for block in blocks:
+            block.compile(dynamic=True)
+        if not blocks:
+            train_forward = torch.compile(ddp_model, dynamic=True)
+    # rank 0의 검증용 사본: schedule-free의 평균 x나 LAWA 평균을 담는다
+    # (학습 가중치는 건드리지 않는다)
+    eval_copy_model = None
+    averages = collections.deque(maxlen=config.weight_average) if config.weight_average else None
+    train_seconds = 0.0  # 순수 학습 시간 (검증·checkpoint·기록 빼고). 목표 도달 시간을 잰다
+
+    def eval_copy(state: dict):
+        nonlocal eval_copy_model
+        if eval_copy_model is None:
+            eval_copy_model = copy.deepcopy(model)
+        eval_copy_model.load_state_dict(state)
+        return eval_copy_model
 
     def autocast():
         if use_cuda:
@@ -415,6 +471,7 @@ def _train(
     step = start_step - 1
     while step + 1 < stop_step:
         step += 1
+        t_step = time.time()
         # multitask는 step마다 task를 번갈아 쓴다 (모든 GPU가 같은 task. 비율은 1:1, 여기서 정함)
         task = config.tasks[step % len(config.tasks)]
         step_loss = torch.zeros((), device=device)
@@ -428,7 +485,7 @@ def _train(
             ctx = contextlib.nullcontext() if sync else ddp_model.no_sync()
             with ctx:
                 with autocast():
-                    logits = ddp_model(x, y[:, :n_train], **_forward_kwargs(config, task))
+                    logits = train_forward(x, y[:, :n_train], **_forward_kwargs(config, task))
                 y_eval = y[:, n_train:]
                 if task == "regression" and config.dequantize_buckets:
                     y_eval = dequantize_targets(y, n_train, bar, config.dequantize_buckets)
@@ -470,6 +527,7 @@ def _train(
             if multitask:
                 window_tasks[task][0] += step_loss.item()
                 window_tasks[task][1] += 1
+        train_seconds += time.time() - t_step  # 위 .item()에서 GPU를 기다렸다
 
         done = step + 1
         # 시각을 넘겼는지는 log_every마다 보고, 모든 GPU가 같은 step에서 멈추도록 판단을 맞춘다
@@ -510,6 +568,8 @@ def _train(
                 history = copy.deepcopy(snap["history"])
                 skipped_steps = snap["skipped_steps"]
                 guard.healthy, guard.bad = list(snap["healthy"]), 0
+                if averages is not None:  # 붕괴 중이었을 수 있는 가중치는 평균에서 뺀다
+                    averages.clear()
                 snapshots[:] = [snap]
                 if d.is_main:
                     print(
@@ -576,8 +636,21 @@ def _train(
             window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
             last_log_step = done
 
+        if (
+            averages is not None
+            and d.is_main
+            and done % config.weight_average_every == 0
+            and not rewound_at_end
+        ):
+            averages.append(_to_cpu(eval_state()))
         if d.is_main and (done % config.val_every == 0 or last) and not rewound_at_end:
-            val = _validate_tasks(model, val_sets, device, autocast, config, bar)
+            val_model = eval_copy(eval_state()) if config.schedule_free else model
+            val = _validate_tasks(val_model, val_sets, device, autocast, config, bar)
+            if averages is not None and len(averages) > 1:
+                averaged = eval_copy(_average_states(list(averages)))
+                avg = _validate_tasks(averaged, val_sets, device, autocast, config, bar)
+                val.update({f"{k}_avg": v for k, v in avg.items()})
+            val["train_seconds"] = train_seconds
             history["val_step"].append(done)
             history["val_loss"].append(val["val_loss"])
             print("  val " + " ".join(f"{k} {v:.4f}" for k, v in val.items()), flush=True)
@@ -593,7 +666,8 @@ def _train(
                 # `config`가 아니라 `model_config`: 예전 코드가 save_checkpoint 파일로 오인하지
                 # 않도록 (`models.state_config`)
                 "model_config": config_dict(model.config),
-                "model": model.state_dict(),
+                # schedule-free면 평균 x (평가가 그대로 읽는다. 이어 학습은 x와 z로 y를 만든다)
+                "model": eval_state(),
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),
                 "step": done,
@@ -619,7 +693,15 @@ def _train(
 
     final_path = out_dir / "final.pt"
     if d.is_main:
-        save_checkpoint(final_path, model, None if borders is None else borders.cpu())
+        final_borders = None if borders is None else borders.cpu()
+        final_model = eval_copy(eval_state()) if config.schedule_free else model
+        save_checkpoint(final_path, final_model, final_borders)
+        if averages:  # LAWA: 최근 가중치 평균
+            save_checkpoint(
+                out_dir / "final_avg.pt", eval_copy(_average_states(list(averages))), final_borders
+            )
+            if mlf is not None:
+                mlf.log_artifact(str(out_dir / "final_avg.pt"), "model")
         (out_dir / "history.json").write_text(json.dumps(history))
         (out_dir / "train_config.json").write_text(json.dumps(asdict(config)))
         if mlf is not None:

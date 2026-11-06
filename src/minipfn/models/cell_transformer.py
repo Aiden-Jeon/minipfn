@@ -176,6 +176,10 @@ class CellTransformer(nn.Module):
             self.thinking_rows = nn.Parameter(0.02 * torch.randn(config.n_thinking_rows, e))
         self._column_noise: dict[tuple, torch.Tensor] = {}  # state_dict에 넣지 않는 캐시
 
+    def repeated_blocks(self) -> list[nn.Module]:
+        """여러 번 쓰는 블록 (학습 가속 옵션 `compile`이 블록마다 compile한다)."""
+        return list(self.layers)
+
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 

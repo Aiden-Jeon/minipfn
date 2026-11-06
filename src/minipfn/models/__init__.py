@@ -25,6 +25,8 @@ ICL 3단계) 다른 클래스(`column_row_transformer`)로 둔다. 학습 루프
   (`training.stability.qk_logit_bounds`). 종류가 "sample_attention"인 것이 학습 지표
   `qk_bound_sample_max`에 들어간다. 없으면 빈 목록
 - `decoder_weight()`: 출력층 가중치 (학습 지표 `decoder_norm`). 없으면 None
+- (선택) `repeated_blocks()`: 여러 번 쓰는 블록 목록. 학습 가속 옵션 `compile`이 블록마다
+  compile한다(없으면 모델 전체를 compile한다)
 - (선택) 설정 클래스의 `ADDED_FIELDS`: 첫 공개 뒤에 더한 필드. 기본값이면 저장하지 않는다
   (`config_dict`)
 - (선택) 설정 클래스의 `INFO_FIELDS`: 가중치 모양과 상관없는 필드(학습 때 본 feature 수 등).
