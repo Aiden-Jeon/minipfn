@@ -9,6 +9,8 @@
   `GreedyEnsembleClassifier`·`GreedyEnsembleRegressor` (추론에 연산을 더 쓰는 집계)
 - `diag_scale`: 데이터셋마다 attention의 대각 scale만 학습하는 test-time 적응 `DiagScale`
   (앙상블 estimator를 감싼다)
+- `distillation`: 추론 estimator(teacher)를 데이터셋마다 GBDT 학생으로 증류하는
+  `DistilledClassifier`·`DistilledRegressor` (예측은 CPU의 학생만 쓴다)
 
 논문의 기본 설정(멤버 수, 온도, 멤버 종류 묶음)을 붙인 클래스는 `minipfn.recipes`에 있다.
 """

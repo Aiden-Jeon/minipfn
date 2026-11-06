@@ -63,6 +63,22 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier --test-time greedy \
     --method-name minipfn-tabpfn-v2-greedy
 
+`--distill`은 teacher(위의 추론 estimator)를 데이터셋마다 GBDT 학생으로 증류해 학생으로만 예측한다
+(issue #44, `minipfn.inference.distillation`, extra `distill`). `oof`는 out-of-fold teacher 라벨
+(arXiv 2605.18654), `synthetic`은 학습 행 전체를 context로 학습 행 + CutMix synthetic 행을 라벨링
+(arXiv 2610.01435), `labels`는 teacher 없이 정답 라벨만 배운 같은 학생(기본 GBDT 비교용)이다.
+학생은 `--student`(xgboost, lightgbm, hist)이고 CPU에서 예측한다. fit마다 teacher·학생 학습 시간과
+나무 수를 `<out-dir>/distill_<suite>.jsonl`에 남긴다(이 실행의 fit만: 실행마다 새로 쓴다).
+학생은 평균만 내므로 회귀에서는 `--uncertainty`와 같이 쓸 수 없다.
+`--latency`(TabArena·BeyondArena)는 fit마다 테스트 행 하나의 예측 시간(`LATENCY_REPEATS`번의
+중앙값)도 남긴다(teacher만 쓸 때도). 예측이 끝난 뒤 시간을 재지 않는 hook에서 재므로 TabArena의
+학습·추론 시간에는 들지 않는다.
+
+  uv run --no-dev --extra arena --extra distill --group arena-dev python $EVAL \
+    --suite tabarena-lite --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor \
+    --distill synthetic --student xgboost --method-name minipfn-tabpfn-v2-kd-xgb
+
 AI Runtime(`scripts/tabpfn_v2/eval.yaml`)에서는 플랫폼이 만든 MLflow run(`MLFLOW_RUN_ID`)에
 기록한다. 로컬에서 `--mlflow`를 주면 `TABPFN_V2_EXPERIMENT`(기본 tabpfn-v2-reproduction)
 experiment에 새 run을 만든다.
@@ -86,6 +102,12 @@ import torch
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
 from minipfn.inference.diag_scale import DiagScale
+from minipfn.inference.distillation import (
+    METHODS,
+    STUDENTS,
+    DistilledClassifier,
+    DistilledRegressor,
+)
 from minipfn.inference.ensemble import (
     DEFAULT_ONE_HOT,
     EnsembleClassifier,
@@ -110,6 +132,7 @@ from minipfn.utils import log_run_source
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
 TEST_TIME = ("none", "greedy", "diagscale", "diagscale+greedy")
+LATENCY_REPEATS = 5
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -161,6 +184,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pool-size", type=int, default=POOL_SIZE, help="--test-time greedy의 pool 멤버 수"
+    )
+    parser.add_argument(
+        "--distill",
+        choices=["none", *METHODS],
+        default="none",
+        help="teacher를 GBDT 학생으로 증류해 학생으로 예측한다 (oof, synthetic, labels: 정답만)",
+    )
+    parser.add_argument(
+        "--student", choices=STUDENTS, default="xgboost", help="--distill의 학생 (CPU)"
+    )
+    parser.add_argument(
+        "--synthetic-ratio",
+        type=float,
+        default=None,
+        help="--distill: synthetic 행 수 / 학습 행 수 (기본: 방법이 정한다. oof 0, synthetic 2)",
+    )
+    parser.add_argument(
+        "--distill-alpha",
+        type=float,
+        default=None,
+        help="--distill: teacher target의 비중, 나머지는 정답 라벨 (기본: oof 0.7, synthetic 1)",
+    )
+    parser.add_argument(
+        "--latency",
+        action="store_true",
+        help="TabArena·BeyondArena: fit마다 한 행 예측 시간을 distill_<suite>.jsonl에 남긴다",
     )
     parser.add_argument(
         "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
@@ -279,6 +328,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     log_path = Path(args.out_dir) / "test_time.jsonl"
     # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
     log_fields = {"suite": suite, "method": args.method_name, **test_time_params(args)}
+    fits_log = fits_path(args)
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
@@ -306,6 +356,19 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             if getattr(task, "name", None):  # AMLB task만 이름이 있다
                 fields["dataset"] = task.name
             record_fits(estimator, log_path, **fields)
+        if args.distill != "none":
+            distilled = DistilledClassifier if suite == "classification" else DistilledRegressor
+            estimator = distilled(
+                estimator,
+                method=args.distill,
+                student=args.student,
+                synthetic_ratio=args.synthetic_ratio,
+                alpha=args.distill_alpha,
+                categorical_features_indices=task.categorical_indices,
+            )
+        if args.distill != "none" or args.latency:
+            record = {"suite": args.suite, "task": suite, "dataset": getattr(task, "name", None)}
+            estimator = RecordedEstimator(estimator, record, fits_log, latency=args.latency)
         return estimator
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
@@ -345,6 +408,79 @@ def test_time_params(args: argparse.Namespace) -> dict:
     return params
 
 
+def fits_path(args: argparse.Namespace) -> Path:
+    """fit 기록 파일 (suite마다 하나, `main`이 실행마다 비운다)."""
+    return Path(args.out_dir) / f"distill_{args.suite}.jsonl"
+
+
+class RecordedEstimator:
+    """estimator를 감싸 fit마다 기록을 `path`(JSONL)에 한 줄씩 남긴다: `record`(suite, task,
+    데이터셋), 표 크기, fit 시간, 증류 기록(`fit_record_`: teacher·학생 학습 시간, 나무 수).
+
+    `latency`면 한 행 예측 시간(ms, `LATENCY_REPEATS`번의 중앙값)을 `after_predict`에서 재고 그때
+    쓴다. TabArena system이 예측이 끝난 뒤 시간을 재지 않는 hook(`post_predict`)에서 테스트 행
+    하나로 부른다. 나머지 속성(`predict`, `predict_proba`, `classes_` 등)은 감싼 estimator의 것이다.
+    """
+
+    def __init__(self, estimator, record: dict, path: Path, latency: bool) -> None:
+        self.estimator = estimator
+        self.record = record
+        self.path = path
+        self.latency = latency
+
+    def __getattr__(self, name: str):
+        # 복사·pickle 도중(estimator가 아직 없을 때)에는 감싼 estimator를 찾지 않는다
+        if name.startswith("__") or name == "estimator":
+            raise AttributeError(name)
+        return getattr(self.estimator, name)
+
+    def fit(self, X, y) -> RecordedEstimator:
+        start = time.perf_counter()
+        self.estimator.fit(X, y)
+        self.record_ = {
+            **self.record,
+            "rows": len(X),
+            "features": int(np.shape(X)[1]),
+            "fit_seconds": time.perf_counter() - start,
+            **getattr(self.estimator, "fit_record_", {}),
+        }
+        if not self.latency:
+            self._write()
+        return self
+
+    def after_predict(self, row) -> None:
+        if not self.latency:
+            return
+        predict = (
+            self.estimator.predict
+            if self.record["task"] == "regression"
+            else self.estimator.predict_proba
+        )
+        times = []
+        for _ in range(LATENCY_REPEATS):
+            t = time.perf_counter()
+            predict(row)
+            times.append(time.perf_counter() - t)
+        self.record_["latency_ms"] = 1000 * float(np.median(times))
+        self._write()
+
+    def _write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self.record_, default=float) + "\n")
+
+
+def distill_params(args: argparse.Namespace) -> dict:
+    """증류를 정하는 인자 (MLflow param, arena 결과를 다시 쓸지 정하는 값)."""
+    params = {"distill": args.distill}
+    if args.distill != "none":
+        params["student"] = args.student
+        for key in ("synthetic_ratio", "distill_alpha"):
+            if getattr(args, key) is not None:
+                params[key] = getattr(args, key)
+    return params
+
+
 def arena_suite(name: str):
     from minipfn.benchmarks import beyondarena, tabarena
 
@@ -377,7 +513,6 @@ def arena_limits(models: dict, args: argparse.Namespace) -> dict:
 def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
     """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다. estimator는
     AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔 넘긴다)."""
-    import json
     import types
 
     from minipfn.benchmarks import arena
@@ -405,6 +540,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
             "one_hot": one_hot,
             # 기본 추론(none)은 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
             **({} if args.test_time == "none" else test_time_params(args)),
+            # 증류하지 않으면 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
+            **({} if args.distill == "none" else distill_params(args)),
         },
         sort_keys=True,
     )
@@ -457,6 +594,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
             **test_time_params(args),
+            **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
         }
     )
@@ -481,10 +619,17 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
     for path in sorted(out_dir.glob("*.csv")) + [out_dir / "summary.json"]:
         mlflow.log_artifact(str(path), f"eval/{summary['suite']}")
     log_test_time_artifact(args)
+    log_distill_artifact(args)
 
 
 def log_test_time_artifact(args: argparse.Namespace) -> None:
     path = Path(args.out_dir) / "test_time.jsonl"
+    if path.exists():
+        mlflow.log_artifact(str(path), "eval")
+
+
+def log_distill_artifact(args: argparse.Namespace) -> None:
+    path = fits_path(args)
     if path.exists():
         mlflow.log_artifact(str(path), "eval")
 
@@ -518,8 +663,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.uncertainty and args.suite in ARENA_SUITES:
         # arena는 공식 패키지의 지표만 낸다. 조용히 무시하지 않고 멈춘다
         raise SystemExit("--uncertainty는 AMLB suite(classification, regression, all)에서만 쓴다.")
+    if args.uncertainty and args.distill != "none" and args.suite in ("regression", "all"):
+        # 회귀 학생은 평균만 내고 예측 분포가 없다
+        raise SystemExit("--distill은 회귀 --uncertainty와 같이 쓸 수 없다 (학생은 평균만 낸다).")
+    if args.test_time != "none" and args.distill != "none":
+        # test-time 기록(record_fits)이 fit을 덮어써서, 증류가 teacher를 복사하면 원래 객체를 쓴다
+        raise SystemExit("--distill은 --test-time none에서만 쓴다.")
+    if args.latency and args.suite not in ARENA_SUITES:
+        raise SystemExit("--latency는 TabArena·BeyondArena suite에서만 쓴다.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    fits_path(args).unlink(missing_ok=True)  # 이 실행의 fit만 남긴다
     use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
     if args.suite in ARENA_SUITES:
         with mlflow_run(use_mlflow):
@@ -547,6 +701,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
                 **test_time_params(args),
+                **distill_params(args),
             }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
@@ -625,6 +780,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         for name in artifacts:
             mlflow.log_artifact(str(out_dir / name), "eval")
         log_test_time_artifact(args)
+        log_distill_artifact(args)
 
 
 def summarize_uncertainty(rows: list[dict], headline: str) -> pd.DataFrame:

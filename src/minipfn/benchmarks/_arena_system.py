@@ -89,6 +89,23 @@ class EstimatorSystem(ExternalSystemModel):
         ]
         return self
 
+    def post_fit(self, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame):
+        # 예측이 끝난 뒤(post_predict) 쓸 테스트 행 하나
+        self.test_row_ = X_test.iloc[:1]
+
+    def post_predict(self):
+        """학습·추론 시간을 재지 않는 hook. estimator에 `after_predict(X_row)`가 있으면 테스트 행
+        하나(`_predict`와 같은 전처리)로 부른다 (한 행 예측 시간 재기 등)."""
+        row = getattr(self, "test_row_", None)
+        hooks = [getattr(e, "after_predict", None) for e in self.estimators_]
+        if row is None or not any(hooks):
+            return
+        Xp, _ = prepare_frame(row)
+        Xp = Xp.reset_index(drop=True)
+        for hook in hooks:
+            if hook is not None:
+                hook(Xp)
+
     def _bags(self, X, y, problem_type: str, random_state) -> list[np.ndarray]:
         seed = 0 if random_state is None else int(random_state)
         splitter = KFold(self.bagging, shuffle=True, random_state=seed)

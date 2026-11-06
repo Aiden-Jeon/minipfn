@@ -33,6 +33,12 @@ dependencies = [
 arena = [
     "tabarena[data-foundry]>=0.1.1.dev20261031",
 ]
+# TFM → GBDT 증류의 학생 (minipfn.inference.distillation). macOS에서는 OpenMP를 따로 설치한다
+# (brew install libomp). 없으면 sklearn HistGradientBoosting 학생(student="hist")만 쓸 수 있다
+distill = [
+    "lightgbm>=4.7",
+    "xgboost>=3.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]

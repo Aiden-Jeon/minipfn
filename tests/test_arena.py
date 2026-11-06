@@ -256,3 +256,25 @@ def test_eval_script_accepts_arena_suites():
     assert (args.suite, args.bagging) == ("beyondarena-lite", 8)
     assert script.arena_suite("beyondarena").subset == ("core2k",)
     assert script.arena_suite("tabarena-lite").name == "tabarena-lite"
+
+
+def test_post_predict_calls_after_predict_with_one_test_row():
+    system = _system()
+    seen = []
+
+    class _Hooked(_Constant):
+        def after_predict(self, row):
+            seen.append(row)
+
+    key = system.register_factory(lambda problem_type, categorical: _Hooked())
+    model = object.__new__(system.EstimatorSystem)
+    model.factory, model.bagging = key, 0
+    X = pd.DataFrame({"x": np.arange(10.0), "when": pd.date_range("2020-01-01", periods=10)})
+    y = pd.Series([0, 1] * 5)
+    model._fit_system(X, y, problem_type="binary", random_state=0)
+    model.post_fit(X, y, X.iloc[3:])
+    model._predict_proba(X)
+    assert seen == []  # 예측(시간을 재는 곳)에서는 부르지 않는다
+    model.post_predict()
+    assert len(seen) == 1 and len(seen[0]) == 1
+    assert seen[0]["x"].iloc[0] == 3.0 and seen[0]["when"].dtype.kind == "f"  # 같은 전처리

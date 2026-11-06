@@ -9,6 +9,8 @@
 #     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--method-name minipfn-tabpfn-v2.5"
 # 추론에 연산을 더 쓰는 방법(issue #43)은 TABPFN_V2_EXTRA_ARGS에 `--test-time greedy`(diagscale,
 # diagscale+greedy)와 다른 --method-name을 준다. 기본보다 오래 걸리므로 timeout_minutes도 늘린다.
+# TFM → GBDT 증류(issue #44)는 TABPFN_V2_EXTRA_ARGS에 `--distill synthetic --student xgboost`(oof,
+# labels; lightgbm)와 다른 --method-name을 준다. 학생은 CPU에서 예측한다.
 # 2.5 checkpoint를 평가할 때는 experiment_name도 tabpfn-v2-5-reproduction으로 바꾼다(멤버 전처리와
 # 크기 상한은 모델 구조로 정해진다).
 experiment_name: tabpfn-v2-reproduction
@@ -26,6 +28,9 @@ environment:
     - autogluon.core[ray]==1.6.4b20261101
     - autogluon.common==1.6.4b20261101
     - autogluon.features==1.6.4b20261101
+    # 증류 학생 (extra distill, uv.lock과 같은 버전)
+    - xgboost==3.4.1
+    - lightgbm==4.7.0
 compute:
   accelerator_type: GPU_1xH100
   num_accelerators: 1
