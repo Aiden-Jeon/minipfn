@@ -30,10 +30,12 @@ coverage gap이다. 데이터셋별 표는 `eval_uncertainty_per_dataset.csv`, s
 
   uv run python $EVAL --suite regression --regressor-path reg.pt --uncertainty
 
-앙상블 멤버의 전처리는 기본으로 모델이 정한다(`recipes.tabpfn_v2.default_inference`: Hub
-config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2). `--member-kinds`로 주면 그
-값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust scaling + soft clipping을 쓰는
-quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
+앙상블 멤버 수와 전처리는 기본으로 모델이 정한다(`minipfn.recipes.default_inference`: 모델 종류의
+recipe가 정한다. Hub config.json의 `inference`가 먼저이고, 없으면 v2·2.5 모델은 구조가 2.5면 v2.5,
+아니면 v2. TabPFN-3·3.5 모델은 3이면 quantile,robust, 3.5면 standard 멤버 8개).
+`--member-kinds`로 주면 멤버 종류만 그 값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust
+scaling + soft clipping을 쓰는 quantile,robust). 멤버 수는 `--n-estimators`로 따로 준다.
+TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
 `TABPFN_V2_EXPERIMENT=tabpfn-v2-5-reproduction`을 준다.
 
 `--suite tabarena-lite`, `beyondarena`, `beyondarena-lite`는 TabArena-Lite·BeyondArena다
@@ -41,7 +43,7 @@ quantile,robust). TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하�
 설치하고 `uv run`에도 같은 옵션을 준다: `uv sync --no-dev --extra arena --group arena-dev`).
 공식 split을 돌리고 공개 leaderboard와 같은 방식으로 Elo·정규화 점수·
 improvability·승률을 낸다. 분류·회귀 체크포인트
-가운데 주지 않은 쪽과 논문 권장 크기(`recipes.tabpfn_v2.SUPPORTED_SIZE`; 클래스 수는 모델 출력 수)를
+가운데 주지 않은 쪽과 논문 권장 크기(recipe의 `SUPPORTED_SIZE`; 클래스 수는 모델 출력 수)를
 넘는 split은 돌리지 않고 imputed로 둔다(`--max-train-rows`·`--max-features`로 바꾼다). 기본은 학습
 split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나눠 8개의 예측을 평균한다.
 `--datasets`로 일부만 돌릴 수 있다(나머지는 imputed). 결과는 `<out-dir>/<suite>/`
@@ -72,7 +74,12 @@ import torch
 
 from minipfn.benchmarks import amlb as bm
 from minipfn.hub import load_model
-from minipfn.inference.ensemble import DEFAULT_ONE_HOT, max_features_of
+from minipfn.inference.ensemble import (
+    DEFAULT_ONE_HOT,
+    EnsembleClassifier,
+    EnsembleRegressor,
+    max_features_of,
+)
 from minipfn.inference.preprocessing import (
     ONE_HOT_MODES,
     one_hot_kinds,
@@ -80,14 +87,7 @@ from minipfn.inference.preprocessing import (
     to_numeric,
 )
 from minipfn.priors.table_size import MAX_FEATURES
-from minipfn.recipes.tabpfn_v2 import (
-    SUPPORTED_SIZE,
-    TabPFNv2Classifier,
-    TabPFNv2Regressor,
-    default_inference,
-    model_architecture,
-    resolve_member_kinds,
-)
+from minipfn.recipes import default_inference, resolve_member_kinds, supported_size
 from minipfn.utils import log_run_source
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
@@ -117,7 +117,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_member_kinds,
         default=None,
         help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
-        " v2 = quantile,power, v2.5 = quantile,robust)",
+        " v2 = quantile,power, v2.5·v3 = quantile,robust, v3.5 = standard)."
+        " 멤버 수는 바꾸지 않는다",
+    )
+    parser.add_argument(
+        "--n-estimators", type=int, default=None, help="앙상블 멤버 수 (기본: 모델이 정한다)"
     )
     parser.add_argument(
         "--uncertainty",
@@ -229,21 +233,25 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
     model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
     # 주지 않으면 모델의 추론 설정 (Hub config.json의 inference, 없으면 모델 구조로)
-    member_kinds = args.member_kinds or default_inference(model, suite)["member_kinds"]
+    inference = default_inference(model, suite)
+    member_kinds = args.member_kinds or inference["member_kinds"]
+    n_estimators = args.n_estimators or inference["n_estimators"]
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
+            "n_estimators": n_estimators,
             "categorical_features_indices": task.categorical_indices,
             "one_hot": one_hot,
             "member_kinds": member_kinds,
             "device": args.device,
         }
         if suite == "classification":
-            return TabPFNv2Classifier(model, **kw)
-        return TabPFNv2Regressor(model, borders, **kw)
+            return EnsembleClassifier(model, **kw)
+        return EnsembleRegressor(model, borders, **kw)
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
+    make.n_estimators = n_estimators
     make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
 
@@ -258,12 +266,13 @@ def arena_suite(name: str):
 
 def arena_limits(models: dict, args: argparse.Namespace) -> dict:
     """문제 종류마다 돌릴 split의 상한. 체크포인트가 없는 쪽(분류·회귀)은 빠진다(imputed).
-    크기는 모델 구조의 논문 권장값(`SUPPORTED_SIZE`, 모르는 구조는 v2), 클래스 수는 모델 출력 수."""
+    크기는 모델 구조의 논문 권장값(`minipfn.recipes.supported_size`: recipe의 `SUPPORTED_SIZE`,
+    모르는 구조는 그 recipe의 첫 구조), 클래스 수는 모델 출력 수."""
     from minipfn.benchmarks.arena import ModelLimits
 
     limits = {}
     for task, (model, _) in models.items():
-        size = dict(SUPPORTED_SIZE[model_architecture(model, task) or "v2"])
+        size = supported_size(model, task)
         if args.max_train_rows is not None:
             size["max_train_rows"] = args.max_train_rows
         if args.max_features is not None:
@@ -448,6 +457,9 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
             mlflow.log_param("member_kinds", next(iter(kinds.values())))
         else:
             mlflow.log_params({f"member_kinds_{suite}": v for suite, v in kinds.items()})
+        mlflow.log_params(
+            {f"n_estimators_{suite}": make.n_estimators for suite, make in factories.items()}
+        )
     rows = []
     for i, (suite, task_id) in enumerate(tasks, start=1):
         start = time.time()

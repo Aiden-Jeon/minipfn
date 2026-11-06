@@ -1,0 +1,55 @@
+# TabPFN-3·3.5 prior-fitting (arXiv 2605.13986·2609.17895 재현, TabICL prior). 학습 코드는 v2와 같고
+# (scripts/tabpfn_v2/train.py), 기본은 TabPFN-3.5다: TABPFN_V2_ARCH=v3.5(column_row_transformer, CLS 8개·
+# head 16·QK-norm·Fourier/ECDF 셀 encoder) + TABPFN_V2_TASK=multitask(분류·회귀를 한 모델로, step마다
+# task를 번갈아 학습, 219M):
+#   databricks air run -f scripts/tabpfn_v3/train.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 기본은 8×H100에서 batch 64로 300 step 실측. 규모는 override로 바꾼다:
+#   GPU 메모리:  --override env_variables.TABPFN_V2_MICRO_BATCH=<GPU당 데이터셋 수> (기본 8)
+#   논문 규모:   --override env_variables.TABPFN_V2_CONFIG_NAME=paper --override env_variables.TABPFN_V2_STEPS=<전체 step> \
+#                --override env_variables.TABPFN_V2_STOP_STEP=<이번 chunk 끝> \
+#                --override mlflow_run_name=tabpfn-v3-5-multitask-paper-chunkNN --override timeout_minutes=<추정 시간>
+#   이어서 학습: --override env_variables.TABPFN_V2_RESUME_RUN_ID=<run_id>
+#   노드 여러 대: --override compute.num_accelerators=16 (또는 32) --override mlflow_run_name=<이름>-16gpu
+#   TabPFN-3(task마다 모델): --override env_variables.TABPFN_V2_ARCH=v3 --override env_variables.TABPFN_V2_TASK=classification
+#                (또는 regression. 53M·58M)
+# 학습 step·lr·batch는 두 보고서에 없어서 v2 paper 설정 그대로다(recipes/tabpfn_v3.py의 paper; multitask는
+# 붕괴 규칙만 v2 회귀의 것). 긴 표 이어 학습(long_tables)은 v2·2.5 구조만 쓴다. 그 밖의 환경변수는
+# scripts/tabpfn_v2/train.yaml과 같다.
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-5-multitask-timing-300steps-8gpu
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+  # 기본 환경에 없는 패키지 (학습 데이터를 만드는 TabICL prior)
+  dependencies:
+    - tabicl>=2.2
+compute:
+  accelerator_type: GPU_8xH100
+  num_accelerators: 8
+code_source:
+  type: snapshot
+  snapshot:
+    # 저장소 루트를 기준으로 src/와 학습 스크립트만 올린다 (노트북은 올리지 않는다)
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v2/train.py
+env_variables:
+  TABPFN_V2_ARCH: v3.5
+  TABPFN_V2_TASK: multitask
+  # v2·2.5 실측과 같은 medium으로 재서 step 시간·메모리를 견준다
+  TABPFN_V2_CONFIG_NAME: medium
+  TABPFN_V2_STEPS: "300"
+  # GPU당 prior 생성 worker 수. 노드의 CPU 수에 맞춰 조정한다.
+  TABPFN_V2_NUM_WORKERS: "8"
+max_retries: 0
+timeout_minutes: 60
+# scripts/tabpfn_v2/train.yaml과 같은 명령 (노드 묶기, expandable_segments, PYTHONHASHSEED=1 고정)
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONHASHSEED=1
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  torchrun $(if [ "${NUM_NODES:-1}" -gt 1 ]; then
+  echo --nnodes=$NUM_NODES --node_rank=$NODE_RANK --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT;
+  else echo --standalone; fi)
+  --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/tabpfn_v2/train.py

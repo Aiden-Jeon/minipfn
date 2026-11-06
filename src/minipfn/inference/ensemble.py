@@ -18,7 +18,8 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   범주형 열은 번호를 섞음 (2) Yeo-Johnson power transform
 - 수치형 열에서 평균으로부터 표준편차 12배 밖의 값은 그 경계로 자른다
 - (`one_hot`을 주면) 범주형 열을 one-hot으로 펼친다. 논문 전처리 목록의 6번인데, 어느 멤버에 어떤
-  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 분위수가 아닌 멤버(power·robust)만
+  범주까지 쓰는지는 적혀 있지 않아 여기서 정한다: `"power"`는 분위수가 아닌 멤버
+  (power·robust·standard)만
   (분위수 멤버는 번호 섞기를 그대로), `"all"`은 모든 멤버.
   범주가 `MAX_ONE_HOT_CATEGORIES`개 넘는 열은 번호로 둔다.
   펼친 뒤 열 수가 `max_one_hot_width`(기본: 모델 설정의 `max_features`, 학습 때 본 feature 수.
@@ -108,7 +109,16 @@ def max_features_of(model: nn.Module) -> int:
     return getattr(model.config, "max_features", MAX_FEATURES)
 
 
+def forward_kwargs(model: nn.Module, task: str) -> dict:
+    """모델 forward에 줄 task. 여러 task를 내는 모델(`model.tasks`, 예: TabPFN-3.5의 multitask
+    column_row_transformer)만 받고, 한 task 모델은 예전처럼 `model(x, y_train)`이다."""
+    return {"task": task} if len(getattr(model, "tasks", ())) > 1 else {}
+
+
 class _Base:
+    # 이 앙상블이 내는 task (여러 task 모델에 forward로 넘긴다)
+    task = ""
+
     def __init__(
         self,
         model: nn.Module,
@@ -167,13 +177,15 @@ class _Base:
                 torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
                 torch.inference_mode(),
             ):
-                logits = model(x, y)[0].float()
+                logits = model(x, y, **forward_kwargs(model, self.task))[0].float()
             # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
             yield i, logits
 
 
 class EnsembleClassifier(_Base):
     """분류: 멤버마다 클래스 번호를 섞고, logit을 온도로 나눠 softmax한 뒤 평균한다."""
+
+    task = "classification"
 
     def fit(self, X: Any, y: Any) -> EnsembleClassifier:
         rng = np.random.default_rng(self.random_state)
@@ -255,6 +267,8 @@ def _bucket_values(borders: torch.Tensor, u_train: np.ndarray) -> np.ndarray:
 
 class EnsembleRegressor(_Base):
     """회귀: 구간 확률을 멤버마다 자기 공간에서 계산해 평균한다 (모듈 docstring)."""
+
+    task = "regression"
 
     def __init__(self, model: nn.Module, borders: torch.Tensor, **kwargs: Any) -> None:
         super().__init__(model, **kwargs)

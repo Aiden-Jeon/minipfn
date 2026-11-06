@@ -58,9 +58,10 @@ from minipfn.utils import DistContext, lr_factor, setup_distributed
 
 
 def _borders(config: TrainConfig, d: DistContext, device: torch.device) -> torch.Tensor | None:
-    """회귀면 rank 0에서 구간 경계를 계산해 모든 GPU에 나눠 준다."""
-    if config.task != "regression":
+    """회귀(multitask의 회귀 쪽 포함)면 rank 0에서 구간 경계를 계산해 모든 GPU에 나눠 준다."""
+    if "regression" not in config.tasks:
         return None
+    config = config.task_configs()["regression"]
     borders = torch.empty(N_BUCKETS + 1, device=device)
     if d.is_main:
         start = time.time()
@@ -86,14 +87,22 @@ def _make_val_batches(config: TrainConfig, n_batches: int = 8):
     return [prior.sample_batch(config.val_batch) for _ in range(n_batches)]
 
 
+def _forward_kwargs(config: TrainConfig, task: str) -> dict:
+    """forward에 줄 task. multitask 모델만 받는다(한 task 모델의 호출은 예전 그대로)."""
+    return {"task": task} if config.task == "multitask" else {}
+
+
 @torch.no_grad()
-def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, float]:
+def _validate(
+    model, val_batches, device, autocast, task, bar, forward: dict | None = None
+) -> dict[str, float]:
+    forward = forward or {}  # multitask 모델에 줄 task (`_forward_kwargs`)
     model.eval()
     total, correct, count = 0.0, 0, 0
     for batch in val_batches:
         x, y = batch.x.to(device), batch.y.to(device)
         with autocast():
-            logits = model(x, y[:, : batch.n_train])
+            logits = model(x, y[:, : batch.n_train], **forward)
         y_eval = y[:, batch.n_train :]
         total += prior_loss(logits, y_eval, task, bar).item()
         if task == "classification":
@@ -103,6 +112,19 @@ def _validate(model, val_batches, device, autocast, task, bar) -> dict[str, floa
     out = {"val_loss": total / len(val_batches)}
     if task == "classification":
         out["val_acc"] = correct / max(1, count)
+    return out
+
+
+def _validate_tasks(model, val_sets, device, autocast, config, bar) -> dict[str, float]:
+    """task마다 검증. 한 task면 예전 지표 그대로, multitask면 지표 이름 뒤에 task를 붙이고
+    `val_loss`는 두 task 손실의 평균이다."""
+    if config.task != "multitask":
+        return _validate(model, val_sets[config.task], device, autocast, config.task, bar)
+    out = {}
+    for task, batches in val_sets.items():
+        val = _validate(model, batches, device, autocast, task, bar, _forward_kwargs(config, task))
+        out.update({f"{k}_{task}": v for k, v in val.items()})
+    out["val_loss"] = sum(out[f"val_loss_{t}"] for t in val_sets) / len(val_sets)
     return out
 
 
@@ -130,9 +152,12 @@ def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     모양이 같은 다른 설정(head 수 등)은 `load_state_dict`가 그대로 읽어 버리므로 미리 맞춰 본다.
     모델 설정을 남기기 전의 학습 중 checkpoint는 task만 본다.
     """
-    regression = state.get("borders") is not None
-    if regression != (config.task == "regression"):
-        got = "regression" if regression else "classification"
+    # 회귀 구간 경계는 회귀를 내는 모델(회귀, multitask)에만 있다
+    has_borders = state.get("borders") is not None
+    if has_borders != ("regression" in config.tasks):
+        got = "regression" if has_borders else "classification"
+        if "multitask" in (config.task, (state_config(state) or {}).get("task")):
+            got = "회귀 구간 경계가 있는" if has_borders else "회귀 구간 경계가 없는"
         raise ValueError(f"{name}은 {got} checkpoint다 (설정의 task: {config.task})")
     saved_config = state_config(state)
     if saved_config is None:
@@ -288,8 +313,13 @@ def _train(
     if borders is None:
         borders = _borders(config, d, device)
     bar = FullSupportBarDistribution(borders).to(device) if borders is not None else None
+    # multitask는 step마다 한 task의 정답 encoder·출력층만 쓰므로 쓰지 않은 파라미터를 허용한다
+    # (모든 GPU가 같은 step에 같은 task를 쓴다)
+    multitask = config.task == "multitask"
     ddp_model = (
-        DistributedDataParallel(model, device_ids=[d.local_rank]) if d.world_size > 1 else model
+        DistributedDataParallel(model, device_ids=[d.local_rank], find_unused_parameters=multitask)
+        if d.world_size > 1
+        else model
     )
 
     def autocast():
@@ -297,21 +327,35 @@ def _train(
             return torch.autocast("cuda", dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
-    loader_kwargs = {"num_workers": config.num_workers, "pin_memory": use_cuda}
-    if config.num_workers > 0:
+    task_configs = config.task_configs()
+    # prior 생성 worker는 task끼리 나눠 쓴다 (multitask여도 GPU당 CPU 사용량은 같게)
+    workers = config.num_workers // len(task_configs) if config.num_workers else 0
+    if config.num_workers:
+        workers = max(1, workers)
+    loader_kwargs = {"num_workers": workers, "pin_memory": use_cuda}
+    if workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
 
-    def make_batches(from_step: int, rewinds: int):
+    def make_batches(from_step: int, rewinds: int) -> dict:
         # 이어서 학습할 때 같은 데이터를 다시 보지 않도록 시드에 시작 step을 섞는다.
-        # 붕괴로 되돌아가면 되돌린 횟수도 섞어 다른 데이터로 다시 간다
+        # 붕괴로 되돌아가면 되돌린 횟수도 섞어 다른 데이터로 다시 간다. multitask는 task 번호도
         seed = (config.seed, from_step, d.rank) + ((rewinds,) if rewinds else ())
-        return iter(DataLoader(PriorBatches(config, seed=seed), batch_size=None, **loader_kwargs))
+        return {
+            task: iter(
+                DataLoader(
+                    PriorBatches(task_config, seed=seed + ((i,) if multitask else ())),
+                    batch_size=None,
+                    **loader_kwargs,
+                )
+            )
+            for i, (task, task_config) in enumerate(task_configs.items())
+        }
 
     batches = make_batches(start_step, rewinds)
 
-    mlf, val_batches = None, None
+    mlf, val_sets = None, None
     if d.is_main:
-        val_batches = _make_val_batches(config)
+        val_sets = {task: _make_val_batches(c) for task, c in task_configs.items()}
         if mlflow_log:
             import mlflow as mlf
 
@@ -357,6 +401,7 @@ def _train(
 
     ddp_model.train()
     window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
+    window_tasks = {t: [0.0, 0] for t in config.tasks}
     window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
     last_log_step, skip_reports = start_step, 0
     stop_step = min(config.stop_step or config.steps, config.steps)
@@ -370,22 +415,24 @@ def _train(
     step = start_step - 1
     while step + 1 < stop_step:
         step += 1
+        # multitask는 step마다 task를 번갈아 쓴다 (모든 GPU가 같은 task. 비율은 1:1, 여기서 정함)
+        task = config.tasks[step % len(config.tasks)]
         step_loss = torch.zeros((), device=device)
         micro_info = []
         for micro in range(accumulation):
             t_wait = time.time()
-            x, y, n_train = next(batches)
+            x, y, n_train = next(batches[task])
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             window_wait += time.time() - t_wait
             sync = micro == accumulation - 1 or d.world_size == 1
             ctx = contextlib.nullcontext() if sync else ddp_model.no_sync()
             with ctx:
                 with autocast():
-                    logits = ddp_model(x, y[:, :n_train])
+                    logits = ddp_model(x, y[:, :n_train], **_forward_kwargs(config, task))
                 y_eval = y[:, n_train:]
-                if bar is not None and config.dequantize_buckets:
+                if task == "regression" and config.dequantize_buckets:
                     y_eval = dequantize_targets(y, n_train, bar, config.dequantize_buckets)
-                loss = prior_loss(logits, y_eval, config.task, bar) / accumulation
+                loss = prior_loss(logits, y_eval, task, bar) / accumulation
                 loss.backward()
             step_loss += loss.detach()
             micro_info.append((loss.detach(), x, y, n_train))
@@ -420,6 +467,9 @@ def _train(
         if torch.isfinite(step_loss):
             window_loss += step_loss.item()
             window_finite += 1
+            if multitask:
+                window_tasks[task][0] += step_loss.item()
+                window_tasks[task][1] += 1
 
         done = step + 1
         # 시각을 넘겼는지는 log_every마다 보고, 모든 GPU가 같은 step에서 멈추도록 판단을 맞춘다
@@ -470,6 +520,7 @@ def _train(
                 del batches
                 batches = make_batches(snap["step"], rewinds)
                 window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
+                window_tasks = {t: [0.0, 0] for t in config.tasks}
                 window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
                 last_log_step = snap["step"]
                 if not last:
@@ -490,6 +541,10 @@ def _train(
                 "data_wait_frac": window_wait / max(elapsed, 1e-9),
                 "datasets_per_sec": config.batch_size * n / max(elapsed, 1e-9),
             }
+            if multitask:  # train_loss는 두 task를 번갈아 쓴 평균이다
+                for t, (total, count) in window_tasks.items():
+                    if count:
+                        metrics[f"train_loss_{t}"] = total / count
             # 출력층 가중치 크기. 계속 커지면 출력이 날카로워지며 학습이 불안정해진다
             if (decoder := model.decoder_weight()) is not None:
                 metrics["decoder_norm"] = decoder.norm().item()
@@ -517,11 +572,12 @@ def _train(
                 mlf.log_metrics(metrics, step=done)
         if done % config.log_every == 0 or last:
             window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
+            window_tasks = {t: [0.0, 0] for t in config.tasks}
             window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
             last_log_step = done
 
         if d.is_main and (done % config.val_every == 0 or last) and not rewound_at_end:
-            val = _validate(model, val_batches, device, autocast, config.task, bar)
+            val = _validate_tasks(model, val_sets, device, autocast, config, bar)
             history["val_step"].append(done)
             history["val_loss"].append(val["val_loss"])
             print("  val " + " ".join(f"{k} {v:.4f}" for k, v in val.items()), flush=True)

@@ -2,7 +2,8 @@
 (TabPFN v2 논문 Nature 2025, Fig. 1b와 Methods "Details on the neural architecture"의 구조).
 
 v2 논문 설명대로 만든 구조다. v2·2.5의 구조 설정은 `minipfn.recipes.tabpfn_v2.ARCHITECTURES`에
-있다. 각 부분은 `notebooks/03_tabpfn_v2/01_two_way_attention_primer`에서 작은 예로 따라갔다.
+있다. 각 부분은 `notebooks/03_tabpfn_v2/01_cell_tokens_and_two_way_attention`과
+`02_attention_properties_and_cost`에서 작은 예로 따라갔다.
 
 - 입력: feature마다 학습 행의 평균·표준편차로 z-정규화하고, 결측 칸은 0으로 두고 표시를 따로 넣는다
 - 셀 2개를 묶어 토큰 하나로 만들고(Linear), 마지막 열에 y 토큰을 붙인다: (B, R, G + 1, E)
@@ -71,6 +72,28 @@ class CellTransformerConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def standardize_cells(
+    x: torch.Tensor, n_train: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """셀 값 (B, R, F) → (z값, 결측 표시, 쓴 열 표시 (B, 1, F)). `column_row_transformer`도 쓴다.
+
+    1) 결측 표시를 만들고, 학습 행으로 z-정규화한다 (결측 칸은 평균, 즉 0이 된다)
+    2) 학습 행에서 상수인 열은 정보가 없으므로 0으로 둔다
+    """
+    missing = ~torch.isfinite(x)
+    x = torch.where(missing, torch.nan, x)
+    mean = torch.nanmean(x[:, :n_train], dim=1, keepdim=True)
+    var = torch.nanmean(torch.square(x[:, :n_train] - mean), dim=1, keepdim=True)
+    std = torch.sqrt(torch.nan_to_num(var, nan=0.0))
+    x = torch.nan_to_num((x - mean) / std.clamp_min(1e-6), nan=0.0)
+    # 학습 행에서 거의 상수인 열은 다른 행에서 값이 아주 커질 수 있다. bf16 역전파가 넘치지
+    # 않도록 ±100으로 자른다
+    x = x.clamp(-100.0, 100.0)
+    indicator = missing.to(x.dtype) * NAN_INDICATOR
+    used = (std > 1e-6).to(x.dtype)
+    return x * used, indicator, used
 
 
 class Attention(nn.Module):
@@ -174,21 +197,8 @@ class CellTransformer(nn.Module):
         b, r, f = x.shape
         g = self.config.features_per_group
 
-        # 1) 결측 표시를 만들고, 학습 행으로 z-정규화한다 (결측 칸은 평균, 즉 0이 된다)
-        missing = ~torch.isfinite(x)
-        x = torch.where(missing, torch.nan, x)
-        mean = torch.nanmean(x[:, :n_train], dim=1, keepdim=True)
-        var = torch.nanmean(torch.square(x[:, :n_train] - mean), dim=1, keepdim=True)
-        std = torch.sqrt(torch.nan_to_num(var, nan=0.0))
-        x = torch.nan_to_num((x - mean) / std.clamp_min(1e-6), nan=0.0)
-        # 학습 행에서 거의 상수인 열은 다른 행에서 값이 아주 커질 수 있다. bf16 역전파가 넘치지
-        # 않도록 ±100으로 자른다
-        x = x.clamp(-100.0, 100.0)
-        indicator = missing.to(x.dtype) * NAN_INDICATOR
-
-        # 2) 학습 행에서 상수인 열은 정보가 없으므로 0으로 둔다
-        used = (std > 1e-6).to(x.dtype)
-        x = x * used
+        # 1)·2) 학습 행으로 z-정규화, 결측 표시, 학습 행에서 상수인 열은 0
+        x, indicator, used = standardize_cells(x, n_train)
 
         # 3) 열 수를 묶음 크기의 배수로 맞추고 묶는다. 쓴 열이 적은 묶음은 √(g / 쓴 열 수)배
         pad = -f % g

@@ -13,10 +13,11 @@
 - `tabpfn`: `save_tabpfn`으로 저장한 `tabpfn_final.pt`(파일 또는
   `runs:/<run_id>/model/tabpfn_final.pt`). 저장소 루트의 `NOTICE`(공식 TabPFN v1 코드의 저작권
   표기)를 함께 올리고, 체크포인트는 `source.json`에 적는다(`minipfn.hub.tabpfn_v1` 참고).
-- `tabpfn_v2`: `minipfn.hub.load_model`이 읽는 체크포인트면 무엇이든. `--task`가 필요하다.
-  체크포인트는 `config.json`의 `source`에, 이 weight의 추론 설정(멤버 수, 멤버 전처리 종류)은
-  `inference`에 적는다. 추론 설정은 모델 구조로 정하고(`recipes.tabpfn_v2.default_inference`:
-  2.5 구조면 v2.5), 카드의 수치를 다른 멤버 종류로 냈으면 `--member-kinds`로 준다.
+- `tabpfn_v2`: `minipfn.hub.load_model`이 읽는 체크포인트면 무엇이든(v2·2.5, TabPFN-3·3.5 모델
+  포함). `--task`가 필요하다. 체크포인트는 `config.json`의 `source`에, 이 weight의 추론 설정(멤버
+  수, 멤버 전처리 종류)은 `inference`에 적는다. 추론 설정은 모델 종류의 recipe가 구조로 정하고
+  (`minipfn.recipes.default_inference`: 2.5 구조면 v2.5, TabPFN-3.5면 standard 8개 등), 카드의
+  수치를 다른 멤버 종류로 냈으면 `--member-kinds`로 준다.
 
 체크포인트를 `model.safetensors` + `config.json`으로 바꾸고 모델 카드를 붙여 올린다. 모델 카드는
 `--model-card`로 주거나, 주지 않으면 repo 이름으로 `hub/<name>/README.md`를 찾는다. 카드가
@@ -66,7 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--member-kinds",
-        help="tabpfn_v2만: config.json에 적을 멤버 전처리 종류 (v2, v2.5 또는 쉼표로 구분한 목록)."
+        help="tabpfn_v2만: config.json에 적을 멤버 전처리 종류 (v2, v2.5, v3, v3.5 또는 쉼표로"
+        " 구분한 목록)."
         " 기본: 모델 구조로 정한다",
     )
     parser.add_argument(
@@ -88,7 +90,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.paper == "tabpfn" and args.member_kinds is not None:
         parser.error("--member-kinds는 --paper tabpfn_v2에서만 씁니다")
     if args.member_kinds is not None:
-        from minipfn.recipes.tabpfn_v2 import resolve_member_kinds
+        from minipfn.recipes import resolve_member_kinds
 
         try:
             args.member_kinds = resolve_member_kinds(args.member_kinds)
@@ -159,7 +161,7 @@ def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
 def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
     """v2: 체크포인트를 변환하고 원본과 다시 읽은 모델을 돌려준다. 회귀 구간 경계도 확인한다."""
     from minipfn.hub import from_pretrained, load_model, save_pretrained
-    from minipfn.recipes.tabpfn_v2 import default_inference
+    from minipfn.recipes import default_inference
 
     model, borders = load_model(args.checkpoint, args.task, out_dir / "checkpoint")
     inference = default_inference(model, args.task)

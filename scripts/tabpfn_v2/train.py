@@ -1,4 +1,4 @@
-"""TabPFN v2를 TabICL prior로 학습하고 MLflow에 기록한다 (Nature 2025 재현).
+"""TabPFN v2·2.5·3·3.5를 TabICL prior로 학습하고 MLflow에 기록한다 (Nature 2025 재현에서 시작).
 
 AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서 같은 스크립트를 쓴다.
 - GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/tabpfn_v2/train.py`
@@ -9,8 +9,11 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 
 모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
 (arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
-회귀 MLP encoder)이다. 이어서 학습하거나 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를
-주면 그 구조가 원래 run과 같은지 확인한다.
+회귀 MLP encoder)이다. `v3`·`v3.5`는 TabPFN-3(arXiv 2605.13986)·3.5(arXiv 2609.17895)의
+열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. `--task multitask`는
+분류·회귀를 한 모델로 같이 학습한다(TabPFN-3.5, `--arch v3.5`만. step마다 task를 번갈아 쓴다).
+이어서 학습하거나
+가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
 `TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
@@ -47,8 +50,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mlflow  # noqa: E402
 
+from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
+from minipfn.recipes import tabpfn_v3  # noqa: E402
 from minipfn.training.config import TrainConfig  # noqa: E402
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
@@ -61,6 +66,8 @@ PRESETS = {
     "long_tables": recipe.long_tables,
 }
 CONFIG_NAMES = tuple(PRESETS)
+# MLflow run 이름의 머리
+RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
 
 def _env(name: str, cast=str):
@@ -72,7 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--task",
-        choices=["classification", "regression"],
+        choices=["classification", "regression", "multitask"],
         default=os.environ.get("TABPFN_V2_TASK", "classification"),
     )
     parser.add_argument(
@@ -82,9 +89,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--arch",
-        choices=tuple(recipe.ARCHITECTURES),
+        choices=recipes.architectures(),
         default=os.environ.get("TABPFN_V2_ARCH"),
-        help="모델 구조: v2(Nature 2025) 또는 v2.5(TabPFN-2.5). 기본: 새로 학습하면 v2,"
+        help="모델 구조: v2(Nature 2025), v2.5(TabPFN-2.5), v3(TabPFN-3), v3.5(TabPFN-3.5)."
+        " 기본: 새로 학습하면 v2,"
         " 이어서 학습하거나 가중치를 가져오면 원래 run의 구조",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
@@ -123,6 +131,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나온다. 회귀 구간 경계는
         # 가져온 checkpoint의 것을 이어 써서 paper 모델의 출력과 맞춘다
         parser.error("long_tables는 --init-run-id(paper run)나 --resume-run-id와 같이 줘야 한다")
+    if (
+        args.config_name == "long_tables"
+        and args.arch is not None
+        and args.arch not in recipe.LONG_TABLES_MICRO_BATCH
+    ):
+        parser.error(f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다")
     return args
 
 
@@ -137,15 +151,18 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
-        return recipe.with_architecture(
+        if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
+            return tabpfn_v3.paper(args.task, arch)  # multitask의 학습 설정도 이 recipe가 정한다
+        return recipes.recipe_for_architecture(arch).with_architecture(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
 
     if source is None:
         arch = args.arch or "v2"
         return _overrides(preset(arch), args), arch
-    arch = args.arch or recipe.architecture_name(replace(TrainConfig(task=args.task), **source))
-    if arch is None and args.config_name == "long_tables":
+    arch = args.arch or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
+    # 원래 run이 긴 표 학습을 하지 않는 구조(TabPFN-3·3.5 등)여도 run을 열기 전에 멈춘다
+    if args.config_name == "long_tables" and arch not in recipe.LONG_TABLES_MICRO_BATCH:
         raise SystemExit(
             f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
         )
@@ -201,8 +218,9 @@ def plot_history(history: dict, task: str) -> plt.Figure:
     if history["val_step"]:
         ax.plot(history["val_step"], history["val_loss"], "o-", color="C1", label="val (prior)")
     ax.set_xlabel("optimizer step")
-    ax.set_ylabel("cross-entropy" if task == "classification" else "bar distribution NLL")
-    ax.set_title(f"TabPFN v2 prior-fitting loss ({task})")
+    labels = {"classification": "cross-entropy", "regression": "bar distribution NLL"}
+    ax.set_ylabel(labels.get(task, "mean of classification CE and regression NLL"))
+    ax.set_title(f"TabPFN prior-fitting loss ({task})")
     ax.legend()
     return fig
 
@@ -259,7 +277,7 @@ def main(argv: list[str] | None = None) -> None:
         # 새 run에 쓴다
         resume_into = args.resume_run_id if args.resume_step is None else None
         run_id = os.environ.get("MLFLOW_RUN_ID") or resume_into
-        prefix = "tabpfn-v2-5" if arch == "v2.5" else "tabpfn-v2"
+        prefix = RUN_PREFIXES.get(arch, "tabpfn-v2")
         run_name = None if run_id else f"{prefix}-{config.task}-{args.config_name}"
         mlflow.start_run(run_id=run_id, run_name=run_name)
         print("MLflow run_id:", mlflow.active_run().info.run_id, flush=True)

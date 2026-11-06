@@ -1,0 +1,35 @@
+# TabPFN-3·3.5 benchmark 평가: v2·2.5와 같은 benchmark(v2 논문 Supplementary Tables 1·2의 57개)로
+# 견준다. 평가 코드는 v2와 같고(scripts/tabpfn_v2/eval.py), 앙상블 멤버 수와 전처리는 checkpoint의
+# 모델 구조가 정한다(recipes/tabpfn_v3.py의 default_inference: 3은 quantile,robust, 3.5는 standard
+# 8개). 다른 종류로 재려면 TABPFN_V2_MEMBER_KINDS를 준다(예: v2.5, v3.5, quantile,power).
+#   databricks air run -f scripts/tabpfn_v3/eval.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--suite classification \
+#       --classifier-path runs:/<run_id>/checkpoints/step_0100000.pt"
+# 모델 구조는 checkpoint의 model_config(model_type과 설정)에서 읽는다.
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-eval
+environment:
+  version: databricks_ai_v6
+  dependencies:
+    - openml>=0.15
+    - huggingface-hub>=0.34
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v2/eval.py
+env_variables:
+  # 비워 두면 모델이 정한다
+  TABPFN_V2_MEMBER_KINDS: ""
+  TABPFN_V2_EXTRA_ARGS: ""
+max_retries: 0
+timeout_minutes: 240
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v2/eval.py --suite all
+  ${TABPFN_V2_MEMBER_KINDS:+--member-kinds $TABPFN_V2_MEMBER_KINDS} $TABPFN_V2_EXTRA_ARGS

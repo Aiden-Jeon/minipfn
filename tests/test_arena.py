@@ -3,7 +3,6 @@
 
 import argparse
 import importlib.util
-import types
 from pathlib import Path
 
 import numpy as np
@@ -230,18 +229,23 @@ def _eval_script():
     return module
 
 
-def test_eval_script_limits_follow_the_model_architecture(monkeypatch):
+def test_eval_script_limits_follow_the_model_architecture():
+    from dataclasses import replace
+
+    from minipfn.recipes import tabpfn_v2
+    from minipfn.training.config import TrainConfig
+
     script = _eval_script()
-    archs = {"classification": "v2.5", "regression": None}
-    monkeypatch.setattr(script, "model_architecture", lambda model, task: archs[task])
-    clf = types.SimpleNamespace(config=types.SimpleNamespace(n_out=10))
+    # 분류는 2.5 구조(층 수만 줄인 것), 회귀는 어느 구조와도 맞지 않는 모델
+    clf = tabpfn_v2.with_architecture(TrainConfig.smoke(), "v2.5", keep_size=True).build_model()
+    reg = replace(TrainConfig.smoke("regression"), features_per_group=4).build_model()
     args = argparse.Namespace(max_train_rows=None, max_features=None)
-    limits = script.arena_limits({"classification": (clf, None), "regression": (clf, "b")}, args)
+    limits = script.arena_limits({"classification": (clf, None), "regression": (reg, "b")}, args)
     assert limits["binary"] == arena.ModelLimits(50_000, 2_000, 10)
     assert limits["multiclass"] is limits["binary"]
     assert limits["regression"] == arena.ModelLimits(10_000, 500)  # 모르는 구조는 v2
     only = script.arena_limits(
-        {"regression": (clf, "b")}, argparse.Namespace(max_train_rows=2048, max_features=None)
+        {"regression": (reg, "b")}, argparse.Namespace(max_train_rows=2048, max_features=None)
     )
     assert only == {"regression": arena.ModelLimits(2048, 500)}  # 분류 체크포인트가 없으면 빠진다
 
