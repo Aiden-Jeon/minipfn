@@ -20,6 +20,16 @@ test fold 점수로 모드를 고르면 결과가 좋게 나오고, checkpoint�
 쓴다. 펼칠 열이 있는지는 fold마다 그 fold의 학습 행으로 본다
 (추론이 멤버 전처리를 학습 행으로 맞추므로).
 
+`--uncertainty`를 주면 점 예측 점수와 함께 예측 분포·불확실성 지표
+(`minipfn.benchmarks.uncertainty`)를 fold마다 낸다. 회귀는 CRPS, 가운데 구간(50·80·90·95%)의
+coverage·폭·interval score, 폭 5분위별 coverage의 최솟값, PIT의 KS 통계량이고, 분류는 ECE,
+log loss, Brier, split conformal(LAC·APS, α = 0.1)의 coverage·집합 크기·SSCS·클래스 조건부
+coverage gap이다. 데이터셋별 표는 `eval_uncertainty_per_dataset.csv`, suite 평균은
+`<suite>_mean_<지표>`로 남긴다(회귀의 CRPS·폭·interval score는 학습 target 표준편차로 나눈
+`_scaled`만 평균한다).
+
+  uv run python $EVAL --suite regression --regressor-path reg.pt --uncertainty
+
 앙상블 멤버의 전처리는 기본으로 모델이 정한다(`recipes.tabpfn_v2.default_inference`: Hub
 config.json의 `inference`, 없으면 모델 구조가 2.5면 v2.5, 아니면 v2). `--member-kinds`로 주면 그
 값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust scaling + soft clipping을 쓰는
@@ -108,6 +118,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="앙상블 멤버 전처리 종류, 쉼표로 구분해 차례로 쓴다 (기본: 모델이 정한다."
         " v2 = quantile,power, v2.5 = quantile,robust)",
+    )
+    parser.add_argument(
+        "--uncertainty",
+        action="store_true",
+        help="AMLB: 예측 분포·불확실성 지표도 낸다 (회귀 CRPS·coverage·PIT, 분류 ECE·conformal)",
     )
     parser.add_argument(
         "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
@@ -388,6 +403,9 @@ def mlflow_run(use_mlflow: bool):
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.uncertainty and args.suite in ARENA_SUITES:
+        # arena는 공식 패키지의 지표만 낸다. 조용히 무시하지 않고 멈춘다
+        raise SystemExit("--uncertainty는 AMLB suite(classification, regression, all)에서만 쓴다.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
@@ -439,7 +457,9 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         for group in same_result_modes(args.one_hot, factories[suite].member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
             make = functools.partial(factories[suite], one_hot=group[0])
-            task_rows = bm.evaluate_task(task, make, n_folds=args.folds)
+            task_rows = bm.evaluate_task(
+                task, make, n_folds=args.folds, uncertainty=args.uncertainty
+            )
             scores[group[0]] = float(np.nanmean([r["score"] for r in task_rows]))
             for mode in group:
                 rows.extend(
@@ -481,9 +501,39 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
             mlflow.log_metric(f"{suite}_mean_{metric}", group["score"].mean())
             mlflow.log_metric(f"{suite}_paper_mean_{metric}", group["paper"].mean())
             mlflow.log_metric(f"{suite}_mean_abs_diff", group["diff"].abs().mean())
+    artifacts = ["eval_rows.csv", "eval_per_dataset.csv", "eval_per_dataset_by_one_hot.csv"]
+    if args.uncertainty:
+        report_uncertainty(rows, headline, out_dir, use_mlflow)
+        artifacts.append("eval_uncertainty_per_dataset.csv")
     if use_mlflow:
-        for name in ("eval_rows.csv", "eval_per_dataset.csv", "eval_per_dataset_by_one_hot.csv"):
+        for name in artifacts:
             mlflow.log_artifact(str(out_dir / name), "eval")
+
+
+def summarize_uncertainty(rows: list[dict], headline: str) -> pd.DataFrame:
+    """headline 모드의 불확실성 지표(`minipfn.benchmarks.uncertainty`)의 데이터셋별 fold 평균."""
+    df = pd.DataFrame(rows)
+    df = df[df.one_hot == headline]
+    keys = ["suite", "task_id", "dataset"]
+    skip = set(keys) | {"fold", "score", "one_hot", "reused"}
+    columns = [c for c in df.columns if c not in skip]
+    return df.groupby(keys)[columns].mean().reset_index()
+
+
+def report_uncertainty(rows: list[dict], headline: str, out_dir: Path, use_mlflow: bool) -> None:
+    """데이터셋별 표를 저장하고 suite마다 데이터셋 평균을 출력·기록한다 (`<suite>_mean_<지표>`).
+    단위가 있는 회귀 지표(CRPS, 폭, interval score)는 학습 target 표준편차로 나눈 `_scaled`만
+    평균한다."""
+    per_dataset = summarize_uncertainty(rows, headline)
+    per_dataset.to_csv(out_dir / "eval_uncertainty_per_dataset.csv", index=False)
+    for suite, group in per_dataset.groupby("suite"):
+        values = group.drop(columns=["suite", "task_id", "dataset"]).dropna(axis=1, how="all")
+        unscaled = {c.removesuffix("_scaled") for c in values.columns if c.endswith("_scaled")}
+        means = values.drop(columns=[c for c in unscaled if c in values.columns]).mean()
+        print(f"{suite} uncertainty (one-hot {headline}, datasets {len(group)}):")
+        print(means.round(4).to_string())
+        if use_mlflow:
+            mlflow.log_metrics({f"{suite}_mean_{k}": float(v) for k, v in means.items()})
 
 
 if __name__ == "__main__":

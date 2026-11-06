@@ -294,27 +294,48 @@ class EnsembleRegressor(_Base):
         return self
 
     def predict_distribution(self, X: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """(구간 log 확률 (n, 구간 수), 원래 단위의 경계).
+        """(구간 log 확률 (n, 구간 수), 원래 단위의 경계 (float64)).
 
         멤버를 공통 경계로 옮겨 섞은 분포다. 꼬리는 공통 경계의 half-normal 그대로라, 이 분포로 낸
-        평균은 `predict`와 다르다 (평균은 `predict`를 쓴다).
+        평균은 `predict`와 다르다 (평균은 `predict`를 쓴다). 경계는 float64로 원래 단위로 옮긴다:
+        안쪽 구간은 z 폭이 1e-6까지 좁아서, target의 평균이 크고 퍼짐이 작으면 float32에서는 여러
+        경계가 한 값으로 뭉친다.
         """
-        borders = self.borders.to(self.device)
-        probs = []
-        for i, logits in self._iter_logits(X, self.y_trains_):
-            p = torch.softmax(logits / self.softmax_temperature, dim=-1)
-            if self.border_maps_[i] is not None:
-                # power transform한 공간의 경계를 z 공간으로 되돌린 것 위에서 확률을 옮긴다
-                p = _probs_on_borders(p, self.border_maps_[i].to(self.device), borders)
-            probs.append(p)
-        log_probs = torch.stack(probs).mean(0).clamp_min(1e-12).log().cpu()
-        return log_probs, (self.borders * self.y_std_ + self.y_mean_)
+        probs = [self._on_common_borders(i, p) for i, p in self._member_probs(X)]
+        return self._mixture(probs)
 
     def predict(self, X: Any) -> np.ndarray:
         """예측분포의 평균. 멤버를 섞은 분포의 평균은 멤버 평균의 평균이라, 공통 경계로 옮기지 않고
         멤버마다 자기 구간 값(`bucket_values_`)으로 계산한다."""
-        means = []
+        return self._mean([self._member_mean(i, p) for i, p in self._member_probs(X)])
+
+    def predict_full(self, X: Any) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        """(`predict`의 평균, `predict_distribution`의 log 확률과 경계)를 forward 한 번으로 낸다.
+        분포 품질을 평가할 때(`minipfn.benchmarks.uncertainty`) 점 예측과 분포를 같이 쓴다."""
+        means, probs = [], []
+        for i, p in self._member_probs(X):
+            means.append(self._member_mean(i, p))
+            probs.append(self._on_common_borders(i, p))
+        return (self._mean(means), *self._mixture(probs))
+
+    def _member_probs(self, X: Any):
+        """멤버마다 (번호, 자기 공간의 구간 확률)."""
         for i, logits in self._iter_logits(X, self.y_trains_):
-            p = torch.softmax(logits / self.softmax_temperature, dim=-1)
-            means.append(p @ self.bucket_values_[i].to(p.device))
+            yield i, torch.softmax(logits / self.softmax_temperature, dim=-1)
+
+    def _member_mean(self, i: int, p: torch.Tensor) -> torch.Tensor:
+        return p @ self.bucket_values_[i].to(p.device)
+
+    def _mean(self, means: list[torch.Tensor]) -> np.ndarray:
         return torch.stack(means).mean(0).cpu().numpy() * self.y_std_ + self.y_mean_
+
+    def _on_common_borders(self, i: int, p: torch.Tensor) -> torch.Tensor:
+        if self.border_maps_[i] is None:
+            return p
+        # power transform한 공간의 경계를 z 공간으로 되돌린 것 위에서 확률을 옮긴다
+        borders = self.borders.to(p.device)
+        return _probs_on_borders(p, self.border_maps_[i].to(p.device), borders)
+
+    def _mixture(self, probs: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        log_probs = torch.stack(probs).mean(0).clamp_min(1e-12).log().cpu()
+        return log_probs, self.borders.double() * self.y_std_ + self.y_mean_
