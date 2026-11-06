@@ -178,7 +178,8 @@ def fit_diag_scale(
 
     X = pd.DataFrame(X).reset_index(drop=True)
     y = np.asarray(y, dtype=np.float64) if regression else np.asarray(y)
-    n_val = int(max(round(0.1 * len(y)), min(200, round(0.25 * len(y)))))
+    # 적어도 1행 (행이 2개 이하면 round가 0을 내서 train_test_split이 실패한다)
+    n_val = int(max(1, round(0.1 * len(y)), min(200, round(0.25 * len(y)))))
     try:
         fit_ix, val_ix = train_test_split(
             np.arange(len(y)),

@@ -80,6 +80,17 @@ def test_pool_starts_with_the_default_members():
         assert np.array_equal(a.class_permutation, b.class_permutation)
 
 
+def test_pool_members_do_not_expand_one_hot_when_it_is_off():
+    rng = np.random.default_rng(0)
+    on = GreedyEnsembleClassifier(_tiny_model(), n_estimators=2, pool_size=20)
+    off = GreedyEnsembleClassifier(_tiny_model(), n_estimators=2, pool_size=20, one_hot="off")
+    assert any(m.one_hot for m in on._pool(rng, [], 2))
+    pool = off._pool(np.random.default_rng(0), [], 2)
+    assert not any(m.one_hot for m in pool)
+    seeds = [m.seed for m in on._pool(np.random.default_rng(0), [], 2)]
+    assert seeds == [m.seed for m in pool]  # 나머지 멤버는 같다
+
+
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_choosing_only_candidate_zero_is_the_default_ensemble(task, monkeypatch):
     x, y = _classification() if task == "classification" else _regression()

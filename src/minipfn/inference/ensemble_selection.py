@@ -21,9 +21,9 @@
 - 후보 하나는 멤버 하나(forward 한 번)와 softmax 온도 하나의 조합이다. 논문의 설정 하나는 멤버
   8개짜리 앙상블이다. 온도는 logit을 나누기만 하므로 forward를 더 하지 않는다
 - pool 멤버 `pool_size`개: 앞의 `n_estimators`개는 기본 앙상블과 같은 멤버(같은 seed)이고,
-  나머지는 무작위로 고른다. 전처리 종류(`pool_kinds`, 기본은 세 종류 모두), one-hot 여부, 이상값을
-  자르는 σ(`OUTLIER_SIGMAS`), (회귀) target power 여부, 멤버 seed(feature 순서, 클래스 번호,
-  샘플 식별자 열)
+  나머지는 무작위로 고른다. 전처리 종류(`pool_kinds`, 기본은 세 종류 모두), one-hot 여부
+  (`one_hot`이 "off"면 펼치지 않는다), 이상값을 자르는 σ(`OUTLIER_SIGMAS`), (회귀) target power
+  여부, 멤버 seed(feature 순서, 클래스 번호, 샘플 식별자 열)
 - 온도와 σ의 후보는 TabArena의 TabPFN-2.5 search space(`softmax_temperature`,
   `OUTLIER_REMOVAL_STD`)에서 가져왔다. 논문의 pool도 이 search space에서 만들었다
 - 후보 0번은 기본 앙상블이다(기본 멤버를 기본 온도로 균일 평균). 논문의 0번 설정과 같은 역할이다
@@ -114,7 +114,8 @@ class _Selection:
                     class_permutation=None if n_classes is None else rng.permutation(n_classes),
                     target_power=n_classes is None and bool(rng.integers(2)),
                     seed=int(rng.integers(0, 2**31 - 1)),
-                    one_hot=bool(rng.integers(2)),
+                    # one_hot="off"면 펼치지 않는다 (뽑기는 그대로 해서 나머지 멤버가 같다)
+                    one_hot=bool(rng.integers(2)) and self.one_hot != "off",
                     outlier_sigma=OUTLIER_SIGMAS[int(rng.integers(len(OUTLIER_SIGMAS)))],
                 )
             )
@@ -249,19 +250,13 @@ class GreedyEnsembleRegressor(_Selection, EnsembleRegressor):
                     total_probs = total_probs + w * self._on_common_borders(i, p)
         return total_mean, total_probs
 
-    def _units(self, total_mean: torch.Tensor) -> np.ndarray:
-        return total_mean.cpu().numpy() * self.y_std_ + self.y_mean_
-
-    def _log_probs(self, total_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        borders = self.borders.double() * self.y_std_ + self.y_mean_
-        return total_probs.clamp_min(1e-12).log().cpu(), borders
-
     def predict(self, X: Any) -> np.ndarray:
-        return self._units(self._weighted(X, mean=True, distribution=False)[0])
+        # 가중합 하나를 `_mean`·`_mixture`(목록의 평균)에 넘겨 원래 단위·log 확률로 바꾼다
+        return self._mean([self._weighted(X, mean=True, distribution=False)[0]])
 
     def predict_distribution(self, X: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._log_probs(self._weighted(X, mean=False, distribution=True)[1])
+        return self._mixture([self._weighted(X, mean=False, distribution=True)[1]])
 
     def predict_full(self, X: Any) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         total_mean, total_probs = self._weighted(X, mean=True, distribution=True)
-        return (self._units(total_mean), *self._log_probs(total_probs))
+        return (self._mean([total_mean]), *self._mixture([total_probs]))

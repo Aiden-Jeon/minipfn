@@ -270,7 +270,14 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     inference = default_inference(model, suite)
     member_kinds = args.member_kinds or inference["member_kinds"]
     n_estimators = args.n_estimators or inference["n_estimators"]
+    if "greedy" in args.test_time and args.pool_size < n_estimators:
+        # 여기서 멈춘다: arena에서는 estimator를 만들 때 실패하면 모든 split이 조용히 imputed가 된다
+        raise SystemExit(
+            f"--pool-size({args.pool_size})는 {suite} 앙상블의 멤버 수({n_estimators}) 이상이어야 한다."
+        )
     log_path = Path(args.out_dir) / "test_time.jsonl"
+    # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
+    log_fields = {"suite": suite, "method": args.method_name, **test_time_params(args)}
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
@@ -294,7 +301,10 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         if args.test_time.startswith("diagscale"):
             estimator = DiagScale(estimator)
         if args.test_time != "none":
-            record_fits(estimator, suite, log_path)
+            fields = dict(log_fields)
+            if getattr(task, "name", None):  # AMLB task만 이름이 있다
+                fields["dataset"] = task.name
+            record_fits(estimator, log_path, **fields)
         return estimator
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
@@ -304,15 +314,15 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     return make
 
 
-def record_fits(estimator, suite: str, path: Path) -> None:
-    """fit할 때마다 test-time 방법의 기록(greedy 선택 `selection_`, DiagScale `adaptation_`)과
-    표 크기, fit 시간을 `path`(JSONL)에 한 줄씩 덧붙인다."""
+def record_fits(estimator, path: Path, **fields) -> None:
+    """fit할 때마다 `fields`(suite, 방법, test-time 설정 등)와 test-time 방법의 기록(greedy 선택
+    `selection_`, DiagScale `adaptation_`), 표 크기, fit 시간을 `path`(JSONL)에 한 줄씩 덧붙인다."""
     fit = estimator.fit
 
     def fit_and_record(X, y):
         start = time.perf_counter()
         fitted = fit(X, y)
-        record = {"suite": suite, "rows": len(X), "features": int(np.shape(X)[1])}
+        record = {**fields, "rows": len(X), "features": int(np.shape(X)[1])}
         for key in ("selection_", "adaptation_"):
             value = getattr(fitted, key, None)
             if value is not None:
