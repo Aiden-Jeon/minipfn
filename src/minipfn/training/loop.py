@@ -200,6 +200,14 @@ def check_resume_step(state: dict, config: TrainConfig) -> None:
     다른 설정의 run(예: paper run을 long_tables로)을 잘못 이으면 학습 없이 끝나고 결과를 그 run에
     덮어쓰게 된다.
     """
+    saved_schedule_free = bool(state.get("schedule_free", False))
+    if saved_schedule_free != config.schedule_free:
+        # optimizer 상태가 다르다 (Adam: exp_avg·step, schedule-free: z·k). checkpoint의 가중치도
+        # schedule-free면 평균 x라 Adam으로는 그대로 이을 수 없다
+        raise ValueError(
+            f"이어 갈 checkpoint는 schedule_free={saved_schedule_free}로 학습했다"
+            f" (설정은 {config.schedule_free}). 원래 run과 같은 optimizer로 이어 간다"
+        )
     step, stop = int(state["step"]), min(config.stop_step or config.steps, config.steps)
     if step >= stop:
         raise ValueError(
@@ -256,6 +264,9 @@ def train(
     if resume_from is not None and init_from is not None:
         raise ValueError("resume_from과 init_from은 함께 줄 수 없다")
     d, device = setup_distributed()
+    # 가속 옵션 tf32는 프로세스 전체 설정이라 끝나면 되돌린다
+    # (같은 프로세스의 다음 학습·평가에 남지 않게)
+    matmul_precision = torch.get_float32_matmul_precision()
     try:
         return _train(
             config,
@@ -272,6 +283,8 @@ def train(
         if d.world_size > 1 and dist.is_initialized():
             dist.destroy_process_group()
         raise
+    finally:
+        torch.set_float32_matmul_precision(matmul_precision)
 
 
 def _train(
@@ -310,15 +323,21 @@ def _train(
         schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     sched = torch.optim.lr_scheduler.LambdaLR(opt, schedule)
 
+    eval_cache: dict = {}  # 이번 step의 평균 x (검증·LAWA·checkpoint가 같은 step에 한 번만 계산)
+
     def eval_state() -> dict:
         # 검증·저장할 가중치. schedule-free면 평균 x (`ScheduleFreeAdamW.average`), 아니면 그대로
-        state = model.state_dict()
-        if config.schedule_free:
+        if not config.schedule_free:
+            return model.state_dict()
+        if "state" not in eval_cache:
+            state = model.state_dict()
             for name, p in model.named_parameters():
                 state[name] = opt.average(p)
-        return state
+            eval_cache["state"] = state
+        return eval_cache["state"]
 
     start_step, skipped_steps, borders, rewinds = 0, 0, None, 0
+    resumed_train_seconds = 0.0
     history: dict[str, list] = {"step": [], "train_loss": [], "val_step": [], "val_loss": []}
     if init_from is not None:
         state = torch.load(init_from, map_location=device, weights_only=True)
@@ -339,6 +358,7 @@ def _train(
         skipped_steps = int(state["skipped_steps"])
         # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록 되돌린 횟수를 이어받는다
         rewinds = int(state.get("rewinds", 0))
+        resumed_train_seconds = float(state.get("train_seconds", 0.0))
         _set_base_lr(opt, sched, config.lr, start_step, d.is_main)
         borders = state["borders"]
     if borders is None:
@@ -369,7 +389,16 @@ def _train(
     # (학습 가중치는 건드리지 않는다)
     eval_copy_model = None
     averages = collections.deque(maxlen=config.weight_average) if config.weight_average else None
-    train_seconds = 0.0  # 순수 학습 시간 (검증·checkpoint·기록 빼고). 목표 도달 시간을 잰다
+    if averages is not None and start_step and d.is_main:
+        # 평균에 쓸 가중치는 메모리에만 있다(모델 K개를 checkpoint에 넣기에는 크다)
+        print(
+            f"LAWA: 이어 학습이라 평균 창이 비어 있다. step {start_step}부터"
+            f" {config.weight_average * config.weight_average_every} step 뒤에 다시 찬다",
+            flush=True,
+        )
+    # 순수 학습 시간 (검증·checkpoint·기록 빼고). 목표 도달 시간을 잰다. checkpoint에 남겨 이어
+    # 학습해도 누적된다
+    train_seconds = resumed_train_seconds
 
     def eval_copy(state: dict):
         nonlocal eval_copy_model
@@ -472,6 +501,7 @@ def _train(
     while step + 1 < stop_step:
         step += 1
         t_step = time.time()
+        eval_cache.clear()  # 가중치가 바뀌므로 지난 step의 평균은 버린다
         # multitask는 step마다 task를 번갈아 쓴다 (모든 GPU가 같은 task. 비율은 1:1, 여기서 정함)
         task = config.tasks[step % len(config.tasks)]
         step_loss = torch.zeros((), device=device)
@@ -646,7 +676,8 @@ def _train(
         if d.is_main and (done % config.val_every == 0 or last) and not rewound_at_end:
             val_model = eval_copy(eval_state()) if config.schedule_free else model
             val = _validate_tasks(val_model, val_sets, device, autocast, config, bar)
-            if averages is not None and len(averages) > 1:
+            # LAWA는 창(K개)이 다 찼을 때만 낸다. 이어 학습하면 창이 비어서 다시 찬다
+            if averages is not None and len(averages) == config.weight_average:
                 averaged = eval_copy(_average_states(list(averages)))
                 avg = _validate_tasks(averaged, val_sets, device, autocast, config, bar)
                 val.update({f"{k}_avg": v for k, v in avg.items()})
@@ -675,6 +706,9 @@ def _train(
                 "skipped_steps": skipped_steps,
                 "borders": borders,
                 "rewinds": rewinds,
+                "train_seconds": train_seconds,
+                # optimizer 종류 (이어 학습할 때 같은지 본다, `check_resume_step`)
+                "schedule_free": config.schedule_free,
             }
             torch.save(state, out_dir / "latest.pt")
             kept = None
@@ -696,7 +730,7 @@ def _train(
         final_borders = None if borders is None else borders.cpu()
         final_model = eval_copy(eval_state()) if config.schedule_free else model
         save_checkpoint(final_path, final_model, final_borders)
-        if averages:  # LAWA: 최근 가중치 평균
+        if averages is not None and len(averages) == config.weight_average:  # LAWA 평균
             save_checkpoint(
                 out_dir / "final_avg.pt", eval_copy(_average_states(list(averages))), final_borders
             )

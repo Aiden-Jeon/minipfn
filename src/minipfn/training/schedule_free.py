@@ -13,7 +13,10 @@ step k에서 c_k = w_k / Σ w (w_k = lr_k², lr_k는 warmup을 거친 lr)로
     y ← (1 − c_k) y + c_k z + lr_k (β1 (1 − c_k) − 1) g̃
     z ← z − lr_k g̃                       (g̃ = g / (√v̂ + ε), v는 Adam의 제곱 평균)
 
-이다. 검증·저장에는 x를 쓴다(`average`). 학습 checkpoint에도 x를 저장해서 평가 스크립트가
+이다. step 수 k와 Σ w는 파라미터마다 센다: gradient가 없는 step(multitask에서 다른 task의 정답
+encoder·출력층)은 그 파라미터에게 step이 아니다. 원본 패키지는 param group마다 세서, 한 step 걸러
+gradient를 받는 파라미터의 bias correction과 평균이 어긋난다. 늘 gradient를 받는 파라미터에서는
+원본과 같다. 검증·저장에는 x를 쓴다(`average`). 학습 checkpoint에도 x를 저장해서 평가 스크립트가
 그대로 읽고, 이어 학습할 때 x와 z로 y를 다시 만든다(`average_to_train_point`).
 """
 
@@ -41,9 +44,6 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
             "betas": betas,
             "eps": eps,
             "weight_decay": weight_decay,
-            "k": 0,
-            "weight_sum": 0.0,
-            "lr_max": 0.0,
         }
         super().__init__(params, defaults)
         self._beta1 = {p: group["betas"][0] for group in self.param_groups for p in group["params"]}
@@ -68,36 +68,49 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
         if closure is not None:
             raise ValueError("ScheduleFreeAdamW는 closure를 받지 않는다")
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None]
-            if not params:
-                continue
-            beta1, beta2 = group["betas"]
-            group["k"] += 1
-            k, lr = group["k"], group["lr"]
-            group["lr_max"] = max(group["lr_max"], lr)
-            weight = group["lr_max"] ** 2
-            group["weight_sum"] += weight
-            ckp1 = weight / group["weight_sum"] if group["weight_sum"] else 0.0
-            bias_correction2 = 1 - beta2**k
-            for p in params:
-                if "z" not in self.state[p]:
-                    self.state[p]["z"] = p.detach().clone()
-                    self.state[p]["exp_avg_sq"] = torch.zeros_like(p)
-            grads = [p.grad for p in params]
-            z = [self.state[p]["z"] for p in params]
-            v = [self.state[p]["exp_avg_sq"] for p in params]
-            torch._foreach_mul_(v, beta2)
-            torch._foreach_addcmul_(v, grads, grads, value=1 - beta2)
-            denom = torch._foreach_div(v, bias_correction2)
-            torch._foreach_sqrt_(denom)
-            torch._foreach_add_(denom, group["eps"])
-            normed = torch._foreach_div(grads, denom)
-            if group["weight_decay"]:
-                torch._foreach_add_(normed, params, alpha=group["weight_decay"])
-            torch._foreach_lerp_(params, z, ckp1)
-            torch._foreach_add_(params, normed, alpha=lr * (beta1 * (1 - ckp1) - 1))
-            torch._foreach_add_(z, normed, alpha=-lr)
+            lr = group["lr"]
+            # 파라미터마다 step 수·lr 최댓값·가중치 합을 갱신하고, 값이 같은 것끼리 한꺼번에
+            # 계산한다 (multitask면 공유 파라미터와 task별 파라미터 두 묶음)
+            buckets: dict[tuple, list[torch.Tensor]] = {}
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "z" not in state:
+                    state.update(
+                        z=p.detach().clone(),
+                        exp_avg_sq=torch.zeros_like(p),
+                        k=0,
+                        lr_max=0.0,
+                        weight_sum=0.0,
+                    )
+                state["k"] += 1
+                state["lr_max"] = max(state["lr_max"], lr)
+                state["weight_sum"] += state["lr_max"] ** 2
+                key = (state["k"], state["lr_max"], state["weight_sum"])
+                buckets.setdefault(key, []).append(p)
+            for (k, lr_max, weight_sum), params in buckets.items():
+                self._update(group, params, lr, k, lr_max**2 / weight_sum if weight_sum else 0.0)
         return None
+
+    def _update(self, group: dict, params: list, lr: float, k: int, ckp1: float) -> None:
+        # step k(그 파라미터들의 k)의 갱신. ckp1 = w_k / Σ w
+        beta1, beta2 = group["betas"]
+        bias_correction2 = 1 - beta2**k
+        grads = [p.grad for p in params]
+        z = [self.state[p]["z"] for p in params]
+        v = [self.state[p]["exp_avg_sq"] for p in params]
+        torch._foreach_mul_(v, beta2)
+        torch._foreach_addcmul_(v, grads, grads, value=1 - beta2)
+        denom = torch._foreach_div(v, bias_correction2)
+        torch._foreach_sqrt_(denom)
+        torch._foreach_add_(denom, group["eps"])
+        normed = torch._foreach_div(grads, denom)
+        if group["weight_decay"]:
+            torch._foreach_add_(normed, params, alpha=group["weight_decay"])
+        torch._foreach_lerp_(params, z, ckp1)
+        torch._foreach_add_(params, normed, alpha=lr * (beta1 * (1 - ckp1) - 1))
+        torch._foreach_add_(z, normed, alpha=-lr)
 
 
 def warmup_factor(step: int, warmup_steps: int) -> float:

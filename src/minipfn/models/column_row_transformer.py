@@ -242,8 +242,11 @@ class QASSMax(nn.Module):
 
     def forward(self, q: torch.Tensor, n_keys: int) -> torch.Tensor:
         # q: (N, H, L, d)
-        # log n은 텐서로 계산한다: Python float로 만들면 torch.compile이 n마다 다시 compile한다
-        log_n = (torch.ones((1, 1), device=q.device) * n_keys).clamp(min=1).log().to(q.dtype)
+        if torch.compiler.is_compiling():
+            # compile할 때는 텐서로: Python float로 만들면 n마다 다시 compile한다
+            log_n = (torch.ones((1, 1), device=q.device) * n_keys).clamp(min=1).log().to(q.dtype)
+        else:  # 예전과 같은 값 (float64 log를 q의 dtype으로)
+            log_n = q.new_full((1, 1), math.log(max(n_keys, 1)))
         base = self.base_mlp(log_n).view(1, self.nhead, 1, self.head_dim)
         return q * base * (1 + torch.tanh(self.query_mlp(q)))
 

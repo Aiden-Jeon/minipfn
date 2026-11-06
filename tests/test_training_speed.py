@@ -161,3 +161,116 @@ def test_train_script_takes_the_speed_options(monkeypatch):
     config, _ = script.build_config(args)
     assert config.compile and config.schedule_free and config.weight_average == 5
     assert config.val_every == 7
+
+
+# ---------------------------------------------------------------------------
+# 리뷰 반영
+# ---------------------------------------------------------------------------
+def test_schedule_free_counts_steps_per_parameter():
+    # 한 step 걸러 gradient를 받는 파라미터(multitask의 task별 출력층)는 자기 step 수로 계산한다:
+    # 늘 받는 파라미터를 같은 gradient 순서로 따로 학습한 것과 같다
+    torch.manual_seed(0)
+    shared, sometimes, alone = (torch.nn.Parameter(torch.randn(4)) for _ in range(3))
+    alone.data.copy_(sometimes.data)
+    opt = ScheduleFreeAdamW([shared, sometimes], lr=0.05)
+    ref = ScheduleFreeAdamW([alone], lr=0.05)
+    for step in range(10):
+        shared.grad = torch.randn(4)
+        sometimes.grad = None
+        if step % 2 == 0:
+            sometimes.grad = torch.randn(4)
+            alone.grad = sometimes.grad.clone()
+            ref.step()
+        opt.step()
+    assert torch.allclose(sometimes, alone) and torch.allclose(
+        opt.average(sometimes), ref.average(alone)
+    )
+    assert opt.state[sometimes]["k"] == 5 and opt.state[shared]["k"] == 10
+
+
+def test_resume_needs_the_same_optimizer_and_keeps_train_seconds(tmp_path):
+    from minipfn.training.loop import check_resume_step
+
+    config = _smoke(schedule_free=True, stop_step=3)
+    train(config, tmp_path / "sf", mlflow_log=False)
+    state = torch.load(tmp_path / "sf" / "latest.pt", weights_only=True)
+    assert state["schedule_free"] is True and state["train_seconds"] > 0
+    with pytest.raises(ValueError, match="schedule_free"):
+        check_resume_step(state, _smoke())  # Adam으로 schedule-free checkpoint를 잇지 않는다
+    train(_smoke(stop_step=3), tmp_path / "adam", mlflow_log=False)
+    adam_state = torch.load(tmp_path / "adam" / "latest.pt", weights_only=True)
+    with pytest.raises(ValueError, match="schedule_free"):
+        check_resume_step(adam_state, _smoke(schedule_free=True))
+    # 이어 학습하면 학습 시간이 이어진다 (0부터 다시 세지 않는다)
+    resumed = tmp_path / "resumed"
+    train(
+        _smoke(schedule_free=True),
+        resumed,
+        resume_from=tmp_path / "sf" / "latest.pt",
+        mlflow_log=False,
+    )
+    later = torch.load(resumed / "latest.pt", weights_only=True)
+    assert later["train_seconds"] > state["train_seconds"]
+
+
+def test_weight_average_waits_for_a_full_window(tmp_path):
+    # 창(K개)이 다 차기 전에는 평균을 내지도 저장하지도 않는다
+    config = _smoke(weight_average=4, weight_average_every=2)  # 6 step이면 3개뿐
+    train(config, tmp_path, mlflow_log=False)
+    assert not (tmp_path / "final_avg.pt").exists()
+
+
+def test_tf32_is_restored_after_training(tmp_path):
+    torch.set_float32_matmul_precision("highest")
+    train(_smoke(tf32=True), tmp_path, mlflow_log=False)
+    assert torch.get_float32_matmul_precision() == "highest"
+
+
+def test_fused_adam_is_not_combined_with_schedule_free():
+    with pytest.raises(ValueError, match="fused_adam"):
+        TrainConfig(schedule_free=True, fused_adam=True)
+
+
+def test_qassmax_eager_keeps_the_float64_log():
+    import math
+
+    from minipfn.models.column_row_transformer import QASSMax
+
+    qassmax = QASSMax(nhead=2, head_dim=4, hidden=8)
+    q = torch.randn(1, 2, 3, 4)
+    base = qassmax.base_mlp(q.new_full((1, 1), math.log(7))).view(1, 2, 1, 4)
+    assert torch.equal(qassmax(q, 7), q * base * (1 + torch.tanh(qassmax.query_mlp(q))))
+
+
+def test_train_script_reads_env_flags_and_keeps_the_source_options(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "scripts" / "tabpfn_v2" / "train.py"
+    spec = importlib.util.spec_from_file_location("train_script_speed2", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    for value, expected in (("True", True), ("yes", True), ("OFF", False), ("", False)):
+        monkeypatch.setenv("TABPFN_V2_COMPILE", value)
+        assert script._env_flag("TABPFN_V2_COMPILE") is expected
+    monkeypatch.setenv("TABPFN_V2_COMPILE", "enabled")
+    with pytest.raises(SystemExit, match="TABPFN_V2_COMPILE"):
+        script._env_flag("TABPFN_V2_COMPILE")
+    monkeypatch.delenv("TABPFN_V2_COMPILE")
+    for name in ("TABPFN_V2_SCHEDULE_FREE", "TABPFN_V2_WEIGHT_AVERAGE", "TABPFN_V2_CONFIG_NAME"):
+        monkeypatch.delenv(name, raising=False)
+    # 원래 run의 param (문자열): 켠 옵션은 이어 학습에서도 켜지고, 숫자는 인자로 주면 그 값
+    params = {"compile": "True", "schedule_free": "True", "weight_average": "10", "tf32": "False"}
+    options = script.source_speed_options(params)
+    assert options == {"compile": True, "schedule_free": True, "weight_average": 10, "tf32": False}
+    from minipfn.hub import run_architecture
+
+    source = run_architecture({k: str(v) for k, v in vars(TrainConfig.smoke()).items()})
+    args = script.parse_args(["--config-name", "smoke", "--resume-run-id", "r"])
+    config, _ = script.build_config(args, source, options)
+    assert config.compile and config.schedule_free and config.weight_average == 10
+    args = script.parse_args(
+        ["--config-name", "smoke", "--resume-run-id", "r", "--weight-average", "3", "--tf32"]
+    )
+    config, _ = script.build_config(args, source, options)
+    assert config.weight_average == 3 and config.tf32

@@ -21,6 +21,16 @@ from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_modul
 from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 
 N_BUCKETS = 5000
+# 학습 가속 옵션 (issue #46). 이어 학습하면 원래 run의 값을 따른다
+# (학습 스크립트, `check_resume_step`)
+SPEED_OPTIONS = (
+    "compile",
+    "fused_adam",
+    "tf32",
+    "schedule_free",
+    "weight_average",
+    "weight_average_every",
+)
 # 한 task 학습과, 분류·회귀를 한 모델로 같이 학습하는 multitask (`task_configs`)
 TASKS = ("classification", "regression", "multitask")
 
@@ -151,6 +161,8 @@ class TrainConfig:
             # QK-clip은 학습 중 가중치(y)를 줄이는데, schedule-free는 평균 가중치(x)를 optimizer
             # 상태에서 다시 만든다. 둘을 같이 쓰는 방식은 정하지 않았다
             raise ValueError("schedule_free와 qk_clip은 같이 쓰지 않는다")
+        if self.schedule_free and self.fused_adam:
+            raise ValueError("fused_adam은 Adam에만 있다 (schedule_free와 같이 쓰지 않는다)")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
 
