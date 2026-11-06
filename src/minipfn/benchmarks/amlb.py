@@ -758,15 +758,23 @@ def load_openml_task(task_id: int) -> OpenMLTask:
     return OpenMLTask(task_id, dataset.name, X, y, cat_ix, task_type, task)
 
 
+def drop_unseen_classes(
+    y_true: np.ndarray, prediction: np.ndarray, classes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """학습 fold에 없던 클래스의 테스트 행은 모델이 예측할 수 없으므로 뺀다. ROC AUC
+    (`score_fold`)와 불확실성 지표(`uncertainty.classification_metrics`)가 같은 행을 쓰도록 둘 다
+    이 함수를 부른다."""
+    seen = np.isin(np.asarray(y_true), np.asarray(classes))
+    return np.asarray(y_true)[seen], np.asarray(prediction)[seen]
+
+
 def score_fold(
     task_type: str, y_true: np.ndarray, prediction: np.ndarray, classes: np.ndarray | None = None
 ) -> float:
     """분류: ROC AUC (이진은 양성 클래스 확률, 다중은 one-vs-rest 평균). 회귀: negative RMSE."""
     if task_type == "regression":
         return -float(mean_squared_error(y_true, prediction) ** 0.5)
-    # 학습 fold에 없던 클래스의 테스트 행은 모델이 예측할 수 없으므로 뺀다
-    seen = np.isin(y_true, classes)
-    y_true, prediction = y_true[seen], prediction[seen]
+    y_true, prediction = drop_unseen_classes(y_true, prediction, classes)
     if len(np.unique(y_true)) < 2:
         return float("nan")  # 클래스가 하나뿐이면 ROC AUC를 정의할 수 없다
     if prediction.shape[1] == 2:
@@ -784,18 +792,48 @@ def evaluate_task(
     task: OpenMLTask,
     make_estimator: Callable[[OpenMLTask], object],
     n_folds: int = 10,
+    uncertainty: bool = False,
 ) -> list[dict]:
+    """fold마다 점수 하나. `uncertainty=True`면 예측 분포·불확실성 지표
+    (`minipfn.benchmarks.uncertainty`)를 같은 행에 더한다. 회귀 estimator에는 `predict_full`
+    (평균, 구간 log 확률, 경계)이나 `predict_distribution`(log 확률, 경계)이 있어야 한다."""
+    from minipfn.benchmarks import uncertainty as unc
+
     rows = []
     for fold, train_ix, test_ix in task.folds(n_folds):
         estimator = make_estimator(task)
         x_train, x_test = task.X.iloc[train_ix], task.X.iloc[test_ix]
         y_train, y_test = task.y.iloc[train_ix].to_numpy(), task.y.iloc[test_ix].to_numpy()
         estimator.fit(x_train, y_train)
+        extra = {}
         if task.task_type == "classification":
             prediction = estimator.predict_proba(x_test)
             score = score_fold("classification", y_test, prediction, estimator.classes_)
+            if uncertainty:
+                extra = unc.classification_metrics(
+                    prediction, y_test, estimator.classes_, seed=fold
+                )
         else:
-            prediction = estimator.predict(x_test)
-            score = score_fold("regression", y_test.astype(float), prediction)
-        rows.append({"task_id": task.task_id, "dataset": task.name, "fold": fold, "score": score})
+            y_test = y_test.astype(float)
+            if uncertainty:
+                prediction, log_probs, borders = _predict_full(estimator, x_test)
+                scale = float(np.std(y_train.astype(float))) or 1.0
+                extra = unc.regression_metrics(np.exp(log_probs), borders, y_test, y_scale=scale)
+                # 같은 단위로 견주도록 RMSE도 학습 target 표준편차로 나눈 값을 남긴다
+                extra["rmse_scaled"] = float(np.sqrt(np.mean((prediction - y_test) ** 2))) / scale
+            else:
+                prediction = estimator.predict(x_test)
+            score = score_fold("regression", y_test, prediction)
+        rows.append(
+            {"task_id": task.task_id, "dataset": task.name, "fold": fold, "score": score, **extra}
+        )
     return rows
+
+
+def _predict_full(estimator, x_test) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if hasattr(estimator, "predict_full"):
+        mean, log_probs, borders = estimator.predict_full(x_test)
+    else:
+        mean = estimator.predict(x_test)
+        log_probs, borders = estimator.predict_distribution(x_test)
+    return np.asarray(mean), np.asarray(log_probs, dtype=np.float64), np.asarray(borders)
