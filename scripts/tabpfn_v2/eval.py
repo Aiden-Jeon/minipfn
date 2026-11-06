@@ -58,8 +58,11 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
 (arXiv 2605.18654), `synthetic`은 학습 행 전체를 context로 학습 행 + CutMix synthetic 행을 라벨링
 (arXiv 2610.01435), `labels`는 teacher 없이 정답 라벨만 배운 같은 학생(기본 GBDT 비교용)이다.
 학생은 `--student`(xgboost, lightgbm, hist)이고 CPU에서 예측한다. fit마다 teacher·학생 학습 시간과
-나무 수를 `<out-dir>/distill.jsonl`에 남긴다. `--latency`는 fit마다 학습 행 하나의 예측 시간
-(`LATENCY_REPEATS`번의 중앙값)도 남긴다(teacher만 쓸 때도).
+나무 수를 `<out-dir>/distill_<suite>.jsonl`에 남긴다(이 실행의 fit만: 실행마다 새로 쓴다).
+학생은 평균만 내므로 회귀에서는 `--uncertainty`와 같이 쓸 수 없다.
+`--latency`(TabArena·BeyondArena)는 fit마다 테스트 행 하나의 예측 시간(`LATENCY_REPEATS`번의
+중앙값)도 남긴다(teacher만 쓸 때도). 예측이 끝난 뒤 시간을 재지 않는 hook에서 재므로 TabArena의
+학습·추론 시간에는 들지 않는다.
 
   uv run --no-dev --extra arena --extra distill --group arena-dev python $EVAL \
     --suite tabarena-lite --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
@@ -171,7 +174,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="--distill: teacher target의 비중, 나머지는 정답 라벨 (기본: oof 0.7, synthetic 1)",
     )
     parser.add_argument(
-        "--latency", action="store_true", help="fit마다 한 행 예측 시간을 distill.jsonl에 남긴다"
+        "--latency",
+        action="store_true",
+        help="TabArena·BeyondArena: fit마다 한 행 예측 시간을 distill_<suite>.jsonl에 남긴다",
     )
     parser.add_argument(
         "--bagging", type=int, default=0, help="TabArena·BeyondArena: k-fold bagging (0: 안 함)"
@@ -282,7 +287,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     member_kinds = args.member_kinds or inference["member_kinds"]
     n_estimators = args.n_estimators or inference["n_estimators"]
 
-    log_path = Path(args.out_dir) / "distill.jsonl"
+    log_path = fits_path(args)
 
     def make(task: bm.OpenMLTask, one_hot: str):
         kw = {
@@ -307,7 +312,8 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
                 categorical_features_indices=task.categorical_indices,
             )
         if args.distill != "none" or args.latency:
-            record_fits(estimator, suite, log_path, latency=args.latency)
+            record = {"suite": args.suite, "task": suite, "dataset": getattr(task, "name", None)}
+            estimator = RecordedEstimator(estimator, record, log_path, latency=args.latency)
         return estimator
 
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
@@ -317,37 +323,66 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     return make
 
 
-def record_fits(estimator, suite: str, path: Path, latency: bool) -> None:
-    """fit할 때마다 표 크기, fit 시간, 증류 기록(`fit_record_`: teacher·학생 학습 시간, 나무 수)을
-    `path`(JSONL)에 한 줄씩 덧붙인다. `latency`면 학습 행 하나의 예측 시간(ms,
-    `LATENCY_REPEATS`번의 중앙값)도 잰다."""
-    fit = estimator.fit
+def fits_path(args: argparse.Namespace) -> Path:
+    """fit 기록 파일 (suite마다 하나, `main`이 실행마다 비운다)."""
+    return Path(args.out_dir) / f"distill_{args.suite}.jsonl"
 
-    def fit_and_record(X, y):
+
+class RecordedEstimator:
+    """estimator를 감싸 fit마다 기록을 `path`(JSONL)에 한 줄씩 남긴다: `record`(suite, task,
+    데이터셋), 표 크기, fit 시간, 증류 기록(`fit_record_`: teacher·학생 학습 시간, 나무 수).
+
+    `latency`면 한 행 예측 시간(ms, `LATENCY_REPEATS`번의 중앙값)을 `after_predict`에서 재고 그때
+    쓴다. TabArena system이 예측이 끝난 뒤 시간을 재지 않는 hook(`post_predict`)에서 테스트 행
+    하나로 부른다. 나머지 속성(`predict`, `predict_proba`, `classes_` 등)은 감싼 estimator의 것이다.
+    """
+
+    def __init__(self, estimator, record: dict, path: Path, latency: bool) -> None:
+        self.estimator = estimator
+        self.record = record
+        self.path = path
+        self.latency = latency
+
+    def __getattr__(self, name: str):
+        # 복사·pickle 도중(estimator가 아직 없을 때)에는 감싼 estimator를 찾지 않는다
+        if name.startswith("__") or name == "estimator":
+            raise AttributeError(name)
+        return getattr(self.estimator, name)
+
+    def fit(self, X, y) -> RecordedEstimator:
         start = time.perf_counter()
-        fitted = fit(X, y)
-        record = {
-            "suite": suite,
+        self.estimator.fit(X, y)
+        self.record_ = {
+            **self.record,
             "rows": len(X),
             "features": int(np.shape(X)[1]),
             "fit_seconds": time.perf_counter() - start,
-            **getattr(fitted, "fit_record_", {}),
+            **getattr(self.estimator, "fit_record_", {}),
         }
-        if latency:
-            row = X.iloc[:1] if isinstance(X, pd.DataFrame) else X[:1]
-            predict = fitted.predict_proba if suite == "classification" else fitted.predict
-            times = []
-            for _ in range(LATENCY_REPEATS):
-                t = time.perf_counter()
-                predict(row)
-                times.append(time.perf_counter() - t)
-            record["latency_ms"] = 1000 * float(np.median(times))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(record, default=float) + "\n")
-        return fitted
+        if not self.latency:
+            self._write()
+        return self
 
-    estimator.fit = fit_and_record
+    def after_predict(self, row) -> None:
+        if not self.latency:
+            return
+        predict = (
+            self.estimator.predict
+            if self.record["task"] == "regression"
+            else self.estimator.predict_proba
+        )
+        times = []
+        for _ in range(LATENCY_REPEATS):
+            t = time.perf_counter()
+            predict(row)
+            times.append(time.perf_counter() - t)
+        self.record_["latency_ms"] = 1000 * float(np.median(times))
+        self._write()
+
+    def _write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self.record_, default=float) + "\n")
 
 
 def distill_params(args: argparse.Namespace) -> dict:
@@ -499,7 +534,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
 
 
 def log_distill_artifact(args: argparse.Namespace) -> None:
-    path = Path(args.out_dir) / "distill.jsonl"
+    path = fits_path(args)
     if path.exists():
         mlflow.log_artifact(str(path), "eval")
 
@@ -533,8 +568,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.uncertainty and args.suite in ARENA_SUITES:
         # arena는 공식 패키지의 지표만 낸다. 조용히 무시하지 않고 멈춘다
         raise SystemExit("--uncertainty는 AMLB suite(classification, regression, all)에서만 쓴다.")
+    if args.uncertainty and args.distill != "none" and args.suite in ("regression", "all"):
+        # 회귀 학생은 평균만 내고 예측 분포가 없다
+        raise SystemExit("--distill은 회귀 --uncertainty와 같이 쓸 수 없다 (학생은 평균만 낸다).")
+    if args.latency and args.suite not in ARENA_SUITES:
+        raise SystemExit("--latency는 TabArena·BeyondArena suite에서만 쓴다.")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    fits_path(args).unlink(missing_ok=True)  # 이 실행의 fit만 남긴다
     use_mlflow = args.mlflow or "MLFLOW_RUN_ID" in os.environ
     if args.suite in ARENA_SUITES:
         with mlflow_run(use_mlflow):

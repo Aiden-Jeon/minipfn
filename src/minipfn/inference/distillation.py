@@ -30,10 +30,13 @@ teacher 라벨을 만드는 방식 두 가지 (`method`로 고르는 묶음 `MET
 
 여기서 정한 것 (논문에 없거나 논문과 다르다):
 
-- 분류 soft target은 행을 클래스 수만큼 복제해 클래스 k의 행에 가중치 p_k를 준다. 라이브러리의
-  multiclass log loss 그대로 soft cross-entropy와 기울기·hessian이 같아서 세 학생 모두 같은 방법을
-  쓴다. 가중치가 0인 복제 행(정답 라벨만 쓰는 `"labels"`의 다른 클래스)은 뺀다. "Pocket"은 tree
-  학생에 클래스마다 MSE 회귀를 썼다고 적었고, 2610.01435는 soft cross-entropy다
+- 분류 손실은 soft cross-entropy다("Pocket"은 tree 학생에 클래스마다 MSE 회귀를 썼다고 적었고,
+  2610.01435는 soft cross-entropy). 이진 분류의 XGBoost·LightGBM 학생은 soft label을 그대로 받는
+  목적함수(`binary:logistic`, `cross_entropy`: label이 0~1인 log loss)로 배운다. 다중 분류와
+  HistGradientBoosting 학생은 행을 클래스 수만큼 복제해 클래스 k의 복제에 가중치 p_k를 준다
+  (multiclass log loss 그대로 soft cross-entropy와 기울기·hessian이 같다). 학생 학습 행이 클래스
+  수배로 늘지 않도록 target이 `MIN_COPY_TARGET`보다 작은 복제는 뺀다(행마다 target이 가장 큰
+  클래스는 남긴다). 뺀 복제의 기울기는 크기가 그 target 정도라 무시한다
 - 회귀 target은 teacher 예측분포의 평균(`predict`)이고 손실은 제곱 오차다. α가 1보다 작으면
   α·teacher 평균 + (1 − α)·정답을 배운다(제곱 오차에서는 두 손실을 섞은 것과 같다)
 - "Pocket"의 행마다의 온도(teacher entropy로 1~5)와 confidence 가중치는 쓰지 않는다 (식이 다
@@ -42,7 +45,12 @@ teacher 라벨을 만드는 방식 두 가지 (`method`로 고르는 묶음 `MET
   수 상한 10,000에 학생 학습 행(synthetic 포함)의 10%를 떼어 50 round early stopping한다(검증
   손실도 teacher target에 대한 손실이다). 학생 bagging은 하지 않는다(2610.01435는 8-fold)
 - 범주형 열은 순서 번호로 바꿔 학생의 범주형 지원으로 넘긴다(XGBoost `enable_categorical`,
-  LightGBM `categorical_feature`, HistGradientBoosting은 범주가 255개 이하인 열만)
+  LightGBM `categorical_feature`, HistGradientBoosting은 범주가 255개 이하인 열만). teacher에는
+  번호를 원래 범주 값(문자열)으로 되돌려 넘긴다. 그래서 teacher는 증류하지 않을 때와 같은 범주
+  순서로 번호를 매긴다(번호 자체를 넘기면 문자열 "10.0"이 "2.0"보다 앞에 온다)
+- OOF는 학습 행이 `n_folds`보다 적으면 fold 수를 행 수로 줄인다. fold의 context에 클래스가
+  하나뿐이면 teacher를 부르지 않고 그 클래스의 확률 1을 쓴다(학습 행이 하나인 클래스가 그 fold에
+  있을 때)
 - teacher 예측은 `TEACHER_BATCH_ROWS`행씩 나눠 낸다(synthetic 행까지 한 번에 넣으면 GPU 메모리가
   모자랄 수 있다. 5,000행은 v2 상한인 학습 행 10,000의 TabArena 테스트 행 수 정도다). 행마다의
   예측은 같은 테스트 행 묶음과 상관없다
@@ -52,6 +60,7 @@ from __future__ import annotations
 
 import copy
 import time
+import warnings
 from typing import Any
 
 import numpy as np
@@ -74,6 +83,8 @@ EARLY_STOPPING_ROUNDS = 50
 MIN_EARLY_STOPPING_ROWS = 20  # 이보다 적으면 검증 행을 떼지 않고 나무 수를 고정한다
 FIXED_ROUNDS = 100
 TEACHER_BATCH_ROWS = 5_000
+MIN_COPY_TARGET = 1e-3  # 분류 soft target 복제에서 뺄 target의 상한
+SOFT_BINARY_STUDENTS = ("xgboost", "lightgbm")  # 이진 soft label을 그대로 받는 학생
 MAX_HIST_CATEGORIES = 255  # HistGradientBoosting 범주형 열의 범주 수 상한 (max_bins)
 STUDENT_DEFAULTS = {
     "xgboost": {
@@ -109,14 +120,13 @@ def resolve_method(method: str, **overrides: Any) -> dict:
 
 class _Student:
     """GBDT 학생 하나: 행 가중치가 있는 학습 행과 검증 행으로 early stopping해 fit한다.
-    분류(`n_classes`)는 정수 라벨, 회귀는 실수 target이다."""
+    `task`는 "regression"(실수 target), "classification"(정수 라벨), "soft_binary"(0~1 label의
+    이진 log loss, `SOFT_BINARY_STUDENTS`만)이다."""
 
-    def __init__(self, backend: str, params: dict, n_classes: int | None) -> None:
-        if backend not in STUDENTS:
-            raise ValueError(f"student는 {STUDENTS} 가운데 하나여야 한다: {backend}")
+    def __init__(self, backend: str, params: dict, task: str) -> None:
         self.backend = backend
         self.params = {**STUDENT_DEFAULTS[backend], **params}
-        self.n_classes = n_classes
+        self.task = task
 
     def fit(self, X, y, w, X_val, y_val, w_val, cat_ix: list[int], n_categories: list[int]):
         self.cat_ix, self.n_categories = cat_ix, n_categories
@@ -141,7 +151,9 @@ class _Student:
         import xgboost as xgb
 
         params = dict(self.params, enable_categorical=True)
-        cls = xgb.XGBRegressor if self.n_classes is None else xgb.XGBClassifier
+        cls = xgb.XGBClassifier if self.task == "classification" else xgb.XGBRegressor
+        if self.task == "soft_binary":
+            params.update(objective="binary:logistic", eval_metric="logloss")
         if early:
             self.model = cls(early_stopping_rounds=EARLY_STOPPING_ROUNDS, **params)
             self.model.fit(
@@ -159,10 +171,13 @@ class _Student:
     def _fit_lightgbm(self, X, y, w, X_val, y_val, w_val, early: bool) -> None:
         import lightgbm as lgb
 
-        cls = lgb.LGBMRegressor if self.n_classes is None else lgb.LGBMClassifier
+        cls = lgb.LGBMClassifier if self.task == "classification" else lgb.LGBMRegressor
+        params = dict(self.params)
+        if self.task == "soft_binary":
+            params["objective"] = "cross_entropy"
         cat = self.cat_ix or "auto"
         if early:
-            self.model = cls(**self.params)
+            self.model = cls(**params)
             self.model.fit(
                 X,
                 y,
@@ -174,17 +189,16 @@ class _Student:
                 callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
             )
         else:
-            self.model = cls(**{**self.params, "n_estimators": FIXED_ROUNDS})
+            self.model = cls(**{**params, "n_estimators": FIXED_ROUNDS})
             self.model.fit(X, y, sample_weight=w, categorical_feature=cat)
 
     def _fit_hist(self, X, y, w, X_val, y_val, w_val, early: bool) -> None:
         from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
-        cls = (
-            HistGradientBoostingRegressor
-            if self.n_classes is None
-            else (HistGradientBoostingClassifier)
-        )
+        if self.task == "soft_binary":
+            raise ValueError("HistGradientBoosting 학생은 soft label을 받지 않는다")
+        regression = self.task == "regression"
+        cls = HistGradientBoostingRegressor if regression else HistGradientBoostingClassifier
         mask = np.zeros(X.shape[1], dtype=bool)
         for i, n in zip(self.cat_ix, self.n_categories, strict=True):
             mask[i] = n <= MAX_HIST_CATEGORIES
@@ -200,6 +214,9 @@ class _Student:
         return self._frame(X) if self.backend == "xgboost" else X
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.task == "soft_binary":
+            p = np.clip(self.model.predict(self._input(X)), 0.0, 1.0)
+            return np.stack([1 - p, p], axis=1)
         return self.model.predict_proba(self._input(X))
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -258,34 +275,65 @@ class _Distilled:
 
     def _encode(self, X: Any) -> np.ndarray:
         X_num, self.cat_ix_, self.encoder_ = to_numeric(X, self.categorical_features_indices)
+        # 범주 수: 결측이 있는 열은 OrdinalEncoder가 NaN도 범주로 두지만 번호는 NaN이라 세지 않는다
         if self.encoder_ is None:
             self.n_categories_ = []
         else:
-            self.n_categories_ = [len(c) for c in self.encoder_.categories_]
+            self.n_categories_ = [int(pd.notna(c).sum()) for c in self.encoder_.categories_]
         return X_num
 
     def _transform(self, X: Any) -> np.ndarray:
         return apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
 
     def _teacher(self):
-        # 번호로 바꾼 표를 넘기므로 범주형 열을 이 표의 번호로 알려 준다 (모델은 같이 쓴다)
+        # 범주형 열을 이 표의 열 번호로 알려 준다 (모델은 같이 쓴다)
         teacher = copy.copy(self.teacher)
         teacher.categorical_features_indices = list(self.cat_ix_)
         return teacher
 
+    def _teacher_frame(self, X: np.ndarray) -> pd.DataFrame:
+        """teacher에 넘길 표: 범주형 열의 번호를 원래 범주 값(`to_numeric`이 쓴 문자열)으로
+        되돌린다. teacher가 다시 번호를 매길 때 증류하지 않을 때와 같은 순서가 된다. 결측은 NaN."""
+        df = pd.DataFrame(X)
+        for j, i in enumerate(self.cat_ix_):
+            categories = np.asarray(self.encoder_.categories_[j], dtype=object)
+            codes = X[:, i]
+            seen = np.isfinite(codes)
+            column = np.full(len(X), np.nan, dtype=object)
+            column[seen] = categories[codes[seen].astype(int)]
+            df[i] = column
+        return df
+
     def _fit_teacher_predict(self, X_ctx, y_ctx, X_query) -> np.ndarray:
-        teacher = self._teacher().fit(pd.DataFrame(X_ctx), y_ctx)
+        constant = self._constant_prediction(y_ctx, len(X_query))
+        if constant is not None:
+            return constant
+        teacher = self._teacher().fit(self._teacher_frame(X_ctx), y_ctx)
         parts = [
-            self._teacher_predict(teacher, pd.DataFrame(X_query[i : i + self.teacher_batch_rows]))
+            self._teacher_predict(
+                teacher, self._teacher_frame(X_query[i : i + self.teacher_batch_rows])
+            )
             for i in range(0, len(X_query), self.teacher_batch_rows)
         ]
-        return np.concatenate(parts) if parts else self._teacher_predict(teacher, X_query[:0])
+        return np.concatenate(parts) if parts else self._empty_prediction(0)
 
-    def _folds(self, y: np.ndarray):
-        splitter = KFold(self.n_folds, shuffle=True, random_state=self.random_state)
-        if self._stratify and np.bincount(y).min() >= self.n_folds:
-            splitter = StratifiedKFold(self.n_folds, shuffle=True, random_state=self.random_state)
-        return splitter.split(np.zeros(len(y)), y)
+    def _constant_prediction(self, y_ctx: np.ndarray, n: int) -> np.ndarray | None:
+        """teacher를 부르지 않아도 되는 context의 예측 (분류: 클래스가 하나뿐일 때)."""
+        return None
+
+    def _folds(self, y: np.ndarray) -> list:
+        """OOF fold (학습 행 번호, 예측할 행 번호). 행이 `n_folds`보다 적으면 fold 수를 행 수로."""
+        if len(y) < 2:
+            raise ValueError("teacher_labels='oof'에는 학습 행이 2개 이상 필요하다")
+        k = min(self.n_folds, len(y))
+        index = np.zeros(len(y))
+        if self._stratify and np.bincount(y).max() >= k:
+            # 행이 k개보다 적은 클래스가 있으면 sklearn이 경고만 하고 나눈다
+            splitter = StratifiedKFold(k, shuffle=True, random_state=self.random_state)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                return list(splitter.split(index, y))
+        return list(KFold(k, shuffle=True, random_state=self.random_state).split(index, y))
 
     def _teacher_targets(self, X: np.ndarray, y: np.ndarray, X_syn: np.ndarray):
         """(학습 행의 teacher 예측 또는 None, synthetic 행의 teacher 예측)."""
@@ -354,6 +402,14 @@ class DistilledClassifier(_Distilled):
     def _empty_prediction(self, n: int) -> np.ndarray:
         return np.zeros((n, len(self.classes_)))
 
+    def _constant_prediction(self, y_ctx: np.ndarray, n: int) -> np.ndarray | None:
+        classes = np.unique(y_ctx)
+        if len(classes) != 1:
+            return None
+        out = self._empty_prediction(n)
+        out[:, classes[0]] = 1.0
+        return out
+
     def _teacher_predict(self, teacher, X) -> np.ndarray:
         # fold의 학습 행에 없던 클래스는 확률 0 (teacher의 classes_는 번호의 일부다)
         out = self._empty_prediction(len(X))
@@ -375,23 +431,48 @@ class DistilledClassifier(_Distilled):
         if n_classes == 1:
             return
         train_ix, val_ix = self._split(len(X), rng)
-        # 학습 행에 target이 0보다 큰 행이 없는 클래스가 있으면 그 클래스의 검증 행을 학습으로
-        # 옮긴다 (학생이 모든 클래스를 알아야 predict_proba의 열이 classes_와 맞는다)
-        missing = (targets[train_ix] > 0).sum(axis=0) == 0
+        if n_classes == 2 and self.student in SOFT_BINARY_STUDENTS:
+            # 이진 soft label을 그대로 (행을 복제하지 않는다)
+            val = (None, None, None)
+            if val_ix is not None:
+                val = (X[val_ix], targets[val_ix, 1], weights[val_ix])
+            student = _Student(self.student, self.student_params, "soft_binary")
+            self.student_ = student.fit(
+                X[train_ix],
+                targets[train_ix, 1],
+                weights[train_ix],
+                *val,
+                self.cat_ix_,
+                self.n_categories_,
+            )
+            return
+        # 학습 행에 남는 복제가 없는 클래스가 있으면 그 클래스의 검증 행을 학습으로 옮긴다
+        # (학생이 모든 클래스를 알아야 predict_proba의 열이 classes_와 맞는다)
+        kept = self._copies(targets)
+        missing = kept[train_ix].sum(axis=0) == 0
         if val_ix is not None and missing.any():
-            move = (targets[val_ix][:, missing] > 0).any(axis=1)
+            move = kept[val_ix][:, missing].any(axis=1)
             train_ix = np.concatenate([train_ix, val_ix[move]])
             val_ix = val_ix[~move] if (~move).any() else None
         val = (None, None, None) if val_ix is None else self._expand(X, targets, weights, val_ix)
-        self.student_ = _Student(self.student, self.student_params, n_classes).fit(
+        student = _Student(self.student, self.student_params, "classification")
+        self.student_ = student.fit(
             *self._expand(X, targets, weights, train_ix), *val, self.cat_ix_, self.n_categories_
         )
 
     @staticmethod
-    def _expand(X, targets, weights, ix):
+    def _copies(targets: np.ndarray) -> np.ndarray:
+        """남길 클래스 복제 (행, 클래스): target이 `MIN_COPY_TARGET` 이상이거나 행에서 가장 큰
+        것."""
+        kept = targets >= MIN_COPY_TARGET
+        kept[np.arange(len(targets)), targets.argmax(axis=1)] = True
+        return kept & (targets > 0)
+
+    @classmethod
+    def _expand(cls, X, targets, weights, ix):
         """soft target을 클래스마다 복제한 행으로: 행 i의 클래스 k 복제에 가중치 w_i · p_ik.
-        가중치가 0인 복제는 뺀다."""
-        rows, classes = np.nonzero(targets[ix] > 0)
+        `_copies`가 남기지 않는 복제는 뺀다."""
+        rows, classes = np.nonzero(cls._copies(targets[ix]))
         w = weights[ix][rows] * targets[ix][rows, classes]
         return X[ix][rows], classes, w
 
@@ -432,7 +513,7 @@ class DistilledRegressor(_Distilled):
         val = (None, None, None)
         if val_ix is not None:
             val = (X[val_ix], targets[val_ix], weights[val_ix])
-        self.student_ = _Student(self.student, self.student_params, None).fit(
+        self.student_ = _Student(self.student, self.student_params, "regression").fit(
             X[train_ix],
             targets[train_ix],
             weights[train_ix],
