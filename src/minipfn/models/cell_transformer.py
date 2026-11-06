@@ -2,7 +2,8 @@
 (TabPFN v2 논문 Nature 2025, Fig. 1b와 Methods "Details on the neural architecture"의 구조).
 
 v2 논문 설명대로 만든 구조다. v2·2.5의 구조 설정은 `minipfn.recipes.tabpfn_v2.ARCHITECTURES`에
-있다. 각 부분은 `notebooks/03_tabpfn_v2/01_two_way_attention_primer`에서 작은 예로 따라갔다.
+있다. 각 부분은 `notebooks/03_tabpfn_v2/01_cell_tokens_and_two_way_attention`과
+`02_attention_properties_and_cost`에서 작은 예로 따라갔다.
 
 - 입력: feature마다 학습 행의 평균·표준편차로 z-정규화하고, 결측 칸은 0으로 두고 표시를 따로 넣는다
 - 셀 2개를 묶어 토큰 하나로 만들고(Linear), 마지막 열에 y 토큰을 붙인다: (B, R, G + 1, E)

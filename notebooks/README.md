@@ -17,7 +17,7 @@
 
 v1부터 3.5까지는 한 줄로 이렇게 이어집니다. 1 → 2는 토큰 단위를 행에서 셀로 바꾸고 회귀를 더했고, 2 → 2.5는 같은 구조를 키웠고, 2.5 → 3에서 구조를 통째로 바꿨고, 3 → 3.5는 3의 뼈대를 넓히고 분류·회귀를 한 모델로 합쳤습니다. 3의 마지막 단계(행 ICL)는 행 하나가 토큰 하나인 v1의 행 Transformer와 attention 규칙이 같습니다. 셀 정보를 앞쪽 블록에서 행 벡터로 압축한 뒤 v1처럼 행끼리 in-context learning을 하는 셈입니다.
 
-v1 칸은 [02_tabpfn/03 논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthrough.ipynb)에서, 나머지 칸은 각 폴더의 01 노트북에서 실제 값으로 따라갑니다. 모델 클래스는 v1이 `RowTransformer`, v2·2.5가 `CellTransformer`, 3·3.5가 `ColumnRowTransformer`이고, 같은 클래스끼리는 설정만 다릅니다.
+v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_architecture.ipynb)에서, v2 칸은 [03_tabpfn_v2/01](03_tabpfn_v2/01_cell_tokens_and_two_way_attention.ipynb)·[02](03_tabpfn_v2/02_attention_properties_and_cost.ipynb)에서, 2.5 칸은 [04_tabpfn_v2_5/01](04_tabpfn_v2_5/01_layers_and_feature_groups.ipynb)~[04](04_tabpfn_v2_5/04_inference_preprocessing.ipynb)에서, 3 칸은 [05_tabpfn_v3/01](05_tabpfn_v3/01_overview_and_cell_encoder.ipynb)·[02](05_tabpfn_v3/02_column_row_icl_stages.ipynb)에서, 3.5 칸은 [06_tabpfn_v3_5/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb)에서 실제 값으로 따라갑니다. 모델 클래스는 v1이 `RowTransformer`, v2·2.5가 `CellTransformer`, 3·3.5가 `ColumnRowTransformer`이고, 같은 클래스끼리는 설정만 다릅니다.
 
 | | v1 | v2 | 2.5 | 3 | 3.5 |
 |---|---|---|---|---|---|
@@ -44,10 +44,13 @@ v1 칸은 [02_tabpfn/03 논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthroug
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [구조적 인과 모델(SCM) 기초](02_tabpfn/01_scm_primer.ipynb) | SCM은 무엇이고, 무작위 SCM으로 표 데이터셋을 어떻게 만드는가? |
-| 02 | [BNN prior 기초](02_tabpfn/02_bnn_primer.ipynb) | BNN prior는 데이터셋을 어떻게 만들고, SCM prior와 무엇이 다른가? |
-| 03 | [논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthrough.ipynb) | SCM·BNN prior를 섞은 PFN은 어떻게 다양한 표 데이터 분류에 forward pass 한 번으로 적응하는가? |
-| 04 | [논문 규모 재현](02_tabpfn/04_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
+| 01 | [구조적 인과 모델(SCM) 기초](02_tabpfn/01_scm_primer.ipynb) | SCM은 무엇이고, SCM에서 데이터를 어떻게 뽑으며, 개입은 무엇인가? |
+| 02 | [무작위 SCM으로 표 데이터셋 만들기](02_tabpfn/02_random_scm_datasets.ipynb) | SCM 자체를 무작위로 뽑으면 어떤 표가 나오고, 그 표는 PFN에 어떻게 들어가는가? |
+| 03 | [BNN prior 기초](02_tabpfn/03_bnn_primer.ipynb) | BNN prior는 데이터셋을 어떻게 만들고, SCM prior와 무엇이 다른가? |
+| 04 | [논문 (1) PFN 복습과 아키텍처](02_tabpfn/04_tabpfn_paper_architecture.ipynb) | PFN을 표 데이터 분류에 쓰려고 Transformer와 입력·앙상블을 어떻게 바꿨는가? |
+| 05 | [논문 (2) 표 데이터를 위한 prior](02_tabpfn/05_tabpfn_paper_prior.ipynb) | SCM·BNN prior를 어떻게 섞고, 연속값을 어떻게 다중 클래스 target으로 바꾸는가? |
+| 06 | [논문 (3) 실험 결과와 한계](02_tabpfn/06_tabpfn_paper_results.ipynb) | forward pass 한 번으로 1시간 튜닝한 AutoML과 비슷한 성능을 내는가, 그리고 어디서 안 되는가? |
+| 07 | [논문 규모 재현](02_tabpfn/07_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
 실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `scripts/tabpfn/plot_card.py`, `scripts/tabpfn/train.yaml`, `scripts/tabpfn/eval.yaml` (Hub: `hub/minipfn-tabpfn-v1/README.md` 카드, `hub/push_to_hub.py`)
 
@@ -55,10 +58,13 @@ v1 칸은 [02_tabpfn/03 논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthroug
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [셀 단위 표현과 2방향 attention](03_tabpfn_v2/01_two_way_attention_primer.ipynb) | 표의 셀을 토큰으로 쓰고 행·열 방향으로 번갈아 attend하면 무엇이 달라지는가? |
-| 02 | [v2 prior](03_tabpfn_v2/02_prior_primer.ipynb) | 무작위 계산 그래프로 범주형 feature, 결측값, 계단 모양 관계가 있는 표를 어떻게 만드는가? |
-| 03 | [논문 walkthrough](03_tabpfn_v2/03_tabpfn_v2_paper_walkthrough.ipynb) | v2는 v1의 무엇을 바꿔 행 10,000개·feature 500개의 분류와 회귀를 forward pass 한 번으로 하는가? |
-| 04 | [학습 데이터: TabICL prior](03_tabpfn_v2/04_tabicl_prior.ipynb) | 논문 prior 대신 쓰는 TabICL prior는 무엇이 같고 다르며, 학습에 쓸 만큼 빨리 만들어지는가? |
+| 01 | [셀 단위 표현과 2방향 attention](03_tabpfn_v2/01_cell_tokens_and_two_way_attention.ipynb) | 표의 셀을 토큰으로 쓰고 행·열 방향으로 번갈아 attend하면 무엇이 달라지는가? |
+| 02 | [2방향 attention의 성질과 비용](03_tabpfn_v2/02_attention_properties_and_cost.ipynb) | 이 구조는 무엇을 보장하고, 열 이름표·셀 묶기·상태 캐시로 무엇을 메우며, 계산은 얼마나 드는가? |
+| 03 | [v2 prior (1) 그래프, 간선, 초기 데이터](03_tabpfn_v2/03_prior_graph_and_edges.ipynb) | 무작위 그래프와 간선 함수(신경망·나무·이산화)로 노드 값을 어떻게 계산하는가? |
+| 04 | [v2 prior (2) 그래프에서 표로](03_tabpfn_v2/04_prior_from_graph_to_table.ipynb) | 노드 값에서 범주형 feature, 결측값, 계단 모양 관계가 있는 표를 어떻게 읽어 내는가? |
+| 05 | [논문 (1) 구조, prior, 학습](03_tabpfn_v2/05_paper_walkthrough_model_and_training.ipynb) | v2는 v1의 무엇을 바꿔 행 10,000개·feature 500개의 분류와 회귀를 forward pass 한 번으로 하는가? |
+| 06 | [논문 (2) 추론, 실험, 한계](03_tabpfn_v2/06_paper_walkthrough_inference_and_results.ipynb) | 추론 앙상블은 어떻게 하고, benchmark와 강건성 실험에서 무엇을 보였으며, 이 저장소는 무엇을 재현하는가? |
+| 07 | [학습 데이터: TabICL prior](03_tabpfn_v2/07_tabicl_prior.ipynb) | 논문 prior 대신 쓰는 TabICL prior는 무엇이 같고 다르며, 학습에 쓸 만큼 빨리 만들어지는가? |
 
 재현 결과(이 prior로 500k step 학습한 뒤 논문 benchmark 숫자와 비교)는 노트북 대신 Hub 모델 카드에 정리했습니다. 분류는 [`hub/minipfn-tabpfn-v2-classifier`](../hub/minipfn-tabpfn-v2-classifier/README.md)로 평균 ROC AUC 0.924(논문 0.932), 회귀는 [`hub/minipfn-tabpfn-v2-regressor`](../hub/minipfn-tabpfn-v2-regressor/README.md)로 논문 대비 RMSE 비율 중앙값 1.023입니다.
 
@@ -68,19 +74,30 @@ v1 칸은 [02_tabpfn/03 논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthroug
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [v2에서 바뀐 구조 4가지](04_tabpfn_v2_5/01_architecture_changes.ipynb) | 층 수, 셀 3개 묶기, thinking 행, 회귀 MLP encoder는 모델의 무엇을 바꾸는가? |
-| 02 | [긴 표 학습과 추론 전처리](04_tabpfn_v2_5/02_long_tables_and_preprocessing.ipynb) | 논문이 공개하지 않은 학습 표 크기와 robust 전처리를 어떻게 정했고, 무엇을 여기서 정했는가? |
+| 01 | [구조 변경 (1) 층 수와 셀 3개 묶기](04_tabpfn_v2_5/01_layers_and_feature_groups.ipynb) | 층을 두 배로 늘리고 셀을 3개씩 묶으면 파라미터와 계산은 어떻게 바뀌는가? |
+| 02 | [구조 변경 (2) thinking 행과 회귀 MLP encoder](04_tabpfn_v2_5/02_thinking_rows_and_regression_encoder.ipynb) | 학습되는 thinking 행 64개와 회귀 MLP encoder는 모델의 무엇을 바꾸는가? |
+| 03 | [긴 표 학습](04_tabpfn_v2_5/03_long_tables.ipynb) | 논문이 공개하지 않은 학습 표 크기를 어떻게 정했고, 왜 짧은 표로 오래·긴 표로 잠깐 학습하는가? |
+| 04 | [추론 전처리와 여기서 정한 것](04_tabpfn_v2_5/04_inference_preprocessing.ipynb) | robust scaling과 soft clipping은 무엇을 하고, 2.5 재현에서 논문에 없어 여기서 정한 것은 무엇인가? |
 
 재현 결과(v2와 같은 benchmark와 TabArena-Lite에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
 
 실행 파일: `scripts/tabpfn_v2_5/train.yaml`, `scripts/tabpfn_v2_5/eval.yaml` (스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`)
 
-## `05_tabpfn_v3/` — Prior Labs, *TabPFN-3: Technical Report* (arXiv 2605.13986, 2026), *TabPFN-3.5: Technical Report* (arXiv 2609.17895, 2026)
+## `05_tabpfn_v3/` — Prior Labs, *TabPFN-3: Technical Report* (arXiv 2605.13986, 2026)
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [열 → 행 → 행 ICL 구조](05_tabpfn_v3/01_column_row_architecture.ipynb) | 셀 토큰의 2방향 attention을 열 요약 → 행 압축 → 행 ICL 세 단계로 바꾸면 무엇이 달라지고, 3.5는 무엇을 더 바꿨으며, 분류·회귀를 한 모델로 어떻게 학습하는가? |
+| 01 | [한눈에 보기와 셀 encoder](05_tabpfn_v3/01_overview_and_cell_encoder.ipynb) | 셀 토큰의 2방향 attention을 세 단계로 바꾸면 파라미터와 계산이 어떻게 달라지고, 셀은 어떻게 토큰이 되는가? |
+| 02 | [열 → 행 → 행 ICL 세 단계와 출력](05_tabpfn_v3/02_column_row_icl_stages.ipynb) | 열 요약 → 행 압축 → 행 ICL과 retrieval decoder는 각각 무엇을 받아 무엇을 내고, 구조는 무엇을 보장하는가? |
+
+실행 파일: `scripts/tabpfn_v3/train.yaml`, `scripts/tabpfn_v3/eval.yaml`. 3.5와 같은 파일이고, 3을 학습하려면 `train.yaml`에 `TABPFN_V2_ARCH=v3`와 `TABPFN_V2_TASK=classification`(또는 `regression`)을 override로 줍니다. 평가는 checkpoint에서 구조를 읽습니다. 스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`입니다.
+
+## `06_tabpfn_v3_5/` — Prior Labs, *TabPFN-3.5: Technical Report* (arXiv 2609.17895, 2026)
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [3.5가 바꾼 것과 multitask 학습](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) | 3의 뼈대를 넓히고 셀 encoder를 Fourier + ECDF로 바꾸면 무엇이 달라지고, 분류·회귀를 한 모델로 어떻게 학습하는가? |
 
 재현 결과(3.5 multitask 학습 뒤 benchmark와 TabArena-Lite·BeyondArena에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
 
-실행 파일: `scripts/tabpfn_v3/train.yaml`, `scripts/tabpfn_v3/eval.yaml` (스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`)
+실행 파일: `scripts/tabpfn_v3/train.yaml`(기본값이 `TABPFN_V2_ARCH=v3.5`, `TABPFN_V2_TASK=multitask`), `scripts/tabpfn_v3/eval.yaml`. 스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`입니다.
