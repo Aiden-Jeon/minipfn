@@ -13,6 +13,33 @@
 
 실행 파일: 없음. 학습은 04 노트북의 8절에서 직접 돌립니다.
 
+## TabPFN 버전 비교
+
+v1부터 3.5까지는 한 줄로 이렇게 이어집니다. 1 → 2는 토큰 단위를 행에서 셀로 바꾸고 회귀를 더했고, 2 → 2.5는 같은 구조를 키웠고, 2.5 → 3에서 구조를 통째로 바꿨고, 3 → 3.5는 3의 뼈대를 넓히고 분류·회귀를 한 모델로 합쳤습니다. 3의 마지막 단계(행 ICL)는 행 하나가 토큰 하나인 v1의 행 Transformer와 attention 규칙이 같습니다. 셀 정보를 앞쪽 블록에서 행 벡터로 압축한 뒤 v1처럼 행끼리 in-context learning을 하는 셈입니다.
+
+v1 칸은 [02_tabpfn/03 논문 walkthrough](02_tabpfn/03_tabpfn_paper_walkthrough.ipynb)에서, 나머지 칸은 각 폴더의 01 노트북에서 실제 값으로 따라갑니다. 모델 클래스는 v1이 `RowTransformer`, v2·2.5가 `CellTransformer`, 3·3.5가 `ColumnRowTransformer`이고, 같은 클래스끼리는 설정만 다릅니다.
+
+| | v1 | v2 | 2.5 | 3 | 3.5 |
+|---|---|---|---|---|---|
+| 뼈대 | **행 하나 = 토큰 하나**, 행 사이 attention | 셀 단위 2방향 attention (feature attention ↔ sample attention을 층마다 번갈아) | v2와 같음 | **열 → 행 → 행 ICL** 3단계 (TabICL식) | 3과 같음 |
+| 셀 묶기 | 없음 (행 전체가 토큰 하나) | 이웃한 셀 2개 → 토큰 1개 | 이웃한 셀 **3개** → 토큰 1개 | 열 $j$, $j+1$, $j+3$의 셀 3개 → 토큰 1개 (feature마다 토큰 하나) | 3과 같음 |
+| 폭 | 512 | 192 | 192 (논문에 없어 v2 값을 씀) | 셀·열·행 단계 128, 행 ICL 512 (CLS 4 × 128) | 행 ICL **1,024** (CLS 8 × 128) |
+| 층 수 | 12 | 12 | 분류 24, 회귀 18 | 열 3블록 + 행 3블록 + 행 ICL 24층 | 3과 같음 (24층은 공개되지 않아 여기서 정함) |
+| head | 4 | 6 | 6 | 행 ICL 8, 테스트 행은 KV head 1개 | 행 ICL 16 (head dim 64) |
+| 정답 y | 클래스 번호를 실수 하나로 `Linear(1 → E)`해 학습 행 토큰에 더함 | 행마다 y 토큰을 따로 붙임 | v2와 같음 | 학습 행의 셀 토큰과 행 벡터에 정답 embedding을 더함 (두 곳) | + 정답 LayerNorm (두 task 공용) |
+| thinking 행 | 없음 | 없음 | **64개** | 없음 | 없음 |
+| 입력 encoder | 행의 feature 100개를 Linear 하나로 (모자라면 0으로 채우고 $100/k$배, 결측은 0) | 셀 묶음마다 Linear | 분류 Linear, **회귀 2층 MLP** | 셀 묶음마다 Linear [값 3, 결측 표시 3] | **Fourier + ECDF 순위** → LayerNorm |
+| attention 안정화 | 없음 | 회귀에 QK-clip 250 (여기서 정함) | v2와 같음 | **QASSMax**, QK-clip은 끔 | + **q·k RMSNorm** |
+| 분류 출력 | Linear → 클래스 10개 | Linear → 클래스 10개 | v2와 같음 | **retrieval decoder** (닮은 학습 행의 정답을 모음, 보고서 최대 160클래스) | + 출력층 앞 잔차 MLP |
+| 회귀 출력 | **없음** (분류만) | bar distribution 5,000 | v2와 같음 | 2층 MLP → bar 5,000 | 잔차 MLP → Linear → bar 5,000 |
+| checkpoint | 분류 하나 | task마다 따로 | task마다 따로 | task마다 따로 | **분류·회귀 한 모델** |
+| 파라미터 (이 저장소) | 2,582만 (논문 25.82M과 같음) | 분류 724만, 회귀 1,108만 | 분류 1,434만, 회귀 1,467만 | 분류 5,306만, 회귀 5,827만 | multitask 2억 1,883만 |
+| 층마다 계산 (행 $R$, 학습 행 $N$, 토큰 열 $C$) | $R \cdot N$ (feature는 100열로 고정) | $R \cdot C^2 + C \cdot R \cdot N$ | v2와 같고 층만 많음 | 24층 행 ICL은 $R \cdot N$이라 **feature 수와 상관없음** | 3과 같음 |
+| 권장 표 크기 | 학습 행 1,000, feature 100, 클래스 10 | 학습 행 1만, feature 500 | 5만, 2,000 | 100만 행·200 feature 또는 10만 행·2,000 feature | 100만 행, 6,000 feature |
+| 추론 앙상블 (분류·회귀 멤버 수) | 클래스 번호 회전 × feature 순서 회전 × (그대로, Yeo-Johnson), 32 (온도 0.8) | quantile + power, 4·8 | quantile + robust, 4·8 | quantile + robust, 4·8 | **standard 하나**, 8·8 |
+
+2.5의 파라미터가 공식 보고서(11M·10M)보다 많은 것은 2.5 논문에 폭과 head 수가 없어 v2 값(192, 6)을 그대로 썼기 때문입니다. 3.5의 층 수와 학습 설정(step, 학습률, task 섞는 비율)은 보고서에 없어서 이 저장소가 정했습니다.
+
 ## `02_tabpfn/` — Hollmann et al., *TabPFN* (ICLR 2023)
 
 | # | 노트북 | 핵심 질문 |
@@ -23,31 +50,6 @@
 | 04 | [논문 규모 재현](02_tabpfn/04_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
 실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `scripts/tabpfn/plot_card.py`, `scripts/tabpfn/train.yaml`, `scripts/tabpfn/eval.yaml` (Hub: `hub/minipfn-tabpfn-v1/README.md` 카드, `hub/push_to_hub.py`)
-
-## TabPFN 버전 비교
-
-v2부터 3.5까지는 한 줄로 이렇게 이어집니다. 2 → 2.5는 같은 구조를 키운 것이고, 2.5 → 3에서 구조를 통째로 바꿨고, 3 → 3.5는 3의 뼈대를 넓히고 분류·회귀를 한 모델로 합쳤습니다. 아래 표의 각 칸은 해당 폴더의 01 노트북에서 실제 값으로 따라갑니다. v2·2.5는 같은 모델 클래스(`CellTransformer`)에 설정만 다르고, 3·3.5도 같은 클래스(`ColumnRowTransformer`)에 설정만 다릅니다.
-
-| | v2 | 2.5 | 3 | 3.5 |
-|---|---|---|---|---|
-| 뼈대 | 셀 단위 2방향 attention (feature attention ↔ sample attention을 층마다 번갈아) | v2와 같음 | **열 → 행 → 행 ICL** 3단계 (TabICL식) | 3과 같음 |
-| 셀 묶기 | 이웃한 셀 2개 → 토큰 1개 | 이웃한 셀 **3개** → 토큰 1개 | 열 $j$, $j+1$, $j+3$의 셀 3개 → 토큰 1개 (feature마다 토큰 하나) | 3과 같음 |
-| 폭 | 192 | 192 (논문에 없어 v2 값을 씀) | 셀·열·행 단계 128, 행 ICL 512 (CLS 4 × 128) | 행 ICL **1,024** (CLS 8 × 128) |
-| 층 수 | 12 | 분류 24, 회귀 18 | 열 3블록 + 행 3블록 + 행 ICL 24층 | 3과 같음 (24층은 공개되지 않아 여기서 정함) |
-| head | 6 | 6 | 행 ICL 8, 테스트 행은 KV head 1개 | 행 ICL 16 (head dim 64) |
-| 정답 y | 행마다 y 토큰을 따로 붙임 | v2와 같음 | 학습 행의 셀 토큰과 행 벡터에 정답 embedding을 더함 (두 곳) | + 정답 LayerNorm (두 task 공용) |
-| thinking 행 | 없음 | **64개** | 없음 | 없음 |
-| 셀 encoder | Linear | 분류 Linear, **회귀 2층 MLP** | Linear [값 3, 결측 표시 3] | **Fourier + ECDF 순위** → LayerNorm |
-| attention 안정화 | 회귀에 QK-clip 250 (여기서 정함) | v2와 같음 | **QASSMax**, QK-clip은 끔 | + **q·k RMSNorm** |
-| 분류 출력 | Linear → 클래스 10개 | v2와 같음 | **retrieval decoder** (닮은 학습 행의 정답을 모음, 보고서 최대 160클래스) | + 출력층 앞 잔차 MLP |
-| 회귀 출력 | bar distribution 5,000 | v2와 같음 | 2층 MLP → bar 5,000 | 잔차 MLP → Linear → bar 5,000 |
-| checkpoint | task마다 따로 | task마다 따로 | task마다 따로 | **분류·회귀 한 모델** |
-| 파라미터 (이 저장소) | 분류 724만, 회귀 1,108만 | 분류 1,434만, 회귀 1,467만 | 분류 5,306만, 회귀 5,827만 | multitask 2억 1,883만 |
-| 층마다 계산 (행 $R$, 학습 행 $N$, 토큰 열 $C$) | $R \cdot C^2 + C \cdot R \cdot N$ | v2와 같고 층만 많음 | 24층 행 ICL은 $R \cdot N$이라 **feature 수와 상관없음** | 3과 같음 |
-| 권장 표 크기 | 학습 행 1만, feature 500 | 5만, 2,000 | 100만 행·200 feature 또는 10만 행·2,000 feature | 100만 행, 6,000 feature |
-| 추론 앙상블 (분류·회귀 멤버 수) | quantile + power, 4·8 | quantile + robust, 4·8 | quantile + robust, 4·8 | **standard 하나**, 8·8 |
-
-2.5의 파라미터가 공식 보고서(11M·10M)보다 많은 것은 2.5 논문에 폭과 head 수가 없어 v2 값(192, 6)을 그대로 썼기 때문입니다. 3.5의 층 수와 학습 설정(step, 학습률, task 섞는 비율)은 보고서에 없어서 이 저장소가 정했습니다.
 
 ## `03_tabpfn_v2/` — Hollmann et al., *Accurate predictions on small data with a tabular foundation model* (Nature 2025)
 
