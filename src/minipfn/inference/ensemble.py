@@ -147,10 +147,11 @@ class _Base:
         self.device = torch.device(device)
         self.random_state = random_state
 
+    def _expands(self, kind: str) -> bool:
+        # `one_hot` 모드에서 이 종류의 멤버가 범주형 열을 one-hot으로 펼치는지
+        return kind in one_hot_kinds(self.one_hot, self.member_kinds)
+
     def _fit_members(self, X: Any, members: list[Member]) -> None:
-        expanded = one_hot_kinds(self.one_hot, self.member_kinds)
-        for m in members:
-            m.one_hot = m.kind in expanded
         X_num, self.cat_ix_, self.encoder_ = to_numeric(X, self.categorical_features_indices)
         self.preprocessors_ = [
             MemberPreprocessor(m, self.cat_ix_, self.max_one_hot_width).fit(X_num) for m in members
@@ -164,15 +165,20 @@ class _Base:
     def _kind(self, i: int) -> str:
         return self.member_kinds[i % len(self.member_kinds)]
 
-    def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
+    def _iter_inputs(self, X: Any, y_trains: list[np.ndarray]):
+        """멤버마다 (번호, 모델 입력 x (1, 학습 행 + 테스트 행, F), y_train (1, 학습 행))."""
         X_test = apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
-        model = self.model.to(self.device).eval()
-        autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
         for i, (prep, y_train) in enumerate(zip(self.preprocessors_, y_trains, strict=True)):
             x_test = prep.transform(X_test, np.random.default_rng(prep.member.seed + 3))
             x = np.concatenate([self.X_trains_[i], x_test])
             x = torch.as_tensor(x, dtype=torch.float32, device=self.device).unsqueeze(0)
             y = torch.as_tensor(y_train, dtype=torch.float32, device=self.device).unsqueeze(0)
+            yield i, x, y
+
+    def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
+        model = self.model.to(self.device).eval()
+        autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
+        for i, x, y in self._iter_inputs(X, y_trains):
             with (
                 torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
                 torch.inference_mode(),
@@ -189,6 +195,23 @@ class EnsembleClassifier(_Base):
 
     def fit(self, X: Any, y: Any) -> EnsembleClassifier:
         rng = np.random.default_rng(self.random_state)
+        y = self._fit_labels(y)
+        return self.fit_members(X, y, self._default_members(rng, len(self.classes_)))
+
+    def _default_members(self, rng: np.random.Generator, n_classes: int) -> list[Member]:
+        return [
+            Member(
+                kind=self._kind(i),
+                class_permutation=rng.permutation(n_classes),
+                target_power=False,
+                seed=int(rng.integers(0, 2**31 - 1)),
+                one_hot=self._expands(self._kind(i)),
+            )
+            for i in range(self.n_estimators)
+        ]
+
+    def _fit_labels(self, y: Any) -> np.ndarray:
+        """클래스(`classes_`)를 정하고 정답을 0부터 매긴 번호로 돌려준다."""
         self.label_encoder_ = LabelEncoder()
         y = self.label_encoder_.fit_transform(np.asarray(y))
         self.classes_ = self.label_encoder_.classes_
@@ -197,27 +220,27 @@ class EnsembleClassifier(_Base):
             raise ValueError(
                 f"클래스 {n_classes}개는 모델 출력({self.model.config.n_out}개)보다 많다."
             )
-        members = [
-            Member(
-                kind=self._kind(i),
-                class_permutation=rng.permutation(n_classes),
-                target_power=False,
-                seed=int(rng.integers(0, 2**31 - 1)),
-            )
-            for i in range(self.n_estimators)
-        ]
+        return y
+
+    def fit_members(self, X: Any, y: np.ndarray, members: list[Member]) -> EnsembleClassifier:
+        """정한 멤버로 맞춘다. `y`는 `classes_`의 번호다 (`_fit_labels` 뒤)."""
         self._fit_members(X, members)
         # 멤버마다 학습 행 정답을 섞은 번호로 넣는다: 원래 클래스 c → perm[c]
         self.y_trains_ = [m.class_permutation[y] for m in members]
         return self
 
-    def predict_proba(self, X: Any) -> np.ndarray:
+    def member_logits(self, X: Any):
+        """멤버마다 (번호, 원래 클래스 순서의 logit (n, 클래스 수))."""
         n_classes = len(self.classes_)
-        probs = []
         for i, logits in self._iter_logits(X, self.y_trains_):
             perm = self.preprocessors_[i].member.class_permutation
-            logits = logits[:, :n_classes][:, perm]  # 섞은 번호의 logit을 원래 클래스 순서로
-            probs.append(torch.softmax(logits / self.softmax_temperature, dim=-1))
+            yield i, logits[:, :n_classes][:, perm]  # 섞은 번호의 logit을 원래 클래스 순서로
+
+    def predict_proba(self, X: Any) -> np.ndarray:
+        probs = [
+            torch.softmax(logits / self.softmax_temperature, dim=-1)
+            for _, logits in self.member_logits(X)
+        ]
         return torch.stack(probs).mean(0).cpu().numpy()
 
     def predict(self, X: Any) -> np.ndarray:
@@ -276,19 +299,26 @@ class EnsembleRegressor(_Base):
 
     def fit(self, X: Any, y: Any) -> EnsembleRegressor:
         rng = np.random.default_rng(self.random_state)
-        y = np.asarray(y, dtype=np.float64)
-        self.y_mean_, self.y_std_ = float(y.mean()), float(y.std()) + 1e-12
-        z = (y - self.y_mean_) / self.y_std_
-        members = [
+        return self.fit_members(X, y, self._default_members(rng))
+
+    def _default_members(self, rng: np.random.Generator) -> list[Member]:
+        return [
             Member(
                 kind=self._kind(i),
                 class_permutation=None,
                 # max(2, 종류 수)개마다 켜고 끈다 (종류 1~2개는 예전과 같은 끔, 끔, 켬, 켬)
                 target_power=(i // max(2, len(self.member_kinds))) % 2 == 1,
                 seed=int(rng.integers(0, 2**31 - 1)),
+                one_hot=self._expands(self._kind(i)),
             )
             for i in range(self.n_estimators)
         ]
+
+    def fit_members(self, X: Any, y: Any, members: list[Member]) -> EnsembleRegressor:
+        """정한 멤버로 맞춘다. `y`는 원래 단위다."""
+        y = np.asarray(y, dtype=np.float64)
+        self.y_mean_, self.y_std_ = float(y.mean()), float(y.std()) + 1e-12
+        z = (y - self.y_mean_) / self.y_std_
         self._fit_members(X, members)
         b = self.borders.double().numpy()
         self.y_trains_, self.bucket_values_, self.border_maps_ = [], [], []
