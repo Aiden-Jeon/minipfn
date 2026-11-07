@@ -18,7 +18,9 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
 `TABPFN_V2_CHECKPOINT_EVERY`, `TABPFN_V2_VAL_EVERY`)로 정한다. 학습 가속 옵션(issue #46,
 `TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·`--weight-average K`
-(또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. 회귀에서 반복되는 target
+(또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. optimizer는
+`--optimizer muon`(또는 `TABPFN_V2_OPTIMIZER=muon`, issue #28)으로 바꾸고, Muon 묶음의 weight
+decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. 회귀에서 반복되는 target
 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
@@ -137,6 +139,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--weight-average-every", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE_EVERY", int)
     )
+    # optimizer (issue #28, TrainConfig 주석). 이어 학습하면 원래 run의 것을 따른다
+    parser.add_argument(
+        "--optimizer", choices=["adam", "muon"], default=os.environ.get("TABPFN_V2_OPTIMIZER")
+    )
+    parser.add_argument(
+        "--muon-weight-decay", type=float, default=_env("TABPFN_V2_MUON_WEIGHT_DECAY", float)
+    )
     parser.add_argument(
         "--collapse-threshold", default=os.environ.get("TABPFN_V2_COLLAPSE_THRESHOLD") or None
     )
@@ -245,6 +254,8 @@ def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
         "val_every": args.val_every,
         "weight_average": args.weight_average,
         "weight_average_every": args.weight_average_every,
+        "optimizer": args.optimizer,
+        "muon_weight_decay": args.muon_weight_decay,
         **{
             name: True
             for name in ("compile", "fused_adam", "tf32", "schedule_free")
