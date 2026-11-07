@@ -139,7 +139,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--weight-average-every", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE_EVERY", int)
     )
-    # optimizer (issue #28, TrainConfig 주석). 이어 학습하면 원래 run의 것을 따른다
+    # optimizer (issue #28, TrainConfig 주석). 이어 학습하면 원래 run의 것을 따른다. 다른 종류
+    # (adam·muon·schedule-free)를 주면 원래 run의 optimizer 설정은 쓰지 않는다 (`_source_options`)
     parser.add_argument(
         "--optimizer", choices=["adam", "muon"], default=os.environ.get("TABPFN_V2_OPTIMIZER")
     )
@@ -190,16 +191,27 @@ def source_speed_options(params: dict[str, str]) -> dict:
     return out
 
 
-def _with_source_speed_options(config: TrainConfig, args, options: dict) -> TrainConfig:
-    # 원래 run에서 켠 옵션은 켠 채로(플래그는 켜기만 한다), 숫자는 인자로 주지 않았으면 원래 값.
-    # schedule_free를 이어 학습에서 새로 켜면 checkpoint 검사(`check_resume_step`)가 멈춘다
-    changes = {}
-    for name, value in options.items():
-        if isinstance(value, bool):
-            changes[name] = value or getattr(config, name)
-        elif getattr(args, name, None) is None:
-            changes[name] = value
-    return replace(config, **changes)
+OPTIMIZER_OPTIONS = ("optimizer", "schedule_free", "muon_weight_decay")
+
+
+def _optimizer_kind(schedule_free: bool, optimizer: str | None) -> str | None:
+    return "schedule_free" if schedule_free else optimizer
+
+
+def _source_options(options: dict, args: argparse.Namespace) -> dict:
+    """원래 run의 학습 가속 옵션 가운데 이어 쓸 것. 인자로 준 값은 그 뒤에 덮어쓴다
+    (`_override_values`). 원래 run에서 켠 옵션은 켠 채로(플래그는 켜기만 한다), 숫자는 인자로
+    주지 않았으면 원래 값이다.
+
+    optimizer 설정(`OPTIMIZER_OPTIONS`)은 한 묶음이다. 원래 run과 다른 종류를 주면(`--optimizer`,
+    `--schedule-free`) 묶음을 통째로 쓰지 않는다(preset 값에서 시작). 가중치만 가져와 새로 학습할 때
+    optimizer를 바꿀 수 있다. 이어 학습에서 바꾸면 checkpoint 검사(`check_resume_step`)가 멈춘다
+    """
+    chosen = _optimizer_kind(args.schedule_free, args.optimizer)
+    source = _optimizer_kind(options.get("schedule_free", False), options.get("optimizer", "adam"))
+    if chosen is not None and chosen != source:
+        options = {k: v for k, v in options.items() if k not in OPTIMIZER_OPTIONS}
+    return options
 
 
 def build_config(
@@ -236,12 +248,25 @@ def build_config(
             raise SystemExit(
                 f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
             )
-    config = _overrides(replace(base, **source), args)
-    return _with_source_speed_options(config, args, speed_options or {}), arch
+    # 원래 run의 구조·옵션과 인자를 한 번에 바꾼다 (설정 검사가 중간 상태를 보지 않도록)
+    changes = {**source, **_source_options(speed_options or {}, args), **_override_values(args)}
+    return _replace(base, changes), arch
 
 
 def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
     """인자·환경변수로 준 값을 설정에 덮어쓴다."""
+    return _replace(config, _override_values(args))
+
+
+def _replace(config: TrainConfig, changes: dict) -> TrainConfig:
+    try:
+        return replace(config, **changes)
+    except ValueError as e:  # 같이 쓰지 않는 옵션 (`TrainConfig.__post_init__`)
+        raise SystemExit(f"학습 설정: {e}") from None
+
+
+def _override_values(args: argparse.Namespace) -> dict:
+    """인자·환경변수로 준 값 (주지 않은 것은 빠진다)."""
     overrides = {
         "steps": args.steps,
         "micro_batch": args.micro_batch,
@@ -264,13 +289,13 @@ def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
         "rewind_lr_factor": args.rewind_lr_factor,
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
-    config = replace(config, **{k: v for k, v in overrides.items() if v is not None})
+    overrides = {k: v for k, v in overrides.items() if v is not None}
     # `off`면 끈다 (CollapseGuard, QK-clip)
     if args.collapse_threshold is not None:
-        config = replace(config, collapse_threshold=_optional_float(args.collapse_threshold))
+        overrides["collapse_threshold"] = _optional_float(args.collapse_threshold)
     if args.qk_clip is not None:
-        config = replace(config, qk_clip=_optional_float(args.qk_clip))
-    return config
+        overrides["qk_clip"] = _optional_float(args.qk_clip)
+    return overrides
 
 
 def _check_source(path: str, config: TrainConfig, *, resume: bool) -> float:

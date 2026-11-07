@@ -320,6 +320,7 @@ def _train(
     model = config.build_model().to(device)
     if config.qk_clip is not None and not model.qk_clip_weights():
         raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
+    adam_kwargs = {"fused": True} if config.fused_adam and use_cuda else {}
     if config.schedule_free:
         # warmup 뒤 일정한 lr. 평균은 optimizer가 든다 (`training.schedule_free`)
         opt = ScheduleFreeAdamW(model.parameters(), lr=config.lr)
@@ -327,15 +328,11 @@ def _train(
     elif config.optimizer == "muon":
         # 블록 안 가중치 행렬은 Muon, 나머지는 Adam (`training.muon`). 스케줄은 Adam과 같다
         opt = MuonAdam(
-            model,
-            lr=config.lr,
-            weight_decay=config.muon_weight_decay,
-            fused_adam=config.fused_adam and use_cuda,
+            model, lr=config.lr, weight_decay=config.muon_weight_decay, adam_kwargs=adam_kwargs
         )
         schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     else:
-        fused = {"fused": True} if config.fused_adam and use_cuda else {}
-        opt = torch.optim.Adam(model.parameters(), lr=config.lr, **fused)
+        opt = torch.optim.Adam(model.parameters(), lr=config.lr, **adam_kwargs)
         schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     sched = torch.optim.lr_scheduler.LambdaLR(opt, schedule)
 

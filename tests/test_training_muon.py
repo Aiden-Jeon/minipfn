@@ -6,11 +6,12 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 from minipfn.recipes import tabpfn_v3
 from minipfn.training.config import TrainConfig
 from minipfn.training.loop import check_resume_step, train
-from minipfn.training.muon import MuonAdam, muon_parameters
+from minipfn.training.muon import MuonAdam, _newton_schulz, muon_parameters
 from minipfn.utils import lr_factor
 
 
@@ -20,11 +21,16 @@ def _names(model, params):
 
 
 def test_muon_takes_block_matrices_only():
-    # v2: 블록 안 Linear weight는 모두 Muon, embedding·decoder·bias는 Adam
+    # v2: 블록 안 Linear weight는 모두 Muon, embedding·decoder·bias는 Adam. qkv는 셋으로 나눈다
     model = TrainConfig.smoke().build_model()
-    muon, adam = muon_parameters(model)
+    pairs, adam = muon_parameters(model)
+    muon = [p for p, _ in pairs]
     assert muon and all(p.ndim == 2 for p in muon)
     assert all(n.startswith("layers.") and n.endswith(".weight") for n in _names(model, muon))
+    split = {n: s for n, p in model.named_parameters() for q, s in pairs if p is q}
+    assert split["layers.0.sample_attention.qkv.weight"] == 3
+    assert split["layers.0.sample_attention.out.weight"] == 1
+    assert split["layers.0.mlp.0.weight"] == 1
     assert not any(
         n.startswith("layers.") and p.ndim == 2
         for n, p in model.named_parameters()
@@ -35,7 +41,7 @@ def test_muon_takes_block_matrices_only():
     v35 = tabpfn_v3.with_architecture(TrainConfig.smoke("multitask"), "v3.5", keep_size=True)
     model = v35.build_model()
     muon, adam = muon_parameters(model)
-    muon_names, adam_names = _names(model, muon), _names(model, adam)
+    muon_names, adam_names = _names(model, [p for p, _ in muon]), _names(model, adam)
     assert "column_blocks.0.summarize.qkv.weight" in muon_names
     assert {"cls_tokens", "column_blocks.0.inducing"} <= adam_names
     assert "column_blocks.0.summarize.qassmax.base_mlp.0.weight" in adam_names
@@ -43,37 +49,77 @@ def test_muon_takes_block_matrices_only():
 
 
 def test_muon_adam_is_muon_plus_adam():
-    # 묶은 optimizer는 같은 파라미터를 torch.optim.Muon·Adam으로 따로 학습한 것과 비트 단위로 같다
-    # (scheduler가 바꾼 lr도 두 묶음에 들어간다)
+    # 묶은 optimizer는 같은 파라미터를 torch.optim.Muon·Adam으로 따로 학습한 것과 비트 단위로 같다.
+    # qkv는 q·k·v 조각을 따로 둔 torch.optim.Muon과 같다 (scheduler가 바꾼 lr도 모든 묶음에
+    # 들어간다)
     torch.manual_seed(0)
     model = TrainConfig.smoke().build_model()
-    ref = TrainConfig.smoke().build_model()
-    ref.load_state_dict(model.state_dict())
     opt = MuonAdam(model, lr=1e-3, weight_decay=0.01)
-    ref_muon, ref_adam = muon_parameters(ref)
+    pairs, adam = muon_parameters(model)
+    pieces = {  # 모델 파라미터 → 따로 학습할 조각들
+        p: [nn.Parameter(w.clone()) for w in p.detach().chunk(s)] for p, s in pairs
+    }
+    pieces.update({p: [nn.Parameter(p.detach().clone())] for p in adam})
     ref_opts = [
         torch.optim.Muon(
-            ref_muon, lr=1e-3, weight_decay=0.01, momentum=0.95, adjust_lr_fn="match_rms_adamw"
+            [w for p, _ in pairs for w in pieces[p]],
+            lr=1e-3,
+            weight_decay=0.01,
+            momentum=0.95,
+            adjust_lr_fn="match_rms_adamw",
         ),
-        torch.optim.Adam(ref_adam, lr=1e-3),
+        torch.optim.Adam([pieces[p][0] for p in adam], lr=1e-3),
     ]
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_factor(s, 2, 6))
     ref_scheds = [
         torch.optim.lr_scheduler.LambdaLR(o, lambda s: lr_factor(s, 2, 6)) for o in ref_opts
     ]
     for _ in range(6):
-        for p, q in zip(model.parameters(), ref.parameters(), strict=True):
-            g = torch.randn_like(p)
-            p.grad, q.grad = g.clone(), g.clone()
+        for p, ws in pieces.items():
+            p.grad = torch.randn_like(p)
+            for w, g in zip(ws, p.grad.chunk(len(ws)), strict=True):
+                w.grad = g.clone()
         opt.step()
         sched.step()
         for o, s in zip(ref_opts, ref_scheds, strict=True):
             o.step()
             s.step()
         opt.zero_grad()
-    for (name, p), q in zip(model.named_parameters(), ref.parameters(), strict=True):
-        assert torch.equal(p, q), name
-    assert [g["lr"] for g in opt.param_groups] == [o.param_groups[0]["lr"] for o in ref_opts]
+    for name, p in model.named_parameters():
+        assert torch.equal(p, torch.cat(list(pieces[p]))), name
+    assert {g["lr"] for g in opt.param_groups} == {o.param_groups[0]["lr"] for o in ref_opts}
+
+
+def test_qkv_is_orthogonalized_per_block():
+    # 조각마다 직교 행렬 쪽으로 간다: 묶어서 하면 각 조각의 특이값이 1보다 한참 작다
+    torch.manual_seed(0)
+    g = torch.randn(3 * 16, 16)
+    split = torch.cat([_newton_schulz(u) for u in g.split(16)]).float()
+    joint = _newton_schulz(g).float()
+    for i in range(3):
+        block = slice(16 * i, 16 * (i + 1))
+        assert torch.linalg.svdvals(split[block]).min() > 0.5
+        assert torch.linalg.svdvals(joint[block]).mean() < 0.75
+
+
+def test_muon_takes_multihead_attention_projections():
+    # nn.MultiheadAttention의 입력 projection(q·k·v 묶음)도 out_proj처럼 Muon이 맡는다
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(1, 8)
+            self.block = nn.MultiheadAttention(8, 2, batch_first=True)
+
+        def repeated_blocks(self):
+            return [self.block]
+
+    model = Model()
+    muon, adam = muon_parameters(model)
+    assert [(n, s) for n, p in model.named_parameters() for q, s in muon if p is q] == [
+        ("block.in_proj_weight", 3),
+        ("block.out_proj.weight", 1),
+    ]
+    assert {"embed.weight", "block.in_proj_bias"} <= _names(model, adam)
 
 
 def test_muon_adam_state_round_trip():
@@ -83,11 +129,16 @@ def test_muon_adam_state_round_trip():
     for p in model.parameters():
         p.grad = torch.randn_like(p)
     opt.step()
+    assert len(opt.state) == len(list(model.parameters()))
     state = opt.state_dict()
-    other = MuonAdam(model, lr=5e-4)
+    # 이어 학습할 때 weight decay는 지금 설정을 쓴다 (lr은 학습 루프가 맞춘다)
+    other = MuonAdam(model, lr=5e-4, weight_decay=0.05)
     other.load_state_dict(state)
-    assert [g["lr"] for g in other.param_groups] == [1e-3, 1e-3]
+    assert [g["lr"] for g in other.param_groups] == [1e-3] * len(other.param_groups)
+    assert [g["weight_decay"] for g in other.muon.param_groups] == [0.05, 0.05]
     assert other.param_groups[0] is other.muon.param_groups[0]  # scheduler가 바꿀 group
+    with pytest.raises(NotImplementedError):
+        other.add_param_group({"params": []})
     with pytest.raises(ValueError, match="MuonAdam"):
         other.load_state_dict(torch.optim.Adam(model.parameters()).state_dict())
 
@@ -201,3 +252,39 @@ def test_train_script_takes_the_optimizer(monkeypatch):
     args = script.parse_args(["--config-name", "smoke", "--resume-run-id", "r"])
     config, _ = script.build_config(args, source, options)
     assert config.optimizer == "muon"
+
+
+def test_train_script_switches_or_keeps_the_source_optimizer(monkeypatch):
+    # 원래 run의 optimizer 설정은 한 묶음: 같은 종류면 이어 쓰고(값만 인자로 바꾼다), 다른 종류를
+    # 주면 통째로 버린다. 설정 검사는 원래 run의 옵션과 인자를 합친 마지막 설정만 본다
+    from minipfn.hub import run_architecture
+
+    for name in (
+        "TABPFN_V2_OPTIMIZER",
+        "TABPFN_V2_MUON_WEIGHT_DECAY",
+        "TABPFN_V2_SCHEDULE_FREE",
+        "TABPFN_V2_CONFIG_NAME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    script = _script("train_script_muon_switch")
+    source = run_architecture({k: str(v) for k, v in vars(TrainConfig.smoke()).items()})
+    muon = {"optimizer": "muon", "muon_weight_decay": 0.05, "schedule_free": False}
+
+    def build(*flags, options=muon):
+        args = script.parse_args(["--config-name", "smoke", "--init-run-id", "r", *flags])
+        return script.build_config(args, source, options)[0]
+
+    config = build("--muon-weight-decay", "0.1")  # --optimizer muon 없이 값만 바꾼다
+    assert config.optimizer == "muon" and config.muon_weight_decay == 0.1
+    config = build("--optimizer", "muon")  # 같은 종류: 원래 weight decay를 이어 쓴다
+    assert config.muon_weight_decay == 0.05
+    config = build("--optimizer", "adam")  # 다른 종류: 원래 weight decay를 버린다
+    assert config.optimizer == "adam" and config.muon_weight_decay == 0.0
+    schedule_free = {"optimizer": "adam", "schedule_free": True}
+    config = build("--optimizer", "muon", options=schedule_free)
+    assert config.optimizer == "muon" and not config.schedule_free
+    assert build(options=schedule_free).schedule_free
+    config = build("--schedule-free")  # muon run에서 schedule-free로
+    assert config.schedule_free and config.optimizer == "adam"
+    with pytest.raises(SystemExit, match="schedule_free"):
+        build("--schedule-free", "--optimizer", "muon")
