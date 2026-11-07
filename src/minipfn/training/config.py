@@ -21,7 +21,7 @@ from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_modul
 from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 
 N_BUCKETS = 5000
-# 학습 가속 옵션 (issue #46). 이어 학습하면 원래 run의 값을 따른다
+# 학습 가속 옵션 (issue #46)과 optimizer 종류 (issue #28). 이어 학습하면 원래 run의 값을 따른다
 # (학습 스크립트, `check_resume_step`)
 SPEED_OPTIONS = (
     "compile",
@@ -30,7 +30,10 @@ SPEED_OPTIONS = (
     "schedule_free",
     "weight_average",
     "weight_average_every",
+    "optimizer",
+    "muon_weight_decay",
 )
+OPTIMIZERS = ("adam", "muon")
 # 한 task 학습과, 분류·회귀를 한 모델로 같이 학습하는 multitask (`task_configs`)
 TASKS = ("classification", "regression", "multitask")
 
@@ -142,6 +145,11 @@ class TrainConfig:
     # 0이면 끈다
     weight_average: int = 0
     weight_average_every: int = 500
+    # optimizer (issue #28): adam(기본, 논문) 또는 muon(블록 안 가중치 행렬은 Muon, 나머지는 Adam,
+    # `training.muon`). muon은 Adam과 같은 lr·스케줄을 쓴다(갱신 크기를 AdamW RMS에 맞춘다).
+    # muon_weight_decay는 Muon 묶음의 decoupled weight decay (Adam 묶음은 지금처럼 없음)
+    optimizer: Literal["adam", "muon"] = "adam"
+    muon_weight_decay: float = 0.0
 
     def __post_init__(self) -> None:
         self.model_type = canonical_model_type(self.model_type)
@@ -163,6 +171,12 @@ class TrainConfig:
             raise ValueError("schedule_free와 qk_clip은 같이 쓰지 않는다")
         if self.schedule_free and self.fused_adam:
             raise ValueError("fused_adam은 Adam에만 있다 (schedule_free와 같이 쓰지 않는다)")
+        if self.optimizer not in OPTIMIZERS:
+            raise ValueError(f"optimizer는 {OPTIMIZERS} 가운데 하나여야 한다: {self.optimizer}")
+        if self.optimizer == "muon" and self.schedule_free:
+            raise ValueError("schedule_free는 Adam 쪽 방법이다 (optimizer=muon과 같이 쓰지 않는다)")
+        if self.muon_weight_decay < 0 or (self.muon_weight_decay and self.optimizer != "muon"):
+            raise ValueError("muon_weight_decay는 0 이상이고 optimizer=muon일 때만 쓴다")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
 
