@@ -21,6 +21,16 @@ from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_modul
 from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 
 N_BUCKETS = 5000
+# 학습 가속 옵션 (issue #46). 이어 학습하면 원래 run의 값을 따른다
+# (학습 스크립트, `check_resume_step`)
+SPEED_OPTIONS = (
+    "compile",
+    "fused_adam",
+    "tf32",
+    "schedule_free",
+    "weight_average",
+    "weight_average_every",
+)
 # 한 task 학습과, 분류·회귀를 한 모델로 같이 학습하는 multitask (`task_configs`)
 TASKS = ("classification", "regression", "multitask")
 
@@ -114,6 +124,24 @@ class TrainConfig:
     # 그래서 이 step마다만 한다. 폭주할 때도 상한은 수천 step에 걸쳐 커져서 50 step 사이에 넘는 양은
     # 몇 % 안팎이다
     qk_clip_every: int = 50
+    # 학습 가속 (nanoTabPFN speedrun, arXiv 2606.03681에서 가져온 것. issue #46). 기본값은 모두
+    # 꺼져 있어 예전 학습과 비트 단위로 같다
+    # - compile: 학습 forward를 torch.compile(dynamic=True)로. 표 크기가 batch마다 달라 shape는
+    #   동적으로 둔다
+    # - fused_adam: CUDA fused Adam (한 kernel로 모든 파라미터를 갱신)
+    # - tf32: float32 matmul을 TF32로 (bf16 autocast 밖의 matmul. `set_float32_matmul_precision`)
+    compile: bool = False
+    fused_adam: bool = False
+    tf32: bool = False
+    # schedule-free AdamW (Defazio et al. 2024, speedrun의 Adam 쪽): cosine 대신 warmup 뒤 일정한
+    # lr로 가고, 가중치의 평균을 optimizer가 들고 있다가 검증·저장할 때 그 평균을 쓴다. 학습 길이를
+    # 미리 정하지 않아도 되어 chunk로 나눠 학습하기 쉽다. β1은 0.9, weight decay는 0
+    schedule_free: bool = False
+    # LAWA(latest weight averaging, speedrun record 7): 이 step마다 남긴 가중치 최근 K개를 평균해
+    # 검증(`val_*_avg`)하고 마지막에 `final_avg.pt`로 저장한다. 학습 자체는 바꾸지 않는다.
+    # 0이면 끈다
+    weight_average: int = 0
+    weight_average_every: int = 500
 
     def __post_init__(self) -> None:
         self.model_type = canonical_model_type(self.model_type)
@@ -129,6 +157,14 @@ class TrainConfig:
             raise ValueError(f"qk_clip은 0보다 커야 한다: {self.qk_clip}")
         if self.qk_clip_every < 1:
             raise ValueError(f"qk_clip_every는 1 이상이어야 한다: {self.qk_clip_every}")
+        if self.schedule_free and self.qk_clip is not None:
+            # QK-clip은 학습 중 가중치(y)를 줄이는데, schedule-free는 평균 가중치(x)를 optimizer
+            # 상태에서 다시 만든다. 둘을 같이 쓰는 방식은 정하지 않았다
+            raise ValueError("schedule_free와 qk_clip은 같이 쓰지 않는다")
+        if self.schedule_free and self.fused_adam:
+            raise ValueError("fused_adam은 Adam에만 있다 (schedule_free와 같이 쓰지 않는다)")
+        if self.weight_average < 0 or self.weight_average_every < 1:
+            raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
 
     @property
     def n_out(self) -> int:

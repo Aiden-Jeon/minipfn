@@ -242,7 +242,11 @@ class QASSMax(nn.Module):
 
     def forward(self, q: torch.Tensor, n_keys: int) -> torch.Tensor:
         # q: (N, H, L, d)
-        log_n = q.new_full((1, 1), math.log(max(n_keys, 1)))
+        if torch.compiler.is_compiling():
+            # compile할 때는 텐서로: Python float로 만들면 n마다 다시 compile한다
+            log_n = (torch.ones((1, 1), device=q.device) * n_keys).clamp(min=1).log().to(q.dtype)
+        else:  # 예전과 같은 값 (float64 log를 q의 dtype으로)
+            log_n = q.new_full((1, 1), math.log(max(n_keys, 1)))
         base = self.base_mlp(log_n).view(1, self.nhead, 1, self.head_dim)
         return q * base * (1 + torch.tanh(self.query_mlp(q)))
 
@@ -547,6 +551,10 @@ class ColumnRowTransformer(nn.Module):
     def tasks(self) -> tuple[str, ...]:
         """이 모델이 내는 task (multitask면 둘 다. forward의 `task`로 고른다)."""
         return self.config.tasks
+
+    def repeated_blocks(self) -> list[nn.Module]:
+        """여러 번 쓰는 블록 (학습 가속 옵션 `compile`이 블록마다 compile한다)."""
+        return [*self.column_blocks, *self.row_blocks, *self.icl_layers]
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

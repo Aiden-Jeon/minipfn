@@ -16,7 +16,10 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
-`TABPFN_V2_CHECKPOINT_EVERY`)로 정한다. 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
+`TABPFN_V2_CHECKPOINT_EVERY`, `TABPFN_V2_VAL_EVERY`)로 정한다. 학습 가속 옵션(issue #46,
+`TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·`--weight-average K`
+(또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. 회귀에서 반복되는 target
+값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
@@ -54,7 +57,7 @@ from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.recipes import tabpfn_v3  # noqa: E402
-from minipfn.training.config import TrainConfig  # noqa: E402
+from minipfn.training.config import SPEED_OPTIONS, TrainConfig  # noqa: E402
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
@@ -68,6 +71,22 @@ PRESETS = {
 CONFIG_NAMES = tuple(PRESETS)
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
+
+
+TRUE_VALUES, FALSE_VALUES = ("1", "true", "yes", "on"), ("", "0", "false", "no", "off")
+
+
+def _env_flag(name: str) -> bool:
+    """켜고 끄는 환경변수 (대소문자 무시: 1/true/yes/on, 0/false/no/off, 비우면 끔). 그 밖의 값은
+    조용히 꺼지지 않도록 멈춘다."""
+    value = os.environ.get(name, "").strip().lower()
+    if value in TRUE_VALUES:
+        return True
+    if value in FALSE_VALUES:
+        return False
+    raise SystemExit(
+        f"{name}={os.environ[name]!r}는 켜고 끄는 값이 아니다 ({TRUE_VALUES} 또는 {FALSE_VALUES})"
+    )
 
 
 def _env(name: str, cast=str):
@@ -108,6 +127,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--checkpoint-every", type=int, default=_env("TABPFN_V2_CHECKPOINT_EVERY", int)
     )
     parser.add_argument("--keep-every", type=int, default=_env("TABPFN_V2_KEEP_EVERY", int))
+    parser.add_argument("--val-every", type=int, default=_env("TABPFN_V2_VAL_EVERY", int))
+    # 학습 가속 (TrainConfig 주석). 켜기만 한다. 이어 학습하면 원래 run에서 켠 것은 그대로 켜진다
+    # (`source_speed_options`)
+    for flag in ("compile", "fused-adam", "tf32", "schedule-free"):
+        env = "TABPFN_V2_" + flag.upper().replace("-", "_")
+        parser.add_argument(f"--{flag}", action="store_true", default=_env_flag(env))
+    parser.add_argument("--weight-average", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE", int))
+    parser.add_argument(
+        "--weight-average-every", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE_EVERY", int)
+    )
     parser.add_argument(
         "--collapse-threshold", default=os.environ.get("TABPFN_V2_COLLAPSE_THRESHOLD") or None
     )
@@ -140,12 +169,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def source_speed_options(params: dict[str, str]) -> dict:
+    """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict."""
+    defaults = TrainConfig()
+    out = {}
+    for name in SPEED_OPTIONS:
+        if name in params:
+            default = getattr(defaults, name)
+            text = params[name]
+            out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
+    return out
+
+
+def _with_source_speed_options(config: TrainConfig, args, options: dict) -> TrainConfig:
+    # 원래 run에서 켠 옵션은 켠 채로(플래그는 켜기만 한다), 숫자는 인자로 주지 않았으면 원래 값.
+    # schedule_free를 이어 학습에서 새로 켜면 checkpoint 검사(`check_resume_step`)가 멈춘다
+    changes = {}
+    for name, value in options.items():
+        if isinstance(value, bool):
+            changes[name] = value or getattr(config, name)
+        elif getattr(args, name, None) is None:
+            changes[name] = value
+    return replace(config, **changes)
+
+
 def build_config(
-    args: argparse.Namespace, source: dict | None = None
+    args: argparse.Namespace, source: dict | None = None, speed_options: dict | None = None
 ) -> tuple[TrainConfig, str | None]:
     """(학습 설정, 구조 이름). `source`는 이어 가거나 가중치를 가져올 run의 모델 구조
     (`hub.run_architecture`)다. 주면 그 구조를 쓰고, `--arch`도 줬으면 둘이 같은지 본다. 구조 이름은
-    `ARCHITECTURES`의 것과 맞지 않으면 None이다."""
+    `ARCHITECTURES`의 것과 맞지 않으면 None이다. `speed_options`는 원래 run의 학습 가속 옵션
+    (`source_speed_options`)이다."""
     keep_size = args.config_name == "smoke"
 
     def preset(arch: str) -> TrainConfig:
@@ -173,7 +227,8 @@ def build_config(
             raise SystemExit(
                 f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
             )
-    return _overrides(replace(base, **source), args), arch
+    config = _overrides(replace(base, **source), args)
+    return _with_source_speed_options(config, args, speed_options or {}), arch
 
 
 def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
@@ -187,6 +242,14 @@ def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
         "stop_step": args.stop_step,
         "checkpoint_every": args.checkpoint_every,
         "keep_every": args.keep_every,
+        "val_every": args.val_every,
+        "weight_average": args.weight_average,
+        "weight_average_every": args.weight_average_every,
+        **{
+            name: True
+            for name in ("compile", "fused_adam", "tf32", "schedule_free")
+            if getattr(args, name)
+        },
         "rewind_lr_factor": args.rewind_lr_factor,
         "deadline": datetime.fromisoformat(args.deadline).timestamp() if args.deadline else None,
     }
@@ -232,13 +295,14 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    source = None
+    source, speed_options = None, None
     if args.init_run_id or args.resume_run_id:
         params = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id).data.params
         if params["task"] != args.task:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
-    config, arch = build_config(args, source)
+        speed_options = source_speed_options(params)
+    config, arch = build_config(args, source, speed_options)
 
     init_path = None
     if args.init_run_id:
