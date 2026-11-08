@@ -49,6 +49,7 @@ from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
 from minipfn.training.data import PriorBatches
 from minipfn.training.losses import dequantize_targets, prior_loss
+from minipfn.training.muon import MuonAdam
 from minipfn.training.schedule_free import ScheduleFreeAdamW, warmup_factor
 from minipfn.training.stability import (
     CollapseGuard,
@@ -208,6 +209,12 @@ def check_resume_step(state: dict, config: TrainConfig) -> None:
             f"이어 갈 checkpoint는 schedule_free={saved_schedule_free}로 학습했다"
             f" (설정은 {config.schedule_free}). 원래 run과 같은 optimizer로 이어 간다"
         )
+    saved_optimizer = state.get("optimizer_type", "adam")  # 이 키가 생기기 전의 run은 Adam
+    if saved_optimizer != config.optimizer:
+        raise ValueError(
+            f"이어 갈 checkpoint는 optimizer={saved_optimizer}로 학습했다"
+            f" (설정은 {config.optimizer}). 원래 run과 같은 optimizer로 이어 간다"
+        )
     step, stop = int(state["step"]), min(config.stop_step or config.steps, config.steps)
     if step >= stop:
         raise ValueError(
@@ -313,13 +320,19 @@ def _train(
     model = config.build_model().to(device)
     if config.qk_clip is not None and not model.qk_clip_weights():
         raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
+    adam_kwargs = {"fused": True} if config.fused_adam and use_cuda else {}
     if config.schedule_free:
         # warmup 뒤 일정한 lr. 평균은 optimizer가 든다 (`training.schedule_free`)
         opt = ScheduleFreeAdamW(model.parameters(), lr=config.lr)
         schedule = lambda s: warmup_factor(s, config.warmup_steps)  # noqa: E731
+    elif config.optimizer == "muon":
+        # 블록 안 가중치 행렬은 Muon, 나머지는 Adam (`training.muon`). 스케줄은 Adam과 같다
+        opt = MuonAdam(
+            model, lr=config.lr, weight_decay=config.muon_weight_decay, adam_kwargs=adam_kwargs
+        )
+        schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     else:
-        fused = {"fused": True} if config.fused_adam and use_cuda else {}
-        opt = torch.optim.Adam(model.parameters(), lr=config.lr, **fused)
+        opt = torch.optim.Adam(model.parameters(), lr=config.lr, **adam_kwargs)
         schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     sched = torch.optim.lr_scheduler.LambdaLR(opt, schedule)
 
@@ -709,6 +722,7 @@ def _train(
                 "train_seconds": train_seconds,
                 # optimizer 종류 (이어 학습할 때 같은지 본다, `check_resume_step`)
                 "schedule_free": config.schedule_free,
+                "optimizer_type": config.optimizer,
             }
             torch.save(state, out_dir / "latest.pt")
             kept = None
