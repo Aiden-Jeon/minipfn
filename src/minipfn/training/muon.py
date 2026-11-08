@@ -82,6 +82,19 @@ def _newton_schulz(grad: torch.Tensor) -> torch.Tensor:
     return x.T if tall else x
 
 
+def _nesterov(grad: torch.Tensor, buf: torch.Tensor, group: dict) -> torch.Tensor:
+    """직교화할 Nesterov 갱신."""
+    return grad.lerp(buf, group["momentum"])
+
+
+def _apply(p: torch.Tensor, update: torch.Tensor, group: dict) -> None:
+    """weight decay와 직교화한 갱신을 더한다. lr은 조각 크기로 보정한다(match_rms_adamw)."""
+    rows, cols = p.shape[0] // group["split"], p.shape[1]
+    lr = group["lr"]
+    p.mul_(1 - lr * group["weight_decay"])
+    p.add_(update, alpha=-(lr * (0.2 * math.sqrt(max(rows, cols)))))
+
+
 def _piece_cost(rows: int, cols: int) -> int:
     """조각 하나의 Newton–Schulz 곱셈 양 (반복 한 번: 짧은 변 m, 긴 변 n이면 m²·(2n + m))."""
     m, n = min(rows, cols), max(rows, cols)
@@ -109,7 +122,11 @@ def shard_group(scope: str):
         return None
     if scope == "all":
         return dist.group.WORLD
-    local = int(os.environ.get("LOCAL_WORLD_SIZE", dist.get_world_size()))
+    # torchrun이 넣는 값. 없으면(다른 launcher) 이 노드의 GPU 수로 본다. 전체 GPU 수로 두면
+    # node가 조용히 all이 되어 노드 사이로 all-gather가 나간다
+    local = int(os.environ.get("LOCAL_WORLD_SIZE") or torch.cuda.device_count() or 1)
+    if dist.get_world_size() % local:
+        raise ValueError(f"GPU {dist.get_world_size()}개를 노드당 {local}개로 나눌 수 없다")
     if local == dist.get_world_size():
         return dist.group.WORLD
     group, _ = dist.new_subgroups(group_size=local)
@@ -156,23 +173,27 @@ class Muon(torch.optim.Optimizer):
             self._step_sharded()
             return
         for group in self.param_groups:
-            lr, momentum, split = group["lr"], group["momentum"], group["split"]
+            split = group["split"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(p.grad)
-                buf = state["momentum_buffer"]
-                buf.lerp_(p.grad, 1 - momentum)
-                update = p.grad.lerp(buf, momentum)  # Nesterov
-                rows, cols = p.shape[0] // split, p.shape[1]
+                buf = self._momentum(p, group)
+                update = _nesterov(p.grad, buf, group)
+                rows = p.shape[0] // split
                 if split == 1:
                     update = _newton_schulz(update)
                 else:
                     update = torch.cat([_newton_schulz(u) for u in update.split(rows)])
-                p.mul_(1 - lr * group["weight_decay"])
-                p.add_(update, alpha=-(lr * (0.2 * math.sqrt(max(rows, cols)))))
+                _apply(p, update, group)
+
+    def _momentum(self, p: torch.Tensor, group: dict) -> torch.Tensor:
+        """momentum buffer를 이번 gradient로 갱신하고 돌려준다 (두 경로가 같이 쓴다)."""
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(p.grad)
+        buf = state["momentum_buffer"]
+        buf.lerp_(p.grad, 1 - group["momentum"])
+        return buf
 
     def _step_sharded(self) -> None:
         """`step`과 같은 갱신을 group의 GPU끼리 조각을 나눠 계산한다.
@@ -201,19 +222,15 @@ class Muon(torch.optim.Optimizer):
 
         sends, sizes, k = [], [0] * n_ranks, 0
         for p, g, rows in active:
-            split, momentum = g["split"], g["momentum"]
-            state = self.state[p]
-            if "momentum_buffer" not in state:
-                state["momentum_buffer"] = torch.zeros_like(p.grad)
-            buf = state["momentum_buffer"]
-            buf.lerp_(p.grad, 1 - momentum)
-            mine = [j for j in range(split) if owner[k + j] == me]
-            if mine:
-                update = p.grad.lerp(buf, momentum)  # Nesterov
-                pieces = update.split(rows) if split > 1 else [update]
-                for j in mine:
-                    orth = _newton_schulz(pieces[j])
-                    sends.append((orth.T if rows > p.shape[1] else orth).reshape(-1))
+            split = g["split"]
+            buf = self._momentum(p, g)
+            for j in range(split):
+                if owner[k + j] != me:
+                    continue
+                # 맡은 조각의 행만 (행 단위 원소별 계산이라 전체를 계산해 자른 것과 같다)
+                rows_j = slice(j * rows, (j + 1) * rows)
+                orth = _newton_schulz(_nesterov(p.grad[rows_j], buf[rows_j], g))
+                sends.append((orth.T if rows > p.shape[1] else orth).reshape(-1))
             for j in range(split):
                 sizes[owner[k + j]] += rows * p.shape[1]
             k += split
@@ -234,10 +251,7 @@ class Muon(torch.optim.Optimizer):
                 offsets[r] += rows * cols
                 parts.append(flat.view(cols, rows).T if rows > cols else flat.view(rows, cols))
             k += g["split"]
-            update = parts[0] if g["split"] == 1 else torch.cat(parts)
-            lr = g["lr"]
-            p.mul_(1 - lr * g["weight_decay"])
-            p.add_(update, alpha=-(lr * (0.2 * math.sqrt(max(rows, cols)))))
+            _apply(p, parts[0] if g["split"] == 1 else torch.cat(parts), g)
 
 
 class MuonAdam(torch.optim.Optimizer):
