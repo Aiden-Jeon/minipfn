@@ -10,6 +10,8 @@
 #                --override mlflow_run_name=tabpfn-v3-5-multitask-paper-chunkNN --override timeout_minutes=<추정 시간>
 #   이어서 학습: --override env_variables.TABPFN_V2_RESUME_RUN_ID=<run_id>
 #   노드 여러 대: --override compute.num_accelerators=16 (또는 32) --override mlflow_run_name=<이름>-16gpu
+#                GPU당 데이터셋 수(micro 8)를 유지하려면 batch도 키운다: --override env_variables.TABPFN_V2_BATCH_SIZE=256
+#                (32 GPU. 이어 학습하면 원래 run의 batch를 따른다)
 #   TabPFN-3(task마다 모델): --override env_variables.TABPFN_V2_ARCH=v3 --override env_variables.TABPFN_V2_TASK=classification
 #                (또는 regression. 53M·58M)
 # 학습 step·lr·batch는 두 보고서에 없어서 v2 paper 설정 그대로다(recipes/tabpfn_v3.py의 paper; multitask는
