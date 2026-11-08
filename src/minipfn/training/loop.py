@@ -49,7 +49,7 @@ from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
 from minipfn.training.data import PriorBatches
 from minipfn.training.losses import dequantize_targets, prior_loss
-from minipfn.training.muon import MuonAdam
+from minipfn.training.muon import MuonAdam, shard_group
 from minipfn.training.schedule_free import ScheduleFreeAdamW, warmup_factor
 from minipfn.training.stability import (
     CollapseGuard,
@@ -326,9 +326,15 @@ def _train(
         opt = ScheduleFreeAdamW(model.parameters(), lr=config.lr)
         schedule = lambda s: warmup_factor(s, config.warmup_steps)  # noqa: E731
     elif config.optimizer == "muon":
-        # 블록 안 가중치 행렬은 Muon, 나머지는 Adam (`training.muon`). 스케줄은 Adam과 같다
+        # 블록 안 가중치 행렬은 Muon, 나머지는 Adam (`training.muon`). 스케줄은 Adam과 같다.
+        # 분산 Muon이면 직교화를 GPU끼리 나눈다 (모든 GPU가 같이 group을 만든다)
+        group = None if config.muon_distributed == "off" else shard_group(config.muon_distributed)
         opt = MuonAdam(
-            model, lr=config.lr, weight_decay=config.muon_weight_decay, adam_kwargs=adam_kwargs
+            model,
+            lr=config.lr,
+            weight_decay=config.muon_weight_decay,
+            adam_kwargs=adam_kwargs,
+            process_group=group,
         )
         schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     else:

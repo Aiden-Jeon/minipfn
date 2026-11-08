@@ -21,8 +21,10 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 `TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·`--weight-average K`
 (또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. optimizer는
 `--optimizer muon`(또는 `TABPFN_V2_OPTIMIZER=muon`, issue #28)으로 바꾸고, Muon 묶음의 weight
-decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. 회귀에서 반복되는 target
-값을 이웃 구간 몇 개에 흩을지는
+decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed node|all`(또는
+`TABPFN_V2_MUON_DISTRIBUTED`, issue #56)은 Muon의 Newton–Schulz를 노드 안 GPU끼리 또는 모든
+GPU끼리 나눠 계산한다(결과·checkpoint 형식 같음, 이어 학습하면 원래 run의 값을 따르고 `off`로
+끈다). 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
@@ -150,6 +152,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--muon-weight-decay", type=float, default=_env("TABPFN_V2_MUON_WEIGHT_DECAY", float)
     )
     parser.add_argument(
+        "--muon-distributed",
+        choices=["off", "node", "all"],
+        default=os.environ.get("TABPFN_V2_MUON_DISTRIBUTED") or None,
+    )
+    parser.add_argument(
         "--collapse-threshold", default=os.environ.get("TABPFN_V2_COLLAPSE_THRESHOLD") or None
     )
     parser.add_argument(
@@ -200,7 +207,7 @@ def inherit_batch_size(args: argparse.Namespace, params: dict[str, str]) -> None
         args.batch_size = int(params["batch_size"])
 
 
-OPTIMIZER_OPTIONS = ("optimizer", "schedule_free", "muon_weight_decay")
+OPTIMIZER_OPTIONS = ("optimizer", "schedule_free", "muon_weight_decay", "muon_distributed")
 
 
 def _optimizer_kind(schedule_free: bool, optimizer: str | None) -> str | None:
@@ -291,6 +298,7 @@ def _override_values(args: argparse.Namespace) -> dict:
         "weight_average_every": args.weight_average_every,
         "optimizer": args.optimizer,
         "muon_weight_decay": args.muon_weight_decay,
+        "muon_distributed": args.muon_distributed,
         **{
             name: True
             for name in ("compile", "fused_adam", "tf32", "schedule_free")
