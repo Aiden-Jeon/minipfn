@@ -236,6 +236,40 @@ def test_inference_classes_load_weights_without_from_pretrained(tmp_path, monkey
         TabPFNv2Regressor(str(reg_dir), borders)
 
 
+def test_v2_5_classes_default_to_the_v2_5_repos(tmp_path, monkeypatch):
+    # 2.5 클래스는 v2 클래스와 같고 인자 없이 만들 때 받는 공개 repo만 다르다
+    from minipfn import TabPFNv2_5Classifier, TabPFNv2_5Regressor, TabPFNv2Classifier
+    from minipfn.recipes import tabpfn_v2
+
+    cls_dir, reg_dir = tmp_path / "cls", tmp_path / "reg"
+    cls_model, reg_model = _model(), _model("regression")
+    borders = torch.linspace(-3, 3, reg_model.config.n_out + 1)
+    hub.save_pretrained(cls_model, None, cls_dir)
+    hub.save_pretrained(reg_model, borders, reg_dir)
+    folders = {
+        tabpfn_v2.HUB_REPOS_V2_5["classification"]: cls_dir,
+        tabpfn_v2.HUB_REPOS_V2_5["regression"]: reg_dir,
+    }
+    asked = []
+    real = hub.from_pretrained
+
+    def fake(spec, revision=None):
+        asked.append(str(spec))
+        return real(folders.get(str(spec).partition("@")[0], spec), revision)
+
+    monkeypatch.setattr(hub, "from_pretrained", fake)
+    _same_weights(cls_model, TabPFNv2_5Classifier().model)
+    reg = TabPFNv2_5Regressor()
+    _same_weights(reg_model, reg.model)
+    assert torch.equal(reg.borders.cpu(), borders)
+    assert asked == [
+        tabpfn_v2.HUB_REPOS_V2_5["classification"],
+        tabpfn_v2.HUB_REPOS_V2_5["regression"],
+    ]
+    assert issubclass(TabPFNv2_5Classifier, TabPFNv2Classifier)
+    assert TabPFNv2_5Regressor(reg_model, borders).model is reg_model
+
+
 def test_from_pretrained_reads_the_branch_after_at(monkeypatch, tmp_path):
     model = _model()
     hub.save_pretrained(model, None, tmp_path)

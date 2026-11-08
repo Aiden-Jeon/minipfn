@@ -20,6 +20,11 @@ TabPFN v2는 분류와 회귀를 따로 학습해 올렸습니다. 두 모델 �
 - 분류: [aiden-jeon/minipfn-tabpfn-v2-classifier](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-classifier). AMLB 29개 데이터셋 평균 ROC AUC 0.924로, 논문은 0.932입니다.
 - 회귀: [aiden-jeon/minipfn-tabpfn-v2-regressor](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-regressor). 28개 데이터셋에서 논문 대비 RMSE 비율의 중앙값이 1.023, 기하평균이 1.118입니다.
 
+TabPFN-2.5도 v2 코드에 2.5 구조(층 분류 24·회귀 18, 셀 3개 묶기, thinking 행 64개, 회귀 MLP encoder)를 넣어 같은 방식으로 500k step 학습한 뒤, 긴·넓은 표로 20k step 더 학습했습니다. 점수는 v2와 같은 benchmark에서 쟀습니다.
+
+- 분류: [aiden-jeon/minipfn-tabpfn-v2-5-classifier](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-5-classifier). 평균 ROC AUC 0.934로, v2 논문(0.932)보다 조금 높습니다.
+- 회귀: [aiden-jeon/minipfn-tabpfn-v2-5-regressor](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-5-regressor). 논문 대비 RMSE 비율의 중앙값이 1.015, 기하평균이 1.105입니다.
+
 직접 학습하려면 [3절](#3-바닥부터-학습하기)을, 개념부터 따라가려면 [4절](#4-step-by-step)의 노트북을 봅니다. 노트북 순서와 각 노트북의 핵심 질문은 [notebooks/README.md](notebooks/README.md)에 있습니다.
 
 ## 2. 학습한 TabPFN으로 바로 예측하기
@@ -78,7 +83,7 @@ pred = reg.predict(x_test)  # 예측 분포의 평균
 print("RMSE:", mean_squared_error(y_test, pred) ** 0.5)  # 55.4 (y_test 표준편차 74.0)
 ```
 
-TabPFN-2.5 가중치도 같은 클래스로 씁니다. 앙상블 멤버 수와 멤버 전처리 종류는 가중치가 정합니다. Hub `config.json`의 `inference`에 적힌 값을 쓰고, 그 값이 없으면 모델 구조를 보고 2.5 구조면 2.5 설정을, 아니면 v2 설정을 씁니다. 그래서 따로 줄 것이 없습니다. 다른 설정과 비교해 보고 싶을 때만 `TabPFNv2Classifier(member_kinds="v2.5", n_estimators=8)`처럼 인자로 줍니다.
+TabPFN-2.5는 `TabPFNv2_5Classifier`·`TabPFNv2_5Regressor`로 씁니다. v2 클래스와 같고, 인자 없이 만들면 2.5 공개 가중치를 받는다는 것만 다릅니다(v2 클래스에 2.5 repo id를 줘도 됩니다). 앙상블 멤버 수와 멤버 전처리 종류는 가중치가 정합니다. Hub `config.json`의 `inference`에 적힌 값을 쓰고, 그 값이 없으면 모델 구조를 보고 2.5 구조면 2.5 설정을, 아니면 v2 설정을 씁니다. 그래서 따로 줄 것이 없습니다. 다른 설정과 비교해 보고 싶을 때만 `TabPFNv2Classifier(member_kinds="v2.5", n_estimators=8)`처럼 인자로 줍니다.
 
 논문 benchmark(분류 29개·회귀 28개 × 10 fold)는 이렇게 잽니다. OpenML에서 데이터를 받으며, GPU가 있으면 빠릅니다(H100 한 장에서 분류 약 15분, 회귀 약 40분).
 

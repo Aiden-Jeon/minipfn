@@ -203,17 +203,22 @@ HUB_REPOS = {
     "classification": "aiden-jeon/minipfn-tabpfn-v2-classifier",
     "regression": "aiden-jeon/minipfn-tabpfn-v2-regressor",
 }
+# TabPFN-2.5 공개 가중치 (`TabPFNv2_5Classifier()`·`TabPFNv2_5Regressor()`의 기본값)
+HUB_REPOS_V2_5 = {
+    "classification": "aiden-jeon/minipfn-tabpfn-v2-5-classifier",
+    "regression": "aiden-jeon/minipfn-tabpfn-v2-5-regressor",
+}
 
 
-def _load(model, task: str) -> tuple[nn.Module, torch.Tensor | None]:
-    # 모델이 아니면 Hub repo id·로컬 폴더(None이면 공개 가중치)에서 받는다
+def _load(model, task: str, repos: dict[str, str]) -> tuple[nn.Module, torch.Tensor | None]:
+    # 모델이 아니면 Hub repo id·로컬 폴더(None이면 `repos`의 공개 가중치)에서 받는다
     if isinstance(model, nn.Module):
         return model, None
     from minipfn.hub import model_or_pretrained
 
-    loaded, borders = model_or_pretrained(model, HUB_REPOS[task], task)
+    loaded, borders = model_or_pretrained(model, repos[task], task)
     if not hasattr(loaded, "model_type"):
-        raise ValueError(f"{model or HUB_REPOS[task]}는 TabPFN v2·2.5 모델이 아니다")
+        raise ValueError(f"{model or repos[task]}는 TabPFN v2·2.5 모델이 아니다")
     return loaded, borders
 
 
@@ -226,6 +231,8 @@ class TabPFNv2Classifier(EnsembleClassifier):
         clf = TabPFNv2Classifier().fit(x_train, y_train)
     """
 
+    hub_repos = HUB_REPOS  # 인자 없이 만들 때 받는 공개 가중치
+
     def __init__(
         self,
         model: nn.Module | str | Path | None = None,
@@ -234,7 +241,7 @@ class TabPFNv2Classifier(EnsembleClassifier):
         member_kinds: str | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
-        model, _ = _load(model, "classification")
+        model, _ = _load(model, "classification", self.hub_repos)
         inference = _inference_kwargs(model, "classification", n_estimators, member_kinds)
         super().__init__(model, **inference, **kwargs)
 
@@ -247,6 +254,8 @@ class TabPFNv2Regressor(EnsembleRegressor):
 
         reg = TabPFNv2Regressor().fit(x_train, y_train)
     """
+
+    hub_repos = HUB_REPOS  # 인자 없이 만들 때 받는 공개 가중치
 
     def __init__(
         self,
@@ -263,6 +272,27 @@ class TabPFNv2Regressor(EnsembleRegressor):
         else:
             if borders is not None:
                 raise ValueError("borders는 모델을 직접 줄 때만 준다 (받는 가중치에 경계가 있다)")
-            model, borders = _load(model, "regression")
+            model, borders = _load(model, "regression", self.hub_repos)
         inference = _inference_kwargs(model, "regression", n_estimators, member_kinds)
         super().__init__(model, borders, **inference, **kwargs)
+
+
+class TabPFNv2_5Classifier(TabPFNv2Classifier):
+    """TabPFN-2.5 분류. `TabPFNv2Classifier`와 같고 공개 가중치만 2.5의 것
+    (`HUB_REPOS_V2_5["classification"]`)이다. 멤버 전처리(quantile, robust)는 가중치의
+    config.json이 정한다.
+
+        clf = TabPFNv2_5Classifier().fit(x_train, y_train)
+    """
+
+    hub_repos = HUB_REPOS_V2_5
+
+
+class TabPFNv2_5Regressor(TabPFNv2Regressor):
+    """TabPFN-2.5 회귀. `TabPFNv2Regressor`와 같고 공개 가중치만 2.5의 것
+    (`HUB_REPOS_V2_5["regression"]`)이다.
+
+        reg = TabPFNv2_5Regressor().fit(x_train, y_train)
+    """
+
+    hub_repos = HUB_REPOS_V2_5
