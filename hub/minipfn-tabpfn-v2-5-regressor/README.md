@@ -85,7 +85,19 @@ On 8 datasets this model beats the paper's RMSE (MIP-2016-regression 0.96×, geo
 
 ### TabArena-Lite
 
-<!-- TODO: fill in from the TabArena-Lite run before merging -->
+[TabArena-Lite](https://huggingface.co/spaces/TabArena/leaderboard) (51 datasets, one split each), scored the way the public leaderboard is: Elo against the leaderboard's method pool, with RandomForest (default) at 1000. The classifier and the regressor run together, so this table is the same on both cards. Splits above the model's size limit (50,000 training rows, 2,000 features, 10 classes) are not run; as on the leaderboard, they take RandomForest (default)'s result ("imputed"). Every method on the public leaderboard is 8-fold bagged; this model is fit once per split.
+
+| Method | Elo | Imputed splits |
+| --- | --- | --- |
+| **minipfn TabPFN-2.5 (this model)** | **1436** (+53/−64) | 7.8% |
+| minipfn TabPFN v2 | 1221 | 35.3% |
+| TabPFNv2 (default), public | 1224 | |
+| RealTabPFN-2.5 (default), public | 1514 | |
+| TabICLv2 (default), public | 1560 | |
+
+This model places 21st of 99 methods. By problem type its Elo is 1445 (binary), 1457 (multiclass) and 1546 (regression). It beats TabPFNv2 (default) on 73% of the splits, CatBoost (default) and tuned + ensembled XGBoost on 65%, and RealTabPFN-2.5 (default) on 43%.
+
+Part of the gain over minipfn v2 comes from the larger size limit: 14 datasets that v2 has to impute run here. On the 33 splits both models run, this model has the lower error on 26 (geometric mean error ratio 0.90): 23 of 26 classification splits but only 3 of 7 regression splits.
 
 ## Limitations
 
