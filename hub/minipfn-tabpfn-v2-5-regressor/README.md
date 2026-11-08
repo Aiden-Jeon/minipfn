@@ -99,11 +99,27 @@ This model places 21st of 99 methods. By problem type its Elo is 1445 (binary), 
 
 Part of the gain over minipfn v2 comes from the larger size limit: 14 datasets that v2 has to impute run here. On the 33 splits both models run, this model has the lower error on 26 (geometric mean error ratio 0.90): 23 of 26 classification splits but only 3 of 7 regression splits.
 
+### BeyondArena
+
+BeyondArena core2k (2,000 splits from 142 datasets), scored like its public leaderboard with XGBoost (default) at 1000. Splits above the size limit, and the 5 that ran out of GPU memory (see Limitations), take RandomForest (default)'s result: 8.2% of the splits (minipfn v2: 15.8%).
+
+| Method | Elo |
+| --- | --- |
+| TabICLv2 (default), public | 1172 |
+| RealTabPFN-2.5 (default), public | 1143 |
+| **minipfn TabPFN-2.5 (this model)** | **1096** (+29/−32) |
+| XGBoost (tuned), public | 1092 |
+| minipfn TabPFN v2 | 1007 |
+| XGBoost (default), public | 1000 |
+
+This model places 25th of 41 methods (minipfn v2: 30th). It is strongest on tiny and small tables (Elo 1269 and 1227) and random splits (1174), and weakest on high-cardinality categorical features (715), temporal splits (823), text features (876) and high-dimensional tables (908). On the 1,685 splits both minipfn models run, this model has the lower error on 1,027 and the higher on 646 (geometric mean error ratio 0.98).
+
 ## Limitations
 
 - **No real-data fine-tuning.** Real-TabPFN-2.5 continues training on real datasets; this model is trained on the synthetic prior only.
 - **Recipe differs from the report.** Model width, thinking-row placement, the robust member, dequantized targets, QK-clip and the long-table stage are our choices; the report does not give them.
 - **A few datasets stay far from the paper.** auction_verification and cpu_activity are 2–3× the paper's RMSE at every checkpoint, as with minipfn v2. cpu_activity also moves a lot between checkpoints (1.32× at 100k, 2.26× at 300k).
+- **GPU memory near the size limit.** Inference on the largest tables inside the 50,000-row × 2,000-feature limit can run out of memory on an 80 GB H100: 5 BeyondArena splits (santander_customer_satisfaction, anes_voting_2026, labour_inspection_compliance) failed this way.
 - **Regression only.** The classifier is a separate model: [aiden-jeon/minipfn-tabpfn-v2-5-classifier](https://huggingface.co/aiden-jeon/minipfn-tabpfn-v2-5-classifier).
 
 ## Usage
