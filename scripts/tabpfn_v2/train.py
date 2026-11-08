@@ -4,7 +4,8 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 - GPU 여러 장: `torchrun --standalone --nproc_per_node=8 scripts/tabpfn_v2/train.py`
 - 노드 여러 대: 노드마다 `torchrun --nnodes=<노드 수> --node_rank=<번호> --master_addr=<주소>
   --master_port=<포트> --nproc_per_node=8 scripts/tabpfn_v2/train.py`. batch는 그대로이고
-  GPU당 micro batch는 batch / GPU 수를 넘지 않게 자동으로 줄어든다.
+  GPU당 micro batch는 batch / GPU 수를 넘지 않게 자동으로 줄어든다. GPU를 늘릴 때 GPU당 데이터셋
+  수를 유지하려면 `TABPFN_V2_BATCH_SIZE`로 batch를 키운다(이어 학습하면 원래 run의 batch를 따른다).
 - 로컬: `uv run python scripts/tabpfn_v2/train.py --config-name smoke --task regression`
 
 모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
@@ -15,7 +16,7 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 이어서 학습하거나
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
-`TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
+`TABPFN_V2_BATCH_SIZE`, `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
 `TABPFN_V2_CHECKPOINT_EVERY`, `TABPFN_V2_VAL_EVERY`)로 정한다. 학습 가속 옵션(issue #46,
 `TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·`--weight-average K`
 (또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. optimizer는
@@ -117,6 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         " 이어서 학습하거나 가중치를 가져오면 원래 run의 구조",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
+    parser.add_argument("--batch-size", type=int, default=_env("TABPFN_V2_BATCH_SIZE", int))
     parser.add_argument("--micro-batch", type=int, default=_env("TABPFN_V2_MICRO_BATCH", int))
     parser.add_argument("--num-workers", type=int, default=_env("TABPFN_V2_NUM_WORKERS", int))
     parser.add_argument("--lr", type=float, default=_env("TABPFN_V2_LR", float))
@@ -189,6 +191,13 @@ def source_speed_options(params: dict[str, str]) -> dict:
             text = params[name]
             out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
     return out
+
+
+def inherit_batch_size(args: argparse.Namespace, params: dict[str, str]) -> None:
+    """이어 학습할 때 `--batch-size`를 주지 않았으면 원래 run의 batch를 쓴다(preset의 64로 조용히
+    돌아가지 않도록). 가중치만 가져와 새로 학습하면(`--init-run-id`) preset 값 그대로다."""
+    if args.resume_run_id and args.batch_size is None and "batch_size" in params:
+        args.batch_size = int(params["batch_size"])
 
 
 OPTIMIZER_OPTIONS = ("optimizer", "schedule_free", "muon_weight_decay")
@@ -269,6 +278,7 @@ def _override_values(args: argparse.Namespace) -> dict:
     """인자·환경변수로 준 값 (주지 않은 것은 빠진다)."""
     overrides = {
         "steps": args.steps,
+        "batch_size": args.batch_size,
         "micro_batch": args.micro_batch,
         "num_workers": args.num_workers,
         "lr": args.lr,
@@ -338,6 +348,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
         speed_options = source_speed_options(params)
+        inherit_batch_size(args, params)
     config, arch = build_config(args, source, speed_options)
 
     init_path = None

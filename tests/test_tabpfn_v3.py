@@ -289,6 +289,33 @@ def test_train_script_builds_v3_and_reads_its_run(monkeypatch):
         script.parse_args(["--config-name", "long_tables", "--init-run-id", "r", "--arch", "v3"])
 
 
+def test_train_script_takes_the_batch_size_and_keeps_it_on_resume(monkeypatch):
+    # GPU 32장에서 GPU당 데이터셋 8개를 유지하려고 batch를 256으로 키운다. 이어 학습하면 인자를
+    # 주지 않아도 원래 run의 batch를 따르고(preset의 64로 돌아가지 않는다), 인자로 주면 그 값이다
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK", "TABPFN_V2_BATCH_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+    script = _script("train")
+    base = ["--config-name", "paper", "--arch", "v3.5", "--task", "multitask"]
+    config, _ = script.build_config(script.parse_args(base))
+    assert config.batch_size == 64
+    monkeypatch.setenv("TABPFN_V2_BATCH_SIZE", "256")
+    config, _ = script.build_config(script.parse_args(base))
+    assert config.batch_size == 256 and config.grad_accumulation(32) == 1
+    assert config.for_world_size(32).micro_batch == 8
+    monkeypatch.delenv("TABPFN_V2_BATCH_SIZE")
+    params = {k: str(v) for k, v in vars(config).items()}
+    resume = ["--config-name", "paper", "--task", "multitask", "--resume-run-id", "r"]
+    for extra, expected in (([], 256), (["--batch-size", "128"], 128)):
+        args = script.parse_args(resume + extra)
+        script.inherit_batch_size(args, params)
+        resumed, _ = script.build_config(args, hub.run_architecture(params))
+        assert resumed.batch_size == expected
+    # 가중치만 가져와 새로 학습하면 preset 값
+    args = script.parse_args(["--config-name", "paper", "--task", "multitask", "--init-run-id", "r"])
+    script.inherit_batch_size(args, params)
+    assert args.batch_size is None
+
+
 def test_eval_script_takes_v3_inference_defaults():
     script = _script("eval")
     assert script.default_inference(_model(arch="v3.5"), "classification") == {
