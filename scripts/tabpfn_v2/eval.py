@@ -124,6 +124,7 @@ from minipfn.inference.ensemble_selection import (
     SELECTIONS,
     GreedyEnsembleClassifier,
     GreedyEnsembleRegressor,
+    check_selection,
 )
 from minipfn.inference.preprocessing import (
     ONE_HOT_MODES,
@@ -209,7 +210,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=OOF_SPLITS,
         default="random",
         help="--test-time greedy의 out-of-fold fold (task: TabArena·BeyondArena split의 group·시간"
-        " 열로 나눈다. 무작위 split은 그대로 random)",
+        " 열로 나눈다. 무작위 split은 그대로 random. diagscale+greedy에서도 DiagScale의 검증"
+        " split은 무작위다)",
     )
     parser.add_argument(
         "--distill",
@@ -345,23 +347,18 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     inference = default_inference(model, suite)
     member_kinds = args.member_kinds or inference["member_kinds"]
     n_estimators = args.n_estimators or inference["n_estimators"]
-    if "greedy" in args.test_time and args.pool_size < n_estimators:
-        # 여기서 멈춘다: arena에서는 estimator를 만들 때 실패하면 모든 split이 조용히 imputed가 된다
-        raise SystemExit(
-            f"--pool-size({args.pool_size})는 {suite} 앙상블의 멤버 수"
-            f"({n_estimators}) 이상이어야 한다."
-        )
     if "greedy" in args.test_time:
-        try:  # 같은 이유로 greedy 설정의 오류(온도 하한 등)도 여기서 확인한다
-            GreedyEnsembleClassifier(
-                model,
+        # 여기서 멈춘다: arena에서는 estimator를 만들 때 실패하면 모든 split이 조용히 imputed가 된다
+        try:
+            check_selection(
                 n_estimators=n_estimators,
                 pool_size=args.pool_size,
+                selection=args.selection,
                 min_improvement=args.min_improvement,
                 min_temperature=args.min_temperature,
             )
         except ValueError as e:
-            raise SystemExit(str(e)) from e
+            raise SystemExit(f"{suite}: {e}") from e
     log_path = Path(args.out_dir) / "test_time.jsonl"
     # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
     log_fields = {"suite": suite, "method": args.method_name, **test_time_params(args)}

@@ -423,3 +423,42 @@ def test_arena_factory_passes_groups_only_for_task_out_of_fold(monkeypatch, tmp_
         )
         script.run_arena(args, tmp_path, use_mlflow=False)
         assert seen["make"].fit_groups is expected
+
+
+def test_group_folds_never_leave_an_empty_fold_or_fail_on_small_classes(monkeypatch):
+    from minipfn.inference import ensemble_selection
+
+    x, y = _classification(120)
+    groups = np.repeat(np.arange(8), 15)
+    kw = {"n_estimators": 2, "pool_size": 3, "n_folds": 8}
+    clf = GreedyEnsembleClassifier(_tiny_model(), **kw)
+    # 층화하다 group이 한 fold에 몰려 검증 행이 없는 fold가 생겨도 그 fold는 버린다
+    real = ensemble_selection.StratifiedGroupKFold
+
+    class WithEmptyFold(real):
+        def split(self, X, y=None, groups=None):
+            yield from super().split(X, y, groups)
+            yield np.arange(len(X)), np.array([], dtype=int)
+
+    monkeypatch.setattr(ensemble_selection, "StratifiedGroupKFold", WithEmptyFold)
+    splits = clf._group_splits(y, groups, stratified=True)
+    assert len(splits) == 8 and all(len(tr) and len(te) for tr, te in splits)
+    assert clf.fit(x, y, groups=groups).selection_["n_folds"] == 8
+    monkeypatch.setattr(ensemble_selection, "StratifiedGroupKFold", real)
+    # 행마다 group, 클래스 행 수 [6, 5] < fold 수 8: 층화 group split이 실패하면 GroupKFold
+    x, y = x[:11], np.array([0] * 6 + [1] * 5)
+    small = GreedyEnsembleClassifier(_tiny_model(), **kw).fit(x, y, groups=np.arange(11))
+    assert small.selection_["grouped"] and small.selection_["n_folds"] == 8
+
+
+def test_split_groups_reads_string_and_ordered_category_times():
+    meta = types.SimpleNamespace(group_on=None, time_on="when")
+    strings = pd.DataFrame({"when": ["2020-01-01", "2021-01-01", "2022-01-01", "2023-01-01"]})
+    assert list(arena.split_groups(strings, meta, n_intervals=2)) == [0, 0, 1, 1]
+    quarters = pd.Categorical(["2020Q2", "2020Q1", "2020Q4", "2020Q3"], ordered=True)
+    quarters = quarters.reorder_categories(["2020Q1", "2020Q2", "2020Q3", "2020Q4"])
+    t = arena.split_groups(pd.DataFrame({"when": quarters}), meta, n_intervals=2)
+    assert list(t) == [0, 0, 1, 1]  # 범주 순서대로
+    # 구간을 2개 만들 수 없으면 (상수, 읽을 수 없는 값) 무작위 fold
+    assert arena.split_groups(pd.DataFrame({"when": [5, 5, 5]}), meta) is None
+    assert arena.split_groups(pd.DataFrame({"when": ["a", "b", "c"]}), meta) is None
