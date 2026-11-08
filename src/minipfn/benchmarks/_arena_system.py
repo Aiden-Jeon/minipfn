@@ -3,6 +3,10 @@
 `tabarena`를 import하므로 `minipfn.benchmarks.arena`가 쓸 때만 불러온다. system 설정은
 yaml로 저장될 수 있어서 estimator를 만드는 함수는 이 모듈의 registry에 두고 그 이름만 넘긴다
 (`debug_mode=True`로 같은 프로세스에서 돌리므로 registry가 그대로 보인다).
+
+estimator를 만드는 함수에 `fit_groups = True`를 달면 fit에 `groups`(행마다의 group 번호)도
+넘긴다. task의 split 정보(`validation_metadata`의 group·시간 열)로 만든다
+(`minipfn.benchmarks.arena.split_groups`).
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
 from tabarena.benchmark.exec_models import ExternalSystemModel
+
+from minipfn.benchmarks.arena import split_groups
 
 _FACTORIES: dict[str, Callable[[str, list[int]], Any]] = {}
 
@@ -73,11 +79,24 @@ class EstimatorSystem(ExternalSystemModel):
         self.bagging = bagging
         self.estimators_: list = []
 
-    def _fit_system(self, X: pd.DataFrame, y: pd.Series, *, problem_type: str, random_state, **_):
+    def _fit_system(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        *,
+        problem_type: str,
+        random_state,
+        validation_metadata=None,
+        **_,
+    ):
         make = _FACTORIES[self.factory]
+        X = X.reset_index(drop=True)
+        groups = (
+            split_groups(X, validation_metadata) if getattr(make, "fit_groups", False) else None
+        )
+        self.grouped_ = groups is not None
         X, categorical = prepare_frame(X)
         y = y.reset_index(drop=True)
-        X = X.reset_index(drop=True)
         self.problem_type_ = problem_type
         self.categorical_ = categorical
         if self.bagging and self.bagging > 1:
@@ -85,7 +104,12 @@ class EstimatorSystem(ExternalSystemModel):
         else:
             parts = [np.arange(len(X))]
         self.estimators_ = [
-            make(problem_type, categorical).fit(X.iloc[ix], y.iloc[ix].to_numpy()) for ix in parts
+            make(problem_type, categorical).fit(
+                X.iloc[ix],
+                y.iloc[ix].to_numpy(),
+                **({} if groups is None else {"groups": groups[ix]}),
+            )
+            for ix in parts
         ]
         return self
 

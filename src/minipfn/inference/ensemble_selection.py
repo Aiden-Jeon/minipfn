@@ -32,6 +32,20 @@
 - 학습 행 전체로 다시 맞출 때는 가중치가 있는 멤버만 맞춘다 (테스트 시간을 줄인다)
 - `selection`: `"greedy"`(논문), `"best"`(out-of-fold 손실이 가장 작은 후보 하나), `"uniform"`(0번을
   뺀 후보 모두 같은 가중치. 논문의 균일 평균에 해당한다)
+
+논문에 없는 것 (issue #52, 기본은 모두 꺼져 있어 논문 방식 그대로다). 논문 방식은 out-of-fold
+손실이 조금이라도 낮으면 고른다. 그래서 out-of-fold 손실이 기본부터 거의 0인 데이터셋에서 아주
+날카로운 온도 하나를 골라 test에서 지나치게 확신하거나, 무작위 fold가 보지 못하는 grouped·temporal
+test의 분포 변화에서 손해를 봤다(BeyondArena-lite):
+
+- `min_improvement`: 고른 조합의 out-of-fold 손실이 기본(후보 0번)보다 이 비율 이상 낮지 않으면
+  기본 앙상블을 그대로 쓴다. 분류는 log loss가 `MIN_IMPROVEMENT_NATS` 이상 낮아야 한다는 조건도
+  함께 둔다(기본 손실이 거의 0이면 비율로는 아주 작은 차이도 크게 보인다)
+- `min_temperature`: 이보다 낮은 온도를 후보에서 뺀다
+- `fit(X, y, groups=...)`: 행마다의 group 번호를 주면 out-of-fold를 group 단위로 나눈다(한 group은
+  한 fold에만 들어간다. 분류는 `StratifiedGroupKFold`, 회귀는 `GroupKFold`). TabArena·BeyondArena의
+  grouped split은 group 열, temporal split은 시간 구간을 group으로 준다
+  (`minipfn.benchmarks._arena_system.split_groups`)
 """
 
 from __future__ import annotations
@@ -43,7 +57,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 
 from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.inference.preprocessing import MEMBER_KINDS, Member
@@ -58,6 +72,8 @@ SELECTIONS = ("greedy", "best", "uniform")
 # TabArena TabPFN-2.5 search space의 softmax_temperature와 OUTLIER_REMOVAL_STD
 TEMPERATURES = (0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.25, 1.5)
 OUTLIER_SIGMAS = (3.0, 6.0, 12.0)
+# min_improvement를 줄 때 분류 log loss가 함께 낮아져야 하는 최소 차이 (nats)
+MIN_IMPROVEMENT_NATS = 1e-3
 
 
 def greedy_weights(preds: np.ndarray, loss, n_rounds: int = N_ROUNDS) -> np.ndarray:
@@ -91,6 +107,8 @@ class _Selection:
         n_folds: int = N_FOLDS,
         n_rounds: int = N_ROUNDS,
         selection: str = "greedy",
+        min_improvement: float = 0.0,
+        min_temperature: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -100,9 +118,17 @@ class _Selection:
             raise ValueError(f"pool_size({pool_size})는 n_estimators({self.n_estimators}) 이상")
         if set(pool_kinds) - set(MEMBER_KINDS):
             raise ValueError(f"pool_kinds는 {MEMBER_KINDS}에서 고른다: {pool_kinds}")
+        if min_temperature is not None:
+            temperatures = tuple(t for t in temperatures if t >= min_temperature)
+            if not temperatures:
+                raise ValueError(f"min_temperature({min_temperature}) 이상인 온도가 없다")
+        if not 0.0 <= min_improvement < 1.0:
+            raise ValueError(f"min_improvement는 0 이상 1 미만이어야 한다: {min_improvement}")
         self.pool_size = pool_size
         self.pool_kinds = tuple(pool_kinds)
         self.temperatures = tuple(temperatures)
+        self.min_improvement = min_improvement
+        self.min_temperature = min_temperature
         self.n_folds = n_folds
         self.n_rounds = n_rounds
         self.selection = selection
@@ -124,6 +150,20 @@ class _Selection:
             )
         return members
 
+    def _groups(self, groups: Any, n_rows: int, n_folds: int) -> np.ndarray | None:
+        """group 번호 배열, 또는 무작위 fold를 쓸 때 None. group이 2개보다 적으면 group으로 나눌
+        수 없어 무작위 fold를 쓴다 (`grouped_`에 남긴다)."""
+        self.grouped_ = False
+        if groups is None:
+            return None
+        groups = pd.factorize(pd.Series(np.asarray(groups, dtype=object)), use_na_sentinel=False)[0]
+        if len(groups) != n_rows:
+            raise ValueError(f"groups의 길이({len(groups)})가 학습 행 수({n_rows})와 다르다")
+        if len(np.unique(groups)) < 2:
+            return None
+        self.grouped_ = True
+        return groups
+
     def _out_of_fold(self, X: Any, y: np.ndarray, members: list[Member], splits) -> np.ndarray:
         """후보마다 out-of-fold 예측 (후보 수, n). 후보 0번은 기본 앙상블, 그다음은 멤버 × 온도
         (멤버 p, 온도 t → 1 + p × 온도 수 + t)."""
@@ -139,6 +179,19 @@ class _Selection:
                     oof[0, test_ix] += preds[n_t] / self.n_estimators
         return oof
 
+    _min_improvement_abs = 0.0  # 분류는 MIN_IMPROVEMENT_NATS
+
+    def _guard(self, weights: np.ndarray, oof: np.ndarray, loss) -> tuple[np.ndarray, bool]:
+        """고른 조합의 out-of-fold 손실이 기본보다 충분히 낮지 않으면 기본 앙상블(후보 0번)만 쓴다
+        (DiagScale의 "나아진 epoch가 없으면 학습 전 그대로"와 같다). (가중치, 되돌렸는지)."""
+        if self.min_improvement <= 0 or weights[0] == 1.0:
+            return weights, False
+        default, selected = loss(np.stack([oof[0], weights @ oof]))
+        need = max(self.min_improvement * default, self._min_improvement_abs)
+        if default - selected >= need:
+            return weights, False
+        return np.eye(len(oof))[0], True  # 손실이 NaN이어도 기본으로
+
     def _select(self, oof: np.ndarray, loss) -> np.ndarray:
         if self.selection == "greedy":
             return greedy_weights(oof, loss, self.n_rounds)
@@ -152,7 +205,7 @@ class _Selection:
 
     def _fit_selected(self, X: Any, y: np.ndarray, members: list[Member], oof, loss):
         """가중치를 고르고, 가중치가 있는 멤버만 학습 행 전체로 맞춘다."""
-        weights = self._select(oof, loss)
+        weights, reverted = self._guard(self._select(oof, loss), oof, loss)
         n_t = len(self.temperatures)
         # 멤버마다 {온도: 가중치}. 0번의 가중치는 기본 멤버에 기본 온도로 나눠 준다
         per_member: list[dict[float, float]] = [{} for _ in members]
@@ -174,6 +227,8 @@ class _Selection:
             "oof_loss_default": float(loss(oof[:1])[0]),
             "oof_loss_selected": float(loss((weights @ oof)[None])[0]),
             "weight_default": float(weights[0]),
+            "reverted": reverted,
+            "grouped": self.grouped_,
         }
         self.member_weights_ = [per_member[p] for p in used]
         return self.fit_members(X, y, [members[p] for p in used])
@@ -184,18 +239,30 @@ class GreedyEnsembleClassifier(_Selection, EnsembleClassifier):
 
     `n_estimators`는 기본 앙상블의 멤버 수다(후보 0번과 pool의 앞 멤버)."""
 
-    def fit(self, X: Any, y: Any) -> GreedyEnsembleClassifier:
+    _min_improvement_abs = MIN_IMPROVEMENT_NATS
+
+    def fit(self, X: Any, y: Any, groups: Any = None) -> GreedyEnsembleClassifier:
+        """`groups`(행마다의 group 번호)를 주면 out-of-fold를 group 단위로 나눈다."""
         rng = np.random.default_rng(self.random_state)
         y = self._fit_labels(y)
         n_classes = len(self.classes_)
         members = self._pool(rng, self._default_members(rng, n_classes), n_classes)
         counts = np.bincount(y, minlength=n_classes)
-        self.n_folds_ = int(np.clip(counts[counts > 0].min(), 2, self.n_folds))
-        splitter = StratifiedKFold(self.n_folds_, shuffle=True, random_state=self.random_state)
+        n_folds = int(np.clip(counts[counts > 0].min(), 2, self.n_folds))
+        groups = self._groups(groups, len(y), n_folds)
+        if groups is None:
+            self.n_folds_ = n_folds
+            splitter = StratifiedKFold(n_folds, shuffle=True, random_state=self.random_state)
+        else:
+            # group 수가 fold 수를 정한다 (클래스 행 수로 줄이지 않는다: 한 group에 몰릴 수 있다)
+            self.n_folds_ = int(min(self.n_folds, len(np.unique(groups))))
+            splitter = StratifiedGroupKFold(
+                self.n_folds_, shuffle=True, random_state=self.random_state
+            )
         with warnings.catch_warnings():
             # 학습 행이 fold 수보다 적은 클래스: 그 클래스가 없는 fold가 생겨도 그대로 쓴다
             warnings.simplefilter("ignore", UserWarning)
-            splits = list(splitter.split(np.zeros(len(y)), y))
+            splits = list(splitter.split(np.zeros(len(y)), y, groups))
         oof = self._out_of_fold(X, y, members, splits)
         return self._fit_selected(X, y, members, oof, _log_loss)
 
@@ -220,13 +287,20 @@ class GreedyEnsembleRegressor(_Selection, EnsembleRegressor):
     """회귀: 멤버 × 온도 후보를 out-of-fold RMSE로 greedy하게 골라 섞는다 (모듈 docstring).
     평균과 예측 분포 모두 같은 가중치로 섞는다."""
 
-    def fit(self, X: Any, y: Any) -> GreedyEnsembleRegressor:
+    def fit(self, X: Any, y: Any, groups: Any = None) -> GreedyEnsembleRegressor:
+        """`groups`(행마다의 group 번호)를 주면 out-of-fold를 group 단위로 나눈다."""
         rng = np.random.default_rng(self.random_state)
         y = np.asarray(y, dtype=np.float64)
         members = self._pool(rng, self._default_members(rng), None)
-        self.n_folds_ = int(min(self.n_folds, len(y)))
-        splitter = KFold(self.n_folds_, shuffle=True, random_state=self.random_state)
-        oof = self._out_of_fold(X, y, members, list(splitter.split(np.zeros(len(y)))))
+        groups = self._groups(groups, len(y), int(min(self.n_folds, len(y))))
+        if groups is None:
+            self.n_folds_ = int(min(self.n_folds, len(y)))
+            splitter = KFold(self.n_folds_, shuffle=True, random_state=self.random_state)
+        else:
+            self.n_folds_ = int(min(self.n_folds, len(np.unique(groups))))
+            splitter = GroupKFold(self.n_folds_)  # group 크기로 나눈다 (무작위가 아니다)
+        splits = list(splitter.split(np.zeros(len(y)), y, groups))
+        oof = self._out_of_fold(X, y, members, splits)
 
         def rmse(preds: np.ndarray) -> np.ndarray:
             return np.sqrt(np.mean((preds - y) ** 2, axis=-1))

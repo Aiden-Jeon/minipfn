@@ -18,6 +18,7 @@ from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.inference.ensemble_selection import (
     GreedyEnsembleClassifier,
     GreedyEnsembleRegressor,
+    _log_loss,
     greedy_weights,
 )
 from minipfn.inference.preprocessing import Member, MemberPreprocessor
@@ -151,6 +152,105 @@ def test_selection_modes():
         GreedyEnsembleClassifier(_tiny_model(), n_estimators=4, pool_size=2)
 
 
+def test_min_improvement_falls_back_to_the_default_ensemble(monkeypatch):
+    x, y = _classification()
+    kw = {"n_estimators": 4, "pool_size": 6, "n_folds": 2}
+    # 조건을 넘을 수 없는 비율: 늘 기본 앙상블과 같은 예측
+    strict = GreedyEnsembleClassifier(_tiny_model(), min_improvement=0.999, **kw)
+    out = strict.fit(x[:90], y[:90]).predict_proba(x[90:])
+    ref = EnsembleClassifier(_tiny_model(), n_estimators=4).fit(x[:90], y[:90])
+    assert np.allclose(out, ref.predict_proba(x[90:]), atol=1e-5)
+    s = strict.selection_
+    assert s["reverted"] and s["weight_default"] == 1.0 and s["used_members"] == 4
+    assert s["oof_loss_selected"] == s["oof_loss_default"]
+    # 조건이 없으면 되돌리지 않는다 (같은 pool·fold)
+    free = GreedyEnsembleClassifier(_tiny_model(), **kw).fit(x[:90], y[:90])
+    assert not free.selection_["reverted"]
+
+
+def test_guard_needs_an_absolute_drop_in_log_loss_when_the_default_is_near_zero():
+    clf = GreedyEnsembleClassifier(_tiny_model(), n_estimators=2, min_improvement=0.01)
+    # 기본(0번)의 log loss 1e-4, 고른 후보 0: 비율로는 100%지만 1e-3 nats보다 작다
+    oof = np.array([[np.exp(-1e-4)] * 4, [1.0] * 4])
+    weights, reverted = clf._guard(np.array([0.0, 1.0]), oof, _log_loss)
+    assert reverted and np.array_equal(weights, [1.0, 0.0])
+    oof = np.array([[np.exp(-0.1)] * 4, [np.exp(-0.05)] * 4])  # 0.1 → 0.05: 둘 다 넘는다
+    assert not clf._guard(np.array([0.0, 1.0]), oof, _log_loss)[1]
+    reg = GreedyEnsembleRegressor(_tiny_model(16), BORDERS, n_estimators=2, min_improvement=0.01)
+    y = np.zeros(4)
+
+    def rmse(p):
+        return np.sqrt(np.mean((p - y) ** 2, axis=-1))
+
+    # 회귀는 비율만 본다: 1e-4 → 0도 넘는다
+    oof = np.array([[1e-4] * 4, [0.0] * 4])
+    assert not reg._guard(np.array([0.0, 1.0]), oof, rmse)[1]
+
+
+def test_min_temperature_drops_sharp_temperatures_from_the_pool():
+    x, y = _classification()
+    clf = GreedyEnsembleClassifier(
+        _tiny_model(), n_estimators=2, pool_size=3, n_folds=2, min_temperature=0.5
+    ).fit(x, y)
+    assert 0.25 not in clf.temperatures and len(clf.temperatures) == 8
+    assert clf.selection_["candidates"] == 1 + 3 * 8
+    assert all(t >= 0.5 or t == clf.softmax_temperature for w in clf.member_weights_ for t in w)
+    with pytest.raises(ValueError):
+        GreedyEnsembleClassifier(_tiny_model(), n_estimators=2, min_temperature=10.0)
+    with pytest.raises(ValueError):
+        GreedyEnsembleClassifier(_tiny_model(), n_estimators=2, min_improvement=1.0)
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_groups_keep_each_group_in_one_out_of_fold_fold(task, monkeypatch):
+    x, y = _classification() if task == "classification" else _regression()
+    groups = np.repeat(np.arange(12), 10)  # 10행씩 12개 group
+    cls = GreedyEnsembleClassifier if task == "classification" else GreedyEnsembleRegressor
+    seen = []
+    original = cls._out_of_fold
+
+    def capture(self, X, y, members, splits):
+        seen.append(splits)
+        return original(self, X, y, members, splits)
+
+    monkeypatch.setattr(cls, "_out_of_fold", capture)
+    args = (_tiny_model(),) if task == "classification" else (_tiny_model(16), BORDERS)
+    est = cls(*args, n_estimators=2, pool_size=3, n_folds=4).fit(
+        x, y, groups=[f"g{g}" for g in groups]
+    )
+    assert est.selection_["grouped"] and est.selection_["n_folds"] == 4
+    for train_ix, test_ix in seen[0]:
+        assert not set(groups[train_ix]) & set(groups[test_ix])
+    # group이 fold 수보다 적으면 group 수만큼, 하나뿐이면 무작위 fold
+    est = cls(*args, n_estimators=2, pool_size=3, n_folds=8).fit(x, y, groups=groups % 3)
+    assert est.selection_["n_folds"] == 3
+    est = cls(*args, n_estimators=2, pool_size=3, n_folds=4).fit(x, y, groups=np.zeros(len(y)))
+    assert not est.selection_["grouped"]
+    with pytest.raises(ValueError):
+        cls(*args, n_estimators=2, pool_size=3).fit(x, y, groups=groups[:5])
+
+
+def test_split_groups_from_task_split_metadata():
+    X = pd.DataFrame(
+        {
+            "patient": ["a", "b", "a", "c", None],
+            "site": [1, 1, 2, 2, 2],
+            "when": pd.to_datetime(["2020-01-01", "2020-01-01", "2021-06-01", None, "2022-01-01"]),
+        }
+    )
+    meta = types.SimpleNamespace
+    g = arena.split_groups(X, meta(group_on="patient", time_on=None))
+    assert g[0] == g[2] and len(set(g)) == 4  # 빈 값도 한 group
+    g = arena.split_groups(X, meta(group_on=["patient", "site"], time_on=None))
+    assert len(set(g)) == 5
+    t = arena.split_groups(X, meta(group_on=None, time_on="when"), n_intervals=2)
+    assert t[0] == t[1] and t[3] == -1  # 같은 시각은 같은 구간, 빈 시각은 -1
+    assert t[0] <= t[2] <= t[4] and len(set(t[[0, 2, 4]])) == 2  # 시간 순서대로 연속 구간
+    assert arena.split_groups(X, meta(group_on=None, time_on=None)) is None
+    assert arena.split_groups(X, None) is None
+    assert arena.split_groups(X, meta(group_on="missing", time_on=None)) is None
+
+
 def test_greedy_regressor_mean_and_distribution_use_the_same_weights():
     x, y = _regression()
     reg = GreedyEnsembleRegressor(_tiny_model(16), BORDERS, n_estimators=4, pool_size=8)
@@ -276,3 +376,27 @@ def test_eval_script_builds_test_time_estimators_and_records_fits(monkeypatch, t
         assert ("adaptation" in record) == (test_time == "diagscale")
     params = script.test_time_params(script.parse_args(["--test-time", "diagscale+greedy"]))
     assert params == {"test_time": "diagscale+greedy", "selection": "greedy", "pool_size": 24}
+    guarded = ["--test-time", "greedy", "--min-improvement", "0.01", "--min-temperature", "0.5"]
+    args = script.parse_args([*guarded, "--oof-split", "task", "--classifier-path", "clf.pt"])
+    assert script.test_time_params(args) == {
+        "test_time": "greedy",
+        "selection": "greedy",
+        "pool_size": 24,
+        "min_improvement": 0.01,
+        "min_temperature": 0.5,
+        "oof_split": "task",
+    }
+    args.out_dir, args.device = str(tmp_path / "guarded"), "cpu"
+    make = script.make_estimator_factory("classification", args)
+    assert make.fit_groups
+    estimator = make(types.SimpleNamespace(categorical_indices=[]), "all")
+    assert estimator.min_improvement == 0.01 and min(estimator.temperatures) == 0.5
+    estimator.pool_size = 4
+    estimator.fit(x, y, groups=np.arange(len(y)) % 5)  # record_fits도 groups를 넘긴다
+    record = json.loads((tmp_path / "guarded" / "test_time.jsonl").read_text())
+    assert record["selection"]["grouped"] and record["oof_split"] == "task"
+    args.min_temperature = 10.0
+    with pytest.raises(SystemExit):
+        script.make_estimator_factory("classification", args)
+    with pytest.raises(SystemExit):
+        script.main(["--test-time", "none", "--min-improvement", "0.01"])

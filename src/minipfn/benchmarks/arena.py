@@ -57,6 +57,38 @@ WINRATE_BASELINES = {
 }
 
 
+# temporal split: 시간 열을 이만큼의 연속 구간으로 나눠 group으로 쓴다 (greedy의 fold 수와 같다)
+TIME_INTERVALS = 8
+
+
+def split_groups(X: pd.DataFrame, metadata, n_intervals: int = TIME_INTERVALS) -> np.ndarray | None:
+    """task의 split 정보로 행마다의 group 번호를 만든다. grouped split은 group 열(여러 열이면 값의
+    조합), temporal split은 시간 열을 행 수가 비슷한 연속 구간으로 나눈 번호(같은 시각은 같은
+    구간, 빈 시각은 -1)다. 둘 다 없으면(무작위 split) None. AutoGluon이 TabArena에서 bagging fold를
+    만드는 방식(`resolve_validation_splits`)과 같은 열을 쓴다."""
+    group_on = getattr(metadata, "group_on", None)
+    time_on = getattr(metadata, "time_on", None)
+    named = [*(group_on if isinstance(group_on, list | tuple) else [group_on]), time_on]
+    missing = [c for c in named if c is not None and c not in X.columns]
+    if missing:  # 학습 행에 그 열이 없으면 무작위 fold (split을 실패시키지 않는다)
+        print(
+            f"split_groups: 학습 행에 없는 split 열 {missing}, 무작위 fold를 쓴다", file=sys.stderr
+        )
+        return None
+    if group_on is not None:
+        columns = list(group_on) if isinstance(group_on, list | tuple) else [group_on]
+        codes = np.stack([pd.factorize(X[c], use_na_sentinel=False)[0] for c in columns], axis=1)
+        return np.unique(codes, axis=0, return_inverse=True)[1].reshape(-1)
+    if time_on is not None:
+        t = X[time_on]
+        if pd.api.types.is_datetime64_any_dtype(t):
+            t = (t - pd.Timestamp(0, tz=getattr(t.dt, "tz", None))) / pd.Timedelta(seconds=1)
+        ranks = pd.to_numeric(t, errors="coerce").rank(method="min")
+        codes = pd.qcut(ranks, q=n_intervals, labels=False, duplicates="drop")
+        return codes.fillna(-1).astype(int).to_numpy()
+    return None
+
+
 def _method_key(method: str) -> str:
     return str(method).removeprefix("TA-").upper()
 

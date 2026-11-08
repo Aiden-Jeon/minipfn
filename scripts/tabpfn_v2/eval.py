@@ -63,6 +63,11 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier --test-time greedy \
     --method-name minipfn-tabpfn-v2-greedy
 
+greedy의 out-of-fold 과적합을 막는 설정(issue #52, 기본은 모두 꺼져 있다):
+`--min-improvement`는 out-of-fold 손실이 기본보다 그 비율 이상 낮지 않으면 기본 앙상블을 쓰고,
+`--min-temperature`는 그보다 낮은 온도를 pool에서 빼고, `--oof-split task`는 TabArena·BeyondArena
+split의 group·시간 열로 out-of-fold fold를 나눈다.
+
 `--distill`은 teacher(위의 추론 estimator)를 데이터셋마다 GBDT 학생으로 증류해 학생으로만 예측한다
 (issue #44, `minipfn.inference.distillation`, extra `distill`). `oof`는 out-of-fold teacher 라벨
 (arXiv 2605.18654), `synthetic`은 학습 행 전체를 context로 학습 행 + CutMix synthetic 행을 라벨링
@@ -132,6 +137,7 @@ from minipfn.utils import log_run_source
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
 TEST_TIME = ("none", "greedy", "diagscale", "diagscale+greedy")
+OOF_SPLITS = ("random", "task")
 LATENCY_REPEATS = 5
 
 
@@ -184,6 +190,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pool-size", type=int, default=POOL_SIZE, help="--test-time greedy의 pool 멤버 수"
+    )
+    parser.add_argument(
+        "--min-improvement",
+        type=float,
+        default=0.0,
+        help="--test-time greedy: 고른 조합의 out-of-fold 손실이 기본보다 이 비율 이상 낮지 않으면"
+        " 기본 앙상블을 쓴다 (0: 조건 없음, 논문 방식)",
+    )
+    parser.add_argument(
+        "--min-temperature",
+        type=float,
+        default=None,
+        help="--test-time greedy: 이보다 낮은 softmax 온도를 pool에서 뺀다 (기본: 빼지 않는다)",
+    )
+    parser.add_argument(
+        "--oof-split",
+        choices=OOF_SPLITS,
+        default="random",
+        help="--test-time greedy의 out-of-fold fold (task: TabArena·BeyondArena split의 group·시간"
+        " 열로 나눈다. 무작위 split은 그대로 random)",
     )
     parser.add_argument(
         "--distill",
@@ -325,6 +351,17 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             f"--pool-size({args.pool_size})는 {suite} 앙상블의 멤버 수"
             f"({n_estimators}) 이상이어야 한다."
         )
+    if "greedy" in args.test_time:
+        try:  # 같은 이유로 greedy 설정의 오류(온도 하한 등)도 여기서 확인한다
+            GreedyEnsembleClassifier(
+                model,
+                n_estimators=n_estimators,
+                pool_size=args.pool_size,
+                min_improvement=args.min_improvement,
+                min_temperature=args.min_temperature,
+            )
+        except ValueError as e:
+            raise SystemExit(str(e)) from e
     log_path = Path(args.out_dir) / "test_time.jsonl"
     # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
     log_fields = {"suite": suite, "method": args.method_name, **test_time_params(args)}
@@ -340,7 +377,12 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         }
         if "greedy" in args.test_time:
             # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
-            kw.update(selection=args.selection, pool_size=args.pool_size)
+            kw.update(
+                selection=args.selection,
+                pool_size=args.pool_size,
+                min_improvement=args.min_improvement,
+                min_temperature=args.min_temperature,
+            )
             if suite == "classification":
                 estimator = GreedyEnsembleClassifier(model, **kw)
             else:
@@ -371,6 +413,8 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             estimator = RecordedEstimator(estimator, record, fits_log, latency=args.latency)
         return estimator
 
+    # arena system이 fit에 split의 group 번호(groups)를 넘긴다
+    make.fit_groups = "greedy" in args.test_time and args.oof_split == "task"
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
     make.n_estimators = n_estimators
@@ -383,9 +427,9 @@ def record_fits(estimator, path: Path, **fields) -> None:
     `selection_`, DiagScale `adaptation_`), 표 크기, fit 시간을 `path`(JSONL)에 한 줄씩 덧붙인다."""
     fit = estimator.fit
 
-    def fit_and_record(X, y):
+    def fit_and_record(X, y, **fit_kwargs):
         start = time.perf_counter()
-        fitted = fit(X, y)
+        fitted = fit(X, y, **fit_kwargs)
         record = {**fields, "rows": len(X), "features": int(np.shape(X)[1])}
         for key in ("selection_", "adaptation_"):
             value = getattr(fitted, key, None)
@@ -405,6 +449,13 @@ def test_time_params(args: argparse.Namespace) -> dict:
     params = {"test_time": args.test_time}
     if "greedy" in args.test_time:
         params.update(selection=args.selection, pool_size=args.pool_size)
+        # issue #52의 설정은 켰을 때만 (끈 설정의 arena 결과 cache는 그대로 다시 쓴다)
+        if args.min_improvement:
+            params["min_improvement"] = args.min_improvement
+        if args.min_temperature is not None:
+            params["min_temperature"] = args.min_temperature
+        if args.oof_split != "random":
+            params["oof_split"] = args.oof_split
     return params
 
 
@@ -434,9 +485,9 @@ class RecordedEstimator:
             raise AttributeError(name)
         return getattr(self.estimator, name)
 
-    def fit(self, X, y) -> RecordedEstimator:
+    def fit(self, X, y, **fit_kwargs) -> RecordedEstimator:
         start = time.perf_counter()
-        self.estimator.fit(X, y)
+        self.estimator.fit(X, y, **fit_kwargs)
         self.record_ = {
             **self.record,
             "rows": len(X),
@@ -666,6 +717,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.uncertainty and args.distill != "none" and args.suite in ("regression", "all"):
         # 회귀 학생은 평균만 내고 예측 분포가 없다
         raise SystemExit("--distill은 회귀 --uncertainty와 같이 쓸 수 없다 (학생은 평균만 낸다).")
+    if "greedy" not in args.test_time and (
+        args.min_improvement or args.min_temperature is not None or args.oof_split != "random"
+    ):
+        raise SystemExit("--min-improvement·--min-temperature·--oof-split은 greedy에서만 쓴다.")
     if args.test_time != "none" and args.distill != "none":
         # test-time 기록(record_fits)이 fit을 덮어써서, 증류가 teacher를 복사하면 원래 객체를 쓴다
         raise SystemExit("--distill은 --test-time none에서만 쓴다.")
