@@ -49,7 +49,12 @@ from minipfn.utils import get_device, log_run_source, set_seed
 if TYPE_CHECKING:
     from minipfn.hub import from_pretrained
     from minipfn.recipes.tabpfn_v1 import TabPFNv1Classifier
-    from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
+    from minipfn.recipes.tabpfn_v2 import (
+        TabPFNv2_5Classifier,
+        TabPFNv2_5Regressor,
+        TabPFNv2Classifier,
+        TabPFNv2Regressor,
+    )
 
 PFNTransformer = PointTransformer  # 예전 이름
 
@@ -59,6 +64,8 @@ _LAZY = {
     "TabPFNv1Classifier": "minipfn.recipes.tabpfn_v1",
     "TabPFNv2Classifier": "minipfn.recipes.tabpfn_v2",
     "TabPFNv2Regressor": "minipfn.recipes.tabpfn_v2",
+    "TabPFNv2_5Classifier": "minipfn.recipes.tabpfn_v2",
+    "TabPFNv2_5Regressor": "minipfn.recipes.tabpfn_v2",
 }
 
 
@@ -103,4 +110,6 @@ __all__ = [
     "TabPFNv1Classifier",
     "TabPFNv2Classifier",
     "TabPFNv2Regressor",
+    "TabPFNv2_5Classifier",
+    "TabPFNv2_5Regressor",
 ]
