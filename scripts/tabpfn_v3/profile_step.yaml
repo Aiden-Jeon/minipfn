@@ -1,0 +1,40 @@
+# TabPFN-3.5 multitask(Muon) 학습 step을 단계별로 잰다 (issue #56, scripts/tabpfn_v3/profile_step.py):
+# forward·backward, gradient all-reduce, Newton–Schulz, Muon step(모든 GPU가 다 계산 / 노드 안끼리 /
+# 모든 GPU끼리 나눔, 결과가 같은지도 본다), Adam step.
+#   databricks air run -f scripts/tabpfn_v3/profile_step.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 기본은 논문 규모 chunk01과 같은 노드 4대(32 GPU)·batch 256(GPU당 8). 8 GPU medium과 견주려면:
+#   --override compute.num_accelerators=8 --override env_variables.PROFILE_BATCH_SIZE=64 \
+#   --override mlflow_run_name=tabpfn-v3-5-multitask-profile-step-8gpu
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-5-multitask-profile-step-32gpu
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+  # 기본 환경에 없는 패키지 (학습 데이터를 만드는 TabICL prior)
+  dependencies:
+    - tabicl>=2.2
+compute:
+  accelerator_type: GPU_8xH100
+  num_accelerators: 32
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v3/profile_step.py
+env_variables:
+  PROFILE_BATCH_SIZE: "256"
+  PROFILE_STEPS: "30"
+max_retries: 0
+timeout_minutes: 45
+# 학습(scripts/tabpfn_v3/train.yaml)과 같은 노드 묶기
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONHASHSEED=1
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  torchrun $(if [ "${NUM_NODES:-1}" -gt 1 ]; then
+  echo --nnodes=$NUM_NODES --node_rank=$NODE_RANK --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT;
+  else echo --standalone; fi)
+  --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/tabpfn_v3/profile_step.py
+  --batch-size $PROFILE_BATCH_SIZE --steps $PROFILE_STEPS --out /tmp/profile.json

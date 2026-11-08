@@ -21,13 +21,22 @@ Muon(Jordan et al. 2024)은 2차원 가중치 행렬의 gradient momentum을 New
 `MuonAdam`은 두 optimizer를 하나로 보이게 묶는다. param_groups는 두 optimizer의 group을 이어 붙인
 것(Muon, Adam 순서)이라서 scheduler(`LambdaLR`)와 lr 바꾸기(`_set_base_lr`)가 두 묶음을 함께 바꾼다.
 DDP에서는 모든 GPU가 평균 낸 같은 gradient로 같은 계산을 한다.
+
+분산 Muon(issue #56, 학습 옵션 `muon_distributed`): 기본은 모든 GPU가 모든 행렬의 Newton–Schulz를
+똑같이 계산한다. `process_group`을 주면 그 group의 GPU끼리 행렬 조각(q·k·v를 나눈 조각 단위)을
+나눠 맡아(`shard_pieces`) 자기 몫만 직교화하고, 결과(bf16)를 all-gather로 모은다(Moonlight·Kimi의
+분산 Muon과 같은 생각). momentum buffer는 지금처럼 모든 GPU에 다 둔다(checkpoint 형식 그대로라서
+나누기 전의 checkpoint에서 이어 학습할 수 있다). 받은 조각은 1 GPU에서 계산한 갱신과 값·stride가
+같은 tensor로 되돌려 더하므로, 가중치는 1 GPU 계산과 비트 단위로 같다(테스트)
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 MUON_MOMENTUM = 0.95
@@ -73,11 +82,55 @@ def _newton_schulz(grad: torch.Tensor) -> torch.Tensor:
     return x.T if tall else x
 
 
+def _piece_cost(rows: int, cols: int) -> int:
+    """조각 하나의 Newton–Schulz 곱셈 양 (반복 한 번: 짧은 변 m, 긴 변 n이면 m²·(2n + m))."""
+    m, n = min(rows, cols), max(rows, cols)
+    return m * m * (2 * n + m)
+
+
+def shard_pieces(shapes: list[tuple[int, int]], n_ranks: int) -> list[int]:
+    """조각(행, 열)마다 맡을 rank. 곱셈 양이 큰 조각부터 지금까지 몫이 가장 적은 rank에 준다(LPT,
+    같으면 번호가 작은 rank). 정수만 쓰므로 모든 GPU가 같은 답을 낸다."""
+    loads, owner = [0] * n_ranks, [0] * len(shapes)
+    for i in sorted(range(len(shapes)), key=lambda i: (-_piece_cost(*shapes[i]), i)):
+        rank = min(range(n_ranks), key=lambda r: (loads[r], r))
+        owner[i] = rank
+        loads[rank] += _piece_cost(*shapes[i])
+    return owner
+
+
+def shard_group(scope: str):
+    """분산 Muon이 행렬을 나눌 process group. "all"은 모든 GPU, "node"는 노드 안 GPU끼리(노드마다
+    group 하나, 노드 사이에는 지금처럼 같은 계산을 한다). 모든 GPU가 같이 불러야 한다. GPU가 하나면
+    None(나누지 않는다)."""
+    if scope not in ("node", "all"):
+        raise ValueError(f"분산 Muon 범위는 node 또는 all이다: {scope}")
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return None
+    if scope == "all":
+        return dist.group.WORLD
+    local = int(os.environ.get("LOCAL_WORLD_SIZE", dist.get_world_size()))
+    if local == dist.get_world_size():
+        return dist.group.WORLD
+    group, _ = dist.new_subgroups(group_size=local)
+    return group
+
+
 class Muon(torch.optim.Optimizer):
     """`torch.optim.Muon`(Nesterov, match_rms_adamw)과 같은 계산. group의 `split`이 1보다 크면
-    weight를 dim 0으로 그만큼 나눠 조각마다 직교화하고 lr도 조각 크기로 보정한다."""
+    weight를 dim 0으로 그만큼 나눠 조각마다 직교화하고 lr도 조각 크기로 보정한다.
 
-    def __init__(self, params, lr: float, *, weight_decay: float = 0.0, split: int = 1) -> None:
+    `process_group`을 주면 그 group의 GPU끼리 조각을 나눠 직교화한다(모듈 주석, 분산 Muon)."""
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        *,
+        weight_decay: float = 0.0,
+        split: int = 1,
+        process_group=None,
+    ) -> None:
         defaults = {
             "lr": lr,
             "weight_decay": weight_decay,
@@ -89,11 +142,19 @@ class Muon(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.ndim != 2 or p.shape[0] % group["split"]:
                     raise ValueError(f"Muon은 {group['split']}조각으로 나눌 2차원 행렬만 받는다")
+        if process_group is not None and dist.get_world_size(process_group) == 1:
+            process_group = None  # 나눌 GPU가 없다
+        self.process_group = process_group
+        # (group 크기, gradient가 있는 파라미터 묶음)마다 조각 주인
+        self._owners: dict[tuple, list[int]] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
         if closure is not None:
             raise ValueError("Muon은 closure를 받지 않는다")
+        if self.process_group is not None:
+            self._step_sharded()
+            return
         for group in self.param_groups:
             lr, momentum, split = group["lr"], group["momentum"], group["split"]
             for p in group["params"]:
@@ -113,9 +174,75 @@ class Muon(torch.optim.Optimizer):
                 p.mul_(1 - lr * group["weight_decay"])
                 p.add_(update, alpha=-(lr * (0.2 * math.sqrt(max(rows, cols)))))
 
+    def _step_sharded(self) -> None:
+        """`step`과 같은 갱신을 group의 GPU끼리 조각을 나눠 계산한다.
+
+        1. 모든 GPU가 momentum buffer를 다 갱신한다 (checkpoint 형식 그대로)
+        2. 자기가 맡은 조각만 Nesterov 갱신을 직교화해 보낼 buffer에 이어 붙인다
+        3. all-gather로 모든 조각을 받는다. 길이는 가장 많이 맡은 GPU에 맞춘다(나머지는 채움)
+        4. 받은 조각을 1 GPU의 `_newton_schulz` 결과와 stride까지 같은 모양으로 되돌려 더한다.
+           세로로 긴 조각은 직교화가 전치한 채로 계산하므로 그 계산된 쪽(가로로 긴 쪽)을 보낸다
+        """
+        group_ = self.process_group
+        me, n_ranks = dist.get_rank(group_), dist.get_world_size(group_)
+        active = [  # (파라미터, group, 조각 행 수) — gradient가 없으면 모든 GPU에서 없다(DDP)
+            (p, g, p.shape[0] // g["split"])
+            for g in self.param_groups
+            for p in g["params"]
+            if p.grad is not None
+        ]
+        if not active:
+            return
+        key = (n_ranks, *(id(p) for p, _, _ in active))
+        if key not in self._owners:
+            shapes = [(rows, p.shape[1]) for p, g, rows in active for _ in range(g["split"])]
+            self._owners[key] = shard_pieces(shapes, n_ranks)
+        owner = self._owners[key]
+
+        sends, sizes, k = [], [0] * n_ranks, 0
+        for p, g, rows in active:
+            split, momentum = g["split"], g["momentum"]
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(p.grad)
+            buf = state["momentum_buffer"]
+            buf.lerp_(p.grad, 1 - momentum)
+            mine = [j for j in range(split) if owner[k + j] == me]
+            if mine:
+                update = p.grad.lerp(buf, momentum)  # Nesterov
+                pieces = update.split(rows) if split > 1 else [update]
+                for j in mine:
+                    orth = _newton_schulz(pieces[j])
+                    sends.append((orth.T if rows > p.shape[1] else orth).reshape(-1))
+            for j in range(split):
+                sizes[owner[k + j]] += rows * p.shape[1]
+            k += split
+
+        width = max(sizes)
+        send = torch.zeros(width, dtype=torch.bfloat16, device=active[0][0].device)
+        if sends:
+            torch.cat(sends, out=send[: sizes[me]])
+        received = torch.empty(n_ranks * width, dtype=send.dtype, device=send.device)
+        dist.all_gather_into_tensor(received, send, group=group_)
+
+        offsets, k = [r * width for r in range(n_ranks)], 0
+        for p, g, rows in active:
+            cols, parts = p.shape[1], []
+            for j in range(g["split"]):
+                r = owner[k + j]
+                flat = received[offsets[r] : offsets[r] + rows * cols]
+                offsets[r] += rows * cols
+                parts.append(flat.view(cols, rows).T if rows > cols else flat.view(rows, cols))
+            k += g["split"]
+            update = parts[0] if g["split"] == 1 else torch.cat(parts)
+            lr = g["lr"]
+            p.mul_(1 - lr * g["weight_decay"])
+            p.add_(update, alpha=-(lr * (0.2 * math.sqrt(max(rows, cols)))))
+
 
 class MuonAdam(torch.optim.Optimizer):
-    """블록 안 가중치 행렬은 Muon, 나머지는 Adam. lr은 두 묶음이 같은 값을 쓴다.
+    """블록 안 가중치 행렬은 Muon, 나머지는 Adam. lr은 두 묶음이 같은 값을 쓴다. `process_group`을
+    주면 Muon 쪽 직교화를 그 group의 GPU끼리 나눈다(분산 Muon, 모듈 주석).
 
     묶음과 상태는 안의 두 optimizer가 든다. `torch.optim.Optimizer.__init__`은 부르지 않는다(부르면
     쓰지 않는 묶음·상태가 따로 생긴다). scheduler가 Optimizer인지 보므로 상속만 한다.
@@ -128,6 +255,7 @@ class MuonAdam(torch.optim.Optimizer):
         *,
         weight_decay: float = 0.0,
         adam_kwargs: dict | None = None,
+        process_group=None,
     ) -> None:
         muon, adam = muon_parameters(model)
         if not muon or not adam:
@@ -139,7 +267,7 @@ class MuonAdam(torch.optim.Optimizer):
             {"params": [p for p, s in muon if s == split], "split": split}
             for split in sorted({s for _, s in muon})
         ]
-        self.muon = Muon(groups, lr=lr, weight_decay=weight_decay)
+        self.muon = Muon(groups, lr=lr, weight_decay=weight_decay, process_group=process_group)
         self.adam = torch.optim.Adam(adam, lr=lr, **(adam_kwargs or {}))
         self.defaults = {"lr": lr}
 

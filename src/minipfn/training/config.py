@@ -32,8 +32,11 @@ SPEED_OPTIONS = (
     "weight_average_every",
     "optimizer",
     "muon_weight_decay",
+    "muon_distributed",
 )
 OPTIMIZERS = ("adam", "muon")
+# 분산 Muon의 범위 (issue #56, `muon_distributed`)
+MUON_DISTRIBUTED = ("off", "node", "all")
 # 한 task 학습과, 분류·회귀를 한 모델로 같이 학습하는 multitask (`task_configs`)
 TASKS = ("classification", "regression", "multitask")
 
@@ -150,6 +153,11 @@ class TrainConfig:
     # muon_weight_decay는 Muon 묶음의 decoupled weight decay (Adam 묶음은 지금처럼 없음)
     optimizer: Literal["adam", "muon"] = "adam"
     muon_weight_decay: float = 0.0
+    # 분산 Muon (issue #56, `training.muon`): Newton–Schulz 직교화를 GPU마다 똑같이 계산하지 않고
+    # GPU끼리 행렬 조각을 나눠 맡은 뒤 all-gather로 모은다. "node"는 노드 안 GPU끼리, "all"은 모든
+    # GPU끼리 나눈다. 갱신 결과는 "off"(기본, 모든 GPU가 다 계산)와 비트 단위로 같고 checkpoint
+    # 형식도 같아서 이어 학습할 때 켜거나 끌 수 있다
+    muon_distributed: Literal["off", "node", "all"] = "off"
 
     def __post_init__(self) -> None:
         self.model_type = canonical_model_type(self.model_type)
@@ -177,6 +185,13 @@ class TrainConfig:
             raise ValueError("schedule_free는 Adam 쪽 방법이다 (optimizer=muon과 같이 쓰지 않는다)")
         if self.muon_weight_decay < 0 or (self.muon_weight_decay and self.optimizer != "muon"):
             raise ValueError("muon_weight_decay는 0 이상이고 optimizer=muon일 때만 쓴다")
+        if self.muon_distributed not in MUON_DISTRIBUTED:
+            raise ValueError(
+                f"muon_distributed는 {MUON_DISTRIBUTED} 가운데 하나여야 한다:"
+                f" {self.muon_distributed}"
+            )
+        if self.muon_distributed != "off" and self.optimizer != "muon":
+            raise ValueError("muon_distributed는 optimizer=muon일 때만 쓴다")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
 
