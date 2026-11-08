@@ -400,3 +400,26 @@ def test_eval_script_builds_test_time_estimators_and_records_fits(monkeypatch, t
         script.make_estimator_factory("classification", args)
     with pytest.raises(SystemExit):
         script.main(["--test-time", "none", "--min-improvement", "0.01"])
+
+
+def test_arena_factory_passes_groups_only_for_task_out_of_fold(monkeypatch, tmp_path):
+    # arena system이 받는 것은 run_arena의 분류·회귀 dispatch 함수다 (fit_groups가 거기 있어야 한다)
+    script = _eval_script()
+    monkeypatch.setattr(script, "load_model", lambda path, task, cache: (_tiny_model(), None))
+    monkeypatch.setattr(script, "arena_suite", lambda name: None)
+    monkeypatch.setattr(script, "arena_limits", lambda models, args: {})
+    monkeypatch.setattr(script, "print_arena_summary", lambda summary: None)
+    seen = {}
+
+    def fake_run(suite, make, **kwargs):
+        seen["make"] = make
+        return {}
+
+    monkeypatch.setattr(arena, "run", fake_run)
+    for oof_split, expected in [("task", True), ("random", False)]:
+        args = script.parse_args(
+            ["--suite", "beyondarena-lite", "--classifier-path", "clf.pt", "--test-time", "greedy"]
+            + ["--oof-split", oof_split, "--out-dir", str(tmp_path), "--device", "cpu"]
+        )
+        script.run_arena(args, tmp_path, use_mlflow=False)
+        assert seen["make"].fit_groups is expected

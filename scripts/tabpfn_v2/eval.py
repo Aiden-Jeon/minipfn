@@ -583,6 +583,9 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
         task = "regression" if problem_type == "regression" else "classification"
         return factories[task](types.SimpleNamespace(categorical_indices=categorical), one_hot)
 
+    # arena system은 이 함수를 받으므로 split의 group 번호를 넘길지도 여기에 단다
+    make.fit_groups = any(getattr(f, "fit_groups", False) for f in factories.values())
+
     # 끝난 split을 다시 쓸지 정하는 값: 체크포인트와 추론 설정이 같을 때만 다시 쓴다
     fingerprint = json.dumps(
         {
