@@ -170,6 +170,14 @@ class TrainConfig:
     # 설정을 레시피에 남겨, 명령 하나로 같은 경로를 밟게 한다(`recipes.tabpfn_v3.paper_run`).
     # MLflow param의 문자열로도 받는다 (`normalize_phases`)
     phases: tuple = ()
+    # 학습 진단 지표 (`training.diagnostics`). 학습 계산은 바꾸지 않는다(켜도 비트 단위로 같다).
+    # 묶음별 가중치·gradient norm(issue #65)은 늘 낸다
+    # - grad_cosine (issue #64): multitask에서 log_every마다 앞 4 step의 gradient로 두 task
+    #   gradient의 묶음별 cosine을 낸다. rank 0에 gradient 3 step치(bf16)를 잠깐 더 둔다
+    # - rank_timing (issue #68): GPU마다 forward·backward 시간과 표 크기를 재서 log_every마다
+    #   rank 0으로 모은다(지표 `rank_*`, step마다 한 줄인 `rank_timing.jsonl`)
+    grad_cosine: bool = False
+    rank_timing: bool = False
 
     def __post_init__(self) -> None:
         self.phases = normalize_phases(self.phases)
@@ -207,6 +215,10 @@ class TrainConfig:
             raise ValueError("muon_distributed는 optimizer=muon일 때만 쓴다")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
+        if self.grad_cosine and self.task != "multitask":
+            raise ValueError("grad_cosine은 두 task의 gradient를 견준다 (multitask에서만 쓴다)")
+        if self.grad_cosine and self.log_every < 4:
+            raise ValueError("grad_cosine은 log_every마다 앞 4 step을 쓴다 (log_every 4 이상)")
         self._check_phases()
 
     def _check_phases(self) -> None:
@@ -261,7 +273,8 @@ class TrainConfig:
         자기 자신."""
         if self.task != "multitask":
             return {self.task: self}
-        return {task: replace(self, task=task) for task in self.tasks}
+        # task 하나의 설정에는 두 task를 견주는 grad_cosine이 없다
+        return {task: replace(self, task=task, grad_cosine=False) for task in self.tasks}
 
     @classmethod
     def medium(cls, task: str = "classification") -> TrainConfig:

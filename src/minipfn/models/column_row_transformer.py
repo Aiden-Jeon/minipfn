@@ -672,12 +672,17 @@ class ColumnRowTransformer(nn.Module):
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def parameter_stage(self, name: str) -> str:
+        """파라미터 이름의 단계 (`STAGES`). 학습 지표의 묶음별 norm이 쓴다
+        (`training.diagnostics.parameter_groups`)."""
+        return STAGES[name.split(".")[0]]
+
     def num_parameters_by_stage(self) -> dict[str, int]:
         """단계마다 파라미터 수 (`STAGE_ORDER` 순서): 셀 encoder(정답 embedding 포함), 열 단계,
         행 단계, 행 ICL(정답 embedding 포함), 출력."""
         counts = dict.fromkeys(STAGE_ORDER, 0)
         for name, p in self.named_parameters():
-            counts[STAGES[name.split(".")[0]]] += p.numel()
+            counts[self.parameter_stage(name)] += p.numel()
         return counts
 
     def num_parameters_by_task(self) -> dict[str, int]:
