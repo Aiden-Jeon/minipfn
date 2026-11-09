@@ -10,7 +10,7 @@ import torch
 from minipfn.hub import run_architecture
 from minipfn.recipes import tabpfn_v3
 from minipfn.training.config import TrainConfig, normalize_phases
-from minipfn.training.loop import _phase_lr, train
+from minipfn.training.loop import _phase_base_lr, train
 
 
 def _smoke(**changes):
@@ -63,14 +63,29 @@ def test_weight_decay_phase_needs_muon():
         TrainConfig(phases=((10, {"muon_weight_decay": 0.1}),))
 
 
-def test_phase_lr_keeps_the_rewind_factor_across_a_boundary():
+def test_phase_base_lr_keeps_the_rewind_factor_and_its_floor():
     config = TrainConfig(phases=((10, {"lr": 1e-4}),))
-    assert _phase_lr(config, 2e-4, 9, 10) == pytest.approx(1e-4)
-    # 구간 안에서 붕괴로 절반(5e-5)이 된 뒤 구간 앞으로 되돌리면 앞 구간 lr의 절반
-    assert _phase_lr(config, 5e-5, 15, 5) == pytest.approx(1e-4)
-    # 같은 구간 안이면 그대로 (비트 동일)
-    base = 1.2345e-4
-    assert _phase_lr(config, base, 3, 7) is base
+    assert _phase_base_lr(config, 9, 1.0) == 2e-4 and _phase_base_lr(config, 10, 1.0) == 1e-4
+    # 붕괴로 절반이 된 배율은 구간이 바뀌어도 이어진다 (구간 앞으로 되돌려도 그 구간 lr × 배율)
+    assert _phase_base_lr(config, 15, 0.5) == pytest.approx(5e-5)
+    assert _phase_base_lr(config, 5, 0.5) == pytest.approx(1e-4)
+    # 낮춘 배율로 구간에 들어가도 rewind_min_lr(2.5e-5) 아래로 내리지 않는다
+    assert _phase_base_lr(config, 15, 0.125) == pytest.approx(config.rewind_min_lr)
+    # 구간 lr이 이미 하한보다 낮으면 그 값
+    low = TrainConfig(phases=((10, {"lr": 1e-5}),))
+    assert _phase_base_lr(low, 15, 0.5) == pytest.approx(1e-5)
+
+
+def test_phases_must_start_before_the_last_step():
+    with pytest.raises(ValueError):
+        TrainConfig(steps=100_000, phases=((125_000, {"lr": 1e-4}),))
+
+
+def test_phases_take_a_dict_by_start_step():
+    config = TrainConfig(
+        optimizer="muon", phases={20: {"lr": 1e-4}, 10: {"muon_weight_decay": 0.1}}
+    )
+    assert config.phases == ((10, (("muon_weight_decay", 0.1),)), (20, (("lr", 1e-4),)))
 
 
 def test_training_switches_lr_and_weight_decay_at_the_phase(tmp_path):
@@ -100,6 +115,24 @@ def test_resume_enters_the_phase_at_the_resume_step(tmp_path):
     after = torch.load(tmp_path / "b" / "latest.pt", weights_only=True)
     assert after["scheduler"]["base_lrs"][0] == pytest.approx(5e-5)
     assert all(g["weight_decay"] == 0.1 for g in after["optimizer"]["muon"]["param_groups"])
+
+
+def test_resume_past_a_phase_start_from_a_run_without_phases(tmp_path):
+    # 구간 설정 없이 구간 시작 뒤(step 4)까지 학습한 checkpoint를 구간 설정으로 이으면 lr과
+    # weight decay가 둘 다 그 구간 값이 된다 (원래 chunk02의 150k checkpoint를 paper_run으로
+    # 잇는 경우)
+    train(_smoke(stop_step=4), tmp_path / "a", mlflow_log=False)
+    assert torch.load(tmp_path / "a" / "latest.pt", weights_only=True)["step"] == 4
+    train(
+        _smoke(phases=PHASES),
+        tmp_path / "b",
+        resume_from=tmp_path / "a" / "latest.pt",
+        mlflow_log=False,
+    )
+    after = torch.load(tmp_path / "b" / "latest.pt", weights_only=True)
+    assert after["scheduler"]["base_lrs"][0] == pytest.approx(5e-5)
+    assert all(g["weight_decay"] == 0.1 for g in after["optimizer"]["muon"]["param_groups"])
+    assert after["lr_scale"] == 1.0
 
 
 def _script():
@@ -142,3 +175,34 @@ def test_paper_run_is_the_trained_v3_5_path(monkeypatch):
     )
     with pytest.raises(SystemExit):
         script.build_config(resume, run_architecture(other), script.source_speed_options(other))
+    # 이어 학습하면 구간 앞의 lr은 원래 run의 lr(처음에 --lr로 바꾼 값)을 잇고, --lr은 받지 않는다
+    custom = {**params, "lr": "0.0003"}
+    resume = script.parse_args(
+        ["--config-name", "paper_run", "--task", "multitask", "--resume-run-id", "r"]
+    )
+    resumed, _ = script.build_config(resume, run_architecture(custom), options)
+    assert script.resume_phase_lr(resumed, resume, custom).lr == 3e-4
+    with pytest.raises(SystemExit):
+        script.resume_phase_lr(resumed, script.parse_args([*resume_args(), "--lr", "1e-4"]), custom)
+    # optimizer를 바꾸면 Muon weight decay가 든 구간 설정도 잇지 않는다
+    init = script.parse_args(
+        [
+            "--config-name",
+            "paper",
+            "--task",
+            "multitask",
+            "--init-run-id",
+            "r",
+            "--optimizer",
+            "adam",
+        ]
+    )
+    built, _ = script.build_config(init, run_architecture(params), options)
+    assert built.optimizer == "adam" and built.phases == ()
+    # 구간 설정은 tag가 param보다 먼저다 (이어 학습하며 바뀔 수 있어서)
+    tagged = script.source_params({"phases": "()"}, {"phases": str(config.phases)})
+    assert normalize_phases(tagged["phases"]) == config.phases
+
+
+def resume_args():
+    return ["--config-name", "paper_run", "--task", "multitask", "--resume-run-id", "r"]

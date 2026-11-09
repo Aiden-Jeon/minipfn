@@ -193,6 +193,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def resume_phase_lr(config: TrainConfig, args: argparse.Namespace, params: dict) -> TrainConfig:
+    """구간 설정이 있는 학습을 이어 갈 때의 lr. lr은 구간이 정하므로 `--lr`은 받지 않고, 첫 구간
+    앞의 lr(`config.lr`)은 원래 run의 것을 잇는다(처음에 `--lr`로 바꾼 run도 같은 경로로)."""
+    if not config.phases:
+        return config
+    if args.lr is not None:
+        raise SystemExit("구간 설정(phases)이 있는 학습은 --lr로 lr을 바꾸지 않는다")
+    return replace(config, lr=float(params["lr"]))
+
+
+def source_params(params: dict[str, str], tags: dict[str, str]) -> dict[str, str]:
+    """원래 run의 param. 구간 설정은 이어 학습하며 바뀔 수 있어 tag(`phases`)가 있으면 그것을
+    쓴다(param은 처음 값에서 바꿀 수 없다)."""
+    if "phases" in tags:
+        return {**params, "phases": tags["phases"]}
+    return params
+
+
 def source_speed_options(params: dict[str, str]) -> dict:
     """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict."""
     defaults = TrainConfig()
@@ -217,7 +235,14 @@ def inherit_batch_size(args: argparse.Namespace, params: dict[str, str]) -> None
         args.batch_size = int(params["batch_size"])
 
 
-OPTIMIZER_OPTIONS = ("optimizer", "schedule_free", "muon_weight_decay", "muon_distributed")
+# 구간 설정(phases)에도 Muon weight decay가 들어 있어 optimizer를 바꾸면 같이 버린다
+OPTIMIZER_OPTIONS = (
+    "optimizer",
+    "schedule_free",
+    "muon_weight_decay",
+    "muon_distributed",
+    "phases",
+)
 
 
 def _optimizer_kind(schedule_free: bool, optimizer: str | None) -> str | None:
@@ -372,13 +397,19 @@ def main(argv: list[str] | None = None) -> None:
 
     source, speed_options = None, None
     if args.init_run_id or args.resume_run_id:
-        params = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id).data.params
+        run = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id)
+        params = source_params(run.data.params, run.data.tags)
         if params["task"] != args.task:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
         speed_options = source_speed_options(params)
+        if args.init_run_id:
+            # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다
+            speed_options.pop("phases", None)
         inherit_batch_size(args, params)
     config, arch = build_config(args, source, speed_options)
+    if args.resume_run_id:
+        config = resume_phase_lr(config, args, params)  # checkpoint를 받기 전에 본다
 
     init_path = None
     if args.init_run_id:
@@ -400,9 +431,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         saved_lr = _check_source(resume_path, config, resume=True)
         if config.phases:
-            # 구간 설정이 있으면 lr은 구간이 정하고, 기준 lr은 checkpoint의 값을 잇는다(학습 루프)
-            if args.lr is not None:
-                raise SystemExit("구간 설정(phases)이 있는 학습은 --lr로 lr을 바꾸지 않는다")
+            pass  # 기준 lr은 구간 lr × checkpoint의 붕괴 배율 (학습 루프. lr은 위에서 정했다)
         elif args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
             config = replace(config, lr=saved_lr)

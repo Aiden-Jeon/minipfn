@@ -215,6 +215,9 @@ class TrainConfig:
             s < 0 for s in starts
         ):
             raise ValueError(f"phases의 시작 step은 0 이상이고 커지는 순서여야 한다: {starts}")
+        if starts and starts[-1] >= self.steps:
+            # 닿지 않는 구간을 받아 두면 run에는 구간이 있다고 남는데 실제로는 바뀌지 않는다
+            raise ValueError(f"phases의 시작 step은 steps({self.steps})보다 작아야 한다: {starts}")
         for start, changes in self.phases:
             settings = dict(changes)
             if not settings or set(settings) - set(PHASE_KEYS):
@@ -336,9 +339,12 @@ class TrainConfig:
 
 def normalize_phases(phases) -> tuple:
     """`TrainConfig.phases`를 `((시작 step, (("lr", 값), ...)), ...)` 꼴로 (설정 이름 순서, 값은
-    float). dict·list로 써도 되고, MLflow param에 남은 문자열(`str(phases)`)도 읽는다."""
+    float). `{시작 step: {설정: 값}}` dict나 (시작 step, dict) 목록으로 써도 되고, MLflow
+    param·tag에 남은 문자열(`str(phases)`)도 읽는다."""
     if isinstance(phases, str):
         phases = ast.literal_eval(phases) if phases.strip() else ()
+    if isinstance(phases, dict):  # {시작 step: {설정: 값}}
+        phases = sorted(phases.items())
     out = []
     for start, changes in phases or ():
         items = changes.items() if isinstance(changes, dict) else changes
