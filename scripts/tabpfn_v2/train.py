@@ -49,6 +49,9 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 구간 설정이 있는 run을 이어 학습하면 그 구간 설정을 따르고, lr은 `--lr`이 아니라 구간이 정한다.
 `--config-name cooldown`은 그 가중치를 `--init-run-id`로 가져와 lr 1e-4 → 0으로 20k step 마무리
 학습한다(`recipes.tabpfn_v3.cooldown`).
+`--config-name stage1|stage2|stage3`(`--arch v3.5 --task multitask`)은 TabICLv2 3단계 학습을 옮긴
+것이다(`recipes.tabpfn_v3.curriculum`: 모든 파라미터 Muon, 표 크기 curriculum, prior filter).
+stage2·3은 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -58,6 +61,7 @@ import argparse
 import os
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import matplotlib
@@ -86,8 +90,12 @@ PRESETS = {
     # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,
     # --init-run-id와 같이)
     "cooldown": tabpfn_v3.cooldown,
+    # TabICLv2 3단계 학습을 옮긴 것 (`recipes.tabpfn_v3.curriculum`, --arch v3.5 --task multitask).
+    # stage2·3은 앞 단계 run에서 가중치를 가져온다(--init-run-id)
+    **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
 }
 CONFIG_NAMES = tuple(PRESETS)
+CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
@@ -202,6 +210,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         # 학습한 가중치를 마무리하는 설정이다. 회귀 구간 경계도 가져온 checkpoint의 것을 쓴다
         parser.error("cooldown은 --init-run-id(paper_run run)나 --resume-run-id와 같이 줘야 한다")
     if (
+        args.config_name in CURRICULUM_NAMES
+        and CURRICULUM_NAMES[args.config_name] > 1
+        and not (args.init_run_id or args.resume_run_id)
+    ):
+        # 단계마다 앞 단계의 가중치에서 새 optimizer로 시작한다 (TabICLv2 `--only_load_model True`)
+        parser.error(
+            f"{args.config_name}는 --init-run-id(앞 단계 run)나 --resume-run-id와 같이 줘야 한다"
+        )
+    if (
         args.config_name == "long_tables"
         and args.arch is not None
         and args.arch not in recipe.LONG_TABLES_MICRO_BATCH
@@ -258,6 +275,8 @@ OPTIMIZER_OPTIONS = (
     "schedule_free",
     "muon_weight_decay",
     "muon_distributed",
+    "muon_scope",
+    "muon_momentum",
     "phases",
 )
 
@@ -297,6 +316,11 @@ def build_config(
         if args.config_name in ("paper_run", "cooldown"):
             try:
                 return PRESETS[args.config_name](args.task, arch)
+            except ValueError as e:
+                raise SystemExit(str(e)) from None
+        if args.config_name in CURRICULUM_NAMES:
+            try:
+                return tabpfn_v3.curriculum(CURRICULUM_NAMES[args.config_name], args.task, arch)
             except ValueError as e:
                 raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:

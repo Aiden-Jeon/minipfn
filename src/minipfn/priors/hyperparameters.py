@@ -61,12 +61,20 @@ class ClassCount:
     """클래스 수 `num_classes` ~ U{2, ..., min(max_classes, 학습 행 수)}.
 
     모든 클래스가 학습 행에 나와야 하므로 클래스 수는 학습 행 수를 넘지 않는다.
+    `binary_prob`가 0보다 크면 그 확률로 먼저 2를 고르고, 아니면 위 균등 분포에서 뽑는다
+    (TabICLv2 `PriorDataset`: 0.5. 그러면 binary가 0.5 + 0.5/9 ≈ 56%다). 0이면 난수를 더 쓰지 않아
+    예전과 같은 데이터셋이 나온다.
     """
 
-    def __init__(self, max_classes: int) -> None:
+    def __init__(self, max_classes: int, binary_prob: float = 0.0) -> None:
+        if not 0.0 <= binary_prob <= 1.0:
+            raise ValueError(f"binary_prob는 0 이상 1 이하여야 한다: {binary_prob}")
         self.max_classes = max_classes
+        self.binary_prob = binary_prob
 
     def __call__(self, rng: Rng, n_train: int, n_features: int) -> dict:
+        if self.binary_prob and rng.numpy.random() < self.binary_prob:
+            return {"num_classes": 2}
         max_classes = min(self.max_classes, n_train)
         return {"num_classes": int(rng.numpy.integers(2, max_classes + 1))}
 

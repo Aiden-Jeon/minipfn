@@ -34,9 +34,13 @@ SPEED_OPTIONS = (
     "optimizer",
     "muon_weight_decay",
     "muon_distributed",
+    "muon_scope",
+    "muon_momentum",
     "phases",
 )
 OPTIMIZERS = ("adam", "muon")
+# Muon이 맡는 파라미터 (`training.muon.muon_parameters`): 블록 안 행렬만, 또는 모든 파라미터
+MUON_SCOPES = ("blocks", "all")
 # step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
 PHASE_KEYS = ("lr", "muon_weight_decay")
 # 분산 Muon의 범위 (issue #56, `muon_distributed`)
@@ -84,6 +88,21 @@ class TrainConfig:
     log_uniform_rows: bool = False  # 학습 행 수를 [min, max]에서 log 균등으로
     max_cells: int = MAX_CELLS  # 표 하나의 셀 수 상한 (검증 행 포함)
     feature_scale: int = MAX_FEATURES  # feature 수 분포를 펼 최대값 (sample_table_size)
+    # TabICLv2 학습 스크립트의 표 크기·prior 설정 (`recipes.tabpfn_v3.curriculum`). 기본값이면
+    # 위의 v2 논문 규칙 그대로다 (`minipfn.priors.graph_scm`)
+    # - size_rule "train_fraction": 행 수(학습 + 검증)를 [min_rows, max_rows]에서
+    #   (log_uniform_rows면 log 균등) 뽑고, 학습 행은 그 U(min_train_fraction, max_train_fraction)
+    #   비율, feature 수는 U(1, max_features). 이 규칙에서는 max_train_rows·n_eval_rows·
+    #   min_train_rows 하한 밖의 eval_rows 필드와 feature_scale을 쓰지 않는다
+    # - binary_prob: 분류 클래스 수를 이 확률로 2로 (TabICLv2 0.5)
+    # - filter_unpredictable: 예측할 수 없는 그래프·데이터셋을 다시 뽑는다
+    size_rule: Literal["eval_rows", "train_fraction"] = "eval_rows"
+    min_rows: int = 1024
+    max_rows: int = 1024
+    min_train_fraction: float = 0.3
+    max_train_fraction: float = 0.9
+    binary_prob: float = 0.0
+    filter_unpredictable: bool = False
     missing_dataset_prob: float = 0.3
     border_datasets: int = 20_000  # 회귀 구간 경계를 정할 때 뽑는 데이터셋 수 (여기서 정함)
     # 최적화 (논문: 약 200만 step × batch 64. warmup 길이와 lr은 여기서 정함)
@@ -157,6 +176,11 @@ class TrainConfig:
     # muon_weight_decay는 Muon 묶음의 decoupled weight decay (Adam 묶음은 지금처럼 없음)
     optimizer: Literal["adam", "muon"] = "adam"
     muon_weight_decay: float = 0.0
+    # muon_scope "all"(TabICLv2 `--muon True`): 모든 파라미터를 Muon으로 (2차원이 아닌 것은 첫
+    # 차원 × 나머지 행렬로 펴서 직교화한다). 그러면 muon_weight_decay가 모든 파라미터에 걸린다.
+    # muon_momentum은 Muon momentum (TabICLv2 0.9 = `--beta1`, `torch.optim.Muon` 기본 0.95)
+    muon_scope: Literal["blocks", "all"] = "blocks"
+    muon_momentum: float = 0.95
     # 분산 Muon (issue #56, `training.muon`): Newton–Schulz 직교화를 GPU마다 똑같이 계산하지 않고
     # GPU끼리 행렬 조각을 나눠 맡은 뒤 all-gather로 모은다. "node"는 노드 안 GPU끼리, "all"은 모든
     # GPU끼리 나눈다. 갱신 결과는 "off"(기본, 모든 GPU가 다 계산)와 비트 단위로 같고 checkpoint
@@ -213,6 +237,14 @@ class TrainConfig:
             )
         if self.muon_distributed != "off" and self.optimizer != "muon":
             raise ValueError("muon_distributed는 optimizer=muon일 때만 쓴다")
+        if self.muon_scope not in MUON_SCOPES:
+            raise ValueError(f"muon_scope는 {MUON_SCOPES} 가운데 하나여야 한다: {self.muon_scope}")
+        if not 0.0 <= self.muon_momentum < 1.0:
+            raise ValueError(f"muon_momentum은 0 이상 1 미만이어야 한다: {self.muon_momentum}")
+        if self.optimizer != "muon" and (self.muon_scope != "blocks" or self.muon_momentum != 0.95):
+            raise ValueError("muon_scope·muon_momentum은 optimizer=muon일 때만 바꾼다")
+        if not 0.0 <= self.binary_prob <= 1.0:
+            raise ValueError(f"binary_prob는 0 이상 1 이하여야 한다: {self.binary_prob}")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
         if self.grad_cosine and self.task != "multitask":

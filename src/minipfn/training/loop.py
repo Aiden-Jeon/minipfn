@@ -381,6 +381,8 @@ def _train(
             weight_decay=config.muon_weight_decay,
             adam_kwargs=adam_kwargs,
             process_group=group,
+            scope=config.muon_scope,
+            momentum=config.muon_momentum,
         )
         schedule = lambda s: lr_factor(s, config.warmup_steps, config.steps)  # noqa: E731
     else:
@@ -451,7 +453,7 @@ def _train(
     if d.is_main:
         muon_ids = None
         if config.optimizer == "muon":
-            muon_ids = {id(p) for p, _ in muon_parameters(model)[0]}
+            muon_ids = {id(p) for p, _ in muon_parameters(model, config.muon_scope)[0]}
         norm_groups = parameter_groups(model, muon_ids)
         grad_window = GroupNormWindow(norm_groups, multitask)
         if config.grad_cosine:

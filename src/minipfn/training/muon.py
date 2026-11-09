@@ -18,6 +18,12 @@ Muon(Jordan et al. 2024)은 2차원 가중치 행렬의 gradient momentum을 New
   Nesterov). 나누지 않는 행렬은 비트 단위로 같다(테스트). 나누기만 더하려고 step을 여기 둔다.
   weight decay는 Muon 묶음에만 있고 기본 0이다(지금 Adam 학습에 weight decay가 없어서)
 
+모든 파라미터 Muon(`scope="all"`, TabICLv2 학습 스크립트의 `--muon True`): 블록 밖 파라미터와
+2차원이 아닌 파라미터도 Muon이 맡는다. 2차원이 아니면 TabICL `Muon`처럼 (첫 차원, 나머지 곱)
+행렬로 펴서 직교화한다(1차원 (n,)은 (n, 1) — 직교화하면 단위 벡터, 0차원은 (1, 1)). lr 보정도 편
+행렬 크기로 한다. 그러면 Adam 묶음이 없고 weight decay가 모든 파라미터에 걸린다. q·k·v 묶은
+weight는 지금처럼 셋으로 나눈다(TabICL은 나누지 않는다).
+
 `MuonAdam`은 두 optimizer를 하나로 보이게 묶는다. param_groups는 두 optimizer의 group을 이어 붙인
 것(Muon, Adam 순서)이라서 scheduler(`LambdaLR`)와 lr 바꾸기(`_set_base_lr`)가 두 묶음을 함께 바꾼다.
 DDP에서는 모든 GPU가 평균 낸 같은 gradient로 같은 계산을 한다.
@@ -46,9 +52,14 @@ NS_STEPS = 5
 NS_EPS = 1e-7
 
 
-def muon_parameters(model: nn.Module) -> tuple[list[tuple[nn.Parameter, int]], list[nn.Parameter]]:
+def muon_parameters(
+    model: nn.Module, scope: str = "blocks"
+) -> tuple[list[tuple[nn.Parameter, int]], list[nn.Parameter]]:
     """([(Muon이 맡을 파라미터, 나눌 조각 수)], Adam이 맡을 파라미터). 순서는 `model.parameters()`
-    순서다. 조각 수는 q·k·v를 묶은 weight가 3, 나머지는 1이다."""
+    순서다. 조각 수는 q·k·v를 묶은 weight가 3, 나머지는 1이다. `scope="all"`이면 모든 파라미터가
+    Muon이다(Adam 쪽은 빈 목록)."""
+    if scope not in ("blocks", "all"):
+        raise ValueError(f"Muon 범위는 blocks 또는 all이다: {scope}")
     blocks = model.repeated_blocks() if hasattr(model, "repeated_blocks") else []
     splits: dict[int, int] = {}
     for block in blocks:
@@ -64,8 +75,18 @@ def muon_parameters(model: nn.Module) -> tuple[list[tuple[nn.Parameter, int]], l
                         splits[id(w)] = 1
                 # out_proj는 nn.Linear라서 위에서 잡힌다
     params = list(model.parameters())
+    if scope == "all":
+        return [(p, splits.get(id(p), 1)) for p in params], []
     muon = [(p, splits[id(p)]) for p in params if id(p) in splits]
     return muon, [p for p in params if id(p) not in splits]
+
+
+def _matrix(t: torch.Tensor) -> torch.Tensor:
+    """직교화할 2차원 view: (첫 차원, 나머지 곱). 0차원은 (1, 1) (TabICL `Muon`의
+    `reshape(len(g), -1)`과 같다). 파라미터를 제자리에서 바꾸므로 view여야 한다."""
+    if t.ndim == 2:
+        return t
+    return t.view(1, 1) if t.ndim == 0 else t.view(t.shape[0], -1)
 
 
 def _newton_schulz(grad: torch.Tensor) -> torch.Tensor:
@@ -88,7 +109,9 @@ def _nesterov(grad: torch.Tensor, buf: torch.Tensor, group: dict) -> torch.Tenso
 
 
 def _apply(p: torch.Tensor, update: torch.Tensor, group: dict) -> None:
-    """weight decay와 직교화한 갱신을 더한다. lr은 조각 크기로 보정한다(match_rms_adamw)."""
+    """weight decay와 직교화한 갱신을 더한다. lr은 조각 크기로 보정한다(match_rms_adamw).
+    2차원이 아닌 파라미터는 편 행렬(`_matrix`)로 본다."""
+    p = _matrix(p)
     rows, cols = p.shape[0] // group["split"], p.shape[1]
     lr = group["lr"]
     p.mul_(1 - lr * group["weight_decay"])
@@ -146,18 +169,22 @@ class Muon(torch.optim.Optimizer):
         *,
         weight_decay: float = 0.0,
         split: int = 1,
+        momentum: float = MUON_MOMENTUM,
+        any_shape: bool = False,
         process_group=None,
     ) -> None:
         defaults = {
             "lr": lr,
             "weight_decay": weight_decay,
-            "momentum": MUON_MOMENTUM,
+            "momentum": momentum,
             "split": split,
         }
         super().__init__(params, defaults)
         for group in self.param_groups:
             for p in group["params"]:
-                if p.ndim != 2 or p.shape[0] % group["split"]:
+                # any_shape면 2차원이 아닌 것도 편 행렬로 받는다 (`_matrix`)
+                shape = _matrix(p).shape if any_shape else p.shape
+                if len(shape) != 2 or shape[0] % group["split"]:
                     raise ValueError(f"Muon은 {group['split']}조각으로 나눌 2차원 행렬만 받는다")
         if process_group is not None and dist.get_world_size(process_group) == 1:
             process_group = None  # 나눌 GPU가 없다
@@ -178,8 +205,8 @@ class Muon(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 buf = self._momentum(p, group)
-                update = _nesterov(p.grad, buf, group)
-                rows = p.shape[0] // split
+                update = _matrix(_nesterov(p.grad, buf, group))
+                rows = update.shape[0] // split
                 if split == 1:
                     update = _newton_schulz(update)
                 else:
@@ -207,7 +234,7 @@ class Muon(torch.optim.Optimizer):
         group_ = self.process_group
         me, n_ranks = dist.get_rank(group_), dist.get_world_size(group_)
         active = [  # (파라미터, group, 조각 행 수) — gradient가 없으면 모든 GPU에서 없다(DDP)
-            (p, g, p.shape[0] // g["split"])
+            (p, g, _matrix(p).shape[0] // g["split"])
             for g in self.param_groups
             for p in g["params"]
             if p.grad is not None
@@ -216,23 +243,26 @@ class Muon(torch.optim.Optimizer):
             return
         key = (n_ranks, *(id(p) for p, _, _ in active))
         if key not in self._owners:
-            shapes = [(rows, p.shape[1]) for p, g, rows in active for _ in range(g["split"])]
+            shapes = [
+                (rows, _matrix(p).shape[1]) for p, g, rows in active for _ in range(g["split"])
+            ]
             self._owners[key] = shard_pieces(shapes, n_ranks)
         owner = self._owners[key]
 
         sends, sizes, k = [], [0] * n_ranks, 0
         for p, g, rows in active:
             split = g["split"]
-            buf = self._momentum(p, g)
+            buf = _matrix(self._momentum(p, g))
+            grad, cols = _matrix(p.grad), _matrix(p).shape[1]
             for j in range(split):
                 if owner[k + j] != me:
                     continue
                 # 맡은 조각의 행만 (행 단위 원소별 계산이라 전체를 계산해 자른 것과 같다)
                 rows_j = slice(j * rows, (j + 1) * rows)
-                orth = _newton_schulz(_nesterov(p.grad[rows_j], buf[rows_j], g))
-                sends.append((orth.T if rows > p.shape[1] else orth).reshape(-1))
+                orth = _newton_schulz(_nesterov(grad[rows_j], buf[rows_j], g))
+                sends.append((orth.T if rows > cols else orth).reshape(-1))
             for j in range(split):
-                sizes[owner[k + j]] += rows * p.shape[1]
+                sizes[owner[k + j]] += rows * cols
             k += split
 
         width = max(sizes)
@@ -244,7 +274,7 @@ class Muon(torch.optim.Optimizer):
 
         offsets, k = [r * width for r in range(n_ranks)], 0
         for p, g, rows in active:
-            cols, parts = p.shape[1], []
+            cols, parts = _matrix(p).shape[1], []
             for j in range(g["split"]):
                 r = owner[k + j]
                 flat = received[offsets[r] : offsets[r] + rows * cols]
@@ -256,7 +286,8 @@ class Muon(torch.optim.Optimizer):
 
 class MuonAdam(torch.optim.Optimizer):
     """블록 안 가중치 행렬은 Muon, 나머지는 Adam. lr은 두 묶음이 같은 값을 쓴다. `process_group`을
-    주면 Muon 쪽 직교화를 그 group의 GPU끼리 나눈다(분산 Muon, 모듈 주석).
+    주면 Muon 쪽 직교화를 그 group의 GPU끼리 나눈다(분산 Muon, 모듈 주석). `scope="all"`이면 모든
+    파라미터가 Muon이고 Adam은 없다(`self.adam`이 None).
 
     묶음과 상태는 안의 두 optimizer가 든다. `torch.optim.Optimizer.__init__`은 부르지 않는다(부르면
     쓰지 않는 묶음·상태가 따로 생긴다). scheduler가 Optimizer인지 보므로 상속만 한다.
@@ -270,9 +301,11 @@ class MuonAdam(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         adam_kwargs: dict | None = None,
         process_group=None,
+        scope: str = "blocks",
+        momentum: float = MUON_MOMENTUM,
     ) -> None:
-        muon, adam = muon_parameters(model)
-        if not muon or not adam:
+        muon, adam = muon_parameters(model, scope)
+        if not muon or (scope == "blocks" and not adam):
             raise ValueError(
                 f"{type(model).__name__}에서 Muon·Adam 묶음을 나눌 수 없다"
                 f" (Muon {len(muon)}개, Adam {len(adam)}개, `repeated_blocks()`가 있어야 한다)"
@@ -281,18 +314,25 @@ class MuonAdam(torch.optim.Optimizer):
             {"params": [p for p, s in muon if s == split], "split": split}
             for split in sorted({s for _, s in muon})
         ]
-        self.muon = Muon(groups, lr=lr, weight_decay=weight_decay, process_group=process_group)
-        self.adam = torch.optim.Adam(adam, lr=lr, **(adam_kwargs or {}))
+        self.muon = Muon(
+            groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            any_shape=scope == "all",
+            process_group=process_group,
+        )
+        self.adam = torch.optim.Adam(adam, lr=lr, **(adam_kwargs or {})) if adam else None
         self.defaults = {"lr": lr}
 
     @property
     def param_groups(self) -> list[dict]:
         # 두 optimizer의 group 그대로 (scheduler가 바꾼 lr을 두 optimizer가 바로 본다)
-        return [*self.muon.param_groups, *self.adam.param_groups]
+        return [*self.muon.param_groups, *(self.adam.param_groups if self.adam else [])]
 
     @property
     def state(self) -> dict:
-        return {**self.muon.state, **self.adam.state}
+        return {**self.muon.state, **(self.adam.state if self.adam else {})}
 
     def add_param_group(self, param_group: dict) -> None:
         raise NotImplementedError("MuonAdam은 만들 때 모델에서 묶음을 정한다")
@@ -302,14 +342,20 @@ class MuonAdam(torch.optim.Optimizer):
         if closure is not None:
             raise ValueError("MuonAdam은 closure를 받지 않는다")
         self.muon.step()
-        self.adam.step()
+        if self.adam:
+            self.adam.step()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.muon.zero_grad(set_to_none=set_to_none)
-        self.adam.zero_grad(set_to_none=set_to_none)
+        if self.adam:
+            self.adam.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self) -> dict:
-        return {"muon": self.muon.state_dict(), "adam": self.adam.state_dict()}
+        # 모든 파라미터 Muon이면 Adam 상태는 None (불러올 때 범위가 같은지 본다)
+        return {
+            "muon": self.muon.state_dict(),
+            "adam": self.adam.state_dict() if self.adam else None,
+        }
 
     def load_state_dict(self, state_dict: dict) -> None:
         if set(state_dict) != {"muon", "adam"}:
@@ -320,7 +366,12 @@ class MuonAdam(torch.optim.Optimizer):
             {k: v for k, v in group.items() if k not in ("params", "lr", "initial_lr")}
             for group in self.muon.param_groups
         ]
+        if (state_dict["adam"] is None) != (self.adam is None):
+            raise ValueError(
+                "checkpoint와 Muon 범위(muon_scope)가 다르다 (원래 run의 범위로 이어 간다)"
+            )
         self.muon.load_state_dict(state_dict["muon"])
         for group, kept in zip(self.muon.param_groups, settings, strict=True):
             group.update(kept)
-        self.adam.load_state_dict(state_dict["adam"])
+        if self.adam:
+            self.adam.load_state_dict(state_dict["adam"])

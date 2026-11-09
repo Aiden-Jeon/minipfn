@@ -7,6 +7,13 @@
 TabICL은 numpy·torch의 전역 난수를 쓴다(`Rng`를 쓰지 않는다). 그래서 이 생성기를 만들 때 전역
 시드를 고정한다. 같은 시드여도 파이썬 프로세스의 문자열 hash 시드(`PYTHONHASHSEED`)가 다르면 다른
 데이터셋을 만든다.
+
+`filter_unpredictable`(TabICLv2 학습 스크립트의 `--filter_unpredictable_graphs True
+--filter_unpredictable_datasets True`): x 노드와 y 노드에 공통 조상이 없는 그래프를 다시 뽑고
+(graph filter, 생성기 안), 만든 데이터셋을 ExtraTrees OOB 예측이 평균보다 낫지 않으면(bootstrap
+p ≥ 0.05) 버린다(dataset filter, `tabicl.prior._dataset.should_filter`). TabICLv2처럼 데이터셋마다
+처음 `FILTER_ATTEMPTS`번만 걸러 그 뒤에는 받는다. 논문: stage 1에서 분류 약 35%, 회귀 약 25%가
+걸러지고 학습 수렴이 좋아진다. 기본은 끔(예전과 같은 데이터셋).
 """
 
 from __future__ import annotations
@@ -19,6 +26,9 @@ import numpy as np
 import torch
 
 from minipfn.priors.pipeline import Rng
+
+# 데이터셋 하나에서 dataset filter를 적용하는 시도 수 (TabICLv2 `PriorDataset`의 `idx <= 5`)
+FILTER_ATTEMPTS = 6
 
 
 def _graph_scm_classes():
@@ -39,10 +49,11 @@ def _graph_scm_classes():
 
         stub.XGBRegressor = XGBRegressor
         sys.modules["xgboost"] = stub
+    from tabicl.prior._dataset import should_filter
     from tabicl.prior._graph_scm import GraphSCM as TabICLGraphSCM
     from tabicl.prior.graph_lib._config import PriorConfig
 
-    return TabICLGraphSCM, PriorConfig
+    return TabICLGraphSCM, PriorConfig, should_filter
 
 
 class GraphSCM:
@@ -52,26 +63,50 @@ class GraphSCM:
     (`minipfn.priors.transforms.filters.DropInvalid`가 그 그룹을 다시 뽑게 한다).
     """
 
-    def __init__(self, task: Literal["classification", "regression"], seed: int = 0) -> None:
+    def __init__(
+        self,
+        task: Literal["classification", "regression"],
+        seed: int = 0,
+        *,
+        filter_unpredictable: bool = False,
+    ) -> None:
         self.regression = task == "regression"
+        self.filter_unpredictable = filter_unpredictable
         np.random.seed(seed)
         torch.manual_seed(seed)
-        self._graph_scm, prior_config = _graph_scm_classes()
-        self._config = prior_config()
+        self._graph_scm, prior_config, self._should_filter = _graph_scm_classes()
+        self._config = prior_config(
+            filter_unpredictable_graphs=filter_unpredictable,
+            filter_unpredictable_datasets=filter_unpredictable,
+        )
 
     def __call__(
         self, n_rows: int, n_features: int, n_datasets: int, hp: dict, rng: Rng
     ) -> tuple[torch.Tensor, torch.Tensor]:
         xs, ys = [], []
         for _ in range(n_datasets):
-            x, y = self._graph_scm(
-                regression=self.regression,
-                seq_len=n_rows,
-                num_features=n_features,
-                max_features=n_features,
-                num_classes=None if self.regression else hp["num_classes"],
-                config=self._config,
-            )()
+            x, y = self._dataset(n_rows, n_features, hp)
             xs.append(x)
             ys.append(y)
         return torch.stack(xs, 1), torch.stack(ys, 1)
+
+    def _dataset(self, n_rows: int, n_features: int, hp: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        make = self._graph_scm(
+            regression=self.regression,
+            seq_len=n_rows,
+            num_features=n_features,
+            max_features=n_features,
+            num_classes=None if self.regression else hp["num_classes"],
+            config=self._config,
+        )
+        x, y = make()
+        if not self.filter_unpredictable:
+            return x, y
+        for _ in range(FILTER_ATTEMPTS - 1):
+            # NaN으로 버린 데이터셋(y가 모두 -100)은 DropInvalid가 다시 뽑는다
+            if (y == -100).all() or not self._should_filter(
+                x, y, self._config, is_classif=not self.regression
+            ):
+                break
+            x, y = make()
+        return x, y
