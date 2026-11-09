@@ -311,7 +311,7 @@ def test_curriculum_recipe():
         assert c.warmup_steps == c.steps // 100
         assert c.max_cells == c.max_rows * 100
         assert tabpfn_v3.architecture_name(c) == "v3.5"
-    assert (s1.steps, s1.lr, s1.grad_clip, s1.micro_batch) == (250_000, 8e-4, 10.0, 4)
+    assert (s1.steps, s1.lr, s1.grad_clip, s1.micro_batch) == (250_000, 8e-4, 10.0, 8)
     assert (s1.min_rows, s1.max_rows, s1.min_train_fraction, s1.max_train_fraction) == (
         1024,
         1024,

@@ -204,7 +204,9 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
 #   stage 2·3도 같은 규칙으로 20K·5K. lr은 스크립트 값 그대로(batch를 키운 만큼 바꾸지 않는다)
 # - 모델은 TabPFN-3.5 구조(219M), 분류·회귀 한 모델. 결측값(`missing_dataset_prob`)·회귀 bar
 #   distribution·붕괴 되돌리기 규칙은 `paper`의 것 그대로
-# - micro batch는 스크립트처럼 4 / 1 / 1 (stage 1을 8로 하면 셀이 1,024 × 100이라 메모리가 빠듯하다)
+# - micro batch 8 / 1 / 1 (스크립트는 4 / 1 / 1). stage 1을 4로 돌린 8×H100 smoke가 GPU당 21~24 GB만
+#   써서(run 2c3d25a9…) 8로 올려 GPU 32장에서 accumulation 없이 간다. 한 forward의 데이터셋 8개가
+#   학습 행 비율·feature 수를 같이 쓴다(TabICLv2는 4개씩)
 CURRICULUM_COMMON = {
     "batch_size": 256,
     "optimizer": "muon",
@@ -227,7 +229,7 @@ CURRICULUM = {
         "min_train_fraction": 0.3,
         "max_train_fraction": 0.9,
         "log_uniform_rows": False,
-        "micro_batch": 4,
+        "micro_batch": 8,
     },
     2: {
         "steps": 20_000,
