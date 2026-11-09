@@ -164,7 +164,7 @@ def test_min_improvement_falls_back_to_the_default_ensemble(monkeypatch):
     assert s["reverted"] and s["weight_default"] == 1.0 and s["used_members"] == 4
     assert s["oof_loss_selected"] == s["oof_loss_default"]
     # 조건이 없으면 되돌리지 않는다 (같은 pool·fold)
-    free = GreedyEnsembleClassifier(_tiny_model(), **kw).fit(x[:90], y[:90])
+    free = GreedyEnsembleClassifier(_tiny_model(), min_improvement=0.0, **kw).fit(x[:90], y[:90])
     assert not free.selection_["reverted"]
 
 
@@ -375,7 +375,19 @@ def test_eval_script_builds_test_time_estimators_and_records_fits(monkeypatch, t
         assert ("selection" in record) == (test_time == "greedy")
         assert ("adaptation" in record) == (test_time == "diagscale")
     params = script.test_time_params(script.parse_args(["--test-time", "diagscale+greedy"]))
-    assert params == {"test_time": "diagscale+greedy", "selection": "greedy", "pool_size": 24}
+    assert params == {
+        "test_time": "diagscale+greedy",
+        "selection": "greedy",
+        "pool_size": 24,
+        "min_improvement": 0.01,  # issue #52의 기본값
+        "oof_split": "task",
+    }
+    # 논문 방식(PR #49)으로 되돌리면 그때의 설정과 같다 (arena 결과 cache도 같다)
+    paper = ["--test-time", "greedy", "--min-improvement", "0", "--oof-split", "random"]
+    params = script.test_time_params(script.parse_args(paper))
+    assert params == {"test_time": "greedy", "selection": "greedy", "pool_size": 24}
+    args = script.parse_args(["--test-time", "none"])
+    assert args.min_improvement == 0.01 and args.oof_split == "task"  # greedy가 아니면 쓰지 않는다
     guarded = ["--test-time", "greedy", "--min-improvement", "0.01", "--min-temperature", "0.5"]
     args = script.parse_args([*guarded, "--oof-split", "task", "--classifier-path", "clf.pt"])
     assert script.test_time_params(args) == {

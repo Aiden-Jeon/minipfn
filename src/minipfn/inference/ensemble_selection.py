@@ -33,15 +33,15 @@
 - `selection`: `"greedy"`(논문), `"best"`(out-of-fold 손실이 가장 작은 후보 하나), `"uniform"`(0번을
   뺀 후보 모두 같은 가중치. 논문의 균일 평균에 해당한다)
 
-논문에 없는 것 (issue #52, 기본은 모두 꺼져 있어 논문 방식 그대로다). 논문 방식은 out-of-fold
-손실이 조금이라도 낮으면 고른다. 그래서 out-of-fold 손실이 기본부터 거의 0인 데이터셋에서 아주
-날카로운 온도 하나를 골라 test에서 지나치게 확신하거나, 무작위 fold가 보지 못하는 grouped·temporal
-test의 분포 변화에서 손해를 봤다(BeyondArena-lite):
+논문에 없는 것 (issue #52). 논문 방식은 out-of-fold 손실이 조금이라도 낮으면 고른다. 그래서
+out-of-fold 손실이 기본부터 거의 0인 데이터셋에서 아주 날카로운 온도 하나를 골라 test에서 지나치게
+확신하거나, 무작위 fold가 보지 못하는 grouped·temporal test의 분포 변화에서 손해를 봤다
+(BeyondArena-lite). 논문 방식 그대로 쓰려면 `min_improvement=0`으로 두고 `groups`를 주지 않는다:
 
-- `min_improvement`: 고른 조합의 out-of-fold 손실이 기본(후보 0번)보다 이 비율 이상 낮지 않으면
-  기본 앙상블을 그대로 쓴다. 분류는 log loss가 `MIN_IMPROVEMENT_NATS` 이상 낮아야 한다는 조건도
-  함께 둔다(기본 손실이 거의 0이면 비율로는 아주 작은 차이도 크게 보인다)
-- `min_temperature`: 이보다 낮은 온도를 후보에서 뺀다
+- `min_improvement` (기본 `MIN_IMPROVEMENT` = 1%): 고른 조합의 out-of-fold 손실이 기본(후보 0번)보다
+  이 비율 이상 낮지 않으면 기본 앙상블을 그대로 쓴다. 분류는 log loss가 `MIN_IMPROVEMENT_NATS`
+  이상 낮아야 한다는 조건도 함께 둔다(기본 손실이 거의 0이면 비율로는 아주 작은 차이도 크게 보인다)
+- `min_temperature` (기본 없음): 이보다 낮은 온도를 후보에서 뺀다. 판정에서 이득이 없어 끄고 둔다
 - `fit(X, y, groups=...)`: 행마다의 group 번호를 주면 out-of-fold를 group 단위로 나눈다(한 group은
   한 fold에만 들어간다. 분류는 `StratifiedGroupKFold`, 나눌 수 없으면 `GroupKFold`, 회귀는
   `GroupKFold`). 빈 fold는 버리고, 남은 fold가 2개보다 적으면 무작위 fold를 쓴다. TabArena·
@@ -76,6 +76,9 @@ SELECTIONS = ("greedy", "best", "uniform")
 # TabArena TabPFN-2.5 search space의 softmax_temperature와 OUTLIER_REMOVAL_STD
 TEMPERATURES = (0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.25, 1.5)
 OUTLIER_SIGMAS = (3.0, 6.0, 12.0)
+# 기본 최소 개선 비율 (issue #52 판정: BeyondArena-lite grouped split Elo 1023 → 1054,
+# TabArena-Lite는 그대로)
+MIN_IMPROVEMENT = 0.01
 # min_improvement를 줄 때 분류 log loss가 함께 낮아져야 하는 최소 차이 (nats)
 MIN_IMPROVEMENT_NATS = 1e-3
 
@@ -106,7 +109,7 @@ def check_selection(
     selection: str = "greedy",
     pool_kinds: tuple[str, ...] = POOL_KINDS,
     temperatures: tuple[float, ...] = TEMPERATURES,
-    min_improvement: float = 0.0,
+    min_improvement: float = MIN_IMPROVEMENT,
     min_temperature: float | None = None,
 ) -> tuple[float, ...]:
     """선택 설정을 확인하고 pool의 온도(`min_temperature` 이상)를 돌려준다. 맞지 않으면 ValueError.
@@ -138,7 +141,7 @@ class _Selection:
         n_folds: int = N_FOLDS,
         n_rounds: int = N_ROUNDS,
         selection: str = "greedy",
-        min_improvement: float = 0.0,
+        min_improvement: float = MIN_IMPROVEMENT,
         min_temperature: float | None = None,
         **kwargs: Any,
     ) -> None:

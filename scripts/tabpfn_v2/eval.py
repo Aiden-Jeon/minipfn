@@ -63,10 +63,11 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier --test-time greedy \
     --method-name minipfn-tabpfn-v2-greedy
 
-greedy의 out-of-fold 과적합을 막는 설정(issue #52, 기본은 모두 꺼져 있다):
-`--min-improvement`는 out-of-fold 손실이 기본보다 그 비율 이상 낮지 않으면 기본 앙상블을 쓰고,
-`--min-temperature`는 그보다 낮은 온도를 pool에서 빼고, `--oof-split task`는 TabArena·BeyondArena
-split의 group·시간 열로 out-of-fold fold를 나눈다.
+greedy의 out-of-fold 과적합을 막는 설정(issue #52): `--min-improvement`(기본 0.01)는 out-of-fold
+손실이 기본보다 그 비율 이상 낮지 않으면 기본 앙상블을 쓰고, `--oof-split task`(기본)는
+TabArena·BeyondArena split의 group·시간 열로 out-of-fold fold를 나누고, `--min-temperature`(기본
+없음)는 그보다 낮은 온도를 pool에서 뺀다. PR #49(논문 방식)와 같게 하려면
+`--min-improvement 0 --oof-split random`.
 
 `--distill`은 teacher(위의 추론 estimator)를 데이터셋마다 GBDT 학생으로 증류해 학생으로만 예측한다
 (issue #44, `minipfn.inference.distillation`, extra `distill`). `oof`는 out-of-fold teacher 라벨
@@ -120,6 +121,7 @@ from minipfn.inference.ensemble import (
     max_features_of,
 )
 from minipfn.inference.ensemble_selection import (
+    MIN_IMPROVEMENT,
     POOL_SIZE,
     SELECTIONS,
     GreedyEnsembleClassifier,
@@ -195,9 +197,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-improvement",
         type=float,
-        default=0.0,
+        default=None,
         help="--test-time greedy: 고른 조합의 out-of-fold 손실이 기본보다 이 비율 이상 낮지 않으면"
-        " 기본 앙상블을 쓴다 (0: 조건 없음, 논문 방식)",
+        f" 기본 앙상블을 쓴다 (기본 {MIN_IMPROVEMENT}, 0: 조건 없음, 논문 방식)",
     )
     parser.add_argument(
         "--min-temperature",
@@ -208,10 +210,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--oof-split",
         choices=OOF_SPLITS,
-        default="random",
-        help="--test-time greedy의 out-of-fold fold (task: TabArena·BeyondArena split의 group·시간"
-        " 열로 나눈다. 무작위 split은 그대로 random. diagscale+greedy에서도 DiagScale의 검증"
-        " split은 무작위다)",
+        default=None,
+        help="--test-time greedy의 out-of-fold fold (기본 task: TabArena·BeyondArena split의"
+        " group·시간 열로 나눈다. 무작위 split과 AMLB는 그대로 무작위. random: 논문 방식."
+        " diagscale+greedy에서도 DiagScale의 검증 split은 무작위다)",
     )
     parser.add_argument(
         "--distill",
@@ -257,7 +259,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="tabpfn_v2_eval")
     parser.add_argument("--mlflow", action="store_true", help="로컬에서도 MLflow에 기록한다")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # greedy 설정은 greedy에서만 준다 (주지 않으면 greedy의 기본값)
+    given = [
+        n
+        for n in ("min_improvement", "min_temperature", "oof_split")
+        if getattr(args, n) is not None
+    ]
+    if given and "greedy" not in args.test_time:
+        parser.error("--min-improvement·--min-temperature·--oof-split은 greedy에서만 쓴다.")
+    if args.min_improvement is None:
+        args.min_improvement = MIN_IMPROVEMENT
+    if args.oof_split is None:
+        args.oof_split = "task"
+    return args
 
 
 def _one_hot_modes(value: str) -> list[str]:
@@ -446,7 +461,7 @@ def test_time_params(args: argparse.Namespace) -> dict:
     params = {"test_time": args.test_time}
     if "greedy" in args.test_time:
         params.update(selection=args.selection, pool_size=args.pool_size)
-        # issue #52의 설정은 켰을 때만 (끈 설정의 arena 결과 cache는 그대로 다시 쓴다)
+        # issue #52의 설정은 논문 방식과 다를 때만 (논문 방식의 arena 결과 cache는 그대로 다시 쓴다)
         if args.min_improvement:
             params["min_improvement"] = args.min_improvement
         if args.min_temperature is not None:
@@ -717,10 +732,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.uncertainty and args.distill != "none" and args.suite in ("regression", "all"):
         # 회귀 학생은 평균만 내고 예측 분포가 없다
         raise SystemExit("--distill은 회귀 --uncertainty와 같이 쓸 수 없다 (학생은 평균만 낸다).")
-    if "greedy" not in args.test_time and (
-        args.min_improvement or args.min_temperature is not None or args.oof_split != "random"
-    ):
-        raise SystemExit("--min-improvement·--min-temperature·--oof-split은 greedy에서만 쓴다.")
     if args.test_time != "none" and args.distill != "none":
         # test-time 기록(record_fits)이 fit을 덮어써서, 증류가 teacher를 복사하면 원래 객체를 쓴다
         raise SystemExit("--distill은 --test-time none에서만 쓴다.")

@@ -9,6 +9,9 @@
 #     --override "env_variables.TABPFN_V2_EXTRA_ARGS=--method-name minipfn-tabpfn-v2.5"
 # 추론에 연산을 더 쓰는 방법(issue #43)은 TABPFN_V2_EXTRA_ARGS에 `--test-time greedy`(diagscale,
 # diagscale+greedy)와 다른 --method-name을 준다. 기본보다 오래 걸리므로 timeout_minutes도 늘린다.
+# greedy는 기본으로 최소 개선 조건과 split의 group·시간 열로 나눈 out-of-fold를 쓴다(issue #52).
+# PR #49(논문 방식)와 같게 하려면 `--min-improvement 0 --oof-split random`을 더한다. BeyondArena를 여러
+# 개 낼 때는 Hugging Face rate limit(429)에 걸리지 않게 5분 넘게 간격을 둔다.
 # TFM → GBDT 증류(issue #44)는 TABPFN_V2_EXTRA_ARGS에 `--distill synthetic --student xgboost`(oof,
 # labels; lightgbm)와 다른 --method-name을 준다. 학생은 CPU에서 예측한다.
 # 2.5 checkpoint를 평가할 때는 experiment_name도 tabpfn-v2-5-reproduction으로 바꾼다(멤버 전처리와
