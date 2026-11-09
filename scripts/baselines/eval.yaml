@@ -1,0 +1,42 @@
+# 예측 분포 baseline 평가 (scripts/baselines/eval.py, issue #48). AMLB 분류 29개·회귀 28개 × 10 fold를
+# v2 `--uncertainty`와 같은 지표로 돌린다. 방법은 BASELINES_METHOD로 주고 run 이름도 같이 바꾼다:
+#   databricks air run -f scripts/baselines/eval.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override env_variables.BASELINES_METHOD=lightgbm --override mlflow_run_name=baseline-eval-lightgbm
+# 방법: lightgbm, xgboost, catboost, catboost_gaussian(회귀만), tabpfn_v2, tabicl. GBDT는 CPU에서,
+# 공개 TFM은 GPU에서 돈다. 일부만 돌리려면 BASELINES_EXTRA_ARGS에 `--suite regression --tasks ...`.
+experiment_name: tabpfn-v2-reproduction
+mlflow_run_name: baseline-eval
+environment:
+  version: databricks_ai_v6
+  # extra baselines와 TabICL (uv.lock과 같은 버전)
+  dependencies:
+    - openml>=0.15
+    - huggingface-hub>=0.34
+    - catboost==1.2.10
+    - lightgbm==4.7.0
+    - xgboost==3.4.1
+    - tabpfn==9.2.0
+    - tabicl==2.2.0
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/baselines/eval.py
+env_variables:
+  BASELINES_METHOD: lightgbm
+  BASELINES_EXTRA_ARGS: ""
+  # 공식 tabpfn 패키지가 사용 통계를 보내지 않게 한다
+  TABPFN_DISABLE_TELEMETRY: "1"
+max_retries: 0
+# 가장 오래 걸리는 것은 CatBoost다(기본 1000번 반복, 회귀는 MultiQuantile 23개 + RMSE 모델): H100 노드에서
+# 실행 약 2시간 30분. LightGBM·XGBoost·TabICL·TabPFN은 20~70분
+timeout_minutes: 480
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/baselines/eval.py --method $BASELINES_METHOD
+  $BASELINES_EXTRA_ARGS

@@ -4,9 +4,11 @@ ECE와 split conformal prediction의 (조건부) coverage.
 점 예측 지표(ROC AUC, RMSE)는 분포가 잘 맞는지, 불확실성을 믿을 수 있는지는 보지 않는다. 학습 없이
 checkpoint의 예측만으로 계산한다.
 
-회귀 분포는 `bar_histogram(probs, borders, tails)`로 한 번 만든다: 경계 `borders` (구간 수 + 1,)와
-구간 확률 `probs` (n, 구간 수). 안쪽 구간은 밀도가 균일해 CDF가 경계 사이에서 직선이다. 양 끝 구간은
-`tails`로 정한다.
+회귀 분포는 `bar_histogram(probs, borders, tails)`로 한 번 만든다: 구간 확률 `probs` (n, 구간 수)와
+경계 `borders`. 경계는 TabPFN의 bar distribution처럼 모든 행이 같으면 (구간 수 + 1,), 행마다 다르면
+(n, 구간 수 + 1)이다. 분위수를 내는 모델(GBDT quantile 회귀, TabICL, 정규분포 모수를 분위수로 바꾼
+것)은 `quantile_histogram(levels, values)`로 행마다 다른 경계의 히스토그램으로 바꿔 넣는다(issue
+#48). 안쪽 구간은 밀도가 균일해 CDF가 경계 사이에서 직선이다. 양 끝 구간은 `tails`로 정한다.
 
 - `"half_normal"`(기본): 모델이 학습한 분포(`FullSupportBarDistribution`)와 같다. 첫 구간의 확률은
   `borders[1]`에서 왼쪽으로, 마지막 구간의 확률은 `borders[-2]`에서 오른쪽으로 half-normal로 퍼지고,
@@ -49,6 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy import special, stats
 
 from minipfn.benchmarks.amlb import drop_unseen_classes
@@ -75,37 +78,99 @@ class BarHistogram:
     """정규화한 구간 확률과 경계 위의 CDF. `bar_histogram`으로 만든다."""
 
     probs: np.ndarray  # (n, B), 행마다 합 1
-    borders: np.ndarray  # (B + 1,), float64
+    borders: np.ndarray  # (n, B + 1), float64. 모든 행이 같은 경계면 `np.broadcast_to`한 view
     cdf: np.ndarray  # (n, B + 1), 경계 위의 CDF (양 끝 0과 1). 꼬리 종류와 상관없이 같다
     tails: str
-
-    @property
-    def scale_left(self) -> float:
-        return float(self.borders[1] - self.borders[0]) / _HALF_NORMAL_MEDIAN
-
-    @property
-    def scale_right(self) -> float:
-        return float(self.borders[-1] - self.borders[-2]) / _HALF_NORMAL_MEDIAN
+    scale_left: np.ndarray  # (n,), 행마다 왼쪽 half-normal 꼬리의 scale (첫 구간 폭 / 중앙값)
+    scale_right: np.ndarray  # (n,), 오른쪽 꼬리의 scale
+    shared_borders: np.ndarray | None = None  # 모든 행이 같은 경계 (B + 1,)면 그 경계
 
 
 def bar_histogram(probs, borders, tails: str = DEFAULT_TAILS) -> BarHistogram:
+    """구간 확률 (n, B)와 경계로 히스토그램을 만든다. 경계는 모든 행이 같으면 (B + 1,), 행마다
+    다르면 (n, B + 1)이다 (분위수 예측은 `quantile_histogram`으로 바꿔서 넣는다)."""
     if tails not in TAILS:
         raise ValueError(f"tails는 {TAILS} 가운데 하나: {tails}")
     probs = np.atleast_2d(np.asarray(probs, dtype=np.float64))
     borders = np.asarray(borders, dtype=np.float64)
-    if borders.ndim != 1 or borders.shape[0] != probs.shape[-1] + 1:
-        raise ValueError(f"경계는 (구간 수 + 1,)이어야 한다: {borders.shape}, {probs.shape}")
-    if np.any(np.diff(borders) < 0):
+    n, n_buckets = probs.shape
+    if borders.shape not in ((n_buckets + 1,), (n, n_buckets + 1)):
+        raise ValueError(
+            f"경계는 (구간 수 + 1,)이나 (행 수, 구간 수 + 1)이어야 한다: {borders.shape}, "
+            f"{probs.shape}"
+        )
+    if np.any(np.diff(borders, axis=-1) < 0):
         raise ValueError("경계는 줄어들면 안 된다")
     if tails == "half_normal" and (
-        len(borders) < 3 or borders[1] <= borders[0] or borders[-1] <= borders[-2]
+        n_buckets < 2
+        or np.any(borders[..., 1] <= borders[..., 0])
+        or np.any(borders[..., -1] <= borders[..., -2])
     ):
         raise ValueError("half-normal 꼬리에는 구간이 2개 이상, 양 끝 구간의 폭이 0보다 커야 한다")
+    shared = borders if borders.ndim == 1 else None
+    # 꼬리 scale은 한 번만 계산한다 (경계가 같으면 상수를 broadcast)
+    scale_left = (borders[..., 1] - borders[..., 0]) / _HALF_NORMAL_MEDIAN
+    scale_right = (borders[..., -1] - borders[..., -2]) / _HALF_NORMAL_MEDIAN
+    if shared is not None:
+        borders = np.broadcast_to(shared, (n, n_buckets + 1))  # 복사하지 않는다
+        scale_left, scale_right = np.full(n, scale_left), np.full(n, scale_right)
     probs = probs.clip(min=0.0)
     probs = probs / probs.sum(axis=1, keepdims=True)
-    cdf = np.concatenate([np.zeros((len(probs), 1)), np.cumsum(probs, axis=1)], axis=1)
+    cdf = np.concatenate([np.zeros((n, 1)), np.cumsum(probs, axis=1)], axis=1)
     cdf[:, -1] = 1.0
-    return BarHistogram(probs, borders, cdf, tails)
+    return BarHistogram(probs, borders, cdf, tails, scale_left, scale_right, shared)
+
+
+def quantile_histogram(levels, values) -> tuple[np.ndarray, np.ndarray]:
+    """분위수 예측을 행마다 경계가 다른 구간 히스토그램으로 바꾼다 (`bar_histogram`에 넣는다).
+
+    `levels` (K,)는 0과 1 사이에서 커지는 확률 수준, `values` (n, K)는 행마다 그 분위수다. CDF가
+    점 (values[:, k], levels[k])를 지나고 그 사이에서 직선이라고 보면 이웃한 두 분위수 사이 구간의
+    확률은 levels의 차이다(ScoringBench가 quantile을 CDF 점으로 바꿔 채점하는 방식). 그러면
+    `quantile(h, levels)`가 `values`를 그대로 돌려준다. 분위수가 엇갈리면(GBDT가 수준마다 따로
+    학습하면 생긴다) 행마다 정렬해서 쓴다(rearrangement, Chernozhukov et al. 2010). 같은 값의
+    분위수는 폭 0인 구간, 곧 원자가 된다.
+
+    가장 낮은 분위수 아래 levels[0], 가장 높은 분위수 위 1 − levels[-1]의 확률은 양 끝 구간으로
+    둔다. 그 폭(half-normal 꼬리의 중앙값)은 꼬리의 밀도가 맞닿은 안쪽 구간의 밀도와 이어지도록
+    정한다. 그 구간의 폭이 0이면 안쪽 전체의 평균 밀도를, 모든 분위수가 같으면 아주 작은 폭을 쓴다.
+
+    돌려주는 값은 (구간 확률 (n, K + 1), 경계 (n, K + 2))다.
+    """
+    levels = np.asarray(levels, dtype=np.float64)
+    values = np.atleast_2d(np.asarray(values, dtype=np.float64))
+    if levels.ndim != 1 or len(levels) < 2 or values.shape[1] != len(levels):
+        raise ValueError(f"분위수는 (행 수, 수준 수 ≥ 2)여야 한다: {levels.shape}, {values.shape}")
+    if levels[0] <= 0 or levels[-1] >= 1 or np.any(np.diff(levels) <= 0):
+        raise ValueError("확률 수준은 0과 1 사이에서 커져야 한다")
+    if not np.isfinite(values).all():
+        raise ValueError("분위수에 NaN이나 무한대가 있다")
+    q = np.sort(values, axis=1)
+    p_buckets = np.concatenate([levels[:1], np.diff(levels), 1 - levels[-1:]])
+    probs = np.broadcast_to(p_buckets, (len(q), len(p_buckets))).copy()
+    # 확률 1당 폭 (밀도의 역수). 맞닿은 구간 → 안쪽 평균 → 아주 작은 폭 순서로 쓴다
+    inner = (q[:, -1] - q[:, 0]) / (levels[-1] - levels[0])
+    tiny = 1e-9 * np.maximum(1.0, np.abs(q).max(axis=1))
+
+    def tail_width(p_tail: float, gap: np.ndarray, p_gap: float) -> np.ndarray:
+        per_prob = np.where(gap > 0, gap / p_gap, inner)
+        # half-normal(scale s, 확률 p)의 맞닿은 점 밀도 p·√(2/π)/s가 1/per_prob와 같다
+        width = _HALF_NORMAL_MEDIAN * p_tail * np.sqrt(2 / np.pi) * per_prob
+        return np.maximum(width, tiny)
+
+    left = tail_width(levels[0], q[:, 1] - q[:, 0], levels[1] - levels[0])
+    right = tail_width(1 - levels[-1], q[:, -1] - q[:, -2], levels[-1] - levels[-2])
+    borders = np.concatenate([(q[:, 0] - left)[:, None], q, (q[:, -1] + right)[:, None]], axis=1)
+    return probs, borders
+
+
+def _bucket_index(borders: np.ndarray, y: np.ndarray, shared: np.ndarray | None) -> np.ndarray:
+    """행마다 borders[k] ≤ y < borders[k + 1]인 k (0 ~ 구간 수 − 1로 자른다). borders (m, B + 1)."""
+    if shared is not None:
+        k = np.searchsorted(shared, y, side="right") - 1
+    else:
+        k = (borders <= y[:, None]).sum(axis=1) - 1
+    return k.clip(0, borders.shape[1] - 2)
 
 
 def _upper_tail(u):
@@ -117,24 +182,24 @@ def _normal_pdf(u):
     return np.exp(-0.5 * u * u) / np.sqrt(2 * np.pi)
 
 
-def _fraction(borders: np.ndarray, k: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """구간 k 안에서 y의 위치 (0~1). 폭 0인 구간은 y가 그 점 이상이면 1."""
-    width = borders[k + 1] - borders[k]
+def _fraction(lo: np.ndarray, hi: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """구간 [lo, hi] 안에서 y의 위치 (0~1). 폭 0인 구간은 y가 그 점 이상이면 1."""
+    width = hi - lo
     safe = np.where(width > 0, width, 1.0)
-    return np.where(width > 0, (y - borders[k]) / safe, (y >= borders[k]).astype(float)).clip(0, 1)
+    return np.where(width > 0, (y - lo) / safe, (y >= lo).astype(float)).clip(0, 1)
 
 
 def pit(h: BarHistogram, y) -> np.ndarray:
     """F(y) (n,)."""
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     b, rows = h.borders, np.arange(len(y))
-    k = (np.searchsorted(b, y, side="right") - 1).clip(0, len(b) - 2)
-    out = h.cdf[rows, k] + h.probs[rows, k] * _fraction(b, k, y)
+    k = _bucket_index(b, y, h.shared_borders)
+    out = h.cdf[rows, k] + h.probs[rows, k] * _fraction(b[rows, k], b[rows, k + 1], y)
     if h.tails == "half_normal":
         p_left, p_right = h.probs[:, 0], h.probs[:, -1]
-        left = p_left * 2 * _upper_tail((b[1] - y) / h.scale_left)
-        right = 1 - p_right * 2 * _upper_tail((y - b[-2]) / h.scale_right)
-        out = np.where(y < b[1], left, np.where(y > b[-2], right, out))
+        left = p_left * 2 * _upper_tail((b[:, 1] - y) / h.scale_left)
+        right = 1 - p_right * 2 * _upper_tail((y - b[:, -2]) / h.scale_right)
+        out = np.where(y < b[:, 1], left, np.where(y > b[:, -2], right, out))
     return out.clip(0.0, 1.0)
 
 
@@ -157,7 +222,7 @@ def quantile(h: BarHistogram, q) -> np.ndarray:
     p = h.probs[rows, k]
     frac = np.where(p > 0, (q[None, :] - h.cdf[rows, k]) / np.where(p > 0, p, 1.0), 0.0)
     b = h.borders
-    out = b[k] + frac.clip(0.0, 1.0) * (b[k + 1] - b[k])
+    out = b[rows, k] + frac.clip(0.0, 1.0) * (b[rows, k + 1] - b[rows, k])
     if h.tails == "half_normal":
         p_left, p_right = h.probs[:, :1], h.probs[:, -1:]
         in_left, in_right = k == 0, k == n_buckets - 1
@@ -168,8 +233,8 @@ def quantile(h: BarHistogram, q) -> np.ndarray:
             arg_right = np.where(in_right, 1 - (1 - q[None, :]) / (2 * p_right), 0.5)
         u_left = special.ndtri(np.nan_to_num(arg_left, nan=0.5).clip(0.5, 1 - 1e-16))
         u_right = special.ndtri(np.nan_to_num(arg_right, nan=0.5).clip(0.5, 1 - 1e-16))
-        out = np.where(in_left, b[1] - h.scale_left * u_left, out)
-        out = np.where(in_right, b[-2] + h.scale_right * u_right, out)
+        out = np.where(in_left, b[:, 1:2] - h.scale_left[:, None] * u_left, out)
+        out = np.where(in_right, b[:, -2:-1] + h.scale_right[:, None] * u_right, out)
     return out
 
 
@@ -207,33 +272,35 @@ def crps(h: BarHistogram, y) -> np.ndarray:
 
 
 def _crps_rows(h: BarHistogram, rows: slice, y: np.ndarray) -> np.ndarray:
-    probs, cdf, b = h.probs[rows], h.cdf[rows], h.borders
+    probs, cdf, b = h.probs[rows], h.cdf[rows], h.borders[rows]
     # 직선 CDF로 적분할 구간: uniform이면 전부, half-normal이면 양 끝을 뺀 안쪽
-    lo, hi = (0, len(b) - 1) if h.tails == "uniform" else (1, len(b) - 2)
-    left, right = b[lo:hi], b[lo + 1 : hi + 1]
+    lo, hi = (0, b.shape[1] - 1) if h.tails == "uniform" else (1, b.shape[1] - 2)
+    left, right = b[:, lo:hi], b[:, lo + 1 : hi + 1]
     width = right - left
     a, c = cdf[:, lo:hi], cdf[:, lo + 1 : hi + 1]
     # 구간 전체가 y보다 오른쪽이면 H = 1, 아니면 H = 0으로 적분한다
     total = np.where(
-        left[None, :] >= y[:, None],
+        left >= y[:, None],
         _segment_square_integral(a, c, 1.0, width),
         _segment_square_integral(a, c, 0.0, width),
     )
     # y가 든 구간은 y에서 둘로 나눈다
-    inside = np.flatnonzero((y > b[lo]) & (y < b[hi]))
+    inside = np.flatnonzero((y > b[:, lo]) & (y < b[:, hi]))
     if len(inside) and hi > lo:
-        k = (np.searchsorted(b, y[inside], side="right") - 1).clip(lo, hi - 1)
-        f_y = cdf[inside, k] + probs[inside, k] * _fraction(b, k, y[inside])
-        split = _segment_square_integral(cdf[inside, k], f_y, 0.0, y[inside] - b[k])
-        split += _segment_square_integral(f_y, cdf[inside, k + 1], 1.0, b[k + 1] - y[inside])
+        b_in, y_in, r = b[inside], y[inside], np.arange(len(inside))
+        k = _bucket_index(b_in, y_in, h.shared_borders).clip(lo, hi - 1)
+        b_k, b_k1 = b_in[r, k], b_in[r, k + 1]
+        f_y = cdf[inside, k] + probs[inside, k] * _fraction(b_k, b_k1, y_in)
+        split = _segment_square_integral(cdf[inside, k], f_y, 0.0, y_in - b_k)
+        split += _segment_square_integral(f_y, cdf[inside, k + 1], 1.0, b_k1 - y_in)
         total[inside, k - lo] = split
     out = total.sum(axis=1)
     if h.tails == "uniform":
         # 맨 바깥 경계 밖: F는 0 또는 1이고 H와 1만큼 다르다
-        return out + (b[0] - y).clip(min=0.0) + (y - b[-1]).clip(min=0.0)
+        return out + (b[:, 0] - y).clip(min=0.0) + (y - b[:, -1]).clip(min=0.0)
     # 왼쪽 꼬리는 t → −t로 뒤집으면 오른쪽 꼬리와 같은 식이다
-    out += _right_tail_crps(probs[:, -1], b[-2], h.scale_right, y)
-    out += _right_tail_crps(probs[:, 0], -b[1], h.scale_left, -y)
+    out += _right_tail_crps(probs[:, -1], b[:, -2], h.scale_right[rows], y)
+    out += _right_tail_crps(probs[:, 0], -b[:, 1], h.scale_left[rows], -y)
     return out
 
 
@@ -274,8 +341,9 @@ def min_coverage_by_width(
 def regression_metrics(
     probs, borders, y, y_scale: float = 1.0, levels=COVERAGE_LEVELS, tails: str = DEFAULT_TAILS
 ) -> dict[str, float]:
-    """fold 하나의 회귀 분포 지표. `y_scale`(학습 target 표준편차 등)로 나눈 CRPS·폭·interval
-    score를 `_scaled`로 같이 낸다 (데이터셋끼리 평균할 때 쓴다)."""
+    """fold 하나의 회귀 분포 지표. 경계는 (B + 1,)이나 행마다 (n, B + 1)이다. `y_scale`(학습
+    target 표준편차 등)로 나눈 CRPS·폭·interval score를 `_scaled`로 같이 낸다 (데이터셋끼리
+    평균할 때 쓴다)."""
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     if len(y) == 0:
         return {}
@@ -422,3 +490,30 @@ def classification_metrics(
         result = conformal(proba, labels, alpha=alpha, kind=kind, seed=seed)
         out.update({f"{kind}_{k}": v for k, v in result.items()})
     return out
+
+
+# ---------------------------------------------------------------------------
+# 집계
+# ---------------------------------------------------------------------------
+
+DATASET_KEYS = ["suite", "task_id", "dataset"]
+
+
+def suite_means(per_dataset) -> dict[str, float]:
+    """suite 하나의 데이터셋별 지표 표(`DATASET_KEYS` 열 + 지표 열)의 데이터셋 평균. 단위가 있는
+    회귀 지표(CRPS, 폭, interval score)는 학습 target 표준편차로 나눈 `_scaled`만 평균하고, 모두
+    NaN인 열은 뺀다."""
+    values = per_dataset.drop(columns=[c for c in DATASET_KEYS if c in per_dataset.columns])
+    values = values.dropna(axis=1, how="all")
+    unscaled = {c.removesuffix("_scaled") for c in values.columns if c.endswith("_scaled")}
+    means = values.drop(columns=[c for c in unscaled if c in values.columns]).mean()
+    return {k: float(v) for k, v in means.items()}
+
+
+def dataset_means(rows, exclude=()) -> pd.DataFrame:
+    """fold마다의 행(`amlb.evaluate_task`가 낸 dict, `suite` 포함)을 데이터셋(`DATASET_KEYS`)별 fold
+    평균으로. `fold`와 `exclude`의 열은 평균하지 않는다."""
+    df = pd.DataFrame(rows)
+    skip = {*DATASET_KEYS, "fold", *exclude}
+    columns = [c for c in df.columns if c not in skip]
+    return df.groupby(DATASET_KEYS)[columns].mean().reset_index()
