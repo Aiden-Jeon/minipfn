@@ -744,9 +744,26 @@ class OpenMLTask:
 
 
 def load_openml_task(task_id: int) -> OpenMLTask:
+    """OpenML task와 데이터. 받다가 네트워크가 끊기면 받다 만 캐시를 지우고 다시 받는다
+    (`benchmarks._retry`)."""
+    from minipfn.benchmarks._retry import clear_openml_cache, retry
+
+    seen: dict[str, int] = {}
+
+    def clear() -> None:
+        clear_openml_cache("tasks", task_id)
+        clear_openml_cache("datasets", seen.get("dataset_id"))
+
+    return retry(
+        lambda: _load_openml_task(task_id, seen), what=f"OpenML task {task_id}", before_retry=clear
+    )
+
+
+def _load_openml_task(task_id: int, seen: dict[str, int]) -> OpenMLTask:
     import openml
 
     task = openml.tasks.get_task(task_id, download_splits=True)
+    seen["dataset_id"] = task.dataset_id
     dataset = task.get_dataset()
     X, y, categorical, _ = dataset.get_data(target=task.target_name, dataset_format="dataframe")
     task_type = (

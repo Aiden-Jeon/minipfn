@@ -264,13 +264,20 @@ def run(
         )
         wanted = set(zip(todo["dataset"], todo["fold"], todo["repeat"], strict=True))
         jobs = [j for j in jobs if _job_split(j) in wanted]
-        # split 하나가 실패해도 멈추지 않는다: 그 split은 결과가 없어 imputed가 된다(`failed`)
-        results = context.run_jobs(
-            jobs,
-            expname=str(run_dir),
-            register=False,
-            debug_mode=True,
-            raise_on_failure=False,
+        # split 하나가 실패해도 멈추지 않는다: 그 split은 결과가 없어 imputed가 된다(`failed`).
+        # split을 돌리기 전에 task 데이터를 받다가 네트워크가 끊기면(`raise_on_failure`가 잡지
+        # 않는다) 다시 부른다. 끝난 split은 `run_dir`에 있어 다시 돌리지 않는다
+        from minipfn.benchmarks._retry import retry
+
+        results = retry(
+            lambda: context.run_jobs(
+                jobs,
+                expname=str(run_dir),
+                register=False,
+                debug_mode=True,
+                raise_on_failure=False,
+            ),
+            what=f"{suite.name} run_jobs",
         )
     if results:
         context.register(results, scope_to_valid_tasks=False)
