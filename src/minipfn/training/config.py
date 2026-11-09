@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, fields, replace
 from typing import Literal
 
@@ -33,8 +34,11 @@ SPEED_OPTIONS = (
     "optimizer",
     "muon_weight_decay",
     "muon_distributed",
+    "phases",
 )
 OPTIMIZERS = ("adam", "muon")
+# step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
+PHASE_KEYS = ("lr", "muon_weight_decay")
 # 분산 Muon의 범위 (issue #56, `muon_distributed`)
 MUON_DISTRIBUTED = ("off", "node", "all")
 # 한 task 학습과, 분류·회귀를 한 모델로 같이 학습하는 multitask (`task_configs`)
@@ -158,8 +162,17 @@ class TrainConfig:
     # GPU끼리 나눈다. 갱신 결과는 "off"(기본, 모든 GPU가 다 계산)와 비트 단위로 같고 checkpoint
     # 형식도 같아서 이어 학습할 때 켜거나 끌 수 있다
     muon_distributed: Literal["off", "node", "all"] = "off"
+    # step 구간별 설정 변경 (issue #29):
+    # `((시작 step, {"lr": ..., "muon_weight_decay": ...}), ...)`.
+    # 시작 step의 갱신부터 그 값을 쓰고, 첫 구간 전에는 위 `lr`·`muon_weight_decay` 필드 값이다.
+    # 구간에 없는 설정은 앞 구간의 값을 잇는다. lr은 기준 lr만 바꾸고 warmup·cosine 모양은 그대로다.
+    # 붕괴로 낮춘 lr 배율(`rewind_lr_factor`)은 구간이 바뀌어도 이어진다. 논문 규모 학습 도중 바꾼
+    # 설정을 레시피에 남겨, 명령 하나로 같은 경로를 밟게 한다(`recipes.tabpfn_v3.paper_run`).
+    # MLflow param의 문자열로도 받는다 (`normalize_phases`)
+    phases: tuple = ()
 
     def __post_init__(self) -> None:
+        self.phases = normalize_phases(self.phases)
         self.model_type = canonical_model_type(self.model_type)
         self.prior_type = canonical_prior_type(self.prior_type)
         model_class(self.model_type)  # 없는 이름이면 ValueError
@@ -194,6 +207,38 @@ class TrainConfig:
             raise ValueError("muon_distributed는 optimizer=muon일 때만 쓴다")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
+        self._check_phases()
+
+    def _check_phases(self) -> None:
+        starts = [start for start, _ in self.phases]
+        if any(b <= a for a, b in zip(starts, starts[1:], strict=False)) or any(
+            s < 0 for s in starts
+        ):
+            raise ValueError(f"phases의 시작 step은 0 이상이고 커지는 순서여야 한다: {starts}")
+        for start, changes in self.phases:
+            settings = dict(changes)
+            if not settings or set(settings) - set(PHASE_KEYS):
+                raise ValueError(f"phases는 {PHASE_KEYS}만 바꾼다 (step {start}: {settings})")
+            if settings.get("lr", 1.0) <= 0:
+                raise ValueError(f"phases의 lr은 0보다 커야 한다 (step {start})")
+            if "lr" in settings and self.schedule_free:
+                raise ValueError("schedule_free는 phases로 lr을 바꾸지 않는다")
+            wd = settings.get("muon_weight_decay", 0.0)
+            if wd < 0 or (wd and self.optimizer != "muon"):
+                raise ValueError(
+                    "phases의 muon_weight_decay는 0 이상이고 optimizer=muon일 때만 쓴다"
+                    f" (step {start})"
+                )
+
+    def phase_value(self, name: str, step: int) -> float:
+        """step번째 갱신(0부터)에 쓰는 `name`(`PHASE_KEYS`)의 값. 시작 step이 `step` 이하인 마지막
+        구간 가운데 그 설정이 있는 것, 없으면 필드 값."""
+        value = getattr(self, name)
+        for start, changes in self.phases:
+            if start > step:
+                break
+            value = dict(changes).get(name, value)
+        return value
 
     @property
     def n_out(self) -> int:
@@ -287,3 +332,15 @@ class TrainConfig:
         if self.task == "multitask":
             raise ValueError("multitask 설정의 prior는 task_configs()의 task마다 만든다")
         return prior_module(self.prior_type).make_prior(self, seed)
+
+
+def normalize_phases(phases) -> tuple:
+    """`TrainConfig.phases`를 `((시작 step, (("lr", 값), ...)), ...)` 꼴로 (설정 이름 순서, 값은
+    float). dict·list로 써도 되고, MLflow param에 남은 문자열(`str(phases)`)도 읽는다."""
+    if isinstance(phases, str):
+        phases = ast.literal_eval(phases) if phases.strip() else ()
+    out = []
+    for start, changes in phases or ():
+        items = changes.items() if isinstance(changes, dict) else changes
+        out.append((int(start), tuple(sorted((str(k), float(v)) for k, v in items))))
+    return tuple(out)

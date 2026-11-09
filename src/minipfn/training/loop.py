@@ -160,6 +160,34 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
         print(f"lr: 기준 {old:.2e} → {lr:.2e} (step {step}부터 {lr * factor:.3e})", flush=True)
 
 
+def _set_muon_weight_decay(opt, weight_decay: float) -> None:
+    """Muon 묶음의 weight decay를 바꾼다 (Muon이 아니면 그대로)."""
+    if isinstance(opt, MuonAdam):
+        for group in opt.muon.param_groups:
+            group["weight_decay"] = weight_decay
+
+
+def _phase_lr(config: TrainConfig, base: float, before: int, after: int) -> float:
+    """`before`번째 갱신의 기준 lr이 `base`일 때 `after`번째 갱신의 기준 lr (`TrainConfig.phases`).
+    구간이 정한 lr의 비율만큼 바꿔서, 붕괴로 낮춘 배율은 그대로 잇는다. 구간 lr이 같으면 `base`
+    그대로(비트 동일)."""
+    old, new = config.phase_value("lr", before), config.phase_value("lr", after)
+    return base if old == new else base * new / old
+
+
+def _enter_phase(opt, sched, config: TrainConfig, step: int, verbose: bool) -> None:
+    """`step`번째 갱신에서 시작하는 구간이 있으면 그 설정으로 바꾼다 (`TrainConfig.phases`)."""
+    if not any(start == step for start, _ in config.phases):
+        return
+    lr = _phase_lr(config, sched.base_lrs[0], step - 1, step)
+    if lr != sched.base_lrs[0]:
+        _set_base_lr(opt, sched, lr, step, verbose)
+    weight_decay = config.phase_value("muon_weight_decay", step)
+    _set_muon_weight_decay(opt, weight_decay)
+    if verbose:
+        print(f"step {step}: 구간 시작 (muon_weight_decay {weight_decay:g})", flush=True)
+
+
 def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     """`state`(학습 중 checkpoint 또는 `save_checkpoint` 파일)가 `config`와 같은 task·모델인지.
 
@@ -378,7 +406,13 @@ def _train(
         # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록 되돌린 횟수를 이어받는다
         rewinds = int(state.get("rewinds", 0))
         resumed_train_seconds = float(state.get("train_seconds", 0.0))
-        _set_base_lr(opt, sched, config.lr, start_step, d.is_main)
+        if config.phases:
+            # 구간 설정이 있으면 기준 lr은 checkpoint의 값(그 구간 lr × 붕괴로 낮춘 배율)을 잇고,
+            # 시작 step에서 새 구간이 열리면 아래 학습 루프가 바꾼다. weight decay는 checkpoint를
+            # 남긴 구간의 값
+            _set_muon_weight_decay(opt, config.phase_value("muon_weight_decay", start_step - 1))
+        else:
+            _set_base_lr(opt, sched, config.lr, start_step, d.is_main)
         borders = state["borders"]
     if borders is None:
         borders = _borders(config, d, device)
@@ -519,6 +553,7 @@ def _train(
     step = start_step - 1
     while step + 1 < stop_step:
         step += 1
+        _enter_phase(opt, sched, config, step, d.is_main)
         t_step = time.time()
         eval_cache.clear()  # 가중치가 바뀌므로 지난 step의 평균은 버린다
         # multitask는 step마다 task를 번갈아 쓴다 (모든 GPU가 같은 task. 비율은 1:1, 여기서 정함)
@@ -612,6 +647,12 @@ def _train(
                 if collapsed:  # 하한까지만 낮춘다 (이미 하한보다 낮으면 그대로)
                     lr_next = min(
                         lr_now, max(lr_now * config.rewind_lr_factor, config.rewind_min_lr)
+                    )
+                if config.phases:
+                    # 구간 경계를 넘어 되돌리면 그 구간의 lr로 옮기고 weight decay도 되돌린다
+                    lr_next = _phase_lr(config, lr_next, done - 1, snap["step"] - 1)
+                    _set_muon_weight_decay(
+                        opt, config.phase_value("muon_weight_decay", snap["step"] - 1)
                     )
                 _set_base_lr(opt, sched, lr_next, snap["step"], d.is_main)
                 history = copy.deepcopy(snap["history"])

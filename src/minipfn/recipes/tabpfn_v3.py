@@ -145,6 +145,28 @@ def paper(task: str = "classification", arch: str = "v3") -> TrainConfig:
     return with_architecture(tabpfn_v2.paper(task), arch)
 
 
+# 논문 규모로 실제 학습한 TabPFN-3.5 경로 (issue #29). `paper`에서 결과를 바꾸는 설정만 더한다:
+# batch 256(GPU 32장 × 8), Muon(issue #28), 125k step부터 기준 lr 2e-4 → 1e-4와 Muon weight decay
+# 0 → 0.1. 125k 구간은 chunk02(lr 2e-4, weight decay 0)가 148~152k부터 gradient norm이 3.7에서
+# 15까지 뛰며 불안정해져서 125k checkpoint로 되돌려 바꾼 것이다(여기서 정함). 계산 결과를
+# 바꾸지 않는 가속 옵션은 넣지 않는다. 실제 run은 compile·fused Adam·TF32·LAWA 10×100·
+# 분산 Muon all을 켰다 (`--compile --fused-adam --tf32 --weight-average 10
+# --weight-average-every 100 --muon-distributed all`)
+PAPER_RUN = {
+    "batch_size": 256,
+    "optimizer": "muon",
+    "phases": ((125_000, {"lr": 1e-4, "muon_weight_decay": 0.1}),),
+}
+
+
+def paper_run(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
+    """실제로 학습한 TabPFN-3.5 논문 규모 설정 (`paper` + `PAPER_RUN`). 한 번에 처음부터 학습하면
+    구간이 바뀌는 step에서 lr·weight decay를 바꾼다(`TrainConfig.phases`). v3.5 multitask만."""
+    if (task, arch) != ("multitask", "v3.5"):
+        raise ValueError(f"paper_run은 v3.5 multitask만 있다 (task {task}, arch {arch})")
+    return replace(paper(task, arch), **PAPER_RUN)
+
+
 # ---------------------------------------------------------------------------
 # 추론
 # ---------------------------------------------------------------------------
