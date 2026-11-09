@@ -54,8 +54,16 @@ def test_groups_split_by_stage_task_and_optimizer():
     # task 하나만 쓰는 부품(정답 encoder, 출력층)은 따로
     assert {"cell_encoder_classification/adam", "output_regression/adam"} <= set(groups)
     assert all(id(p) in muon_ids for p in groups["row_icl/muon"])
+    # attention logit 배율 부품(QK-norm gain, QASSMax MLP)은 단계 안에서 따로
+    assert {"row_icl_qk_norm/adam", "row_icl_qassmax/adam", "column_stage_qassmax/muon"} <= set(
+        groups
+    )
+    names = {id(p): n for n, p in model.named_parameters()}
+    assert all("_norm." in names[id(p)] for p in groups["row_icl_qk_norm/adam"])
+    assert not any("qassmax" in names[id(p)] for p in groups["row_icl/muon"])
     shared = shared_groups(groups, ("classification", "regression"))
     assert "row_icl/muon" in shared and "output_regression/adam" not in shared
+    assert "row_icl_qk_norm/adam" in shared
     # Adam만 쓰면 optimizer는 붙지 않는다
     assert "row_icl" in parameter_groups(model)
 

@@ -2,7 +2,9 @@
 
 - 묶음별 norm (issue #65): 파라미터를 단계(모델이 정한다, `parameter_stage`)와 optimizer
   묶음(Muon/Adam)으로 나눠 가중치 norm과 clip 전 gradient norm을 낸다. multitask면 task 하나만
-  쓰는 부품(정답 encoder, 출력층)은 `<단계>_<task>` 묶음이 따로 된다
+  쓰는 부품(정답 encoder, 출력층)은 `<단계>_<task>` 묶음이 따로 된다. attention logit 배율을 정하는
+  작은 parameter(QK-norm gain, QASSMax MLP)도 `<단계>_qk_norm`·`<단계>_qassmax`로 따로 둔다. 긴
+  학습에서 gradient가 이쪽으로 몰렸는데(#65 checkpoint 분석) 단계 전체 norm에 묻혀 보이지 않는다
 - task gradient cosine (issue #64, 옵션 `grad_cosine`): multitask는 step마다 task를 번갈아 쓰므로
   기록 step 앞의 연속 4 step(분류·회귀·분류·회귀 또는 반대)의 gradient로 두 task가 같이 쓰는
   묶음마다 cosine을 잰다. 다른 task끼리는 1 step 떨어진 세 쌍의 평균, 같은 task끼리는 2 step
@@ -24,20 +26,31 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+# attention logit 배율을 정하는 부품: 이름에 이 모듈이 들어 있으면 단계 안에서 묶음을 따로 둔다
+ATTENTION_SCALE_PARTS: dict[str, str] = {
+    "q_norm": "qk_norm",
+    "k_norm": "qk_norm",
+    "qassmax": "qassmax",
+}
+
 
 def parameter_groups(model: nn.Module, muon_ids: set[int] | None = None) -> dict[str, list]:
     """묶음 이름 → 파라미터 목록 (`model.named_parameters()` 순서).
 
-    이름은 `<단계>[_<task>][/muon|/adam]`이다. 단계는 `model.parameter_stage(name)`(없으면 맨 위
-    모듈 이름), task는 multitask 모델에서 그 task만 쓰는 부품일 때, optimizer는 Muon을 쓸 때
-    (`muon_ids`: Muon이 맡는 파라미터의 id)만 붙는다."""
+    이름은 `<단계>[_qk_norm|_qassmax][_<task>][/muon|/adam]`이다. 단계는
+    `model.parameter_stage(name)`(없으면 맨 위 모듈 이름)다. `_qk_norm`·`_qassmax`는 attention
+    logit 배율 부품(`ATTENTION_SCALE_PARTS`), task는 multitask 모델에서 그 task만 쓰는 부품일 때,
+    optimizer는 Muon을 쓸 때(`muon_ids`: Muon이 맡는 파라미터의 id)만 붙는다."""
     tasks = tuple(getattr(model, "tasks", ()))
     stage_of = getattr(model, "parameter_stage", None)
     groups: dict[str, list] = {}
     for name, p in model.named_parameters():
         group = stage_of(name) if stage_of is not None else name.split(".")[0]
+        parts = name.split(".")
+        scale = next((ATTENTION_SCALE_PARTS[q] for q in parts if q in ATTENTION_SCALE_PARTS), None)
+        if scale is not None:
+            group += f"_{scale}"
         if len(tasks) > 1:
-            parts = name.split(".")
             task = next((t for t in tasks if t in parts), None)
             if task is not None:
                 group += f"_{task}"
