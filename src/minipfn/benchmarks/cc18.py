@@ -43,10 +43,16 @@ class OpenMLDataset:
 def load_openml_dataset(did: int, max_samples: int = spec.EVAL_MAX_SAMPLES) -> OpenMLDataset:
     import openml
 
-    ds = openml.datasets.get_dataset(
-        did, download_data=True, download_qualities=False, download_features_meta_data=True
-    )
-    x_df, y_ser, cat_mask, _ = ds.get_data(target=ds.default_target_attribute)
+    from minipfn.benchmarks._retry import retry
+
+    def download():
+        ds = openml.datasets.get_dataset(
+            did, download_data=True, download_qualities=False, download_features_meta_data=True
+        )
+        return ds, ds.get_data(target=ds.default_target_attribute)
+
+    # 받다가 네트워크가 끊기면 다시 받는다 (`benchmarks._retry`)
+    ds, (x_df, y_ser, cat_mask, _) = retry(download, what=f"OpenML dataset {did}")
     categorical = [i for i, c in enumerate(cat_mask) if c]
     cols = []
     for i, col in enumerate(x_df.columns):

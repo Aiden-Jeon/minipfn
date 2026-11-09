@@ -744,11 +744,12 @@ class OpenMLTask:
 
 
 def load_openml_task(task_id: int) -> OpenMLTask:
+    """OpenML task와 데이터. 받다가 네트워크가 끊기면 다시 받는다(`benchmarks._retry`)."""
     import openml
 
-    task = openml.tasks.get_task(task_id, download_splits=True)
-    dataset = task.get_dataset()
-    X, y, categorical, _ = dataset.get_data(target=task.target_name, dataset_format="dataframe")
+    from minipfn.benchmarks._retry import fetch_openml_task
+
+    task, dataset, (X, y, categorical, _) = fetch_openml_task(task_id)
     task_type = (
         "regression"
         if task.task_type_id == openml.tasks.TaskType.SUPERVISED_REGRESSION
