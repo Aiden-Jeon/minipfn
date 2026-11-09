@@ -167,6 +167,26 @@ def paper_run(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
     return replace(paper(task, arch), **PAPER_RUN)
 
 
+# paper_run으로 학습한 가중치를 lr을 0까지 내리며 짧게 마무리 학습한다 (issue #29, 여기서 정함).
+# paper_run의 lr은 2M step cosine이라 200k에서도 거의 줄지 않았고, 100k → 200k에 benchmark가
+# 그대로였다(분류 AUC 0.932 → 0.931). 2.5의 long_tables처럼 가중치만 가져와(`init_from`) 새
+# optimizer로 warmup 1k + cosine 20k step, lr 1e-4(paper_run 125k 뒤의 lr)에서 0까지. 표 크기는
+# paper 그대로다
+COOLDOWN = {
+    "steps": 20_000,
+    "warmup_steps": 1_000,
+    "lr": 1e-4,
+    "muon_weight_decay": 0.1,
+    "keep_every": 5_000,
+    "phases": (),
+}
+
+
+def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
+    """`paper_run` 가중치의 마무리 학습 설정 (`paper_run` + `COOLDOWN`). v3.5 multitask만."""
+    return replace(paper_run(task, arch), **COOLDOWN)
+
+
 # ---------------------------------------------------------------------------
 # 추론
 # ---------------------------------------------------------------------------
