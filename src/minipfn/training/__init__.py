@@ -6,6 +6,8 @@
 - `data`: prior를 DataLoader로 내보내는 IterableDataset (`PriorBatches`, `PriorGroups`)
 - `losses`: 분류 cross-entropy, 회귀 bar distribution NLL과 target 흩기
 - `stability`: QK-clip, 붕괴 감지
+- `diagnostics`: 학습 진단 지표 (묶음별 가중치·gradient norm, task gradient cosine, rank별 시간·표
+  크기). 읽기만 하고 학습 계산은 바꾸지 않는다
 
 PFN·TabPFN v1 재현의 학습 루프는 그 논문에만 있는 절차라 `minipfn.recipes.pfn`·`recipes.tabpfn_v1`에
 있다.

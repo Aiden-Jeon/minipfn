@@ -14,6 +14,10 @@
 #                (32 GPU. 이어 학습하면 원래 run의 batch를 따른다)
 #   Muon 분산:   --override env_variables.TABPFN_V2_MUON_DISTRIBUTED=all (Newton–Schulz를 GPU끼리 나눔,
 #                결과·checkpoint 같음, issue #56. node는 노드 안끼리. 이어 학습하면 따라가고 off로 끈다)
+#   진단 지표:   --override env_variables.TABPFN_V2_GRAD_COSINE=1 (두 task gradient의 묶음별 cosine, issue #64)
+#                --override env_variables.TABPFN_V2_RANK_TIMING=1 (GPU마다 forward·backward 시간과 표 크기,
+#                MLflow diagnostics/rank_timing_from_*.jsonl, issue #68). 학습 계산은 그대로, chunk마다 켠다.
+#                묶음별 가중치·gradient norm(issue #65)은 늘 남는다
 #   TabPFN-3(task마다 모델): --override env_variables.TABPFN_V2_ARCH=v3 --override env_variables.TABPFN_V2_TASK=classification
 #                (또는 regression. 53M·58M)
 # 학습 step·lr·batch는 두 보고서에 없어서 v2 paper 설정 그대로다(recipes/tabpfn_v3.py의 paper; multitask는

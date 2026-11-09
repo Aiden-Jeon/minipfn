@@ -26,6 +26,10 @@ decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed 
 GPU끼리 나눠 계산한다(결과·checkpoint 형식 같음, 이어 학습하면 원래 run의 값을 따르고 `off`로
 끈다). 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
+학습 진단 지표(`minipfn.training.diagnostics`)는 묶음별 가중치·gradient norm을 늘 남기고,
+`--grad-cosine`(`TABPFN_V2_GRAD_COSINE=1`, multitask만, issue #64)은 두 task gradient의 묶음별
+cosine을, `--rank-timing`(`TABPFN_V2_RANK_TIMING=1`, issue #68)은 GPU마다 forward·backward 시간과
+표 크기를 더 남긴다. 학습 계산은 그대로이고 이어 학습해도 따라가지 않는다(chunk마다 켠다).
 train loss가 갑자기 뛰어 돌아오지 않으면 메모리에 둔 건강한 상태로 되돌리고 다른 데이터로 다시 간다
 (붕괴 감지 문턱 `TABPFN_V2_COLLAPSE_THRESHOLD`, 기본 0.5, `off`면 끔). 그때마다 기준 lr에
 `TABPFN_V2_REWIND_LR_FACTOR`를 곱한다(paper 회귀는 0.5, 그 밖에는 1 = 그대로).
@@ -142,6 +146,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 학습 가속 (TrainConfig 주석). 켜기만 한다. 이어 학습하면 원래 run에서 켠 것은 그대로 켜진다
     # (`source_speed_options`)
     for flag in ("compile", "fused-adam", "tf32", "schedule-free"):
+        env = "TABPFN_V2_" + flag.upper().replace("-", "_")
+        parser.add_argument(f"--{flag}", action="store_true", default=_env_flag(env))
+    # 학습 진단 지표 (TrainConfig 주석, issue #64·#68). 학습 계산은 그대로라 이어 학습해도 따라가지
+    # 않는다(chunk마다 정한다)
+    for flag in ("grad-cosine", "rank-timing"):
         env = "TABPFN_V2_" + flag.upper().replace("-", "_")
         parser.add_argument(f"--{flag}", action="store_true", default=_env_flag(env))
     parser.add_argument("--weight-average", type=int, default=_env("TABPFN_V2_WEIGHT_AVERAGE", int))
@@ -347,7 +356,14 @@ def _override_values(args: argparse.Namespace) -> dict:
         "muon_distributed": args.muon_distributed,
         **{
             name: True
-            for name in ("compile", "fused_adam", "tf32", "schedule_free")
+            for name in (
+                "compile",
+                "fused_adam",
+                "tf32",
+                "schedule_free",
+                "grad_cosine",
+                "rank_timing",
+            )
             if getattr(args, name)
         },
         "rewind_lr_factor": args.rewind_lr_factor,

@@ -48,8 +48,18 @@ from minipfn.models.bar_distribution import FullSupportBarDistribution
 from minipfn.priors import prior_module
 from minipfn.training.config import N_BUCKETS, TrainConfig
 from minipfn.training.data import PriorBatches
+from minipfn.training.diagnostics import (
+    GroupNormWindow,
+    RankTiming,
+    TaskGradientCosine,
+    group_norms,
+    parameter_groups,
+    rank_timing_metrics,
+    weight_norm_metrics,
+    write_rank_timing,
+)
 from minipfn.training.losses import dequantize_targets, prior_loss
-from minipfn.training.muon import MuonAdam, shard_group
+from minipfn.training.muon import MuonAdam, muon_parameters, shard_group
 from minipfn.training.schedule_free import ScheduleFreeAdamW, warmup_factor
 from minipfn.training.stability import (
     CollapseGuard,
@@ -435,6 +445,21 @@ def _train(
         if d.world_size > 1
         else model
     )
+    # 학습 진단 지표 (`training.diagnostics`): 묶음별 norm과 task gradient cosine은 rank 0만
+    # 계산한다(DDP 평균 뒤라 gradient가 모든 GPU에서 같다). rank별 시간은 모든 GPU가 잰다
+    norm_groups, grad_window, cosine = None, None, None
+    if d.is_main:
+        muon_ids = None
+        if config.optimizer == "muon":
+            muon_ids = {id(p) for p, _ in muon_parameters(model)[0]}
+        norm_groups = parameter_groups(model, muon_ids)
+        grad_window = GroupNormWindow(norm_groups, multitask)
+        if config.grad_cosine:
+            cosine = TaskGradientCosine(norm_groups, config.tasks, config.log_every)
+    cosine_metrics: dict[str, float] = {}  # 다음 기록에 낼 cosine
+    timing = RankTiming(device) if config.rank_timing else None
+    # chunk마다 따로 (이어 쓰는 MLflow run에서 앞 chunk의 파일을 덮어쓰지 않도록)
+    timing_path = out_dir / f"rank_timing_from_{start_step:07d}.jsonl"
     # 학습 forward. 가속 옵션 compile이면 반복 블록마다 compile한다(모델 전체를 compile하면 표
     # 크기에 따라 갈리는 Python 분기 때문에 batch마다 다시 compile된다). 블록 목록이 없는 모델은
     # 전체를
@@ -589,6 +614,7 @@ def _train(
             window_wait += time.time() - t_wait
             sync = micro == accumulation - 1 or d.world_size == 1
             ctx = contextlib.nullcontext() if sync else ddp_model.no_sync()
+            marks = (timing.mark(),) if timing is not None else ()
             with ctx:
                 with autocast():
                     logits = train_forward(x, y[:, :n_train], **_forward_kwargs(config, task))
@@ -596,12 +622,25 @@ def _train(
                 if task == "regression" and config.dequantize_buckets:
                     y_eval = dequantize_targets(y, n_train, bar, config.dequantize_buckets)
                 loss = prior_loss(logits, y_eval, task, bar) / accumulation
+                if timing is not None:
+                    marks += (timing.mark(),)
                 loss.backward()
+            if timing is not None:  # backward에는 마지막 micro batch의 all-reduce 대기가 들어 있다
+                timing.add_micro(*marks, timing.mark(), x, n_train)
             step_loss += loss.detach()
             micro_info.append((loss.detach(), x, y, n_train))
+        # 묶음별 gradient norm은 clip 전 값이다
+        step_norms = group_norms(norm_groups, grads=True) if grad_window is not None else None
         # gradient가 inf/nan이면 이 step을 건너뛴다 (DDP 평균 뒤라 모든 GPU가 같은 판단을 한다)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        if torch.isfinite(grad_norm):
+        finite = bool(torch.isfinite(grad_norm))
+        if grad_window is not None and finite:
+            grad_window.update(task, step_norms, grad_norm)
+        # clip은 gradient 전체에 같은 배율을 곱하므로 cosine은 clip 전과 같다
+        if cosine is not None and cosine.wants(step):
+            if (found := cosine.update(step, task, finite)) is not None:
+                cosine_metrics = found
+        if finite:
             opt.step()
             if config.qk_clip is not None and (step + 1) % config.qk_clip_every == 0:
                 clipped, bound = apply_qk_clip(model, config.qk_clip, d.world_size)
@@ -624,6 +663,8 @@ def _train(
                     )
         opt.zero_grad(set_to_none=True)
         sched.step()
+        if timing is not None:
+            timing.step_done(step, config.tasks.index(task))
 
         if d.world_size > 1:
             dist.all_reduce(step_loss, op=dist.ReduceOp.AVG)
@@ -695,12 +736,19 @@ def _train(
                 window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
                 window_tasks = {t: [0.0, 0] for t in config.tasks}
                 window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
+                for diagnostic in (grad_window, cosine, timing):
+                    if diagnostic is not None:  # 되돌린 구간의 기록은 버린다
+                        diagnostic.reset()
+                cosine_metrics = {}
                 last_log_step = snap["step"]
                 if not last:
                     step = snap["step"] - 1
                     continue
                 done, rewound_at_end = snap["step"], True  # 되돌린 상태를 남기고 멈춘다
-        if d.is_main and (done % config.log_every == 0 or last) and not rewound_at_end:
+        log_now = (done % config.log_every == 0 or last) and not rewound_at_end
+        # rank별 시간은 모든 GPU가 같이 모은다 (rank 0만 받는다)
+        timing_rows = timing.gather(d.world_size) if timing is not None and log_now else None
+        if d.is_main and log_now:
             n = done - last_log_step
             elapsed = time.time() - window_start
             metrics = {
@@ -733,6 +781,15 @@ def _train(
                 # 이 window에서 clip할 때마다 줄인 head 수의 합
                 metrics["qk_clipped_heads"] = float(window_clipped)
                 metrics["qk_bound_before_clip"] = float(window_bound)
+            # 진단 지표: 묶음별 gradient norm(window 평균·최대)과 가중치 norm, task gradient cosine,
+            # rank별 시간·표 크기
+            metrics.update(grad_window.metrics())
+            metrics.update(weight_norm_metrics(norm_groups))
+            metrics.update(cosine_metrics)
+            cosine_metrics = {}
+            if timing_rows is not None:
+                metrics.update(rank_timing_metrics(timing_rows))
+                write_rank_timing(timing_path, timing_rows, config.tasks)
             history["step"].append(done)
             history["train_loss"].append(metrics["train_loss"])
             print(
@@ -747,6 +804,8 @@ def _train(
             window_loss, window_wait, window_start, window_finite = 0.0, 0.0, time.time(), 0
             window_tasks = {t: [0.0, 0] for t in config.tasks}
             window_clipped, window_bound = 0, 0.0  # QK-clip: 줄인 head 수, 줄이기 전 최대 상한
+            if grad_window is not None:
+                grad_window.reset()
             last_log_step = done
 
         if (
@@ -806,6 +865,8 @@ def _train(
                 if kept is not None:
                     mlf.log_artifact(str(kept), "checkpoints")
                 mlf.log_metric("checkpoint_step", done, step=done)
+                if timing_path.exists():
+                    mlf.log_artifact(str(timing_path), "diagnostics")
         if last:
             break
         if guard is not None and done % config.snapshot_every == 0 and not guard.suspect:
@@ -827,6 +888,8 @@ def _train(
         if mlf is not None:
             mlf.log_artifact(str(final_path), "model")
             mlf.log_artifact(str(out_dir / "history.json"))
+            if timing_path.exists():
+                mlf.log_artifact(str(timing_path), "diagnostics")
     if d.world_size > 1:
         dist.barrier()
         dist.destroy_process_group()
