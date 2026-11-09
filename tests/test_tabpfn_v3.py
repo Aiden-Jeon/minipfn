@@ -401,6 +401,14 @@ def test_arena_limits_follow_the_model_recipe():
     # 클래스는 정답 embedding(10개)을 묶어 MAX_CLASSES까지 받는다 (issue #66)
     assert limits["binary"].max_train_rows == 100_000
     assert limits["binary"].max_classes == MAX_CLASSES == 160
+    # 멤버마다 feature를 골라 넣으면 feature 수 상한이 없다 (--max-features로 다시 둔다)
+    wide = script.parse_args(["--max-features-per-member", "6000"])
+    assert wide.max_features_per_member == 6000
+    limits = script.arena_limits({"classification": (_model(arch="v3"), None)}, wide)
+    assert limits["binary"].max_features is None and limits["binary"].max_train_rows == 100_000
+    wide.max_features = 9000
+    limits = script.arena_limits({"classification": (_model(arch="v3"), None)}, wide)
+    assert limits["binary"].max_features == 9000
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +665,10 @@ def test_eval_seed_changes_members_and_the_arena_fingerprint(monkeypatch, tmp_pa
     }
     assert fingerprint(3, v2_model)["seed"] == 3
     assert fingerprint(0, model)["inference"] == "chunked" and "seed" not in fingerprint(0, model)
+    a = script.parse_args(["--max-features-per-member", "6000"])
+    factories = {"classification": types.SimpleNamespace(model=v2_model)}
+    printed = json.loads(script.arena_fingerprint(a, paths, factories, kinds, "all"))
+    assert printed["max_features_per_member"] == 6000
 
 
 def test_forward_rejects_labels_outside_the_target_embeddings():

@@ -103,6 +103,7 @@ def _views(estimator: _Base, model: nn.Module, n_views: int, random_state: int) 
         "member_kinds": estimator.member_kinds,
         "softmax_temperature": estimator.softmax_temperature,
         "max_one_hot_width": estimator.max_one_hot_width,
+        "max_features_per_member": estimator.max_features_per_member,
         "device": estimator.device,
         "random_state": random_state,
     }

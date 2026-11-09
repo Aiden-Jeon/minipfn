@@ -15,6 +15,9 @@
 그 경계로 자르고, 열
 순서를 섞고, 표준정규 난수로 된 샘플 식별자 열을 붙인다. `one_hot`인 멤버는 범주형 열을 one-hot으로
 펼친다(`one_hot_sizes`). 어느 멤버를 어떻게 섞는지는 `minipfn.inference.ensemble`에 있다.
+
+feature가 멤버 상한보다 많으면 멤버마다 일부 열만 쓴다(`feature_subset`, 공식 TabPFN 추론 코드의
+`max_features_per_estimator`와 v2·2.5의 방법 "random").
 """
 
 from __future__ import annotations
@@ -58,6 +61,29 @@ def apply_encoder(df: pd.DataFrame, cat_ix: list[int], encoder: Any) -> np.ndarr
         cats = df.iloc[:, cat_ix]
         out[:, cat_ix] = encoder.transform(cats.astype(str).where(cats.notna()))
     return out
+
+
+def feature_subset(n_features: int, max_features: int | None, seed: int) -> np.ndarray | None:
+    """멤버 하나가 쓸 원래 열 번호(정렬한 것). 열이 `max_features`보다 적거나 같으면(또는 None이면)
+    None(전부)이다.
+
+    공식 TabPFN 추론 코드가 v2·2.5에 쓰는 "random" 방법(`_subsample_features_random`)처럼 멤버마다
+    따로 뽑는다. `seed`는 멤버의 것(`Member.seed`)에서 정해서, 같은 멤버는 어느 fit에서나(greedy의
+    fold와 마지막 fit) 같은 열을 쓴다. 상한 안의 표에는 난수를 쓰지 않아 예전과 같다."""
+    if max_features is None or n_features <= max_features:
+        return None
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.permutation(n_features)[:max_features])
+
+
+def select_features(
+    X: np.ndarray, cat_ix: list[int], features: np.ndarray | None
+) -> tuple[np.ndarray, list[int]]:
+    """X의 열 일부(`features`, None이면 전부)와 그 안에서의 범주형 열 번호."""
+    if features is None:
+        return X, cat_ix
+    cat = set(cat_ix)
+    return X[:, features], [j for j, i in enumerate(features) if int(i) in cat]
 
 
 def _one_hot_width(n: int) -> int:
