@@ -109,10 +109,22 @@ def max_features_of(model: nn.Module) -> int:
     return getattr(model.config, "max_features", MAX_FEATURES)
 
 
+def max_classes_of(model: nn.Module) -> int:
+    """분류에서 받는 클래스 수 상한: 모델의 `max_classes`(column_row_transformer의 retrieval
+    decoder는 정답 embedding을 묶어 출력 수보다 많이 받는다), 없으면 출력 수(`config.n_out`).
+    `EnsembleClassifier`와 평가 스크립트의 TabArena·BeyondArena 상한이 같이 쓴다."""
+    return int(getattr(model, "max_classes", model.config.n_out))
+
+
 def forward_kwargs(model: nn.Module, task: str) -> dict:
-    """모델 forward에 줄 task. 여러 task를 내는 모델(`model.tasks`, 예: TabPFN-3.5의 multitask
-    column_row_transformer)만 받고, 한 task 모델은 예전처럼 `model(x, y_train)`이다."""
-    return {"task": task} if len(getattr(model, "tasks", ())) > 1 else {}
+    """모델 forward에 줄 인자. task는 여러 task를 내는 모델(`model.tasks`, 예: TabPFN-3.5의
+    multitask column_row_transformer)만 받고, 한 task 모델은 예전처럼 `model(x, y_train)`이다.
+    추론용 인자를 받는 모델(`supports_inference_options`)에는 `inference=True`(큰 표의 메모리를
+    줄이는 계산)를 준다."""
+    kwargs = {"task": task} if len(getattr(model, "tasks", ())) > 1 else {}
+    if getattr(model, "supports_inference_options", False):
+        kwargs["inference"] = True
+    return kwargs
 
 
 class _Base:
@@ -162,6 +174,10 @@ class _Base:
             for prep in self.preprocessors_
         ]
 
+    def _model_targets(self, y: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """모델에 줄 학습 행 정답 (1, 학습 행)과 forward에 더 줄 인자."""
+        return y, {}
+
     def _kind(self, i: int) -> str:
         return self.member_kinds[i % len(self.member_kinds)]
 
@@ -178,18 +194,28 @@ class _Base:
     def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
         model = self.model.to(self.device).eval()
         autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
+        kwargs = forward_kwargs(model, self.task)
         for i, x, y in self._iter_inputs(X, y_trains):
+            y, extra = self._model_targets(y)
             with (
                 torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
                 torch.inference_mode(),
             ):
-                logits = model(x, y, **forward_kwargs(model, self.task))[0].float()
+                logits = model(x, y, **kwargs, **extra)[0].float()
             # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
             yield i, logits
 
 
 class EnsembleClassifier(_Base):
-    """분류: 멤버마다 클래스 번호를 섞고, logit을 온도로 나눠 softmax한 뒤 평균한다."""
+    """분류: 멤버마다 클래스 번호를 섞고, logit을 온도로 나눠 softmax한 뒤 평균한다.
+
+    클래스가 모델 출력 수(`config.n_out`, 정답 embedding 수)보다 많으면 retrieval decoder 모델
+    (`max_classes_of`가 더 큰 모델, column_row_transformer)만 받는다. 정답 embedding에는 섞은 번호를
+    `n_out`으로 나눈 나머지(묶음)를, decoder에는 섞은 번호 그대로를 준다. decoder는 attention
+    가중치로 학습 행의 원래 클래스 one-hot을 평균하므로 클래스마다 확률이 나온다. 멤버마다 번호를
+    섞으므로 같은 embedding을 쓰는 클래스 묶음도 멤버마다 다르다. 클래스 11개면 한 묶음만 2개다.
+    (여기서 정함. 공식 TabPFN-3.5는 정답 embedding 160개를 학습해 묶지 않는다)
+    """
 
     task = "classification"
 
@@ -216,11 +242,19 @@ class EnsembleClassifier(_Base):
         y = self.label_encoder_.fit_transform(np.asarray(y))
         self.classes_ = self.label_encoder_.classes_
         n_classes = len(self.classes_)
-        if n_classes > self.model.config.n_out:
+        if n_classes > max_classes_of(self.model):
             raise ValueError(
-                f"클래스 {n_classes}개는 모델 출력({self.model.config.n_out}개)보다 많다."
+                f"클래스 {n_classes}개는 모델이 받는 수({max_classes_of(self.model)}개)보다 많다."
             )
         return y
+
+    def _model_targets(self, y: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        # 클래스가 정답 embedding 수보다 많으면 embedding은 묶음 번호, decoder는 원래 번호
+        # (클래스 docstring)
+        n_out, n_classes = self.model.config.n_out, len(self.classes_)
+        if n_classes <= n_out:
+            return y, {}
+        return torch.remainder(y, n_out), {"y_classes": y, "n_classes": n_classes}
 
     def fit_members(self, X: Any, y: np.ndarray, members: list[Member]) -> EnsembleClassifier:
         """정한 멤버로 맞춘다. `y`는 `classes_`의 번호다 (`_fit_labels` 뒤)."""

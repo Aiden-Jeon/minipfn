@@ -72,12 +72,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from minipfn.models.cell_transformer import standardize_cells
+from minipfn.models.cell_transformer import NAN_INDICATOR, standardize_cells
 
 TASKS = ("classification", "regression", "multitask")
 ENCODERS = ("linear", "fourier")
 N_FOURIER = 32  # TabPFN-3.5 cell encoder의 주파수 수
 N_HARMONICS = 4  # TabPFN-3.5 ECDF의 sin·cos 차수
+# 추론에서 받는 클래스 수 상한 (공식 TabPFN-3.5와 같다). retrieval decoder에는 클래스마다
+# 파라미터가 없어서, 정답 embedding 수(`n_out`)보다 많은 클래스는 embedding을 묶어 받는다
+# (`forward`의 `y_classes`)
+MAX_CLASSES = 160
 
 
 @dataclass
@@ -384,10 +388,19 @@ class InducedBlock(nn.Module):
 
     def forward(self, h: torch.Tensor, n_train: int) -> torch.Tensor:
         # h: (N, R, E), N = 데이터셋 × 열. 앞의 n_train행이 학습 행
+        return self.spread(h, self.summary(h[:, :n_train]))
+
+    def summary(self, h_train: torch.Tensor) -> torch.Tensor:
+        """inducing point가 학습 행 (N, n_train, E)을 요약한 것 (N, n_inducing, E). 테스트 행은 보지
+        않으므로, 추론에서 행을 나눠 계산할 때 열마다 한 번만 구해 둔다."""
         nm = self.norms
-        ind = self.inducing.to(h.dtype).expand(h.shape[0], -1, -1)
-        ind = ind + self.summarize(nm["ind"](ind), context=nm["rows"](h[:, :n_train]))
-        ind = ind + self.summarize_mlp(nm["ind_mlp"](ind))
+        ind = self.inducing.to(h_train.dtype).expand(h_train.shape[0], -1, -1)
+        ind = ind + self.summarize(nm["ind"](ind), context=nm["rows"](h_train))
+        return ind + self.summarize_mlp(nm["ind_mlp"](ind))
+
+    def spread(self, h: torch.Tensor, ind: torch.Tensor) -> torch.Tensor:
+        """행마다 요약(`summary`)에 attention한다. 행끼리는 서로 보지 않는다."""
+        nm = self.norms
         h = h + self.broadcast(nm["h"](h), context=nm["hidden"](ind))
         return h + self.broadcast_mlp(nm["h_mlp"](h))
 
@@ -447,6 +460,52 @@ class PreHeadMLP(nn.Module):
         return h + self.mlp(self.norm(h))
 
 
+class _CellStats:
+    """셀 정규화(`standardize_cells`)와 ECDF midrank(`ecdf_midrank`)의 학습 행 통계를 한 번 구해
+    두고, 행·열 일부(`features`)에 같은 식을 쓴다 (`ColumnRowTransformer._rows_chunked`). 칸마다의
+    계산이라 전체 표로 한 번에 계산한 값과 같다."""
+
+    def __init__(self, x: torch.Tensor, n_train: int, ecdf: bool) -> None:
+        train = x[:, :n_train]
+        finite = torch.isfinite(train)
+        t = torch.where(finite, train, torch.nan)
+        self.mean = torch.nanmean(t, dim=1, keepdim=True)  # (B, 1, C)
+        var = torch.nanmean(torch.square(t - self.mean), dim=1, keepdim=True)
+        self.std = torch.sqrt(torch.nan_to_num(var, nan=0.0))
+        self.used = (self.std > 1e-6).to(x.dtype)
+        self.sorted = self.n_valid = None
+        if ecdf:
+            train = torch.where(finite, train.float(), torch.inf)
+            self.sorted = train.transpose(1, 2).sort(-1).values.contiguous()  # (B, C, N)
+            self.n_valid = finite.sum(1).clamp_min(1)  # (B, C)
+
+    def features(
+        self, x: torch.Tensor, cols: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """행 일부 x (B, Rj, Cj)의 (z값, 결측 표시, ECDF u). `cols`는 x의 열이 원래 표의 몇 번째
+        열인지(None이면 모든 열). u는 ECDF를 쓰지 않으면 None이다."""
+
+        def pick(t: torch.Tensor) -> torch.Tensor:
+            return t if cols is None else t[..., cols]
+
+        mean, std, used = pick(self.mean), pick(self.std), pick(self.used)
+        missing = ~torch.isfinite(x)
+        z = torch.where(missing, torch.nan, x)
+        z = torch.nan_to_num((z - mean) / std.clamp_min(1e-6), nan=0.0).clamp(-100.0, 100.0)
+        indicator = missing.to(z.dtype) * NAN_INDICATOR
+        z = z * used
+        if self.sorted is None:
+            return z, indicator, None
+        sorted_train = self.sorted if cols is None else self.sorted[:, cols]
+        n_valid = self.n_valid if cols is None else self.n_valid[:, cols]
+        values = torch.where(~missing, x.float(), 0.0).transpose(1, 2).contiguous()
+        left = torch.searchsorted(sorted_train, values, side="left")
+        right = torch.searchsorted(sorted_train, values, side="right")
+        u = ((left + right).float() / 2 / n_valid[..., None].float()).clamp(0, 1)
+        u = torch.where(~missing, u.transpose(1, 2), 0.5).to(z.dtype)
+        return z, indicator, torch.where(used > 0, u, 0.5)
+
+
 class RetrievalDecoder(nn.Module):
     """many-class retrieval decoder: 테스트 행(query)이 학습 행(key)에 attention한 가중치로 학습
     행의 one-hot 정답을 평균한다(head 평균). logit은 log(max(p, 1e-5) + 3e-5)."""
@@ -458,23 +517,69 @@ class RetrievalDecoder(nn.Module):
         self.k_projection = nn.Linear(dim, heads * head_dim)
         self.qassmax = QASSMax(heads, head_dim, hidden)
 
-    def forward(self, h: torch.Tensor, y_train: torch.Tensor, n_train: int) -> torch.Tensor:
-        # h: (B, R, D) → 테스트 행 logit (B, T, n_classes). query는 테스트 행, key는 학습 행에서만
+    def forward(
+        self,
+        h: torch.Tensor,
+        y_train: torch.Tensor,
+        n_train: int,
+        *,
+        n_classes: int | None = None,
+        fused: bool = False,
+    ) -> torch.Tensor:
+        """h: (B, R, D) → 테스트 행 logit (B, T, n_classes). query는 테스트 행, key는 학습 행에서만.
+
+        `n_classes`(기본: 정답 embedding 수)는 one-hot의 클래스 수다. decoder에는 클래스마다
+        파라미터가 없어서 정답 embedding 수보다 많아도 된다(추론에서 정답 embedding을 묶을 때).
+        `fused`면 (테스트 행 × 학습 행) score 행렬을 만들지 않고 one-hot을 value로 둔
+        attention 한 번으로 계산한다(추론용. 큰 표에서 그 행렬이 수백 GB가 된다). 값은 같고
+        계산 순서만 다르다."""
         b = h.shape[0]
+        n_classes = n_classes or self.n_classes
         q = self.q_projection(h[:, n_train:]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_projection(h[:, :n_train]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
         q = self.qassmax(q, n_train)
-        # 확률·log는 float32로 (bf16이면 clip 값 근처가 뭉개진다)
-        scores = (q @ k.transpose(-1, -2)).float() / math.sqrt(self.head_dim)
-        onehot = F.one_hot(y_train.long().clamp(0, self.n_classes - 1), self.n_classes).float()
-        p = (torch.softmax(scores, dim=-1) @ onehot[:, None]).mean(1)  # (B, T, n_classes)
+        onehot = F.one_hot(y_train.long().clamp(0, n_classes - 1), n_classes).float()
+        if fused:
+            p = _retrieve(q, k, onehot).mean(1)
+        else:
+            # 확률·log는 float32로 (bf16이면 clip 값 근처가 뭉개진다)
+            scores = (q @ k.transpose(-1, -2)).float() / math.sqrt(self.head_dim)
+            p = (torch.softmax(scores, dim=-1) @ onehot[:, None]).mean(1)  # (B, T, n_classes)
         return torch.log(p.clamp_min(1e-5) + 3e-5)
+
+
+def _retrieve(q: torch.Tensor, k: torch.Tensor, onehot: torch.Tensor) -> torch.Tensor:
+    """softmax(q·kᵀ/√d) @ onehot을 head마다 (B, H, T, n_classes)로, score 행렬 없이 float32로.
+
+    q (B, H, T, d), k (B, H, N, d), onehot (B, N, n_classes). attention kernel의 value 폭을 q·k와
+    같게 하려고 one-hot을 d 열씩 잘라 조각마다 attention한다(공식 TabPFN-3.5 추론 코드의
+    `_chunked_class_attention`과 같은 방법). q·k는 조각마다 같으므로 복사하지 않는다. autocast를
+    끄고 float32로 계산한다."""
+    b, heads, t, d = q.shape
+    n, n_classes = onehot.shape[1:]
+    pieces = math.ceil(n_classes / d)
+    v = F.pad(onehot, (0, pieces * d - n_classes)).view(b, n, pieces, d)
+    q, k = q.float(), k.float()
+    with torch.autocast(q.device.type, enabled=False):
+        out = [  # 조각마다 (B, H, T, d)
+            F.scaled_dot_product_attention(q, k, v[:, None, :, j].expand(-1, heads, -1, -1))
+            for j in range(pieces)
+        ]
+    return torch.cat(out, dim=-1)[..., :n_classes]
 
 
 class ColumnRowTransformer(nn.Module):
     # 모델 종류 (`minipfn.models.MODEL_TYPES`)
     model_type = "column_row_transformer"
     config_class = ColumnRowTransformerConfig
+    # 추론(`forward`의 `inference`)에서 단계 0~2를 나눠 계산하는 크기. 공식 TabPFN-3.5 추론 코드의
+    # 기본값과 같다: 행 묶음 하나의 셀 수(batch × 행 × 열), 학습 행 요약을 구할 때 한 번에 계산하는
+    # 열 수
+    inference_chunk_cells = 2048 * 768
+    inference_column_chunk = 4
+    # forward가 추론용 인자(`inference`, `y_classes`·`n_classes`)를 받는다
+    # (`minipfn.inference.ensemble.forward_kwargs`)
+    supports_inference_options = True
 
     def __init__(self, config: ColumnRowTransformerConfig | None = None) -> None:
         super().__init__()
@@ -552,6 +657,14 @@ class ColumnRowTransformer(nn.Module):
         """이 모델이 내는 task (multitask면 둘 다. forward의 `task`로 고른다)."""
         return self.config.tasks
 
+    @property
+    def max_classes(self) -> int:
+        """추론에서 받는 클래스 수 상한 (`MAX_CLASSES`, 정답 embedding 수가 더 많으면 그 수).
+        분류를 내지 않는 모델(회귀만)은 0이다."""
+        if "classification" not in self.config.tasks:
+            return 0
+        return max(self.config.output_size("classification"), MAX_CLASSES)
+
     def repeated_blocks(self) -> list[nn.Module]:
         """여러 번 쓰는 블록 (학습 가속 옵션 `compile`이 블록마다 compile한다)."""
         return [*self.column_blocks, *self.row_blocks, *self.icl_layers]
@@ -610,13 +723,30 @@ class ColumnRowTransformer(nn.Module):
         return F.pad(target, (0, 0, 0, rows - y_train.shape[1]))
 
     def forward(
-        self, x: torch.Tensor, y_train: torch.Tensor, task: str | None = None
+        self,
+        x: torch.Tensor,
+        y_train: torch.Tensor,
+        task: str | None = None,
+        *,
+        y_classes: torch.Tensor | None = None,
+        n_classes: int | None = None,
+        inference: bool = False,
     ) -> torch.Tensor:
         """테스트 행의 logit (B, R - n_train, 출력 수).
 
         x: (B, R, C), 학습 행 다음에 테스트 행. y_train: (B, n_train).
         분류면 y는 0부터 시작하는 클래스 번호, 회귀면 z-정규화한 값이다. `task`는 multitask
         모델에서만 준다("classification" 또는 "regression"). 한 task 모델은 그 task다.
+
+        추론에서만 쓰는 인자:
+
+        - `y_classes`·`n_classes`(분류): retrieval decoder가 평균할 학습 행 클래스 번호와 클래스 수.
+          주면 `y_train`은 정답 embedding에만 쓰인다. 클래스가 정답 embedding 수(`n_out`)보다
+          많을 때 embedding 번호를 묶어 `y_train`으로, 원래 번호를 `y_classes`로 준다
+          (`minipfn.inference.ensemble.EnsembleClassifier`). 출력은 (B, T, n_classes)
+        - `inference`: 큰 표의 메모리를 줄인다. 셀 수(B × R × C)가 `inference_chunk_cells`보다
+          많으면 단계 0~2를 행 묶음으로 나눠 계산하고(`_rows_chunked`), 분류 decoder는 score 행렬을
+          만들지 않는다. 테스트 행끼리는 서로 보지 않으므로 값은 같다(계산 순서만 다르다)
         """
         cfg = self.config
         if task is None:
@@ -625,25 +755,29 @@ class ColumnRowTransformer(nn.Module):
             task = cfg.task
         elif task not in cfg.tasks:
             raise ValueError(f"이 모델의 task는 {cfg.tasks}다: {task}")
+        if (y_classes is None) != (n_classes is None):
+            raise ValueError("y_classes와 n_classes는 같이 준다")
+        if n_classes is not None and n_classes > self.max_classes:
+            raise ValueError(f"클래스 {n_classes}개는 상한({self.max_classes}개)보다 많다")
+        if task == "classification" and not self.training:
+            # 정답 embedding 수보다 큰 번호는 embedding·decoder에서 마지막 클래스로 합쳐진다.
+            # 학습 중에는 prior가 범위를 지키므로 (GPU 동기화를 피해) 평가·추론에서만 본다
+            n_labels = cfg.output_size("classification") if y_classes is None else n_classes
+            labels = y_train if y_classes is None else y_classes
+            if labels.numel() and int(labels.max()) >= n_labels:
+                raise ValueError(
+                    f"클래스 번호 {int(labels.max())}는 {n_labels}개 범위 밖이다. 클래스가 정답 "
+                    f"embedding 수({cfg.output_size('classification')})보다 많으면 y_train에 묶은 "
+                    "번호를, y_classes·n_classes에 원래 번호를 준다"
+                )
+            if y_classes is not None and int(y_train.max()) >= cfg.output_size("classification"):
+                raise ValueError("y_classes를 주면 y_train은 정답 embedding 수 안의 묶은 번호다")
         b, r, c = x.shape
         n_train = y_train.shape[1]
-        cells = self._embed_cells(x, n_train)  # (B, R, C, E)
-        cells = cells + self._target("cell", task, y_train, r, cells)[:, :, None]
-        e = cells.shape[-1]
-
-        # 1) 열 단계: (B × C, R, E)
-        h = cells.permute(0, 2, 1, 3).reshape(b * c, r, e)
-        for block in self.column_blocks:
-            h = block(h, n_train)
-
-        # 2) 행 단계: (B × R, n_cls + C, E) → CLS 출력을 이어 붙인 행 벡터 (B, R, n_cls × E).
-        #    마지막 블록은 CLS만 query다(그 뒤에 쓰는 것은 CLS뿐)
-        h = h.view(b, c, r, e).transpose(1, 2).reshape(b * r, c, e)
-        h = torch.cat([self.cls_tokens.to(h.dtype).expand(b * r, -1, -1), h], dim=1)
-        for block in self.row_blocks[:-1]:
-            h = block(h)
-        h = self.row_blocks[-1](h, n_queries=cfg.n_cls)
-        rows = self.row_norm(h).reshape(b, r, cfg.icl_dim)
+        if inference and b * r * c > self.inference_chunk_cells:
+            rows = self._rows_chunked(x, y_train, task)
+        else:
+            rows = self._rows(x, y_train, task)
 
         # 3) 행 ICL: 학습 행 벡터에 정답 embedding을 한 번 더 더한다
         rows = rows + self._target("icl", task, y_train, r, rows)
@@ -655,5 +789,106 @@ class ColumnRowTransformer(nn.Module):
         if cfg.head_mlp:
             rows = self.pre_head[task](rows)
         if task == "classification":
-            return self.heads[task](rows, y_train, n_train)
+            labels = y_train if y_classes is None else y_classes
+            return self.heads[task](rows, labels, n_train, n_classes=n_classes, fused=inference)
         return self.heads[task](rows[:, n_train:])
+
+    def _rows(self, x: torch.Tensor, y_train: torch.Tensor, task: str) -> torch.Tensor:
+        """단계 0~2 (셀 encoder, 열 단계, 행 단계): x (B, R, C) → 행 벡터 (B, R, n_cls × E)."""
+        b, r, c = x.shape
+        n_train = y_train.shape[1]
+        cells = self._embed_cells(x, n_train)  # (B, R, C, E)
+        cells = cells + self._target("cell", task, y_train, r, cells)[:, :, None]
+        e = cells.shape[-1]
+
+        # 1) 열 단계: (B × C, R, E)
+        h = cells.permute(0, 2, 1, 3).reshape(b * c, r, e)
+        for block in self.column_blocks:
+            h = block(h, n_train)
+        # 2) 행 단계
+        return self._row_stage(h.view(b, c, r, e).transpose(1, 2))
+
+    def _row_stage(self, h: torch.Tensor) -> torch.Tensor:
+        """행 단계: 셀 토큰 (B, R, C, E) → (B × R, n_cls + C, E) → CLS 출력을 이어 붙인 행 벡터
+        (B, R, n_cls × E). 마지막 블록은 CLS만 query다(그 뒤에 쓰는 것은 CLS뿐)."""
+        cfg = self.config
+        b, r, c, e = h.shape
+        h = h.reshape(b * r, c, e)
+        h = torch.cat([self.cls_tokens.to(h.dtype).expand(b * r, -1, -1), h], dim=1)
+        for block in self.row_blocks[:-1]:
+            h = block(h)
+        h = self.row_blocks[-1](h, n_queries=cfg.n_cls)
+        return self.row_norm(h).reshape(b, r, cfg.icl_dim)
+
+    def _rows_chunked(self, x: torch.Tensor, y_train: torch.Tensor, task: str) -> torch.Tensor:
+        """`_rows`와 같은 값을 행 묶음으로 나눠 계산한다 (추론용, 공식 TabPFN-3.5 추론 코드의
+        chunkwise inference와 같은 순서).
+
+        열 단계에서 행은 서로 보지 않고 inducing point의 요약(`InducedBlock.summary`)만 본다. 요약은
+        학습 행으로만 정해지므로 (1) 열을 `inference_column_chunk`개씩 나눠 학습 행만으로 블록마다
+        요약을 구해 두고, (2) 행을 `inference_chunk_cells / (B × C)`개씩 나눠 셀 encoder, 열
+        단계(요약에 attention), 행 단계를 계산한다. 셀 정규화·ECDF 통계도 학습 행으로 한 번만
+        구한다(`_CellStats`). 그래서 (B, R, C, E) 크기의 텐서를 한 번에 두지 않는다."""
+        b, r, c = x.shape
+        n_train = y_train.shape[1]
+        stats = _CellStats(x, n_train, ecdf=self.config.encoder == "fourier")
+        offsets = torch.tensor(self.offsets, device=x.device)
+        groups = (torch.arange(c, device=x.device)[:, None] + offsets) % c  # 열 j에 묶는 열
+        target = None  # 학습 행의 셀 정답 embedding (B, n_train, E), 셀 dtype을 알 때 만든다
+
+        def embed(x_part: torch.Tensor, cols: torch.Tensor | None, shape) -> torch.Tensor:
+            nonlocal target
+            cells = self._encode_cells(*stats.features(x_part, cols), shape)
+            if target is None:
+                target = self._target("cell", task, y_train, n_train, cells)
+            return cells
+
+        # (1) 블록마다 요약 (B × C, n_inducing, E)
+        summaries: list[torch.Tensor | None] = [None] * len(self.column_blocks)
+        for c0 in range(0, c, self.inference_column_chunk):
+            src = groups[c0 : c0 + self.inference_column_chunk]  # (Cj, G): 묶는 열
+            cj = src.shape[0]
+            cells = embed(x[:, :n_train, src.reshape(-1)], src.reshape(-1), (cj, src.shape[1]))
+            cells = cells + target[:, :, None]
+            e = cells.shape[-1]
+            h = cells.permute(0, 2, 1, 3).reshape(b * cj, n_train, e)
+            for i, block in enumerate(self.column_blocks):
+                ind = block.summary(h)
+                if summaries[i] is None:
+                    summaries[i] = ind.new_empty(b, c, *ind.shape[1:])
+                summaries[i][:, c0 : c0 + cj] = ind.view(b, cj, *ind.shape[1:])
+                if i + 1 < len(self.column_blocks):
+                    h = block.spread(h, ind)
+
+        # (2) 행 묶음마다 셀 encoder → 열 단계 → 행 단계
+        step = max(1, self.inference_chunk_cells // (b * c))
+        out = None
+        for r0 in range(0, r, step):
+            r1 = min(r0 + step, r)
+            cells = embed(x[:, r0:r1], None, None)  # (B, Rj, C, E)
+            if r0 < n_train:  # 학습 행에만 정답 embedding
+                k = min(r1, n_train) - r0
+                cells = torch.cat([cells[:, :k] + target[:, r0 : r0 + k, None], cells[:, k:]], 1)
+            e = cells.shape[-1]
+            h = cells.permute(0, 2, 1, 3).reshape(b * c, r1 - r0, e)
+            for block, ind in zip(self.column_blocks, summaries, strict=True):
+                h = block.spread(h, ind.reshape(b * c, *ind.shape[2:]))
+            rows = self._row_stage(h.view(b, c, r1 - r0, e).transpose(1, 2))
+            if out is None:
+                out = rows.new_empty(b, r, rows.shape[-1])
+            out[:, r0:r1] = rows
+        return out
+
+    def _encode_cells(self, z, indicator, u, shape) -> torch.Tensor:
+        """셀 값 (`_CellStats.features`) → 토큰. `shape`이 None이면 열 C개를 circular shift로
+        묶고(`_group`), (Cj, G)면 이미 묶은 열 Cj × G개다. 결과는 (B, 행, Cj, E)."""
+
+        def group(t: torch.Tensor) -> torch.Tensor:
+            if shape is None:
+                return _group(t, self.offsets)
+            return t.view(*t.shape[:2], *shape)
+
+        zg, ig = group(z), group(indicator)
+        if self.config.encoder == "fourier":
+            return self.cell_encoder(zg, ig, group(u))
+        return self.cell_encoder(torch.cat([zg, ig], dim=-1))
