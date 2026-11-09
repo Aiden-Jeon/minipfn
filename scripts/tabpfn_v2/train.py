@@ -26,6 +26,8 @@ decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed 
 GPU끼리 나눠 계산한다(결과·checkpoint 형식 같음, 이어 학습하면 원래 run의 값을 따르고 `off`로
 끈다). 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
+`--shared-table-size`(`TABPFN_V2_SHARED_TABLE_SIZE=1`, issue #68)는 step마다 모든 GPU가 같은
+학습 행·feature 수의 표를 쓰게 한다(내용은 GPU마다 다르다. 가장 큰 표를 기다리는 시간을 줄인다).
 학습 진단 지표(`minipfn.training.diagnostics`)는 묶음별 가중치·gradient norm을 늘 남기고,
 `--grad-cosine`(`TABPFN_V2_GRAD_COSINE=1`, multitask만, issue #64)은 두 task gradient의 묶음별
 cosine을, `--rank-timing`(`TABPFN_V2_RANK_TIMING=1`, issue #68)은 GPU마다 forward·backward 시간과
@@ -145,7 +147,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-every", type=int, default=_env("TABPFN_V2_VAL_EVERY", int))
     # 학습 가속 (TrainConfig 주석). 켜기만 한다. 이어 학습하면 원래 run에서 켠 것은 그대로 켜진다
     # (`source_speed_options`)
-    for flag in ("compile", "fused-adam", "tf32", "schedule-free"):
+    for flag in ("compile", "fused-adam", "tf32", "schedule-free", "shared-table-size"):
         env = "TABPFN_V2_" + flag.upper().replace("-", "_")
         parser.add_argument(f"--{flag}", action="store_true", default=_env_flag(env))
     # 학습 진단 지표 (TrainConfig 주석, issue #64·#68). 학습 계산은 그대로라 이어 학습해도 따라가지
@@ -361,6 +363,7 @@ def _override_values(args: argparse.Namespace) -> dict:
                 "fused_adam",
                 "tf32",
                 "schedule_free",
+                "shared_table_size",
                 "grad_cosine",
                 "rank_timing",
             )

@@ -28,11 +28,21 @@ def derive_seed(*keys: int) -> int:
 class PriorBatches(IterableDataset):
     """DataLoader worker마다 다른 시드로 prior batch를 끝없이 만든다.
 
-    `config`는 `make_prior(seed)`와 `micro_batch`가 있는 학습 설정(`TrainConfig`)이다."""
+    `config`는 `make_prior(seed)`와 `micro_batch`가 있는 학습 설정(`TrainConfig`)이다.
 
-    def __init__(self, config: Any, seed: tuple[int, ...]) -> None:
+    `size_seed`를 주면 표 크기(학습 행·feature 수)는 prior의 난수가 아니라 이 seed의 난수로 뽑는다
+    (학습 옵션 `shared_table_size`, issue #68). 이 난수는 전체 batch 순서대로 크기를 하나씩 내고,
+    worker w는 W개마다 w번째 것을 쓴다(DataLoader가 worker를 돌아가며 받는 순서와 같다). 그래서
+    rank가 들어가지 않은 seed를 주면 모든 GPU의 i번째 batch가 같은 크기다. 표 내용은 `seed`로
+    정해져 GPU마다 다르다. prior에는 `sample_size(rng)`와 `sample_batch(n, size=...)`가 있어야
+    한다."""
+
+    def __init__(
+        self, config: Any, seed: tuple[int, ...], size_seed: tuple[int, ...] | None = None
+    ) -> None:
         self.config = config
         self.seed = seed
+        self.size_seed = size_seed
 
     def __iter__(self):
         info = get_worker_info()
@@ -40,8 +50,15 @@ class PriorBatches(IterableDataset):
         torch.set_num_threads(1)
         seed = hash((*self.seed, worker)) % (2**31)
         prior = self.config.make_prior(seed)
+        if self.size_seed is None:
+            while True:
+                batch = prior.sample_batch(self.config.micro_batch)
+                yield batch.x, batch.y, batch.n_train
+        n_workers = 1 if info is None else info.num_workers
+        size_rng = np.random.default_rng(derive_seed(*self.size_seed))
         while True:
-            batch = prior.sample_batch(self.config.micro_batch)
+            sizes = [prior.sample_size(size_rng) for _ in range(n_workers)]
+            batch = prior.sample_batch(self.config.micro_batch, size=sizes[worker])
             yield batch.x, batch.y, batch.n_train
 
 

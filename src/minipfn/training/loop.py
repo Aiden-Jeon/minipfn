@@ -69,6 +69,8 @@ from minipfn.training.stability import (
 )
 from minipfn.utils import DistContext, lr_factor, setup_distributed
 
+SIZE_SEED_TAG = 2**31 - 1  # 표 크기 난수의 seed 끝에 붙이는 수 (`shared_table_size`)
+
 
 def _borders(config: TrainConfig, d: DistContext, device: torch.device) -> torch.Tensor | None:
     """회귀(multitask의 회귀 쪽 포함)면 rank 0에서 구간 경계를 계산해 모든 GPU에 나눠 준다."""
@@ -513,10 +515,22 @@ def _train(
         # 이어서 학습할 때 같은 데이터를 다시 보지 않도록 시드에 시작 step을 섞는다.
         # 붕괴로 되돌아가면 되돌린 횟수도 섞어 다른 데이터로 다시 간다. multitask는 task 번호도
         seed = (config.seed, from_step, d.rank) + ((rewinds,) if rewinds else ())
+
+        def size_seed(i: int) -> tuple[int, ...] | None:
+            # 표 크기를 GPU끼리 맞추면(`shared_table_size`) 크기 난수에는 rank를 넣지 않는다.
+            # 마지막 수는 데이터 seed와 섞이지 않게 붙인 표시
+            if not config.shared_table_size:
+                return None
+            return (config.seed, from_step, rewinds, i, SIZE_SEED_TAG)
+
         return {
             task: iter(
                 DataLoader(
-                    PriorBatches(task_config, seed=seed + ((i,) if multitask else ())),
+                    PriorBatches(
+                        task_config,
+                        seed=seed + ((i,) if multitask else ()),
+                        size_seed=size_seed(i),
+                    ),
                     batch_size=None,
                     **loader_kwargs,
                 )

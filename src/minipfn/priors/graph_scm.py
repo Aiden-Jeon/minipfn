@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import numpy as np
 import torch
 
 from minipfn.priors.base import PriorBatch
@@ -104,9 +105,11 @@ class GraphSCMPrior:
     def max_missing_rate(self) -> float:
         return self._missing.max_rate
 
-    def sample_size(self) -> tuple[int, int]:
+    def sample_size(self, rng: np.random.Generator | None = None) -> tuple[int, int]:
+        """(학습 행 수, feature 수). `rng`를 주면 prior의 난수 대신 그것으로 뽑는다(학습 옵션
+        `shared_table_size`: GPU끼리 같은 크기를 쓰도록 rank가 들어가지 않은 난수를 준다)."""
         n_train, n_features = sample_table_size(
-            self.rng.numpy,
+            self.rng.numpy if rng is None else rng,
             self.max_train_rows,
             self.n_eval_rows,
             self.max_features,

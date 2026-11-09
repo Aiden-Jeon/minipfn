@@ -35,6 +35,7 @@ SPEED_OPTIONS = (
     "muon_weight_decay",
     "muon_distributed",
     "phases",
+    "shared_table_size",
 )
 OPTIMIZERS = ("adam", "muon")
 # step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
@@ -178,6 +179,12 @@ class TrainConfig:
     #   rank 0으로 모은다(지표 `rank_*`, step마다 한 줄인 `rank_timing.jsonl`)
     grad_cosine: bool = False
     rank_timing: bool = False
+    # 표 크기를 step마다 GPU끼리 맞춘다 (issue #68, 학습 가속 옵션. 논문에 없음, 여기서 정함).
+    # 끄면(기본) GPU마다 표 크기를 따로 뽑아, 가장 큰 표를 받은 GPU를 나머지가 all-reduce에서
+    # 기다린다(8 GPU에서 셀 수 최대/평균 약 2.7배, forward 최대/평균 약 1.4배). 켜면 i번째 batch의
+    # 학습 행·feature 수가 모든 GPU에서 같고 표 내용만 다르다(`training.data.PriorBatches`).
+    # 학습 전체의 크기 분포는 같고, 한 step 안의 크기가 GPU 수만큼에서 하나로 준다
+    shared_table_size: bool = False
 
     def __post_init__(self) -> None:
         self.phases = normalize_phases(self.phases)

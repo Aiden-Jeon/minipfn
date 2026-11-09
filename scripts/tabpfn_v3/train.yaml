@@ -18,6 +18,8 @@
 #                --override env_variables.TABPFN_V2_RANK_TIMING=1 (GPU마다 forward·backward 시간과 표 크기,
 #                MLflow diagnostics/rank_timing_from_*.jsonl, issue #68). 학습 계산은 그대로, chunk마다 켠다.
 #                묶음별 가중치·gradient norm(issue #65)은 늘 남는다
+#   표 크기 맞추기: --override env_variables.TABPFN_V2_SHARED_TABLE_SIZE=1 (step마다 모든 GPU가 같은 학습 행·feature
+#                수, 내용은 GPU마다 다름. 가장 큰 표를 기다리는 시간을 줄인다, issue #68. 이어 학습하면 따라간다)
 #   TabPFN-3(task마다 모델): --override env_variables.TABPFN_V2_ARCH=v3 --override env_variables.TABPFN_V2_TASK=classification
 #                (또는 regression. 53M·58M)
 # 학습 step·lr·batch는 두 보고서에 없어서 v2 paper 설정 그대로다(recipes/tabpfn_v3.py의 paper; multitask는
