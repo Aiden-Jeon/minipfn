@@ -43,7 +43,8 @@ TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
 설치하고 `uv run`에도 같은 옵션을 준다: `uv sync --no-dev --extra arena --group arena-dev`).
 공식 split을 돌리고 공개 leaderboard와 같은 방식으로 Elo·정규화 점수·
 improvability·승률을 낸다. 분류·회귀 체크포인트
-가운데 주지 않은 쪽과 논문 권장 크기(recipe의 `SUPPORTED_SIZE`; 클래스 수는 모델 출력 수)를
+가운데 주지 않은 쪽과 논문 권장 크기(recipe의 `SUPPORTED_SIZE`; 클래스 수는 모델이 받는 수
+`max_classes_of`)를
 넘는 split은 돌리지 않고 imputed로 둔다(`--max-train-rows`·`--max-features`로 바꾼다). 기본은 학습
 split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나눠 8개의 예측을 평균한다.
 `--datasets`로 일부만 돌릴 수 있다(나머지는 imputed). 결과는 `<out-dir>/<suite>/`
@@ -52,6 +53,10 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
   uv run --no-dev --extra arena --group arena-dev python $EVAL --suite tabarena-lite \
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier \
     --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
+
+`--seed`(기본 0)는 앙상블 멤버의 난수(feature·클래스 순서, 식별자 열 등)를 바꾼다. 같은 모델을
+seed만 바꿔 다시 평가하면 benchmark 점수의 노이즈를 잴 수 있다(issue #67). arena 결과 cache는
+seed마다 따로다.
 
 `--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
 학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
@@ -118,6 +123,7 @@ from minipfn.inference.ensemble import (
     DEFAULT_ONE_HOT,
     EnsembleClassifier,
     EnsembleRegressor,
+    max_classes_of,
     max_features_of,
 )
 from minipfn.inference.ensemble_selection import (
@@ -173,6 +179,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--n-estimators", type=int, default=None, help="앙상블 멤버 수 (기본: 모델이 정한다)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="앙상블 멤버의 난수 seed (feature·클래스 순서, 식별자 열 등. 같은 모델의 평가 노이즈를"
+        " 잴 때 바꾼다)",
     )
     parser.add_argument(
         "--uncertainty",
@@ -386,6 +399,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "one_hot": one_hot,
             "member_kinds": member_kinds,
             "device": args.device,
+            "random_state": args.seed,
         }
         if "greedy" in args.test_time:
             # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
@@ -555,7 +569,8 @@ def arena_suite(name: str):
 def arena_limits(models: dict, args: argparse.Namespace) -> dict:
     """문제 종류마다 돌릴 split의 상한. 체크포인트가 없는 쪽(분류·회귀)은 빠진다(imputed).
     크기는 모델 구조의 논문 권장값(`minipfn.recipes.supported_size`: recipe의 `SUPPORTED_SIZE`,
-    모르는 구조는 그 recipe의 첫 구조), 클래스 수는 모델 출력 수."""
+    모르는 구조는 그 recipe의 첫 구조), 클래스 수는 모델이 받는 수(`max_classes_of`: 출력 수,
+    column_row_transformer는 정답 embedding을 묶어 `MAX_CLASSES`개까지)."""
     from minipfn.benchmarks.arena import ModelLimits
 
     limits = {}
@@ -566,7 +581,7 @@ def arena_limits(models: dict, args: argparse.Namespace) -> dict:
         if args.max_features is not None:
             size["max_features"] = args.max_features
         if task == "classification":
-            lim = ModelLimits(**size, max_classes=int(model.config.n_out))
+            lim = ModelLimits(**size, max_classes=max_classes_of(model))
             limits.update(binary=lim, multiclass=lim)
         else:
             limits["regression"] = ModelLimits(**size)
@@ -608,6 +623,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
             **({} if args.test_time == "none" else test_time_params(args)),
             # 증류하지 않으면 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
             **({} if args.distill == "none" else distill_params(args)),
+            # seed 0(기본)도 예전 fingerprint 그대로
+            **({"seed": args.seed} if args.seed else {}),
         },
         sort_keys=True,
     )
@@ -659,6 +676,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "method_name": args.method_name,
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
+            "seed": args.seed,
             **test_time_params(args),
             **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
@@ -757,6 +775,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "folds": args.folds,
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
+                "seed": args.seed,
                 **test_time_params(args),
                 **distill_params(args),
             }

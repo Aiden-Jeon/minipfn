@@ -14,8 +14,10 @@ from minipfn import hub
 from minipfn import models as registry
 from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.models.column_row_transformer import (
+    MAX_CLASSES,
     ColumnRowTransformer,
     ColumnRowTransformerConfig,
+    RetrievalDecoder,
     ecdf_midrank,
     group_offsets,
 )
@@ -395,7 +397,9 @@ def test_arena_limits_follow_the_model_recipe():
     script = _script("eval")
     args = _argparse.Namespace(max_train_rows=None, max_features=None)
     limits = script.arena_limits({"classification": (_model(arch="v3"), None)}, args)
-    assert limits["binary"].max_train_rows == 100_000 and limits["binary"].max_classes == 10
+    # 클래스는 정답 embedding(10개)을 묶어 MAX_CLASSES까지 받는다 (issue #66)
+    assert limits["binary"].max_train_rows == 100_000
+    assert limits["binary"].max_classes == MAX_CLASSES == 160
 
 
 # ---------------------------------------------------------------------------
@@ -552,3 +556,86 @@ def test_tiny_config_and_randomize_zero_weights():
     x, y = _data("classification")
     with torch.no_grad():
         assert model(x, y).shape == (2, 15, 10)
+
+
+# ---------------------------------------------------------------------------
+# 큰 표·클래스 10개 초과 추론 (issue #66)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("arch", ["v3", "v3.5"])
+@pytest.mark.parametrize("task", ["classification", "regression", "multitask"])
+def test_inference_path_matches_the_training_path(arch, task, monkeypatch):
+    # 추론 경로(단계 0~2를 행·열 묶음으로, decoder는 score 행렬 없이)는 학습 경로와 값이 같다
+    if task == "multitask" and arch == "v3":
+        pytest.skip("multitask는 3.5만")
+    model = _model(task, arch)
+    for t in model.tasks:
+        x, y = _data(t, r=41, c=8)
+        x[1, 30, 4] = float("inf")
+        x[:, :, 6] = 2.0  # 학습 행에서 상수인 열
+        kw = {"task": t} if task == "multitask" else {}
+        with torch.no_grad():
+            full = model(x, y, **kw)
+            # 묶음 크기가 행·열 수로 나누어떨어지지 않게 (마지막 묶음이 작다)
+            monkeypatch.setattr(model, "inference_chunk_cells", 2 * 8 * 6)
+            monkeypatch.setattr(model, "inference_column_chunk", 3)
+            chunked = model(x, y, inference=True, **kw)
+            monkeypatch.setattr(model, "inference_chunk_cells", 10**9)
+            fused = model(x, y, inference=True, **kw)
+        assert torch.allclose(chunked, full, atol=1e-5), (chunked - full).abs().max()
+        assert torch.allclose(fused, full, atol=1e-5)
+        if t == "regression":  # 회귀는 decoder가 같고 단계 0~2만 나눈다
+            assert torch.equal(fused, full)
+
+
+def test_fused_retrieval_matches_the_score_matrix_for_many_classes():
+    # one-hot을 head dim씩 잘라 접는 계산: 클래스 수가 head dim(8)보다 많아도 같다
+    torch.manual_seed(0)
+    decoder = RetrievalDecoder(dim=16, heads=2, head_dim=8, n_classes=3, hidden=8).eval()
+    torch.nn.init.normal_(decoder.qassmax.query_mlp[2].weight, std=0.1)
+    h, y = torch.randn(2, 30, 16), torch.randint(0, 20, (2, 22)).float()
+    with torch.no_grad():
+        plain = decoder(h, y, 22, n_classes=20)
+        fused = decoder(h, y, 22, n_classes=20, fused=True)
+    assert plain.shape == fused.shape == (2, 8, 20)
+    assert torch.allclose(fused, plain, atol=1e-5)
+    assert torch.allclose(plain.exp().sum(-1), torch.ones(2, 8), atol=1e-3)
+
+
+def test_more_classes_than_target_embeddings_share_embeddings():
+    model = _model()  # 정답 embedding 10개
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 5))
+    y = np.digitize(X[:, 0], np.quantile(X[:, 0], np.linspace(0, 1, 14)[1:-1]))  # 클래스 13개
+    labels = np.array([f"c{i:02d}" for i in range(13)])[y]
+    clf = EnsembleClassifier(model, n_estimators=3, member_kinds="standard")
+    clf.fit(X[:200], labels[:200])
+    proba = clf.predict_proba(X[200:])
+    assert list(clf.classes_) == sorted(set(labels)) and proba.shape == (100, 13)
+    assert np.allclose(proba.sum(1), 1, atol=1e-3)
+    # 정답 embedding에는 묶음 번호(섞은 번호 mod 10), decoder에는 섞은 번호 그대로
+    y_member = torch.as_tensor(clf.y_trains_[0], dtype=torch.float32)[None]
+    grouped, extra = clf._model_targets(y_member)
+    assert grouped.max() < 10 and torch.equal(grouped, y_member % 10)
+    assert extra["n_classes"] == 13 and torch.equal(extra["y_classes"], y_member)
+    # 클래스 상한(MAX_CLASSES)보다 많으면 받지 않는다
+    with pytest.raises(ValueError, match="받는 수"):
+        EnsembleClassifier(model, n_estimators=1).fit(X[:200], np.arange(200) % 161)
+    # 출력 수가 클래스 수인 모델(v2 cell_transformer)은 예전처럼 출력 수까지만
+    v2_model = TrainConfig.smoke("classification").build_model()
+    assert v2_model.model_type == "cell_transformer"
+    with pytest.raises(ValueError, match="받는 수"):
+        EnsembleClassifier(v2_model, n_estimators=1).fit(X[:200], labels[:200])
+
+
+def test_eval_seed_changes_members_and_the_arena_fingerprint(monkeypatch, tmp_path):
+    script = _script("eval")
+    args = script.parse_args(["--suite", "classification", "--seed", "3"])
+    assert args.seed == 3 and script.parse_args([]).seed == 0
+    model = _model()
+    monkeypatch.setattr(script, "load_model", lambda *a, **k: (model, None))
+    args.classifier_path, args.out_dir = "unused", str(tmp_path)
+    make = script.make_estimator_factory("classification", args)
+    import types
+
+    estimator = make(types.SimpleNamespace(categorical_indices=[]), "all")
+    assert estimator.random_state == 3
