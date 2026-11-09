@@ -28,3 +28,13 @@ notebooks/06_tabpfn_v3_5/01_changes_and_multitask.ipynb !filter
 notebooks/topics_architecture/01_architecture_evolution.ipynb !filter
 notebooks/topics_prior/01_prior_evolution.ipynb !filter
 notebooks/topics_inference/01_inference_evolution.ipynb !filter
+notebooks/topics_inference/02_greedy_ensemble_selection.ipynb !filter
+notebooks/topics_inference/03_greedy_guard.ipynb !filter
+notebooks/topics_inference/04_diag_scale.ipynb !filter
+notebooks/topics_inference/05_gbdt_distillation.ipynb !filter
+notebooks/topics_evaluation/01_comparing_models.ipynb !filter
+notebooks/topics_evaluation/02_regression_uncertainty.ipynb !filter
+notebooks/topics_evaluation/03_classification_calibration.ipynb !filter
+notebooks/topics_training/01_muon.ipynb !filter
+notebooks/topics_training/02_weight_averaging.ipynb !filter
+notebooks/topics_training/03_stability.ipynb !filter

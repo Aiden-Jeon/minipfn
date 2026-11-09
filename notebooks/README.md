@@ -114,7 +114,7 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 
 ## 축별 폴더 — `topics_xxx/`
 
-논문 폴더가 버전 하나를 깊게 본다면, 이 폴더들은 축 하나를 v1부터 3.5까지 따라갑니다. 논문 폴더와 같은 깊이(`notebooks/` 바로 아래)에 둡니다.
+논문 폴더가 버전 하나를 깊게 본다면, 이 폴더들은 축 하나를 따라갑니다. 각 폴더의 01은 그 축을 v1부터 3.5까지 한 노트북에서 견주고, 그 뒤 노트북은 이 저장소가 그 축에 더한 기법(greedy 선택, 증류, Muon 등)을 작은 toy 예제로 하나씩 봅니다. 실제 규모의 결과는 각 노트북 끝에 짧게 적고, 자세한 숫자는 PR과 Hub 카드에 있습니다. 논문 폴더와 같은 깊이(`notebooks/` 바로 아래)에 둡니다.
 
 ### `topics_architecture/` — 모델 구조
 
@@ -133,3 +133,23 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
 | 01 | [추론의 흐름](topics_inference/01_inference_evolution.ipynb) | 버전마다 앙상블 멤버를 몇 개, 어떤 전처리로 만들고, 멤버 수와 종류가 실제 데이터셋의 점수를 얼마나 바꾸는가? |
+| 02 | [멤버를 골라 섞기 — greedy ensemble selection](topics_inference/02_greedy_ensemble_selection.ipynb) | 멤버 × 온도 후보 217개를 out-of-fold 손실로 골라 섞으면 기본 앙상블보다 나은가? 작은 데이터에서는 왜 낮은 온도를 골라 손해를 보는가? |
+| 03 | [greedy 선택의 안전장치 — 최소 개선과 group fold](topics_inference/03_greedy_guard.ipynb) | greedy가 out-of-fold 노이즈에 맞추거나 test가 처음 보는 group일 때 무엇이 막아 주고, 무엇은 못 막는가? |
+| 04 | [데이터셋마다 조금만 학습하기 — DiagScale](topics_inference/04_diag_scale.ipynb) | attention의 query·key 닮음에 차원마다 곱하는 scale 4,608개만 학습하면 무엇이 바뀌고, 학습이 해가 될 때는 어떻게 원래 모델로 돌아가는가? |
+| 05 | [TabPFN을 GBDT로 옮기기 — 증류](topics_inference/05_gbdt_distillation.ipynb) | teacher의 확률을 GBDT 학생이 어떻게 배우고, 학습 행에서 정답 쪽으로 기우는 teacher 확률을 out-of-fold와 CutMix 행으로 어떻게 피하는가? |
+
+### `topics_evaluation/` — 평가
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [여러 데이터셋에서 모델 견주기 — 정규화 점수, 순위, Elo](topics_evaluation/01_comparing_models.ipynb) | 데이터셋마다 지표와 크기가 다른 오차를 모델마다 하나로 어떻게 모으고, Elo는 승패에서 어떻게 계산하는가? |
+| 02 | [회귀 예측 분포 재기 — CRPS, 구간, PIT](topics_evaluation/02_regression_uncertainty.ipynb) | 평균이 같은 예측 분포를 CRPS·coverage·interval score·PIT로 어떻게 가리고, 전체 coverage가 맞아도 어디서 틀리는가? |
+| 03 | [분류 확률 재기 — calibration과 conformal prediction](topics_evaluation/03_classification_calibration.ipynb) | 확률이 말한 만큼 맞히는지 ECE로 어떻게 재고, 확률이 틀려도 정답을 90% 담는 집합을 conformal로 어떻게 만드는가? |
+
+### `topics_training/` — 학습
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [갱신을 직교화하는 optimizer — Muon](topics_training/01_muon.ipynb) | gradient 행렬을 직교화하면 갱신이 어떻게 달라지고, Newton–Schulz는 SVD 없이 어떻게 하며, 작은 모델에서 Adam과 견주면 어떤가? |
+| 02 | [가중치를 평균하기 — LAWA와 schedule-free](topics_training/02_weight_averaging.ipynb) | 학습률을 줄이지 않고 흔들리는 가중치를 평균하면 무엇이 좋아지고, schedule-free의 z·x·y는 무엇인가? |
+| 03 | [학습이 무너지지 않게 — QK-clip, 이산 target 흩기, 붕괴 감지](topics_training/03_stability.ipynb) | attention sink, 반복되는 회귀 target, 갑작스러운 손실 붕괴를 각각 어떻게 재고 막는가? |
