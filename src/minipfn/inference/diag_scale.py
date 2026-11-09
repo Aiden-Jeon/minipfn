@@ -265,11 +265,12 @@ class DiagScale:
         self.estimator = estimator
         self.kwargs = kwargs
 
-    def fit(self, X: Any, y: Any) -> DiagScale:
+    def fit(self, X: Any, y: Any, **fit_kwargs: Any) -> DiagScale:
+        """`fit_kwargs`(greedy 선택의 `groups` 등)는 감싼 estimator의 fit에 넘긴다."""
         model, self.adaptation_ = fit_diag_scale(self.estimator, X, y, **self.kwargs)
         estimator = copy.copy(self.estimator)
         estimator.model = model
-        self.estimator_ = estimator.fit(X, y)
+        self.estimator_ = estimator.fit(X, y, **fit_kwargs)
         return self
 
     def __getattr__(self, name: str):
