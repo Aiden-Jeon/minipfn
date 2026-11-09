@@ -264,20 +264,14 @@ def run(
         )
         wanted = set(zip(todo["dataset"], todo["fold"], todo["repeat"], strict=True))
         jobs = [j for j in jobs if _job_split(j) in wanted]
-        # split 하나가 실패해도 멈추지 않는다: 그 split은 결과가 없어 imputed가 된다(`failed`).
-        # split을 돌리기 전에 task 데이터를 받다가 네트워크가 끊기면(`raise_on_failure`가 잡지
-        # 않는다) 다시 부른다. 끝난 split은 `run_dir`에 있어 다시 돌리지 않는다
-        from minipfn.benchmarks._retry import retry
-
-        results = retry(
-            lambda: context.run_jobs(
-                jobs,
-                expname=str(run_dir),
-                register=False,
-                debug_mode=True,
-                raise_on_failure=False,
-            ),
-            what=f"{suite.name} run_jobs",
+        prefetch_tasks(context, jobs, what=suite.name)
+        # split 하나가 실패해도 멈추지 않는다: 그 split은 결과가 없어 imputed가 된다(`failed`)
+        results = context.run_jobs(
+            jobs,
+            expname=str(run_dir),
+            register=False,
+            debug_mode=True,
+            raise_on_failure=False,
         )
     if results:
         context.register(results, scope_to_valid_tasks=False)
@@ -391,6 +385,30 @@ def model_pool(context, method: str) -> pd.DataFrame:
 def _job_split(job) -> tuple[str, int, int]:
     task = job.task if hasattr(job, "task") else job
     return (task.dataset, int(task.fold), int(task.repeat))
+
+
+def prefetch_tasks(context, jobs: list, *, what: str) -> None:
+    """split을 돌리기 전에 `jobs`의 task 데이터를 받아 두고, 네트워크 오류면 task마다 다시 한다
+    (`benchmarks._retry`).
+
+    `run_jobs`는 split을 돌리는 도중에 task마다 데이터를 받는데(OpenML task), 그 단계의 오류는
+    `raise_on_failure=False`가 잡지 않아 평가 전체가 멈춘다. 미리 받아 두면 `run_jobs`는 캐시만
+    읽는다. `make_context`는 `cache_config`를 주지 않으므로 둘 다 openml 기본 캐시를 쓴다.
+    - OpenML task(TabArena): task·split·dataset을 task마다 받는다(`fetch_openml_task`).
+    - Data Foundry task(BeyondArena, id가 정수가 아니다): `materialize`가 받는다. 받은 데이터셋은
+      건너뛰므로 다시 불러도 남은 것만 받는다."""
+    from minipfn.benchmarks._retry import fetch_openml_task, retry
+
+    collection = context.task_metadata_collection.subset_to_jobs(jobs)
+    task_ids: list[int] = []
+    for ttm in collection:
+        try:
+            task_ids.append(int(ttm.task_id_str))
+        except (TypeError, ValueError):
+            continue
+    for task_id in dict.fromkeys(task_ids):
+        fetch_openml_task(task_id)
+    retry(collection.materialize, what=f"{what} materialize")
 
 
 def _new_method_name(leaderboard: pd.DataFrame, method: str) -> str | None:
