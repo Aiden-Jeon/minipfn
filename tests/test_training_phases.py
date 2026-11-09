@@ -206,3 +206,26 @@ def test_paper_run_is_the_trained_v3_5_path(monkeypatch):
 
 def resume_args():
     return ["--config-name", "paper_run", "--task", "multitask", "--resume-run-id", "r"]
+
+
+def test_cooldown_finishes_paper_run_weights(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK", "TABPFN_V2_STEPS"):
+        monkeypatch.delenv(name, raising=False)
+    config = tabpfn_v3.cooldown()
+    assert (config.steps, config.warmup_steps, config.lr) == (20_000, 1_000, 1e-4)
+    assert config.phases == () and config.muon_weight_decay == 0.1
+    assert config.batch_size == 256 and config.optimizer == "muon"
+    assert config.model_config() == tabpfn_v3.paper_run().model_config()
+    script = _script()
+    base = ["--config-name", "cooldown", "--arch", "v3.5", "--task", "multitask"]
+    with pytest.raises(SystemExit):  # 학습한 가중치 없이는 쓰지 않는다
+        script.parse_args(base)
+    # 실제 200k run(chunk02 재시작)은 125k부터 Muon weight decay 0.1로 학습했다. 가속 옵션처럼
+    # optimizer 설정도 원래 run의 것을 잇는다
+    trained = replace(tabpfn_v3.paper_run(), lr=1e-4, muon_weight_decay=0.1, phases=())
+    params = {k: str(v) for k, v in vars(trained).items()}
+    args = script.parse_args([*base, "--init-run-id", "r", "--init-step", "200000"])
+    options = script.source_speed_options(params)
+    options.pop("phases", None)  # 가중치만 가져오면 구간을 잇지 않는다 (학습 스크립트 main)
+    built, arch = script.build_config(args, run_architecture(params), options)
+    assert arch == "v3.5" and built == config

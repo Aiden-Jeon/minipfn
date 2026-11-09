@@ -47,6 +47,8 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 `--config-name paper_run`(`--arch v3.5 --task multitask`)은 실제로 학습한 TabPFN-3.5 경로다
 (`recipes.tabpfn_v3.paper_run`: batch 256, Muon, step 구간별 lr·weight decay 변경 `phases`).
 구간 설정이 있는 run을 이어 학습하면 그 구간 설정을 따르고, lr은 `--lr`이 아니라 구간이 정한다.
+`--config-name cooldown`은 그 가중치를 `--init-run-id`로 가져와 lr 1e-4 → 0으로 20k step 마무리
+학습한다(`recipes.tabpfn_v3.cooldown`).
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -81,6 +83,9 @@ PRESETS = {
     "long_tables": recipe.long_tables,
     # 실제로 학습한 TabPFN-3.5 경로 (`recipes.tabpfn_v3.paper_run`, --arch v3.5 --task multitask)
     "paper_run": tabpfn_v3.paper_run,
+    # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,
+    # --init-run-id와 같이)
+    "cooldown": tabpfn_v3.cooldown,
 }
 CONFIG_NAMES = tuple(PRESETS)
 # MLflow run 이름의 머리
@@ -193,6 +198,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         # 처음부터 학습하면 lr 5e-5·20k step으로는 덜 학습된 모델이 나온다. 회귀 구간 경계는
         # 가져온 checkpoint의 것을 이어 써서 paper 모델의 출력과 맞춘다
         parser.error("long_tables는 --init-run-id(paper run)나 --resume-run-id와 같이 줘야 한다")
+    if args.config_name == "cooldown" and not (args.init_run_id or args.resume_run_id):
+        # 학습한 가중치를 마무리하는 설정이다. 회귀 구간 경계도 가져온 checkpoint의 것을 쓴다
+        parser.error("cooldown은 --init-run-id(paper_run run)나 --resume-run-id와 같이 줘야 한다")
     if (
         args.config_name == "long_tables"
         and args.arch is not None
@@ -286,9 +294,9 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
-        if args.config_name == "paper_run":
+        if args.config_name in ("paper_run", "cooldown"):
             try:
-                return tabpfn_v3.paper_run(args.task, arch)
+                return PRESETS[args.config_name](args.task, arch)
             except ValueError as e:
                 raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
