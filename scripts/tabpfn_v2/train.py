@@ -40,6 +40,9 @@ ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 
 `checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).
 `--init-run-id`(또는 `TABPFN_V2_INIT_RUN_ID`, 남긴 step은 `TABPFN_V2_INIT_STEP`)는 그 run의
 checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--config-name long_tables`로 긴 표 학습).
+`--config-name paper_run`(`--arch v3.5 --task multitask`)은 실제로 학습한 TabPFN-3.5 경로다
+(`recipes.tabpfn_v3.paper_run`: batch 256, Muon, step 구간별 lr·weight decay 변경 `phases`).
+구간 설정이 있는 run을 이어 학습하면 그 구간 설정을 따르고, lr은 `--lr`이 아니라 구간이 정한다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -62,7 +65,7 @@ from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.recipes import tabpfn_v3  # noqa: E402
-from minipfn.training.config import SPEED_OPTIONS, TrainConfig  # noqa: E402
+from minipfn.training.config import SPEED_OPTIONS, TrainConfig, normalize_phases  # noqa: E402
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
@@ -72,6 +75,8 @@ PRESETS = {
     "medium": TrainConfig.medium,
     "paper": recipe.paper,
     "long_tables": recipe.long_tables,
+    # 실제로 학습한 TabPFN-3.5 경로 (`recipes.tabpfn_v3.paper_run`, --arch v3.5 --task multitask)
+    "paper_run": tabpfn_v3.paper_run,
 }
 CONFIG_NAMES = tuple(PRESETS)
 # MLflow run 이름의 머리
@@ -188,6 +193,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def resume_phase_lr(config: TrainConfig, args: argparse.Namespace, params: dict) -> TrainConfig:
+    """구간 설정이 있는 학습을 이어 갈 때의 lr. lr은 구간이 정하므로 `--lr`은 받지 않고, 첫 구간
+    앞의 lr(`config.lr`)은 원래 run의 것을 잇는다(처음에 `--lr`로 바꾼 run도 같은 경로로)."""
+    if not config.phases:
+        return config
+    if args.lr is not None:
+        raise SystemExit("구간 설정(phases)이 있는 학습은 --lr로 lr을 바꾸지 않는다")
+    return replace(config, lr=float(params["lr"]))
+
+
+def source_params(params: dict[str, str], tags: dict[str, str]) -> dict[str, str]:
+    """원래 run의 param. 구간 설정은 이어 학습하며 바뀔 수 있어 tag(`phases`)가 있으면 그것을
+    쓴다(param은 처음 값에서 바꿀 수 없다)."""
+    if "phases" in tags:
+        return {**params, "phases": tags["phases"]}
+    return params
+
+
 def source_speed_options(params: dict[str, str]) -> dict:
     """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict."""
     defaults = TrainConfig()
@@ -196,6 +219,11 @@ def source_speed_options(params: dict[str, str]) -> dict:
         if name in params:
             default = getattr(defaults, name)
             text = params[name]
+            if name == "phases":
+                # 구간 설정은 있을 때만 잇는다 (없는 run을 이어도 preset의 구간을 지우지 않도록)
+                if phases := normalize_phases(text):
+                    out[name] = phases
+                continue
             out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
     return out
 
@@ -207,7 +235,14 @@ def inherit_batch_size(args: argparse.Namespace, params: dict[str, str]) -> None
         args.batch_size = int(params["batch_size"])
 
 
-OPTIMIZER_OPTIONS = ("optimizer", "schedule_free", "muon_weight_decay", "muon_distributed")
+# 구간 설정(phases)에도 Muon weight decay가 들어 있어 optimizer를 바꾸면 같이 버린다
+OPTIMIZER_OPTIONS = (
+    "optimizer",
+    "schedule_free",
+    "muon_weight_decay",
+    "muon_distributed",
+    "phases",
+)
 
 
 def _optimizer_kind(schedule_free: bool, optimizer: str | None) -> str | None:
@@ -242,6 +277,11 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
+        if args.config_name == "paper_run":
+            try:
+                return tabpfn_v3.paper_run(args.task, arch)
+            except ValueError as e:
+                raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
             return tabpfn_v3.paper(args.task, arch)  # multitask의 학습 설정도 이 recipe가 정한다
         return recipes.recipe_for_architecture(arch).with_architecture(
@@ -264,6 +304,12 @@ def build_config(
             raise SystemExit(
                 f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
             )
+    source_phases = (speed_options or {}).get("phases")
+    if source_phases and base.phases and source_phases != base.phases:
+        raise SystemExit(
+            f"원래 run의 구간 설정 {source_phases}가 --config-name {args.config_name}의 것"
+            f" {base.phases}과 다르다"
+        )
     # 원래 run의 구조·옵션과 인자를 한 번에 바꾼다 (설정 검사가 중간 상태를 보지 않도록)
     changes = {**source, **_source_options(speed_options or {}, args), **_override_values(args)}
     return _replace(base, changes), arch
@@ -351,13 +397,19 @@ def main(argv: list[str] | None = None) -> None:
 
     source, speed_options = None, None
     if args.init_run_id or args.resume_run_id:
-        params = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id).data.params
+        run = mlflow.MlflowClient().get_run(args.init_run_id or args.resume_run_id)
+        params = source_params(run.data.params, run.data.tags)
         if params["task"] != args.task:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
         speed_options = source_speed_options(params)
+        if args.init_run_id:
+            # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다
+            speed_options.pop("phases", None)
         inherit_batch_size(args, params)
     config, arch = build_config(args, source, speed_options)
+    if args.resume_run_id:
+        config = resume_phase_lr(config, args, params)  # checkpoint를 받기 전에 본다
 
     init_path = None
     if args.init_run_id:
@@ -378,7 +430,9 @@ def main(argv: list[str] | None = None) -> None:
             dst_path=str(out_dir / f"resume_rank{rank}"),
         )
         saved_lr = _check_source(resume_path, config, resume=True)
-        if args.lr is None:
+        if config.phases:
+            pass  # 기준 lr은 구간 lr × checkpoint의 붕괴 배율 (학습 루프. lr은 위에서 정했다)
+        elif args.lr is None:
             # lr을 따로 주지 않으면 설정 기본값이 아니라 checkpoint가 쓰던 lr을 이어 간다
             config = replace(config, lr=saved_lr)
         elif args.lr > saved_lr and config.rewind_lr_factor < 1 and rank == 0:

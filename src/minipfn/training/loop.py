@@ -160,6 +160,42 @@ def _set_base_lr(opt, sched, lr: float, step: int, verbose: bool) -> None:
         print(f"lr: 기준 {old:.2e} → {lr:.2e} (step {step}부터 {lr * factor:.3e})", flush=True)
 
 
+def _set_muon_weight_decay(opt, weight_decay: float) -> None:
+    """Muon 묶음의 weight decay를 바꾼다 (Muon이 아니면 그대로)."""
+    if isinstance(opt, MuonAdam):
+        for group in opt.muon.param_groups:
+            group["weight_decay"] = weight_decay
+
+
+def _phase_base_lr(config: TrainConfig, step: int, lr_scale: float) -> float:
+    """step번째 갱신(0부터)의 기준 lr = 그 구간의 lr × 붕괴로 낮춘 배율 (`TrainConfig.phases`).
+    낮춘 배율이 있으면 `rewind_min_lr` 아래로는 내리지 않는다(구간 lr이 이미 그보다 낮으면 그대로).
+    붕괴 규칙과 같은 하한이다."""
+    lr = config.phase_value("lr", step)
+    if lr_scale == 1.0:
+        return lr
+    return max(lr * lr_scale, min(config.rewind_min_lr, lr))
+
+
+def _apply_phase(
+    opt, sched, config: TrainConfig, step: int, lr_scale: float, verbose: bool
+) -> None:
+    """step번째 갱신의 구간 설정(기준 lr, Muon weight decay)으로 맞춘다. 이어 학습·되돌리기·구간
+    시작이 모두 이것을 쓴다. 같은 step이면 몇 번 불러도 같다."""
+    lr = _phase_base_lr(config, step, lr_scale)
+    if lr != sched.base_lrs[0]:
+        _set_base_lr(opt, sched, lr, step, verbose)
+    _set_muon_weight_decay(opt, config.phase_value("muon_weight_decay", step))
+
+
+def _resume_lr_scale(state: dict, config: TrainConfig) -> float:
+    """checkpoint의 붕괴 배율. 구간 설정 없이 학습한 checkpoint면 그 기준 lr ÷ 그 run의 lr
+    (`config.lr`, 학습 스크립트가 원래 run의 값을 넣는다)."""
+    if "lr_scale" in state:
+        return float(state["lr_scale"])
+    return float(state["scheduler"]["base_lrs"][0]) / config.lr
+
+
 def check_checkpoint(state: dict, config: TrainConfig, name: str) -> None:
     """`state`(학습 중 checkpoint 또는 `save_checkpoint` 파일)가 `config`와 같은 task·모델인지.
 
@@ -356,6 +392,8 @@ def _train(
         return eval_cache["state"]
 
     start_step, skipped_steps, borders, rewinds = 0, 0, None, 0
+    # 붕괴로 낮춘 lr 배율 (구간 설정이 있을 때 쓴다, `_phase_base_lr`)
+    lr_scale = 1.0
     resumed_train_seconds = 0.0
     history: dict[str, list] = {"step": [], "train_loss": [], "val_step": [], "val_loss": []}
     if init_from is not None:
@@ -378,7 +416,13 @@ def _train(
         # 이어서 학습해도 붕괴 뒤의 데이터를 다시 보지 않도록 되돌린 횟수를 이어받는다
         rewinds = int(state.get("rewinds", 0))
         resumed_train_seconds = float(state.get("train_seconds", 0.0))
-        _set_base_lr(opt, sched, config.lr, start_step, d.is_main)
+        if config.phases:
+            # 구간 설정이 있으면 이어 가는 step의 구간 lr × checkpoint의 붕괴 배율, 그 구간의
+            # weight decay로 맞춘다
+            lr_scale = _resume_lr_scale(state, config)
+            _apply_phase(opt, sched, config, start_step, lr_scale, d.is_main)
+        else:
+            _set_base_lr(opt, sched, config.lr, start_step, d.is_main)
         borders = state["borders"]
     if borders is None:
         borders = _borders(config, d, device)
@@ -482,6 +526,10 @@ def _train(
                 new = {k: v for k, v in asdict(config).items() if k not in run_params}
                 if new:
                     mlf.log_params(new)
+            # 구간 설정은 이어 학습할 때 바뀔 수 있어(없던 run에 preset의 구간을 더할 때) 바꿀 수
+            # 있는 tag에도 남긴다. 학습 스크립트는 tag를 param보다 먼저 읽는다
+            if config.phases or run_params.get("phases", "()") != "()":
+                mlf.set_tag("phases", str(config.phases))
 
     guard = None
     if config.collapse_threshold is not None:
@@ -516,9 +564,18 @@ def _train(
             mlf.log_metric("qk_clip", config.qk_clip, step=start_step)
     if guard is not None:
         snapshot(start_step)
+    phase_starts = {start for start, _ in config.phases}
     step = start_step - 1
     while step + 1 < stop_step:
         step += 1
+        if step in phase_starts:
+            _apply_phase(opt, sched, config, step, lr_scale, d.is_main)
+            if d.is_main:
+                lr, wd = sched.base_lrs[0], config.phase_value("muon_weight_decay", step)
+                print(
+                    f"step {step}: 구간 시작 (기준 lr {lr:.2e}, muon_weight_decay {wd:g})",
+                    flush=True,
+                )
         t_step = time.time()
         eval_cache.clear()  # 가중치가 바뀌므로 지난 step의 평균은 버린다
         # multitask는 step마다 task를 번갈아 쓴다 (모든 GPU가 같은 task. 비율은 1:1, 여기서 정함)
@@ -608,12 +665,19 @@ def _train(
                 opt.load_state_dict(snap["optimizer"])
                 sched.load_state_dict(snap["scheduler"])
                 # 한 번 튄 채로 끝난 것뿐이면 붕괴가 아니므로 lr은 그대로 둔다
-                lr_next = lr_now
-                if collapsed:  # 하한까지만 낮춘다 (이미 하한보다 낮으면 그대로)
-                    lr_next = min(
-                        lr_now, max(lr_now * config.rewind_lr_factor, config.rewind_min_lr)
-                    )
-                _set_base_lr(opt, sched, lr_next, snap["step"], d.is_main)
+                if config.phases:
+                    # 배율만 낮추고, 되돌아간 step의 구간 lr·weight decay로 맞춘다 (구간 경계 앞으로
+                    # 되돌려도 그 구간 값. 하한은 `_phase_base_lr`)
+                    if collapsed:
+                        lr_scale *= config.rewind_lr_factor
+                    _apply_phase(opt, sched, config, snap["step"], lr_scale, d.is_main)
+                else:
+                    lr_next = lr_now
+                    if collapsed:  # 하한까지만 낮춘다 (이미 하한보다 낮으면 그대로)
+                        lr_next = min(
+                            lr_now, max(lr_now * config.rewind_lr_factor, config.rewind_min_lr)
+                        )
+                    _set_base_lr(opt, sched, lr_next, snap["step"], d.is_main)
                 history = copy.deepcopy(snap["history"])
                 skipped_steps = snap["skipped_steps"]
                 guard.healthy, guard.bad = list(snap["healthy"]), 0
@@ -730,6 +794,8 @@ def _train(
                 "schedule_free": config.schedule_free,
                 "optimizer_type": config.optimizer,
             }
+            if config.phases:  # 구간 설정이 없는 checkpoint는 지금과 같게 둔다
+                state["lr_scale"] = lr_scale
             torch.save(state, out_dir / "latest.pt")
             kept = None
             if keep:
