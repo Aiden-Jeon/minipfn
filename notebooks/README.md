@@ -31,7 +31,7 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 
 ## 축별로 보기
 
-위 표는 버전마다 무엇이 다른지를 보고, 아래 폴더별 표는 버전 하나를 깊게 봅니다. 축 하나를 버전 순서로 따라가려면 이 표에서 한 줄을 왼쪽부터 읽습니다. 축 하나를 한 노트북에서 다섯 버전으로 나란히 견주는 것은 [`axes/`](#axes--축별-흐름) 폴더에 있습니다(모델 구조, prior, 추론).
+위 표는 버전마다 무엇이 다른지를 보고, 아래 폴더별 표는 버전 하나를 깊게 봅니다. 축 하나를 버전 순서로 따라가려면 이 표에서 한 줄을 왼쪽부터 읽습니다. 축 하나를 다섯 버전으로 나란히 견주는 노트북은 축마다 `topics_xxx/` 폴더에 있습니다([축별 폴더](#축별-폴더--topics_xxx)).
 
 | 축 | v1 | v2 | 2.5 | 3 | 3.5 |
 |---|---|---|---|---|---|
@@ -112,10 +112,24 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 
 실행 파일: `scripts/tabpfn_v3/train.yaml`(기본값이 `TABPFN_V2_ARCH=v3.5`, `TABPFN_V2_TASK=multitask`), `scripts/tabpfn_v3/eval.yaml`. 스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`입니다.
 
-## `axes/` — 축별 흐름
+## 축별 폴더 — `topics_xxx/`
+
+논문 폴더가 버전 하나를 깊게 본다면, 이 폴더들은 축 하나를 v1부터 3.5까지 따라갑니다. 논문 폴더와 같은 깊이(`notebooks/` 바로 아래)에 둡니다.
+
+### `topics_architecture/` — 모델 구조
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [모델 구조의 흐름](axes/01_architecture_evolution.ipynb) | 같은 표를 v1·v2·2.5·3·3.5에 넣으면 토큰과 텐서 모양, 파라미터, attention 연산량이 어떻게 달라지는가? |
-| 02 | [prior의 흐름](axes/02_prior_evolution.ipynb) | 버전마다 쓰는 prior에서 뽑은 데이터셋은 클래스·범주형 열·결측값·표 크기에서 어떻게 다르고, 만드는 데 얼마나 걸리는가? |
-| 03 | [추론의 흐름](axes/03_inference_evolution.ipynb) | 버전마다 앙상블 멤버를 몇 개, 어떤 전처리로 만들고, 멤버 수와 종류가 실제 데이터셋의 점수를 얼마나 바꾸는가? |
+| 01 | [모델 구조의 흐름](topics_architecture/01_architecture_evolution.ipynb) | 같은 표를 v1·v2·2.5·3·3.5에 넣으면 토큰과 텐서 모양, 파라미터, attention 연산량이 어떻게 달라지는가? |
+
+### `topics_prior/` — prior (학습 데이터)
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [prior의 흐름](topics_prior/01_prior_evolution.ipynb) | 버전마다 쓰는 prior에서 뽑은 데이터셋은 클래스·범주형 열·결측값·표 크기에서 어떻게 다르고, 만드는 데 얼마나 걸리는가? |
+
+### `topics_inference/` — 추론
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [추론의 흐름](topics_inference/01_inference_evolution.ipynb) | 버전마다 앙상블 멤버를 몇 개, 어떤 전처리로 만들고, 멤버 수와 종류가 실제 데이터셋의 점수를 얼마나 바꾸는가? |
