@@ -205,17 +205,23 @@ class GBDTQuantileRegressor:
         return self
 
     def predict(self, X) -> np.ndarray:
-        return np.asarray(self.mean_model_.predict(self.encoder_.transform(X, self.backend)))
+        return self._mean(self.encoder_.transform(X, self.backend))
 
     def predict_quantiles(self, X) -> np.ndarray:
         """(n, 수준 수). 엇갈린 분위수는 `quantile_histogram`이 정렬한다."""
-        frame = self.encoder_.transform(X, self.backend)
-        out = [np.asarray(m.predict(frame), dtype=float) for m in self.quantile_models_]
-        return np.stack(out, axis=1) if len(out) > 1 else out[0].reshape(len(frame), -1)
+        return self._quantiles(self.encoder_.transform(X, self.backend))
 
     def predict_full(self, X) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        probs, borders = unc.quantile_histogram(self.levels, self.predict_quantiles(X))
-        return self.predict(X), np.log(probs), borders
+        frame = self.encoder_.transform(X, self.backend)  # 평균·분위수 모델이 같이 쓴다
+        probs, borders = unc.quantile_histogram(self.levels, self._quantiles(frame))
+        return self._mean(frame), np.log(probs), borders
+
+    def _mean(self, frame: pd.DataFrame) -> np.ndarray:
+        return np.asarray(self.mean_model_.predict(frame))
+
+    def _quantiles(self, frame: pd.DataFrame) -> np.ndarray:
+        out = [np.asarray(m.predict(frame), dtype=float) for m in self.quantile_models_]
+        return np.stack(out, axis=1) if len(out) > 1 else out[0].reshape(len(frame), -1)
 
 
 class CatBoostGaussianRegressor:

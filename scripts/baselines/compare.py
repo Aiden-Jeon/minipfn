@@ -13,8 +13,9 @@ MLflow run(`runs:/<run_id>`, artifact `eval/`)이다. 출처 끝에 `#regression
 suite마다 모든 방법에 결과가 있는 데이터셋만 쓴다(데이터셋 수를 같이 낸다). 출력:
 
 - 방법 × 지표의 데이터셋 평균 (`compare_means.csv`, 표준 출력은 markdown)
-- 지표마다 데이터셋별 순위(1이 가장 좋다)의 평균 (`compare_ranks.csv`). coverage는 목표(90%)와의
-  거리, SSCS·폭 5분위별 coverage 최솟값은 클수록 좋다고 본다
+- 지표마다 데이터셋별 순위(1이 가장 좋다)의 평균 (`compare_ranks.csv`). coverage는 marginal이든
+  묶음별 최솟값(폭 5분위별, SSCS)이든 목표(90%)와의 거리로 본다(너무 넓은 구간·집합이 이기지 않게).
+  순위는 지표마다 모든 방법에 값이 있는 데이터셋에서만 매긴다
 - 데이터셋마다 방법들의 점 예측 순위(회귀 RMSE, 분류 ROC AUC)와 분포 지표 순위(회귀 CRPS, 분류 log
   loss)의 Spearman 상관을 낸 뒤 평균한 값 (1이면 두 순위가 같다)
 - 데이터셋별 긴 표 (`compare_per_dataset.csv`)
@@ -29,7 +30,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-KEYS = ["suite", "task_id", "dataset"]
+from minipfn.benchmarks.uncertainty import DATASET_KEYS as KEYS
+
 TARGET = 0.9  # 가운데 90% 구간·conformal α = 0.1
 
 # 지표: "min" 작을수록, "max" 클수록, 숫자면 그 값에 가까울수록 좋다
@@ -39,7 +41,7 @@ METRICS = {
         "crps_scaled": "min",
         "interval_score_90_scaled": "min",
         "coverage_90": TARGET,
-        "coverage_min_by_width_90": "max",
+        "coverage_min_by_width_90": TARGET,
         "pit_ks": "min",
     },
     "classification": {
@@ -49,9 +51,9 @@ METRICS = {
         "ece": "min",
         "lac_coverage": TARGET,
         "lac_set_size": "min",
-        "lac_sscs": "max",
+        "lac_sscs": TARGET,
         "aps_set_size": "min",
-        "aps_sscs": "max",
+        "aps_sscs": TARGET,
     },
 }
 POINT_METRIC = {"regression": "rmse_scaled", "classification": "score"}
@@ -76,11 +78,11 @@ def resolve(source: str) -> Path:
 
 
 def load(source: str) -> pd.DataFrame:
-    """출처 하나의 데이터셋별 표. `출처#suite`면 그 suite만 남긴다."""
-    source, _, suite = source.partition("#")
-    if suite and suite not in METRICS:
-        raise SystemExit(f"suite는 {tuple(METRICS)} 가운데 하나: {suite}")
-    path = resolve(source)
+    """출처 하나의 데이터셋별 표. `출처#regression`·`출처#classification`이면 그 suite만 남긴다
+    (다른 `#`는 경로의 일부로 둔다)."""
+    head, _, suffix = source.rpartition("#")
+    suite = suffix if head and suffix in METRICS else ""
+    path = resolve(head if suite else source)
     table = pd.read_csv(path / "eval_uncertainty_per_dataset.csv")
     if "score" not in table.columns:
         scores = pd.read_csv(path / "eval_per_dataset.csv")[[*KEYS, "score"]]
@@ -94,7 +96,10 @@ def collect(specs: list[str]) -> pd.DataFrame:
         name, sep, source = spec.partition("=")
         if not sep or not name or not source:
             raise SystemExit(f"이름=출처로 준다: {spec}")
-        tables.append(load(source).assign(method=name))
+        table = load(source)
+        if table.empty:
+            raise SystemExit(f"결과가 없다: {spec}")
+        tables.append(table.assign(method=name))
     df = pd.concat(tables, ignore_index=True)
     duplicated = df.duplicated(["method", *KEYS])
     if duplicated.any():
@@ -110,7 +115,10 @@ def common_datasets(df: pd.DataFrame) -> pd.DataFrame:
         n_methods = group["method"].nunique()
         counts = group.groupby("task_id")["method"].nunique()
         out.append(group[group["task_id"].isin(counts[counts == n_methods].index)])
-    return pd.concat(out, ignore_index=True)
+    df = pd.concat(out, ignore_index=True)
+    if df.empty:
+        raise SystemExit("모든 방법에 결과가 있는 데이터셋이 없다.")
+    return df
 
 
 def loss(values: pd.Series, direction) -> pd.Series:
@@ -123,12 +131,14 @@ def loss(values: pd.Series, direction) -> pd.Series:
 
 
 def ranks(group: pd.DataFrame, suite: str) -> pd.DataFrame:
-    """지표마다 데이터셋 안에서 방법의 순위 (1이 가장 좋다, 같으면 평균 순위)."""
+    """지표마다 데이터셋 안에서 방법의 순위 (1이 가장 좋다, 같으면 평균 순위). 한 방법이라도 값이
+    NaN인 데이터셋은 그 지표에서 순위를 매기지 않는다(NaN): 방법마다 순위 범위와 데이터셋이 같다."""
     out = group[["method", *KEYS]].copy()
     for metric, direction in METRICS[suite].items():
         if metric in group.columns:
+            complete = group[metric].notna().groupby(group["task_id"]).transform("all")
             by_dataset = loss(group[metric], direction).groupby(group["task_id"])
-            out[metric] = by_dataset.rank(method="average")
+            out[metric] = by_dataset.rank(method="average").where(complete)
     return out
 
 
@@ -137,7 +147,11 @@ def rank_agreement(rank_table: pd.DataFrame, suite: str) -> tuple[float, int]:
     point, dist = POINT_METRIC[suite], DISTRIBUTION_METRIC[suite]
     rhos = []
     for _, g in rank_table.groupby("task_id"):
-        if g[point].nunique() > 1 and g[dist].nunique() > 1:
+        if (
+            g[[point, dist]].notna().all().all()
+            and g[point].nunique() > 1
+            and g[dist].nunique() > 1
+        ):
             rhos.append(stats.spearmanr(g[point], g[dist]).statistic)
     return (float(np.mean(rhos)) if rhos else float("nan")), len(rhos)
 
@@ -172,11 +186,15 @@ def main(argv: list[str] | None = None) -> None:
         rank_table = ranks(group, suite)
         mean_ranks = rank_table.groupby("method")[columns].mean().reindex(means.index)
         rho, n_rho = rank_agreement(rank_table, suite)
+        ranked = rank_table.groupby("task_id")[columns].apply(lambda g: g.notna().all())
+        partial = {m: int(c) for m, c in ranked.sum().items() if c < n}
         print(f"\n## {suite} (datasets {n}, methods {len(means)})\n")
         print("데이터셋 평균\n")
         print(markdown(means))
         print("\n평균 순위 (1이 가장 좋다)\n")
         print(markdown(mean_ranks, digits=2))
+        if partial:
+            print(f"\n(순위를 매긴 데이터셋이 {n}개보다 적은 지표: {partial})")
         print(
             f"\n점 예측({POINT_METRIC[suite]})과 분포({DISTRIBUTION_METRIC[suite]}) 순위의 "
             f"데이터셋별 Spearman 평균: {rho:.3f} (datasets {n_rho})"

@@ -167,3 +167,66 @@ def test_compare_uses_common_datasets_and_ranks_methods(tmp_path, capsys):
     assert _script("compare").load(f"{tmp_path / 'a'}#classification").empty
     with pytest.raises(SystemExit, match="이름=출처"):
         _script("compare").main([str(tmp_path / "a")])
+
+
+def _regression_row(task_id, **metrics):
+    return {
+        "suite": "regression",
+        "task_id": task_id,
+        "dataset": f"d{task_id}",
+        "score": -1.0,
+        "rmse_scaled": 1.0,
+        "crps_scaled": 1.0,
+        **metrics,
+    }
+
+
+def test_compare_scores_worst_group_coverage_by_distance_to_the_target(tmp_path):
+    # 너무 넓은 구간(묶음별 최솟값 0.99)이 목표에 가까운 0.88을 이기지 않는다
+    _write_run(tmp_path / "wide", [_regression_row(1, coverage_min_by_width_90=0.99)], True)
+    _write_run(tmp_path / "good", [_regression_row(1, coverage_min_by_width_90=0.88)], True)
+    out = tmp_path / "out"
+    args = [f"wide={tmp_path / 'wide'}", f"good={tmp_path / 'good'}", "--out-dir", str(out)]
+    _script("compare").main(args)
+    ranks = pd.read_csv(out / "compare_ranks.csv", index_col=0)
+    assert ranks.loc["good", "coverage_min_by_width_90"] == 1
+    assert ranks.loc["wide", "coverage_min_by_width_90"] == 2
+
+
+def test_compare_ranks_only_datasets_where_every_method_has_the_metric(tmp_path, capsys):
+    # 데이터셋 2에서 b의 pit_ks가 NaN이면 그 데이터셋은 pit_ks 순위에서 모두 빠진다
+    _write_run(
+        tmp_path / "a", [_regression_row(1, pit_ks=0.1), _regression_row(2, pit_ks=0.5)], True
+    )
+    _write_run(
+        tmp_path / "b", [_regression_row(1, pit_ks=0.2), _regression_row(2, pit_ks=None)], True
+    )
+    out = tmp_path / "out"
+    _script("compare").main([f"a={tmp_path / 'a'}", f"b={tmp_path / 'b'}", "--out-dir", str(out)])
+    ranks = pd.read_csv(out / "compare_ranks.csv", index_col=0)
+    assert ranks.loc["a", "pit_ks"] == 1 and ranks.loc["b", "pit_ks"] == 2
+    assert "{'pit_ks': 1}" in capsys.readouterr().out
+
+
+def test_compare_suite_suffix_and_empty_inputs(tmp_path):
+    compare = _script("compare")
+    run = tmp_path / "run#3"  # 경로 안의 #는 suite 필터가 아니다
+    _write_run(run, [_regression_row(1, pit_ks=0.1)], True)
+    assert len(compare.load(str(run))) == 1
+    assert len(compare.load(f"{run}#regression")) == 1
+    with pytest.raises(SystemExit, match="결과가 없다"):
+        compare.collect([f"a={run}#classification"])
+    other = tmp_path / "other"
+    _write_run(other, [_regression_row(2, pit_ks=0.1)], True)
+    with pytest.raises(SystemExit, match="데이터셋이 없다"):
+        compare.common_datasets(compare.collect([f"a={run}", f"b={other}"]))
+
+
+def test_dataset_means_average_folds_and_skip_columns():
+    rows = [
+        {"suite": "regression", "task_id": 1, "dataset": "d", "fold": f, "crps": c, "method": "m"}
+        for f, c in ((0, 1.0), (1, 3.0))
+    ]
+    table = unc.dataset_means(rows, exclude=("method",))
+    assert list(table.columns) == ["suite", "task_id", "dataset", "crps"]
+    assert table["crps"].tolist() == [2.0]

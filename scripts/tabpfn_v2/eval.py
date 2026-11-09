@@ -93,7 +93,6 @@ experiment에 새 run을 만든다.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import functools
 import json
 import os
@@ -137,7 +136,7 @@ from minipfn.inference.preprocessing import (
 )
 from minipfn.priors.table_size import MAX_FEATURES
 from minipfn.recipes import default_inference, resolve_member_kinds, supported_size
-from minipfn.utils import log_run_source
+from minipfn.utils import mlflow_eval_run
 
 ARENA_SUITES = ("tabarena-lite", "beyondarena", "beyondarena-lite")
 TEST_TIME = ("none", "greedy", "diagscale", "diagscale+greedy")
@@ -711,18 +710,9 @@ def summarize(rows: list[dict]) -> pd.DataFrame:
     return per_dataset
 
 
-@contextlib.contextmanager
 def mlflow_run(use_mlflow: bool):
-    """평가 run 하나. AI Runtime에서는 플랫폼이 만든 run(`MLFLOW_RUN_ID`), 로컬에서는
-    `TABPFN_V2_EXPERIMENT`에 새 run. 도중에 예외가 나면 run을 FAILED로 끝낸다."""
-    if not use_mlflow:
-        yield
-        return
-    if "MLFLOW_RUN_ID" not in os.environ:
-        mlflow.set_experiment(os.environ.get("TABPFN_V2_EXPERIMENT", "tabpfn-v2-reproduction"))
-    with mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID")):
-        log_run_source(__file__, env_prefix="TABPFN_V2_")
-        yield
+    """평가 run 하나 (`minipfn.utils.mlflow_eval_run`, 로컬 experiment는 `TABPFN_V2_EXPERIMENT`)."""
+    return mlflow_eval_run(use_mlflow, __file__, "TABPFN_V2_", "tabpfn-v2-reproduction")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -852,12 +842,8 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
 
 def summarize_uncertainty(rows: list[dict], headline: str) -> pd.DataFrame:
     """headline 모드의 불확실성 지표(`minipfn.benchmarks.uncertainty`)의 데이터셋별 fold 평균."""
-    df = pd.DataFrame(rows)
-    df = df[df.one_hot == headline]
-    keys = ["suite", "task_id", "dataset"]
-    skip = set(keys) | {"fold", "score", "one_hot", "reused"}
-    columns = [c for c in df.columns if c not in skip]
-    return df.groupby(keys)[columns].mean().reset_index()
+    rows = [r for r in rows if r["one_hot"] == headline]
+    return unc.dataset_means(rows, exclude=("score", "one_hot", "reused"))
 
 
 def report_uncertainty(rows: list[dict], headline: str, out_dir: Path, use_mlflow: bool) -> None:

@@ -25,7 +25,6 @@ task 하나가 실패하면 나머지는 계속 돌리고, 끝에 실패한 task
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import time
 import traceback
@@ -39,7 +38,7 @@ import torch
 from minipfn.benchmarks import amlb as bm
 from minipfn.benchmarks import baselines as bl
 from minipfn.benchmarks import uncertainty as unc
-from minipfn.utils import log_run_source
+from minipfn.utils import mlflow_eval_run
 
 METHODS = tuple(dict.fromkeys(bl.CLASSIFIERS + bl.REGRESSORS))
 SUITES = ("classification", "regression")
@@ -82,10 +81,8 @@ def selected_tasks(args: argparse.Namespace) -> list[tuple[str, int]]:
 
 def per_dataset_tables(rows: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(점 예측 점수와 논문 TabPFN 점수, 불확실성 지표의 데이터셋별 fold 평균 + score)."""
-    df = pd.DataFrame(rows)
     keys = unc.DATASET_KEYS
-    metrics = [c for c in df.columns if c not in {*keys, "fold", "method"}]
-    per_dataset = df.groupby(keys)[metrics].mean().reset_index()
+    per_dataset = unc.dataset_means(rows, exclude=("method",))
     paper = {**bm.paper_scores("classification"), **bm.paper_scores("regression")}
     scores = per_dataset[[*keys, "score"]].copy()
     scores["paper"] = scores["task_id"].map(paper)
@@ -93,18 +90,9 @@ def per_dataset_tables(rows: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
     return scores, per_dataset
 
 
-@contextlib.contextmanager
 def mlflow_run(use_mlflow: bool):
-    """AI Runtime에서는 플랫폼이 만든 run(`MLFLOW_RUN_ID`), 로컬에서는 `BASELINES_EXPERIMENT`에 새
-    run."""
-    if not use_mlflow:
-        yield
-        return
-    if "MLFLOW_RUN_ID" not in os.environ:
-        mlflow.set_experiment(os.environ.get("BASELINES_EXPERIMENT", "tabpfn-v2-reproduction"))
-    with mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID")):
-        log_run_source(__file__, env_prefix="BASELINES_")
-        yield
+    """평가 run 하나 (`minipfn.utils.mlflow_eval_run`, 로컬 experiment는 `BASELINES_EXPERIMENT`)."""
+    return mlflow_eval_run(use_mlflow, __file__, "BASELINES_", "tabpfn-v2-reproduction")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -131,9 +119,9 @@ def run(args: argparse.Namespace, tasks: list, out_dir: Path, use_mlflow: bool) 
         mlflow.set_tag("method", args.method)
     rows, failures = [], []
     for i, (suite, task_id) in enumerate(tasks, start=1):
-        start = time.time()
         try:
             task = bm.load_openml_task(task_id)
+            start = time.time()  # 모델 시간만 잰다 (OpenML 내려받기·읽기는 뺀다)
 
             def make(t: bm.OpenMLTask):
                 return bl.make_baseline(args.method, t.task_type, args.device, args.seed)

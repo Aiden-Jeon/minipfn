@@ -51,6 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy import special, stats
 
 from minipfn.benchmarks.amlb import drop_unseen_classes
@@ -80,17 +81,9 @@ class BarHistogram:
     borders: np.ndarray  # (n, B + 1), float64. 모든 행이 같은 경계면 `np.broadcast_to`한 view
     cdf: np.ndarray  # (n, B + 1), 경계 위의 CDF (양 끝 0과 1). 꼬리 종류와 상관없이 같다
     tails: str
+    scale_left: np.ndarray  # (n,), 행마다 왼쪽 half-normal 꼬리의 scale (첫 구간 폭 / 중앙값)
+    scale_right: np.ndarray  # (n,), 오른쪽 꼬리의 scale
     shared_borders: np.ndarray | None = None  # 모든 행이 같은 경계 (B + 1,)면 그 경계
-
-    @property
-    def scale_left(self) -> np.ndarray:
-        """행마다 왼쪽 half-normal 꼬리의 scale (n,)."""
-        return (self.borders[:, 1] - self.borders[:, 0]) / _HALF_NORMAL_MEDIAN
-
-    @property
-    def scale_right(self) -> np.ndarray:
-        """행마다 오른쪽 half-normal 꼬리의 scale (n,)."""
-        return (self.borders[:, -1] - self.borders[:, -2]) / _HALF_NORMAL_MEDIAN
 
 
 def bar_histogram(probs, borders, tails: str = DEFAULT_TAILS) -> BarHistogram:
@@ -115,13 +108,17 @@ def bar_histogram(probs, borders, tails: str = DEFAULT_TAILS) -> BarHistogram:
     ):
         raise ValueError("half-normal 꼬리에는 구간이 2개 이상, 양 끝 구간의 폭이 0보다 커야 한다")
     shared = borders if borders.ndim == 1 else None
+    # 꼬리 scale은 한 번만 계산한다 (경계가 같으면 상수를 broadcast)
+    scale_left = (borders[..., 1] - borders[..., 0]) / _HALF_NORMAL_MEDIAN
+    scale_right = (borders[..., -1] - borders[..., -2]) / _HALF_NORMAL_MEDIAN
     if shared is not None:
         borders = np.broadcast_to(shared, (n, n_buckets + 1))  # 복사하지 않는다
+        scale_left, scale_right = np.full(n, scale_left), np.full(n, scale_right)
     probs = probs.clip(min=0.0)
     probs = probs / probs.sum(axis=1, keepdims=True)
     cdf = np.concatenate([np.zeros((n, 1)), np.cumsum(probs, axis=1)], axis=1)
     cdf[:, -1] = 1.0
-    return BarHistogram(probs, borders, cdf, tails, shared)
+    return BarHistogram(probs, borders, cdf, tails, scale_left, scale_right, shared)
 
 
 def quantile_histogram(levels, values) -> tuple[np.ndarray, np.ndarray]:
@@ -511,3 +508,12 @@ def suite_means(per_dataset) -> dict[str, float]:
     unscaled = {c.removesuffix("_scaled") for c in values.columns if c.endswith("_scaled")}
     means = values.drop(columns=[c for c in unscaled if c in values.columns]).mean()
     return {k: float(v) for k, v in means.items()}
+
+
+def dataset_means(rows, exclude=()) -> pd.DataFrame:
+    """fold마다의 행(`amlb.evaluate_task`가 낸 dict, `suite` 포함)을 데이터셋(`DATASET_KEYS`)별 fold
+    평균으로. `fold`와 `exclude`의 열은 평균하지 않는다."""
+    df = pd.DataFrame(rows)
+    skip = {*DATASET_KEYS, "fold", *exclude}
+    columns = [c for c in df.columns if c not in skip]
+    return df.groupby(DATASET_KEYS)[columns].mean().reset_index()

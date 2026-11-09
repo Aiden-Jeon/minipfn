@@ -33,7 +33,8 @@ env_variables:
   # 공식 tabpfn 패키지가 사용 통계를 보내지 않게 한다
   TABPFN_DISABLE_TELEMETRY: "1"
 max_retries: 0
-# LightGBM은 분위수 수준마다 모델을 학습해(23개 + 평균) 가장 오래 걸린다
+# 가장 오래 걸리는 것은 CatBoost다(기본 1000번 반복, 회귀는 MultiQuantile 23개 + RMSE 모델): H100 노드에서
+# 실행 약 2시간 30분. LightGBM·XGBoost·TabICL·TabPFN은 20~70분
 timeout_minutes: 480
 command: >-
   PYTHONPATH=$CODE_SOURCE_PATH/src

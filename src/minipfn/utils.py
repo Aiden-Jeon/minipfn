@@ -1,3 +1,4 @@
+import contextlib
 import math
 import os
 import random
@@ -65,6 +66,24 @@ def log_run_source(script: str | Path, env_prefix: str, artifact_path: str = "co
         tags["git_commit"] = commit
         tags["git_dirty"] = str(bool(_git("status", "--porcelain", cwd=script.parent)))
     mlflow.set_tags(tags)
+
+
+@contextlib.contextmanager
+def mlflow_eval_run(enabled: bool, script: str | Path, env_prefix: str, default_experiment: str):
+    """평가 스크립트의 MLflow run 하나. AI Runtime에서는 플랫폼이 만든 run(`MLFLOW_RUN_ID`),
+    로컬에서는 `<env_prefix>EXPERIMENT`(없으면 `default_experiment`)에 새 run을 만들고
+    `log_run_source`로 코드를 남긴다. 도중에 예외가 나면 run을 FAILED로 끝낸다. `enabled`가
+    False면 아무것도 하지 않는다."""
+    if not enabled:
+        yield
+        return
+    import mlflow
+
+    if "MLFLOW_RUN_ID" not in os.environ:
+        mlflow.set_experiment(os.environ.get(f"{env_prefix}EXPERIMENT", default_experiment))
+    with mlflow.start_run(run_id=os.environ.get("MLFLOW_RUN_ID")):
+        log_run_source(script, env_prefix=env_prefix)
+        yield
 
 
 def lr_factor(step: int, warmup_steps: int, schedule_steps: int) -> float:
