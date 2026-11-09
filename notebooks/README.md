@@ -37,7 +37,7 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 |---|---|---|---|---|---|
 | 모델 구조 | [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2절 | [03/01](03_tabpfn_v2/01_cell_tokens_and_two_way_attention.ipynb), [03/02](03_tabpfn_v2/02_attention_properties_and_cost.ipynb) | [04/01](04_tabpfn_v2_5/01_layers_and_feature_groups.ipynb), [04/02](04_tabpfn_v2_5/02_thinking_rows_and_regression_encoder.ipynb) | [05/01](05_tabpfn_v3/01_overview_and_cell_encoder.ipynb), [05/02](05_tabpfn_v3/02_column_row_icl_stages.ipynb) | [06/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) 1~4절 |
 | prior (학습 데이터) | [02/01](02_tabpfn/01_scm_primer.ipynb), [02/02](02_tabpfn/02_random_scm_datasets.ipynb), [02/03](02_tabpfn/03_bnn_primer.ipynb), [02/05](02_tabpfn/05_tabpfn_paper_prior.ipynb) | 논문 prior [03/03](03_tabpfn_v2/03_prior_graph_and_edges.ipynb), [03/04](03_tabpfn_v2/04_prior_from_graph_to_table.ipynb), 이 저장소가 쓰는 TabICL prior [03/07](03_tabpfn_v2/07_tabicl_prior.ipynb) | v2와 같은 TabICL prior | v2와 같은 TabICL prior | v2와 같은 TabICL prior |
-| 학습 | [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2.6절 | [03/05](03_tabpfn_v2/05_paper_walkthrough_model_and_training.ipynb) 5절 | 긴 표 학습 [04/03](04_tabpfn_v2_5/03_long_tables.ipynb) | 학습하지 않음 (3.5만 학습) | multitask [06/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) 5절 |
+| 학습 | [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2.6절 | [03/05](03_tabpfn_v2/05_paper_walkthrough_model_and_training.ipynb) 5절 | 긴 표 학습 [04/03](04_tabpfn_v2_5/03_long_tables.ipynb) | 학습하지 않음 (3.5만 학습) | 분류·회귀를 번갈아 한 모델로 (`scripts/tabpfn_v3/train.yaml`, 노트북 없음) |
 | 추론 | 회전 앙상블 [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2.5절 | [03/06](03_tabpfn_v2/06_paper_walkthrough_inference_and_results.ipynb) 1절 | robust·soft clip [04/04](04_tabpfn_v2_5/04_inference_preprocessing.ipynb) | 열 순서 섞기 [05/02](05_tabpfn_v3/02_column_row_icl_stages.ipynb) 5절 | standard 하나 [06/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) 2절 |
 | 재현 결과 | Table 1 ROC AUC 0.932, Hub 카드 ([분류](../hub/minipfn-tabpfn-v1/README.md)) | Hub 카드 ([분류](../hub/minipfn-tabpfn-v2-classifier/README.md), [회귀](../hub/minipfn-tabpfn-v2-regressor/README.md)) | 학습이 끝난 뒤 | — | 학습이 끝난 뒤 |
 
@@ -106,7 +106,7 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [3.5가 바꾼 것과 multitask 학습](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) | 3의 뼈대를 넓히고 셀 encoder를 Fourier + ECDF로 바꾸면 무엇이 달라지고, 분류·회귀를 한 모델로 어떻게 학습하는가? |
+| 01 | [3.5가 바꾼 것과 multitask 구조](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) | 3의 뼈대를 넓히고 셀 encoder를 Fourier + ECDF로 바꾸면 무엇이 달라지고, 분류·회귀를 모델 하나가 어떻게 같이 하는가? |
 
 재현 결과(3.5 multitask 학습 뒤 benchmark와 TabArena-Lite·BeyondArena에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
 
