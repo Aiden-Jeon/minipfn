@@ -31,15 +31,15 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 
 ## 축별로 보기
 
-위 표는 버전마다 무엇이 다른지를 보고, 아래 폴더별 표는 버전 하나를 깊게 봅니다. 축 하나를 버전 순서로 따라가려면 이 표에서 한 줄을 왼쪽부터 읽습니다. 축 하나를 한 노트북에서 다섯 버전으로 나란히 견주는 것은 [`axes/`](#axes--축별-흐름) 폴더에 있습니다(모델 구조, prior, 추론).
+위 표는 버전마다 무엇이 다른지를 보고, 아래 폴더별 표는 버전 하나를 깊게 봅니다. 축 하나를 버전 순서로 따라가려면 이 표에서 한 줄을 왼쪽부터 읽습니다. 축 하나를 다섯 버전으로 나란히 견주는 노트북은 축마다 `topics_xxx/` 폴더에 있습니다([축별 폴더](#축별-폴더--topics_xxx)).
 
 | 축 | v1 | v2 | 2.5 | 3 | 3.5 |
 |---|---|---|---|---|---|
 | 모델 구조 | [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2절 | [03/01](03_tabpfn_v2/01_cell_tokens_and_two_way_attention.ipynb), [03/02](03_tabpfn_v2/02_attention_properties_and_cost.ipynb) | [04/01](04_tabpfn_v2_5/01_layers_and_feature_groups.ipynb), [04/02](04_tabpfn_v2_5/02_thinking_rows_and_regression_encoder.ipynb) | [05/01](05_tabpfn_v3/01_overview_and_cell_encoder.ipynb), [05/02](05_tabpfn_v3/02_column_row_icl_stages.ipynb) | [06/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) 1~4절 |
 | prior (학습 데이터) | [02/01](02_tabpfn/01_scm_primer.ipynb), [02/02](02_tabpfn/02_random_scm_datasets.ipynb), [02/03](02_tabpfn/03_bnn_primer.ipynb), [02/05](02_tabpfn/05_tabpfn_paper_prior.ipynb) | 논문 prior [03/03](03_tabpfn_v2/03_prior_graph_and_edges.ipynb), [03/04](03_tabpfn_v2/04_prior_from_graph_to_table.ipynb), 이 저장소가 쓰는 TabICL prior [03/07](03_tabpfn_v2/07_tabicl_prior.ipynb) | v2와 같은 TabICL prior | v2와 같은 TabICL prior | v2와 같은 TabICL prior |
-| 학습 | [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2.6절, [02/07](02_tabpfn/07_tabpfn_reproduction.ipynb) 1~4절 | [03/05](03_tabpfn_v2/05_paper_walkthrough_model_and_training.ipynb) 5절 | 긴 표 학습 [04/03](04_tabpfn_v2_5/03_long_tables.ipynb) | 학습하지 않음 (3.5만 학습) | multitask [06/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) 5절 |
+| 학습 | [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2.6절 | [03/05](03_tabpfn_v2/05_paper_walkthrough_model_and_training.ipynb) 5절 | 긴 표 학습 [04/03](04_tabpfn_v2_5/03_long_tables.ipynb) | 학습하지 않음 (3.5만 학습) | 분류·회귀를 번갈아 한 모델로 (`scripts/tabpfn_v3/train.yaml`, 노트북 없음) |
 | 추론 | 회전 앙상블 [02/04](02_tabpfn/04_tabpfn_paper_architecture.ipynb) 2.5절 | [03/06](03_tabpfn_v2/06_paper_walkthrough_inference_and_results.ipynb) 1절 | robust·soft clip [04/04](04_tabpfn_v2_5/04_inference_preprocessing.ipynb) | 열 순서 섞기 [05/02](05_tabpfn_v3/02_column_row_icl_stages.ipynb) 5절 | standard 하나 [06/01](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) 2절 |
-| 재현 결과 | Table 1 ROC AUC 0.932 [02/07](02_tabpfn/07_tabpfn_reproduction.ipynb) 5절 | Hub 카드 ([분류](../hub/minipfn-tabpfn-v2-classifier/README.md), [회귀](../hub/minipfn-tabpfn-v2-regressor/README.md)) | 학습이 끝난 뒤 | — | 학습이 끝난 뒤 |
+| 재현 결과 | Table 1 ROC AUC 0.932, Hub 카드 ([분류](../hub/minipfn-tabpfn-v1/README.md)) | Hub 카드 ([분류](../hub/minipfn-tabpfn-v2-classifier/README.md), [회귀](../hub/minipfn-tabpfn-v2-regressor/README.md)) | 학습이 끝난 뒤 | — | 학습이 끝난 뒤 |
 
 ## `01_pfn/` — Müller et al., *Transformers Can Do Bayesian Inference* (ICLR 2022)
 
@@ -61,8 +61,6 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 | 03 | [BNN prior 기초](02_tabpfn/03_bnn_primer.ipynb) | BNN prior는 데이터셋을 어떻게 만들고, SCM prior와 무엇이 다른가? |
 | 04 | [논문 (1) PFN 복습과 아키텍처](02_tabpfn/04_tabpfn_paper_architecture.ipynb) | PFN을 표 데이터 분류에 쓰려고 Transformer와 입력·앙상블을 어떻게 바꿨는가? |
 | 05 | [논문 (2) 표 데이터를 위한 prior](02_tabpfn/05_tabpfn_paper_prior.ipynb) | SCM·BNN prior를 어떻게 섞고, 연속값을 어떻게 다중 클래스 target으로 바꾸는가? |
-| 06 | [논문 (3) 실험 결과와 한계](02_tabpfn/06_tabpfn_paper_results.ipynb) | forward pass 한 번으로 1시간 튜닝한 AutoML과 비슷한 성능을 내는가, 그리고 어디서 안 되는가? |
-| 07 | [논문 규모 재현](02_tabpfn/07_tabpfn_reproduction.ipynb) | 논문 수치로 학습한 TabPFN이 OpenML Table 1에서 논문 ROC AUC(0.934)를 다시 내는가? (결과: 0.932) |
 
 실행 파일: `scripts/tabpfn/train.py`, `scripts/tabpfn/eval.py`, `scripts/tabpfn/plot_card.py`, `scripts/tabpfn/train.yaml`, `scripts/tabpfn/eval.yaml` (Hub: `hub/minipfn-tabpfn-v1/README.md` 카드, `hub/push_to_hub.py`)
 
@@ -108,16 +106,50 @@ v1 칸은 [02_tabpfn/04 논문 (1) 아키텍처](02_tabpfn/04_tabpfn_paper_archi
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [3.5가 바꾼 것과 multitask 학습](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) | 3의 뼈대를 넓히고 셀 encoder를 Fourier + ECDF로 바꾸면 무엇이 달라지고, 분류·회귀를 한 모델로 어떻게 학습하는가? |
+| 01 | [3.5가 바꾼 것과 multitask 구조](06_tabpfn_v3_5/01_changes_and_multitask.ipynb) | 3의 뼈대를 넓히고 셀 encoder를 Fourier + ECDF로 바꾸면 무엇이 달라지고, 분류·회귀를 모델 하나가 어떻게 같이 하는가? |
 
 재현 결과(3.5 multitask 학습 뒤 benchmark와 TabArena-Lite·BeyondArena에서의 판정)는 학습이 끝난 뒤 이 폴더에 노트북을 더해 정리합니다.
 
 실행 파일: `scripts/tabpfn_v3/train.yaml`(기본값이 `TABPFN_V2_ARCH=v3.5`, `TABPFN_V2_TASK=multitask`), `scripts/tabpfn_v3/eval.yaml`. 스크립트는 v2와 같은 `scripts/tabpfn_v2/train.py`, `scripts/tabpfn_v2/eval.py`입니다.
 
-## `axes/` — 축별 흐름
+## 축별 폴더 — `topics_xxx/`
+
+논문 폴더가 버전 하나를 깊게 본다면, 이 폴더들은 축 하나를 따라갑니다. 각 폴더의 01은 그 축을 v1부터 3.5까지 한 노트북에서 견주고, 그 뒤 노트북은 이 저장소가 그 축에 더한 기법(greedy 선택, 증류, Muon 등)을 작은 toy 예제로 하나씩 봅니다. 실제 규모의 결과는 각 노트북 끝에 짧게 적고, 자세한 숫자는 PR과 Hub 카드에 있습니다. 논문 폴더와 같은 깊이(`notebooks/` 바로 아래)에 둡니다.
+
+### `topics_architecture/` — 모델 구조
 
 | # | 노트북 | 핵심 질문 |
 |---|--------|-----------|
-| 01 | [모델 구조의 흐름](axes/01_architecture_evolution.ipynb) | 같은 표를 v1·v2·2.5·3·3.5에 넣으면 토큰과 텐서 모양, 파라미터, attention 연산량이 어떻게 달라지는가? |
-| 02 | [prior의 흐름](axes/02_prior_evolution.ipynb) | 버전마다 쓰는 prior에서 뽑은 데이터셋은 클래스·범주형 열·결측값·표 크기에서 어떻게 다르고, 만드는 데 얼마나 걸리는가? |
-| 03 | [추론의 흐름](axes/03_inference_evolution.ipynb) | 버전마다 앙상블 멤버를 몇 개, 어떤 전처리로 만들고, 멤버 수와 종류가 실제 데이터셋의 점수를 얼마나 바꾸는가? |
+| 01 | [모델 구조의 흐름](topics_architecture/01_architecture_evolution.ipynb) | 같은 표를 v1·v2·2.5·3·3.5에 넣으면 토큰과 텐서 모양, 파라미터, attention 연산량이 어떻게 달라지는가? |
+
+### `topics_prior/` — prior (학습 데이터)
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [prior의 흐름](topics_prior/01_prior_evolution.ipynb) | 버전마다 쓰는 prior에서 뽑은 데이터셋은 클래스·범주형 열·결측값·표 크기에서 어떻게 다르고, 만드는 데 얼마나 걸리는가? |
+
+### `topics_inference/` — 추론
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [추론의 흐름](topics_inference/01_inference_evolution.ipynb) | 버전마다 앙상블 멤버를 몇 개, 어떤 전처리로 만들고, 멤버 수와 종류가 실제 데이터셋의 점수를 얼마나 바꾸는가? |
+| 02 | [멤버를 골라 섞기 — greedy ensemble selection](topics_inference/02_greedy_ensemble_selection.ipynb) | 멤버 × 온도 후보 217개를 out-of-fold 손실로 골라 섞으면 기본 앙상블보다 나은가? 작은 데이터에서는 왜 낮은 온도를 골라 손해를 보는가? |
+| 03 | [greedy 선택의 안전장치 — 최소 개선과 group fold](topics_inference/03_greedy_guard.ipynb) | greedy가 out-of-fold 노이즈에 맞추거나 test가 처음 보는 group일 때 무엇이 막아 주고, 무엇은 못 막는가? |
+| 04 | [데이터셋마다 조금만 학습하기 — DiagScale](topics_inference/04_diag_scale.ipynb) | attention의 query·key 닮음에 차원마다 곱하는 scale 4,608개만 학습하면 무엇이 바뀌고, 학습이 해가 될 때는 어떻게 원래 모델로 돌아가는가? |
+| 05 | [TabPFN을 GBDT로 옮기기 — 증류](topics_inference/05_gbdt_distillation.ipynb) | teacher의 확률을 GBDT 학생이 어떻게 배우고, 학습 행에서 정답 쪽으로 기우는 teacher 확률을 out-of-fold와 CutMix 행으로 어떻게 피하는가? |
+
+### `topics_evaluation/` — 평가
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [여러 데이터셋에서 모델 견주기 — 정규화 점수, 순위, Elo](topics_evaluation/01_comparing_models.ipynb) | 데이터셋마다 지표와 크기가 다른 오차를 모델마다 하나로 어떻게 모으고, Elo는 승패에서 어떻게 계산하는가? |
+| 02 | [회귀 예측 분포 재기 — CRPS, 구간, PIT](topics_evaluation/02_regression_uncertainty.ipynb) | 평균이 같은 예측 분포를 CRPS·coverage·interval score·PIT로 어떻게 가리고, 전체 coverage가 맞아도 어디서 틀리는가? |
+| 03 | [분류 확률 재기 — calibration과 conformal prediction](topics_evaluation/03_classification_calibration.ipynb) | 확률이 말한 만큼 맞히는지 ECE로 어떻게 재고, 확률이 틀려도 정답을 90% 담는 집합을 conformal로 어떻게 만드는가? |
+
+### `topics_training/` — 학습
+
+| # | 노트북 | 핵심 질문 |
+|---|--------|-----------|
+| 01 | [갱신을 직교화하는 optimizer — Muon](topics_training/01_muon.ipynb) | gradient 행렬을 직교화하면 갱신이 어떻게 달라지고, Newton–Schulz는 SVD 없이 어떻게 하며, 작은 모델에서 Adam과 견주면 어떤가? |
+| 02 | [가중치를 평균하기 — LAWA와 schedule-free](topics_training/02_weight_averaging.ipynb) | 학습률을 줄이지 않고 흔들리는 가중치를 평균하면 무엇이 좋아지고, schedule-free의 z·x·y는 무엇인가? |
+| 03 | [학습이 무너지지 않게 — QK-clip, 이산 target 흩기, 붕괴 감지](topics_training/03_stability.ipynb) | attention sink, 반복되는 회귀 target, 갑작스러운 손실 붕괴를 각각 어떻게 재고 막는가? |

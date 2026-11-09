@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>TabPFN v2 prior (1) — 그래프, 간선, 초기 데이터</title>
+<style>
+  body{margin:0;background:var(--background,#fff);color:var(--foreground,#171717);font-family:var(--font-sans,system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif);font-size:14px;line-height:1.55}
+  .wrap{max-width:1080px;margin:0 auto;padding:18px 18px 28px}
+  h1{font-size:19px;margin:0 0 4px}
+  h2{font-size:15px;margin:0 0 8px}
+  h3{font-size:13.5px;margin:0 0 6px}
+  p{margin:0 0 8px}
+  .muted{color:var(--muted-foreground,#6b7280)}
+  .tabs{display:flex;gap:6px;margin:14px 0 12px;flex-wrap:wrap}
+  .tab{border:1px solid var(--border,#e5e7eb);background:var(--card,#fff);color:var(--card-foreground,#171717);padding:6px 12px;border-radius:999px;cursor:pointer;font:inherit}
+  .tab.on{background:var(--primary,#171717);color:var(--primary-foreground,#fff);border-color:var(--primary,#171717)}
+  .tab:not(.on):hover{background:var(--accent,#f3f4f6);color:var(--accent-foreground,#171717)}
+  .panel{display:none}.panel.on{display:block}
+  .card{background:var(--card,#fff);color:var(--card-foreground,#171717);border:1px solid var(--border,#e5e7eb);border-radius:var(--radius,10px);padding:12px 14px}
+  .grid2{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:12px}
+  .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+  @media (max-width:860px){.grid2,.grid3{grid-template-columns:1fr}}
+  .controls{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin-bottom:12px}
+  .controls label{display:flex;gap:6px;align-items:center}
+  button.btn{font:inherit;border:1px solid var(--border,#e5e7eb);background:var(--secondary,#f3f4f6);color:var(--secondary-foreground,#171717);padding:5px 11px;border-radius:8px;cursor:pointer}
+  button.btn:hover{background:var(--accent,#e5e7eb);color:var(--accent-foreground,#171717)}
+  button.btn.primary{background:var(--primary,#171717);color:var(--primary-foreground,#fff);border-color:var(--primary,#171717)}
+  button.btn:disabled{opacity:.45;cursor:default}
+  select,input[type=range]{accent-color:var(--primary,#171717)}
+  select{font:inherit;background:var(--background,#fff);color:var(--foreground,#171717);border:1px solid var(--input,#d1d5db);border-radius:6px;padding:2px 6px}
+  .mono{font-family:var(--font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12.5px}
+  table{border-collapse:collapse;width:100%}
+  th,td{border-bottom:1px solid var(--border,#e5e7eb);padding:3px 6px;text-align:right;white-space:nowrap}
+  th{color:var(--muted-foreground,#6b7280);font-weight:600;font-size:12px}
+  td:first-child,th:first-child{text-align:left}
+  .steps{margin:0;padding-left:0;list-style:none}
+  .steps li{padding:5px 8px;border-radius:6px;margin-bottom:4px;border:1px solid transparent;opacity:.4;transition:opacity .2s}
+  .steps li.done{opacity:1}
+  .steps li.now{opacity:1;border-color:var(--ring,#9ca3af);background:var(--muted,#f5f5f5)}
+  .pill{display:inline-block;padding:0 7px;border-radius:999px;font-size:12px;border:1px solid var(--border,#e5e7eb)}
+  .yes{color:var(--destructive,#dc2626);font-weight:600}
+  .stat{display:flex;gap:18px;flex-wrap:wrap;margin-top:6px}
+  .stat b{font-size:16px}
+  svg text{fill:var(--foreground,#171717)}
+  .legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-top:6px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:-1px;border:1.5px solid transparent}
+  canvas{border-radius:6px;cursor:crosshair;display:block}
+  .formula{font-family:var(--font-mono,ui-monospace,Menlo,monospace);background:var(--muted,#f5f5f5);border-radius:6px;padding:6px 8px;font-size:12.5px;margin:6px 0}
+  .bars .row{display:grid;grid-template-columns:128px 1fr 50px;gap:6px;align-items:center;font-size:12.5px;margin:2px 0}
+  .bars .track{height:12px;background:var(--muted,#f3f4f6);border-radius:3px;overflow:hidden}
+  .bars .fill{height:100%;border-radius:3px;transition:width .35s}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TabPFN v2 prior (1) — 그래프, 간선, 초기 데이터</h1>
+  <p class="muted">노트북 <span class="mono">03_tabpfn_v2/03_prior_graph_and_edges.ipynb</span>를 직접 움직여 보는 페이지입니다. 노트북과 같은 예제 값(그래프 seed 3, 간선 seed 7)으로 시작합니다.</p>
+  <div class="tabs">
+    <button class="tab on" data-tab="gnr">① 그래프 뽑기 (GNR)</button>
+    <button class="tab" data-tab="edge">② 간선 함수</button>
+    <button class="tab" data-tab="init">③ 원인 노드의 초기 데이터</button>
+  </div>
+
+  <!-- ① GNR -->
+  <section class="panel on" id="panel-gnr">
+    <div class="controls">
+      <label>방향 바꿀 확률 P <input type="range" id="gP" min="0" max="1" step="0.05" value="0.5"> <b id="gPv" class="mono">0.50</b></label>
+      <label>속도 <select id="gSpeed"><option value="1100">천천히</option><option value="600" selected>보통</option><option value="250">빠르게</option></select></label>
+      <button class="btn primary" id="gNext">다음 노드 추가</button>
+      <button class="btn" id="gPlay">자동 재생</button>
+      <button class="btn" id="gFast">+20개 한 번에</button>
+      <button class="btn" id="gReset">처음부터</button>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h2>그래프 <span class="muted" style="font-weight:400;font-size:12.5px">(화살표: 원인 → 결과, 가운데가 노드 0)</span></h2>
+        <svg id="gSvg" viewBox="0 0 560 470" width="100%" style="display:block"></svg>
+        <div class="legend">
+          <span><span class="dot" style="background:var(--muted,#eee);border-color:var(--muted-foreground,#888)"></span>원인 노드 (부모 0개)</span>
+          <span><span class="dot" id="lgHub"></span>부모가 있는 노드 (클수록 hub)</span>
+          <span><span class="dot" id="lgPick" style="border-width:3px"></span>고른 노드</span>
+          <span><span class="dot" id="lgAtt" style="border-width:3px"></span>실제로 붙은 노드</span>
+        </div>
+        <div class="stat">
+          <span>노드 수 <b id="sN">1</b></span>
+          <span>원인 노드 비율 <b id="sRoot">–</b></span>
+          <span>가장 큰 hub의 부모 수 <b id="sHub">0</b></span>
+        </div>
+      </div>
+      <div style="display:grid;gap:12px;align-content:start">
+        <div class="card">
+          <h2 id="stepTitle">이번 단계</h2>
+          <ol class="steps" id="stepList">
+            <li data-k="1">① 기존 노드 중 하나를 고르게 고릅니다.</li>
+            <li data-k="2">② 고른 노드가 붙어 있던 노드를 확인합니다.</li>
+            <li data-k="3">③ 난수 r을 뽑아 r &lt; P이면 방향을 바꿉니다.</li>
+            <li data-k="4">④ 새 노드를 이어 붙입니다.</li>
+          </ol>
+        </div>
+        <div class="card">
+          <h2>다음 노드가 붙을 확률 <span class="muted" style="font-weight:400;font-size:12.5px">(상위 8개)</span></h2>
+          <div class="bars" id="probBars"></div>
+          <div class="formula">p_u = (1 − P)/t + P · k_u/t &nbsp; (k_u = u의 부모 수, t = 기존 노드 수)</div>
+          <p class="muted" style="font-size:12.5px;margin:0">고르기는 공평하지만, 방향을 바꾸면 고른 노드가 붙어 있던 노드로 갑니다. 그래서 이미 많이 붙은 노드일수록 더 잘 붙습니다. P를 올려 보세요.</p>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h2>단계 기록 <span class="muted" style="font-weight:400;font-size:12.5px">(최근 순)</span></h2>
+      <table class="mono" id="logTable">
+        <thead><tr><th>새 노드</th><th>고른 노드</th><th>고른 노드가 붙은 노드</th><th>방향 바꿀 확률</th><th>난수 r</th><th>방향 바꿈 (r &lt; P)</th><th>붙은 노드</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="muted" style="font-size:12.5px;margin:6px 0 0" id="presetNote">P = 0.5일 때 처음 5단계는 노트북 예제(seed 3)와 같은 난수를 씁니다. 그 뒤나 P를 바꾼 뒤에는 새 난수로 뽑습니다.</p>
+    </div>
+  </section>
+
+  <!-- ② 간선 -->
+  <section class="panel" id="panel-edge">
+    <div class="card" style="margin-bottom:12px">
+      <div class="controls" style="margin:0">
+        <b>부모 벡터 x</b>
+        <label class="mono">x[0] <input type="range" id="x0" min="-2" max="2" step="0.05" value="0.5"> <span id="x0v">0.50</span></label>
+        <label class="mono">x[1] <input type="range" id="x1" min="-2" max="2" step="0.05" value="-1"> <span id="x1v">-1.00</span></label>
+        <label class="mono">x[2] <input type="range" id="x2" min="-2" max="2" step="0.05" value="0.3"> <span id="x2v">0.30</span></label>
+        <button class="btn" id="xReset">노트북 값으로</button>
+      </div>
+      <p class="muted" style="margin:6px 0 0;font-size:12.5px">세 간선 모두 같은 x를 받습니다. 아래 지도(가로 x[0], 세로 x[1])를 클릭하거나 끌어도 x가 바뀝니다.</p>
+    </div>
+    <div class="grid3">
+      <div class="card">
+        <h3>신경망 간선 σ(Wx + b)</h3>
+        <label style="font-size:12.5px">활성화 함수 <select id="act"></select></label>
+        <svg id="actSvg" viewBox="0 0 300 180" width="100%" style="display:block;margin-top:6px"></svg>
+        <table class="mono" id="nnTable" style="margin-top:6px"></table>
+        <p class="muted" style="font-size:12px;margin:6px 0 0" id="actNote"></p>
+      </div>
+      <div class="card">
+        <h3>결정 나무 간선 (깊이 2)</h3>
+        <svg id="treeSvg" viewBox="0 0 400 190" width="100%" style="display:block"></svg>
+        <canvas id="treeMap" width="240" height="240" style="width:100%;max-width:240px;margin:6px auto 0"></canvas>
+        <p class="muted" style="font-size:12px;margin:6px 0 0">지도 색 = 도착하는 잎. 같은 색 안에서는 출력이 똑같고, 경계를 넘는 순간 출력이 뚝 바뀝니다(계단 모양). x[2]를 움직이면 왼쪽 절반의 잎이 바뀝니다.</p>
+      </div>
+      <div class="card">
+        <h3>이산화 (K = 3)</h3>
+        <div class="bars" id="discBars"></div>
+        <div class="mono" id="discOut" style="margin:6px 0;font-size:12.5px"></div>
+        <canvas id="discMap" width="240" height="240" style="width:100%;max-width:240px;margin:0 auto"></canvas>
+        <p class="muted" style="font-size:12px;margin:6px 0 0">지도 색 = 가장 가까운 대표 벡터의 번호(범주형 값). 이 번호가 범주형 feature가 되고, 그래프 안으로는 번호마다 정해 둔 임베딩 벡터를 흘려 보냅니다.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ③ 초기 데이터 -->
+  <section class="panel" id="panel-init">
+    <div class="controls">
+      <label>분포 <select id="iMode"><option value="normal">정규</option><option value="uniform">균등</option><option value="mixed">혼합</option></select></label>
+      <label><input type="checkbox" id="iProto" checked> 원형(prototype) 섞기</label>
+      <label>원형 수 M <input type="range" id="iM" min="2" max="50" step="1" value="10"> <b id="iMv" class="mono">10</b></label>
+      <label>온도 β <input type="range" id="iB" min="0" max="1" step="0.01" value="0.17"> <b id="iBv" class="mono">0.05</b></label>
+      <button class="btn" id="iRe">다시 뽑기</button>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h2>원인 노드 하나(2차원)의 초기 데이터 500행 <span class="muted" style="font-weight:400;font-size:12.5px">(표준화 후)</span></h2>
+        <svg id="iSvg" viewBox="0 0 460 460" width="100%" style="display:block;max-width:500px"></svg>
+      </div>
+      <div style="display:grid;gap:12px;align-content:start">
+        <div class="card">
+          <h2>행마다 원형을 섞는 가중치</h2>
+          <div class="formula">x_i = Σ_j α_ij · x*_j,&nbsp; α_i = softmax(z_i / β),&nbsp; z ~ N(0, 1)</div>
+          <h3 style="margin-top:8px">행 1</h3><div class="bars" id="w1"></div>
+          <h3 style="margin-top:8px">행 2</h3><div class="bars" id="w2"></div>
+        </div>
+        <div class="card">
+          <p style="margin:0">β가 크면 행마다 원형을 고르게 섞어서 모든 행이 평균 근처로 모입니다. β가 작으면 원형 하나를 거의 그대로 가져와서 행들이 원형 M개 근처에 덩어리로 모입니다. 같은 고객이 여러 번 나오는 표처럼 행이 서로 독립이 아닌 데이터를 흉내 냅니다.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+// ---------- 공통 ----------
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = () => ({
+  c1: css('--chart-1') || '#2563eb', c2: css('--chart-2') || '#16a34a', c3: css('--chart-3') || '#f59e0b',
+  c4: css('--chart-4') || '#9333ea', c5: css('--chart-5') || '#e11d48',
+  fg: css('--foreground') || '#171717', mfg: css('--muted-foreground') || '#6b7280',
+  muted: css('--muted') || '#f3f4f6', border: css('--border') || '#e5e7eb', bg: css('--background') || '#ffffff',
+  red: css('--destructive') || '#dc2626'
+});
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function normalGen(rng){return ()=>{let u=0,v=0;while(u===0)u=rng();while(v===0)v=rng();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v)}}
+const f2 = v => (v>=0?' ':'') + v.toFixed(2);
+const f3 = v => v.toFixed(3);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === 'panel-' + b.dataset.tab));
+  if (b.dataset.tab === 'edge') renderEdges();
+  if (b.dataset.tab === 'init') renderInit();
+  if (b.dataset.tab === 'gnr') renderGraph();
+});
+
+// ---------- ① GNR ----------
+const PRESET = [{picked:0,r:null},{picked:1,r:0.2368105065960997},{picked:0,r:null},{picked:0,r:null},{picked:4,r:0.5821620360643678}];
+const G = { P:0.5, att:[null], log:[], rng:mulberry32(12345), usePreset:true, pos:[{x:280,y:235}], hl:{}, busy:false, playing:false, seed:12345 };
+const svg = document.getElementById('gSvg');
+const W0 = 560, H0 = 470, CX = 280, CY = 235;
+
+function children(att){const ch=att.map(()=>[]);att.forEach((p,i)=>{if(p!==null)ch[p].push(i)});return ch}
+function layout(att){
+  const n = att.length, ch = children(att), leaf = new Array(n).fill(0), depth = new Array(n).fill(0);
+  for (let i=n-1;i>=0;i--) leaf[i] = ch[i].length ? ch[i].reduce((s,c)=>s+leaf[c],0) : 1;
+  for (let i=1;i<n;i++) depth[i] = depth[att[i]] + 1;
+  const maxD = Math.max(1, ...depth), R = 215, step = n <= 8 ? Math.min(R / maxD, 110) : R / maxD;
+  const a0 = new Array(n), a1 = new Array(n); a0[0] = -Math.PI/2; a1[0] = 1.5*Math.PI;
+  const pos = new Array(n);
+  for (let u=0;u<n;u++){
+    const mid = (a0[u]+a1[u])/2, r = depth[u]*step;
+    pos[u] = { x: CX + r*Math.cos(mid), y: CY + r*Math.sin(mid) };
+    let s = a0[u];
+    for (const c of ch[u]){ const span = (a1[u]-a0[u])*leaf[c]/leaf[u]; a0[c]=s; a1[c]=s+span; s+=span; }
+  }
+  return pos;
+}
+function radius(k, n){ const base = n > 80 ? 3.5 : n > 30 ? 6 : 10; return base + 2.2*Math.sqrt(k); }
+function nParents(att){ const k = att.map(()=>0); att.forEach(p=>{ if(p!==null) k[p]++; }); return k; }
+
+function renderGraph(){
+  const c = C(), att = G.att, n = att.length, k = nParents(att), pos = G.pos, hl = G.hl;
+  const showLabel = n <= 45;
+  let s = `<defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="${c.mfg}"/></marker>
+    <marker id="ahR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="${c.red}"/></marker>
+  </defs>`;
+  const line = (a, b, color, w, marker, dash) => {
+    const pa = pos[a], pb = pos[b]; if (!pa || !pb) return '';
+    const dx = pb.x-pa.x, dy = pb.y-pa.y, L = Math.hypot(dx,dy) || 1;
+    const ra = radius(k[a], n)+1, rb = radius(k[b], n)+3;
+    if (L < ra + rb + 1) return '';
+    return `<line x1="${pa.x+dx/L*ra}" y1="${pa.y+dy/L*ra}" x2="${pb.x-dx/L*rb}" y2="${pb.y-dy/L*rb}" stroke="${color}" stroke-width="${w}" ${dash?'stroke-dasharray="5 4"':''} marker-end="url(#${marker})" opacity="${color===c.mfg?0.55:1}"/>`;
+  };
+  for (let i=1;i<n;i++){ const isNew = hl.newNode === i; s += line(i, att[i], isNew ? c.red : c.mfg, isNew ? 2.4 : 1.1, isNew ? 'ahR' : 'ah'); }
+  if (hl.redirectFrom !== undefined && hl.redirectTo !== undefined) {
+    const pa = pos[hl.redirectFrom], pb = pos[hl.redirectTo];
+    if (pa && pb) {
+      const mx = (pa.x+pb.x)/2 + (pb.y-pa.y)*0.25, my = (pa.y+pb.y)/2 - (pb.x-pa.x)*0.25;
+      s += `<path d="M${pa.x},${pa.y} Q${mx},${my} ${pb.x},${pb.y}" fill="none" stroke="${c.c4}" stroke-width="2.2" stroke-dasharray="6 4"/>`;
+      s += `<text x="${mx}" y="${my-4}" font-size="12" text-anchor="middle" style="fill:${c.c4};font-weight:600">${hl.redirectLabel || 'redirect'}</text>`;
+    }
+  }
+  for (let i=0;i<n;i++){
+    const p = pos[i]; if (!p) continue;
+    const r = radius(k[i], n);
+    const fill = k[i] === 0 ? c.muted : c.c1;
+    const op = k[i] === 0 ? 1 : Math.min(1, 0.35 + 0.12*k[i]);
+    let stroke = k[i] === 0 ? c.mfg : c.c1, sw = 1;
+    if (hl.picked === i){ stroke = c.c3; sw = 3.5; }
+    if (hl.attach === i){ stroke = c.red; sw = 3.5; }
+    if (hl.newNode === i){ stroke = c.red; sw = 2.5; }
+    s += `<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${fill}" fill-opacity="${op}" stroke="${stroke}" stroke-width="${sw}"/>`;
+    if (showLabel || i === 0 || hl.picked === i || hl.attach === i || hl.newNode === i)
+      s += `<text x="${p.x}" y="${p.y+4}" font-size="${n>30?10:12}" text-anchor="middle" style="pointer-events:none;font-weight:600">${i}</text>`;
+  }
+  if (hl.pending !== undefined && hl.pendingPos){
+    const p = hl.pendingPos;
+    s += `<circle cx="${p.x}" cy="${p.y}" r="${radius(0,n)}" fill="${c.bg}" stroke="${c.red}" stroke-width="2.5" stroke-dasharray="3 3"/>`;
+    s += `<text x="${p.x}" y="${p.y+4}" font-size="12" text-anchor="middle" style="font-weight:600">${hl.pending}</text>`;
+  }
+  svg.innerHTML = s;
+  document.getElementById('sN').textContent = n;
+  const roots = k.filter(v=>v===0).length;
+  document.getElementById('sRoot').textContent = n > 1 ? Math.round(100*roots/n) + '%' : '–';
+  document.getElementById('sHub').textContent = Math.max(...k);
+  const lgHub = document.getElementById('lgHub'); lgHub.style.background = c.c1;
+  document.getElementById('lgPick').style.borderColor = c.c3;
+  document.getElementById('lgAtt').style.borderColor = c.red;
+  renderProb();
+}
+
+function attachProb(att, P){
+  const n = att.length, p = new Array(n).fill(0);
+  for (let u=0;u<n;u++){
+    if (att[u] !== null){ p[u] += (1-P)/n; p[att[u]] += P/n; } else p[u] += 1/n;
+  }
+  return p;
+}
+function renderProb(){
+  const c = C(), k = nParents(G.att), p = attachProb(G.att, G.P);
+  const order = p.map((v,i)=>i).sort((a,b)=>p[b]-p[a] || a-b).slice(0,8);
+  const max = Math.max(...p);
+  document.getElementById('probBars').innerHTML = order.map(i =>
+    `<div class="row"><span class="mono">node ${i} <span class="muted">(k=${k[i]})</span></span><div class="track"><div class="fill" style="width:${100*p[i]/max}%;background:${i===0?c.c4:c.c1}"></div></div><span class="mono" style="text-align:right">${(100*p[i]).toFixed(1)}%</span></div>`
+  ).join('');
+}
+
+function setStepUI(k, html){
+  document.querySelectorAll('#stepList li').forEach(li => {
+    const j = +li.dataset.k;
+    li.classList.toggle('done', j < k || k === 5);
+    li.classList.toggle('now', j === k);
+    if (html && html[j] !== undefined) li.innerHTML = html[j];
+  });
+}
+const STEP_TXT = {1:'① 기존 노드 중 하나를 고르게 고릅니다.',2:'② 고른 노드가 붙어 있던 노드를 확인합니다.',3:'③ 난수 r을 뽑아 r &lt; P이면 방향을 바꿉니다.',4:'④ 새 노드를 이어 붙입니다.'};
+
+function draw(){
+  const t = G.att.length, idx = t - 1;
+  if (G.usePreset && idx < PRESET.length && Math.abs(G.P-0.5) < 1e-9){ return PRESET[idx]; }
+  G.usePreset = false;
+  const picked = Math.floor(G.rng()*t);
+  const r = G.att[picked] !== null ? G.rng() : null;
+  return { picked, r };
+}
+
+function animateTo(target, ms){
+  const from = G.pos.map(p => ({...p}));
+  return new Promise(res => {
+    if (ms <= 0){ G.pos = target; renderGraph(); return res(); }
+    const t0 = performance.now();
+    const tick = now => {
+      const u = Math.min(1, (now-t0)/ms), e = u<.5 ? 2*u*u : 1-Math.pow(-2*u+2,2)/2;
+      G.pos = target.map((q,i) => { const f = from[i] || target[G.att[i]] || q; return { x: f.x+(q.x-f.x)*e, y: f.y+(q.y-f.y)*e }; });
+      renderGraph();
+      if (u < 1) requestAnimationFrame(tick); else res();
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+function pushStep(t, picked, r, redirected, attach){
+  const pp = G.att[picked];
+  G.log.push({ t, picked, pp, pr: pp===null?0:G.P, r, redirected, attach });
+  G.att.push(attach);
+}
+function renderLog(){
+  const rows = G.log.slice(-10).reverse().map(s =>
+    `<tr><td>${s.t}</td><td>${s.picked}</td><td>${s.pp===null?'없음':s.pp}</td><td>${s.pr.toFixed(2)}</td><td>${s.r===null?'-':s.r.toFixed(3)}</td><td class="${s.redirected?'yes':''}">${s.redirected}</td><td>${s.attach}</td></tr>`).join('');
+  document.querySelector('#logTable tbody').innerHTML = rows || '<tr><td colspan="7" class="muted" style="text-align:left">아직 노드 0 하나뿐입니다. "다음 노드 추가"를 눌러 보세요.</td></tr>';
+}
+
+async function stepAnimated(){
+  if (G.busy || G.att.length >= 200) return;
+  G.busy = true; setButtons();
+  const d = +document.getElementById('gSpeed').value;
+  const t = G.att.length, { picked, r } = draw(), pp = G.att[picked], can = pp !== null;
+  const redirected = can && r < G.P, attach = redirected ? pp : picked;
+  document.getElementById('stepTitle').textContent = `이번 단계: 새 노드 ${t}`;
+  G.hl = { picked, pending: t, pendingPos: { x: CX + 230, y: 22 } };
+  setStepUI(1, {...STEP_TXT, 1: `① 노드 0~${t-1} 중 하나를 고릅니다 (각 1/${t}) → <b>노드 ${picked}</b>`});
+  renderGraph(); await sleep(d);
+  setStepUI(2, {2: can ? `② 노드 ${picked}는 <b>노드 ${pp}</b>에 붙어 있습니다.` : `② 노드 0은 붙은 노드가 없습니다 → 방향을 바꿀 수 없음`});
+  if (can){ G.hl.redirectFrom = picked; G.hl.redirectTo = pp; G.hl.redirectLabel = 'attached to'; }
+  renderGraph(); await sleep(d);
+  setStepUI(3, {3: can ? `③ r = <b>${r.toFixed(3)}</b> ${r < G.P ? '&lt;' : '≥'} P = ${G.P.toFixed(2)} → ${redirected ? '<span class="yes">방향을 바꿉니다</span>' : '그대로 붙습니다'}` : `③ 방향 바꿀 확률 0, 난수를 뽑지 않습니다`});
+  if (!redirected){ delete G.hl.redirectFrom; delete G.hl.redirectTo; } else G.hl.redirectLabel = 'redirect';
+  G.hl.attach = attach;
+  renderGraph(); await sleep(d);
+  pushStep(t, picked, r, redirected, attach);
+  G.pos.push({ ...G.hl.pendingPos });
+  G.hl = { newNode: t, attach };
+  setStepUI(4, {4: `④ <b>${t} → ${attach}</b> 간선 (노드 ${t}가 원인, 노드 ${attach}가 결과)`});
+  renderLog();
+  await animateTo(layout(G.att), Math.min(700, d));
+  setStepUI(5);
+  G.busy = false; setButtons();
+}
+function stepFast(m){
+  for (let j=0;j<m && G.att.length<200;j++){
+    const t = G.att.length, { picked, r } = draw(), pp = G.att[picked];
+    const redirected = pp !== null && r < G.P;
+    pushStep(t, picked, r, redirected, redirected ? pp : picked);
+    G.pos.push({ ...(G.pos[G.att[t]] || {x:CX,y:CY}) });
+  }
+  G.hl = {}; renderLog();
+  document.getElementById('stepTitle').textContent = '이번 단계';
+  setStepUI(0, STEP_TXT);
+  animateTo(layout(G.att), 600);
+  setButtons();
+}
+function setButtons(){
+  const full = G.att.length >= 200;
+  document.getElementById('gNext').disabled = G.busy || full || G.playing;
+  document.getElementById('gFast').disabled = G.busy || full || G.playing;
+  document.getElementById('gPlay').textContent = G.playing ? '멈춤' : '자동 재생';
+  document.getElementById('gPlay').disabled = full && !G.playing;
+}
+function reset(keepPreset){
+  G.playing = false; G.att = [null]; G.log = []; G.pos = [{x:CX,y:CY}]; G.hl = {};
+  G.seed = Math.floor(Math.random()*1e9); G.rng = mulberry32(G.seed);
+  G.usePreset = keepPreset && Math.abs(G.P-0.5) < 1e-9;
+  document.getElementById('presetNote').style.display = G.usePreset ? '' : 'none';
+  document.getElementById('stepTitle').textContent = '이번 단계';
+  setStepUI(0, STEP_TXT); renderLog(); renderGraph(); setButtons();
+}
+document.getElementById('gNext').onclick = stepAnimated;
+document.getElementById('gFast').onclick = () => stepFast(20);
+document.getElementById('gReset').onclick = () => reset(Math.abs(G.P-0.5) < 1e-9);
+document.getElementById('gPlay').onclick = async () => {
+  G.playing = !G.playing; setButtons();
+  while (G.playing && G.att.length < 200){ await stepAnimated(); await sleep(150); }
+  G.playing = false; setButtons();
+};
+document.getElementById('gP').oninput = e => {
+  G.P = +e.target.value; document.getElementById('gPv').textContent = G.P.toFixed(2);
+  if (G.usePreset){ G.usePreset = false; document.getElementById('presetNote').style.display = 'none'; }
+  renderProb();
+};
+
+// ---------- ② 간선 ----------
+const E = {
+  W: [[0.250191,0.794428,0.551371],[-0.549586,-0.399667,0.747107],[-0.989469,0.642457,0.594139]],
+  b: [-0.310237,0.244921,0.178444],
+  dims: [0,2,1], th: [0.2,0.0,-0.5],
+  leaves: [[0.11,-0.93,-0.03],[0.7,-1.34,-0.46],[-1.9,-1.29,-1.84],[-0.24,-1.27,0.27]],
+  protos: [[0.16,-0.19,-2.52],[-0.54,-0.05,0.11],[-1.53,-0.48,-0.98]],
+  emb: [[-0.81,1.06,-0.81],[-0.03,0.88,-0.58],[-0.11,0.11,0.06]]
+};
+const ACTS = {
+  identity: v=>v, log: v=>Math.log(Math.abs(v)+1e-3), sigmoid: v=>1/(1+Math.exp(-v)), abs: Math.abs, sin: Math.sin, tanh: Math.tanh,
+  rank: null, square: v=>v*v, power: v=>Math.sign(v)*Math.pow(Math.abs(v),1.5), smooth_relu: v=>Math.log1p(Math.exp(v)),
+  step: v=>v>0?1:0, modulo: v=>((v%1)+1)%1
+};
+const NOTES = {
+  rank: '순위는 같은 좌표의 여러 행 사이에서 몇 번째인지(0~1)라서, 행이 하나뿐이면 0입니다. 곡선은 행이 많을 때의 모양입니다.',
+  step: '계단: 0을 넘는 순간 0 → 1로 뚝 바뀝니다.', modulo: '나머지: 1마다 0으로 돌아가는 톱니 모양입니다.',
+  log: 'log(|v| + 0.001): 0 근처에서 크게 음수로 떨어집니다.'
+};
+const actSel = document.getElementById('act');
+actSel.innerHTML = Object.keys(ACTS).map(a => `<option ${a==='sin'?'selected':''}>${a}</option>`).join('');
+const X = () => [0,1,2].map(i => +document.getElementById('x'+i).value);
+function setX(v){ v.forEach((a,i)=>{ if(a!==null){ document.getElementById('x'+i).value = a; } }); renderEdges(); }
+[0,1,2].forEach(i => document.getElementById('x'+i).oninput = renderEdges);
+actSel.onchange = renderEdges;
+document.getElementById('xReset').onclick = () => setX([0.5,-1,0.3]);
+
+function treeLeaf(x){
+  const right = x[E.dims[0]] > E.th[0];
+  const second = right ? x[E.dims[2]] > E.th[2] : x[E.dims[1]] > E.th[1];
+  return { right, second, leaf: 2*(+right) + (+second) };
+}
+function discCat(x){
+  const d = E.protos.map(p => Math.hypot(...p.map((q,i)=>x[i]-q)));
+  let best = 0; d.forEach((v,i)=>{ if(v<d[best]) best=i; });
+  return { d, cat: best };
+}
+const fmtV = v => '[' + v.map(a=>a.toFixed(2)).join(', ') + ']';
+
+function renderEdges(){
+  const c = C(), x = X(), pal = [c.c1, c.c2, c.c3, c.c4];
+  [0,1,2].forEach(i => document.getElementById('x'+i+'v').textContent = x[i].toFixed(2));
+  // 신경망
+  const name = actSel.value, lin = E.W.map((row,i) => row.reduce((s,w,j)=>s+w*x[j],0) + E.b[i]);
+  const f = ACTS[name];
+  const out = name === 'rank' ? [0,0,0] : lin.map(f);
+  const grid = Array.from({length:241}, (_,i)=>-3+i*0.025);
+  const gy = name === 'rank' ? grid.map((_,i)=>i/240) : grid.map(f);
+  let ylo = Math.min(...gy, ...out), yhi = Math.max(...gy, ...out); if (yhi-ylo<1e-6){ ylo-=1; yhi+=1; }
+  const pad = (yhi-ylo)*0.08; ylo-=pad; yhi+=pad;
+  const L=34,R=292,T=10,B=150, sx = v => L+(v+3)/6*(R-L), sy = v => B-(v-ylo)/(yhi-ylo)*(B-T);
+  let s = `<line x1="${L}" y1="${B}" x2="${R}" y2="${B}" stroke="${c.border}"/><line x1="${L}" y1="${T}" x2="${L}" y2="${B}" stroke="${c.border}"/>`;
+  if (ylo<0 && yhi>0) s += `<line x1="${L}" y1="${sy(0)}" x2="${R}" y2="${sy(0)}" stroke="${c.border}" stroke-dasharray="3 3"/>`;
+  s += `<line x1="${sx(0)}" y1="${T}" x2="${sx(0)}" y2="${B}" stroke="${c.border}" stroke-dasharray="3 3"/>`;
+  let dpath = '';
+  grid.forEach((g,i) => { const jump = name==='step'||name==='modulo' ? (i>0 && Math.abs(gy[i]-gy[i-1])>0.5) : false; dpath += (i===0||jump?'M':'L') + sx(g).toFixed(1) + ',' + sy(gy[i]).toFixed(1); });
+  s += `<path d="${dpath}" fill="none" stroke="${c.mfg}" stroke-width="1.8"/>`;
+  lin.forEach((z,i) => { const zc = Math.max(-3,Math.min(3,z));
+    s += `<line x1="${sx(zc)}" y1="${B}" x2="${sx(zc)}" y2="${sy(out[i])}" stroke="${pal[i]}" stroke-dasharray="2 2"/>`;
+    s += `<circle cx="${sx(zc)}" cy="${sy(out[i])}" r="5" fill="${pal[i]}" stroke="${c.bg}" stroke-width="1.5"/>`; });
+  s += `<text x="${(L+R)/2}" y="170" font-size="11" text-anchor="middle">input (Wx + b)</text>`;
+  s += `<text x="${L-4}" y="${T+8}" font-size="10" text-anchor="end">${yhi.toFixed(1)}</text><text x="${L-4}" y="${B}" font-size="10" text-anchor="end">${ylo.toFixed(1)}</text>`;
+  s += `<text x="${L}" y="168" font-size="10" text-anchor="middle">-3</text><text x="${R}" y="168" font-size="10" text-anchor="middle">3</text>`;
+  document.getElementById('actSvg').innerHTML = s;
+  document.getElementById('nnTable').innerHTML = `<tr><th></th><th>x</th><th>Wx + b</th><th>${esc(name)}(·)</th></tr>` +
+    [0,1,2].map(i => `<tr><td><span class="dot" style="background:${pal[i]}"></span>좌표 ${i}</td><td>${x[i].toFixed(2)}</td><td>${f3(lin[i])}</td><td>${f3(out[i])}</td></tr>`).join('');
+  document.getElementById('actNote').textContent = NOTES[name] || '세 점은 좌표마다의 Wx + b 값과 활성화 함수를 지난 값입니다. W, b는 노트북과 같은 값(seed 7)입니다.';
+
+  // 결정 나무
+  const tr = treeLeaf(x), pathSet = new Set(['root', tr.right ? 'R' : 'Lf', 'leaf'+tr.leaf]);
+  const nodes = { root:[200,22,`x[${E.dims[0]}] > ${E.th[0]} ?`], Lf:[100,82,`x[${E.dims[1]}] > ${E.th[1]} ?`], R:[300,82,`x[${E.dims[2]}] > ${E.th[2]} ?`] };
+  [50,150,250,350].forEach((lx,kk) => nodes['leaf'+kk] = [lx,150,`leaf ${kk}`]);
+  const links = [['root','Lf','No'],['root','R','Yes'],['Lf','leaf0','No'],['Lf','leaf1','Yes'],['R','leaf2','No'],['R','leaf3','Yes']];
+  let t = '';
+  links.forEach(([a,b,lab]) => { const on = pathSet.has(a) && pathSet.has(b), [x0,y0]=nodes[a], [x1,y1]=nodes[b];
+    t += `<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y1}" stroke="${on?c.red:c.border}" stroke-width="${on?3:1.5}"/>`;
+    t += `<text x="${(x0+x1)/2 + (lab==='Yes'?8:-8)}" y="${(y0+y1)/2}" font-size="10" text-anchor="middle" style="fill:${on?c.red:c.mfg}">${lab}</text>`; });
+  Object.entries(nodes).forEach(([k2,[nx,ny,label]]) => { const on = pathSet.has(k2), isLeaf = k2.startsWith('leaf'), w = isLeaf ? 94 : 100;
+    const fill = isLeaf ? pal[+k2.slice(4)] : c.bg;
+    t += `<rect x="${nx-w/2}" y="${ny-13}" width="${w}" height="${isLeaf?38:26}" rx="6" fill="${fill}" fill-opacity="${isLeaf?(on?0.35:0.12):1}" stroke="${on?c.red:c.mfg}" stroke-width="${on?2.5:1}"/>`;
+    t += `<text x="${nx}" y="${ny+4}" font-size="11" text-anchor="middle" style="font-weight:${on?700:400}">${label}</text>`;
+    if (isLeaf) t += `<text x="${nx}" y="${ny+18}" font-size="10" text-anchor="middle">${fmtV(E.leaves[+k2.slice(4)])}</text>`; });
+  document.getElementById('treeSvg').innerHTML = t;
+  drawMap('treeMap', (a,b) => treeLeaf([a,b,x[2]]).leaf, pal, x, ['leaf 0','leaf 1','leaf 2','leaf 3'], tr.leaf);
+
+  // 이산화
+  const dc = discCat(x), dmax = Math.max(...dc.d);
+  document.getElementById('discBars').innerHTML = dc.d.map((v,i) =>
+    `<div class="row"><span class="mono">범주 ${i}${i===dc.cat?' ◀':''}</span><div class="track"><div class="fill" style="width:${100*v/dmax}%;background:${pal[i]};opacity:${i===dc.cat?1:0.4}"></div></div><span class="mono" style="text-align:right">${v.toFixed(3)}</span></div>`).join('') +
+    `<p class="muted" style="font-size:12px;margin:4px 0 0">막대 = x와 대표 벡터 사이의 거리. 가장 짧은 것이 이깁니다.</p>`;
+  document.getElementById('discOut').innerHTML = `범주형 값 = <b>${dc.cat}</b><br>흘려 보내는 벡터 = ${fmtV(E.emb[dc.cat])}`;
+  drawMap('discMap', (a,b) => discCat([a,b,x[2]]).cat, pal, x, ['cat 0','cat 1','cat 2'], dc.cat, E.protos);
+}
+
+function drawMap(id, fn, pal, x, names, cur, protos){
+  const cv = document.getElementById(id), ctx = cv.getContext('2d'), S = cv.width, c = C();
+  const toV = p => -2 + 4*p/S, toP = v => (v+2)/4*S;
+  const step = 4;
+  for (let py=0; py<S; py+=step) for (let px=0; px<S; px+=step){
+    const k = fn(toV(px+step/2), -toV(py+step/2));
+    ctx.fillStyle = pal[k]; ctx.globalAlpha = k === cur ? 0.42 : 0.18; ctx.fillRect(px,py,step,step);
+  }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = c.border; ctx.lineWidth = 1; ctx.strokeRect(0.5,0.5,S-1,S-1);
+  ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(toP(0),0); ctx.lineTo(toP(0),S); ctx.moveTo(0,toP(0)); ctx.lineTo(S,toP(0)); ctx.stroke(); ctx.setLineDash([]);
+  if (protos) protos.forEach((p,i) => { const px = toP(p[0]), py = S - toP(p[1]);
+    ctx.fillStyle = pal[i]; ctx.strokeStyle = c.fg; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(px,py-7); ctx.lineTo(px+7,py); ctx.lineTo(px,py+7); ctx.lineTo(px-7,py); ctx.closePath(); ctx.fill(); ctx.stroke(); });
+  const mx = toP(x[0]), my = S - toP(x[1]);
+  ctx.fillStyle = c.red; ctx.strokeStyle = c.bg; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(mx,my,6,0,2*Math.PI); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = c.fg; ctx.font = '11px ' + (css('--font-sans') || 'system-ui');
+  ctx.fillText('x[0] →', S-44, S-6); ctx.save(); ctx.translate(14, S/2 + 20); ctx.rotate(-Math.PI/2); ctx.fillText('x[1] →', 0, 0); ctx.restore();
+  ctx.fillText(`x[2] = ${x[2].toFixed(2)}` + (protos ? '  (◆ prototype, x[0]·x[1] only)' : ''), 24, 14);
+  if (!cv._bound){
+    cv._bound = true;
+    const set = e => { const r = cv.getBoundingClientRect(); const a = toV((e.clientX-r.left)/r.width*S), b = -toV((e.clientY-r.top)/r.height*S);
+      const q = v => Math.round(Math.max(-2,Math.min(2,v))*20)/20; setX([q(a), q(b), null]); };
+    cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); set(e); });
+    cv.addEventListener('pointermove', e => { if (e.buttons) set(e); });
+  }
+}
+
+// ---------- ③ 초기 데이터 ----------
+const N = 500, MMAX = 50;
+let I = null;
+function genInit(seed){
+  const rng = mulberry32(seed), nrm = normalGen(rng);
+  const unif = () => -1.7 + 3.4*rng();
+  const mk = (n, f) => Array.from({length:n}, () => [f(), f()]);
+  I = { normal: mk(N, nrm), uniform: mk(N, unif), pN: mk(MMAX, nrm), pU: mk(MMAX, unif),
+        z: Array.from({length:N}, () => Array.from({length:MMAX}, nrm)), mixCol: [rng()<0.5, rng()<0.5] };
+}
+const betaOf = v => Math.exp(Math.log(0.02) + v*(Math.log(5)-Math.log(0.02)));
+function pick(mode, nArr, uArr){
+  if (mode === 'normal') return nArr; if (mode === 'uniform') return uArr;
+  return nArr.map((r,i) => [I.mixCol[0] ? r[0] : uArr[i][0], I.mixCol[1] ? r[1] : uArr[i][1]]);
+}
+function weights(i, M, beta){
+  const z = I.z[i].slice(0,M).map(v=>v/beta), m = Math.max(...z), e = z.map(v=>Math.exp(v-m)), s = e.reduce((a,b)=>a+b,0);
+  return e.map(v=>v/s);
+}
+function renderInit(){
+  if (!I) genInit(7);
+  const c = C(), mode = document.getElementById('iMode').value, useP = document.getElementById('iProto').checked;
+  const M = +document.getElementById('iM').value, beta = betaOf(+document.getElementById('iB').value);
+  document.getElementById('iMv').textContent = M; document.getElementById('iBv').textContent = beta < 0.1 ? beta.toFixed(3) : beta.toFixed(2);
+  ['iM','iB'].forEach(id => document.getElementById(id).disabled = !useP);
+  let pts, protos = null;
+  if (!useP) pts = pick(mode, I.normal, I.uniform);
+  else {
+    protos = pick(mode, I.pN, I.pU).slice(0, M);
+    pts = Array.from({length:N}, (_,i) => { const w = weights(i, M, beta); return [0,1].map(d => w.reduce((s,a,j)=>s+a*protos[j][d],0)); });
+  }
+  const mean = [0,1].map(d => pts.reduce((s,p)=>s+p[d],0)/N);
+  const sd = [0,1].map(d => Math.sqrt(pts.reduce((s,p)=>s+(p[d]-mean[d])**2,0)/N) + 1e-8);
+  const std = p => [0,1].map(d => (p[d]-mean[d])/sd[d]);
+  const S = 460, lim = 3.6, sx = v => S/2 + v/lim*(S/2-14), sy = v => S/2 - v/lim*(S/2-14);
+  let s = `<rect x="0.5" y="0.5" width="${S-1}" height="${S-1}" fill="none" stroke="${c.border}" rx="6"/>`;
+  s += `<line x1="${sx(-lim)}" y1="${sy(0)}" x2="${sx(lim)}" y2="${sy(0)}" stroke="${c.border}" stroke-dasharray="3 3"/><line x1="${sx(0)}" y1="${sy(-lim)}" x2="${sx(0)}" y2="${sy(lim)}" stroke="${c.border}" stroke-dasharray="3 3"/>`;
+  pts.forEach((p,i) => { const q = std(p); s += `<circle cx="${sx(q[0]).toFixed(1)}" cy="${sy(q[1]).toFixed(1)}" r="${i<2?5:2.3}" fill="${i<2?c.red:c.c1}" fill-opacity="${i<2?1:0.55}" ${i<2?`stroke="${c.bg}" stroke-width="1.5"`:''}/>`; });
+  if (protos){
+    // 행마다 가중치가 가장 큰 원형과 그 가중치 — 0.9를 넘으면 원형 위에 거의 겹친다
+    const cnt = new Array(M).fill(0);
+    for (let i=0;i<N;i++){ const w = weights(i, M, beta); let j = 0; w.forEach((v,jj)=>{ if (v>w[j]) j=jj; }); if (w[j] > 0.9) cnt[j]++; }
+    protos.forEach((p,j) => { const q = std(p), X0 = sx(q[0]), Y0 = sy(q[1]);
+      if (Math.abs(q[0])<lim && Math.abs(q[1])<lim){
+        s += `<path d="M${X0},${Y0-7}L${X0+7},${Y0}L${X0},${Y0+7}L${X0-7},${Y0}Z" fill="none" stroke="${c.fg}" stroke-width="1.6"/>`;
+        if (cnt[j]) s += `<text x="${X0+9}" y="${Y0-7}" font-size="11" style="font-weight:600">${cnt[j]}</text>`;
+      } });
+  }
+  s += `<text x="10" y="20" font-size="12">${useP ? `prototypes (M = ${M}, beta = ${beta<0.1?beta.toFixed(3):beta.toFixed(2)})` : 'independent rows'}, ${mode}</text>`;
+  s += `<text x="10" y="${S-10}" font-size="11" style="fill:${c.mfg}">◆ prototype (number = rows with weight > 0.9 on it)   ● rows 1, 2 (red)</text>`;
+  document.getElementById('iSvg').innerHTML = s;
+  const wbars = (i, el) => {
+    if (!useP){ document.getElementById(el).innerHTML = '<p class="muted" style="font-size:12.5px;margin:0">원형을 쓰지 않으면 행마다 따로 뽑습니다.</p>'; return; }
+    const w = weights(i, M, beta), order = w.map((_,j)=>j).sort((a,b)=>w[b]-w[a]).slice(0,5), rest = 1 - order.reduce((s2,j)=>s2+w[j],0);
+    document.getElementById(el).innerHTML = order.map(j => `<div class="row"><span class="mono">원형 ${j+1}</span><div class="track"><div class="fill" style="width:${100*w[j]}%;background:${c.c1}"></div></div><span class="mono" style="text-align:right">${w[j].toFixed(2)}</span></div>`).join('') +
+      (M > 5 ? `<div class="row"><span class="mono muted">나머지 ${M-5}개</span><div class="track"><div class="fill" style="width:${100*rest}%;background:${c.mfg}"></div></div><span class="mono" style="text-align:right">${rest.toFixed(2)}</span></div>` : '');
+  };
+  wbars(0, 'w1'); wbars(1, 'w2');
+}
+['iMode','iProto','iM','iB'].forEach(id => document.getElementById(id).addEventListener('input', renderInit));
+document.getElementById('iRe').onclick = () => { genInit(Math.floor(Math.random()*1e9)); renderInit(); };
+
+// ---------- 시작 ----------
+reset(true);
+// 노트북에서 띄울 때는 window.MINIPFN_TAB으로 탭 하나만 보여 준다
+const EMB = window.MINIPFN_TAB;
+if (EMB){
+  document.querySelector('h1').style.display = 'none';
+  document.querySelector('.wrap > p.muted').style.display = 'none';
+  document.querySelector('.tabs').style.display = 'none';
+  document.querySelector('.wrap').style.paddingTop = '4px';
+  document.querySelector(`.tab[data-tab="${EMB}"]`).click();
+}
+// iframe 안이면 높이를 내용에 맞춘다
+try {
+  const fe = window.frameElement;
+  const wrap = document.querySelector('.wrap');
+  if (fe) new ResizeObserver(() => { fe.style.height = Math.ceil(wrap.getBoundingClientRect().height + 8) + 'px'; }).observe(wrap);
+} catch (e) {}
+new MutationObserver(() => { renderGraph(); if (document.getElementById('panel-edge').classList.contains('on')) renderEdges(); if (document.getElementById('panel-init').classList.contains('on')) renderInit(); })
+  .observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] });
+})();
+</script>
+</body>
+</html>
