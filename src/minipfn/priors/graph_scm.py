@@ -132,10 +132,10 @@ class GraphSCMPrior:
         return self._missing.max_rate
 
     def sample_shape(self) -> tuple[int, int, int]:
-        """(학습 행 수, 검증 행 수, feature 수). "eval_rows" 규칙이면 검증 행 수는 늘
-        `n_eval_rows`다."""
+        """(학습 행 수, feature 수, 검증 행 수) — `sample_batch`의 `size`와 같은 순서. "eval_rows"
+        규칙이면 검증 행 수는 늘 `n_eval_rows`다."""
         if self.size_rule == "train_fraction":
-            return sample_split_size(
+            n_train, n_eval, n_features = sample_split_size(
                 self.rng.numpy,
                 min_rows=self.min_rows,
                 max_rows=self.max_rows,
@@ -146,8 +146,9 @@ class GraphSCMPrior:
                 max_cells=self.max_cells,
                 min_train_rows=self.min_train_rows,
             )
+            return n_train, n_features, n_eval
         n_train, n_features = self.sample_size()
-        return n_train, self.n_eval_rows, n_features
+        return n_train, n_features, self.n_eval_rows
 
     def sample_size(self) -> tuple[int, int]:
         """ "eval_rows" 규칙의 (학습 행 수, feature 수)."""
@@ -176,11 +177,8 @@ class GraphSCMPrior:
     def sample_batch(self, batch_size: int, size: tuple[int, ...] | None = None) -> PriorBatch:
         """`size`는 (학습 행 수, feature 수) 또는 (학습 행 수, feature 수, 검증 행 수). 주지 않으면
         `sample_shape`로 뽑는다."""
-        if size is None:
-            n_train, n_eval, n_features = self.sample_shape()
-        else:
-            n_train, n_features, *rest = size
-            n_eval = rest[0] if rest else self.n_eval_rows
+        n_train, n_features, *rest = self.sample_shape() if size is None else size
+        n_eval = rest[0] if rest else self.n_eval_rows
         n_train = max(n_train, self.min_train_rows)
         return self.pipeline.sample_batch(batch_size, n_train + n_eval, n_train, n_features)
 
@@ -220,6 +218,7 @@ def _check(*, size_rule: str, **sizes) -> None:
                     "max_train_fraction",
                     "max_features",
                     "max_cells",
+                    "min_train_rows",
                 )
             }
         )
@@ -287,8 +286,7 @@ def _border_targets(args: tuple[int, int, dict, bool]) -> torch.Tensor:
     )
     values = []
     for _ in range(n_datasets):
-        n_train, n_eval, n_features = prior.sample_shape()
-        _, y = prior._one_dataset(n_train, n_features, n_eval)
+        _, y = prior._one_dataset(*prior.sample_shape())
         values.append(torch.unique(y.float()))
     return torch.cat(values)
 

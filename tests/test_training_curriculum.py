@@ -77,7 +77,7 @@ def test_long_table_sizes():
     assert long_table_feature_cap(10_240, 100) == 100
     assert long_table_feature_cap(10_241, 100) == 80
     assert long_table_feature_cap(60_000, 10) == 10
-    assert long_table_feature_cap(100_000, 100) == 15
+    assert long_table_feature_cap(100_000, 100) == 10
 
 
 def test_split_size_respects_cells_and_minimum():

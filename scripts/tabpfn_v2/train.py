@@ -313,14 +313,9 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
-        if args.config_name in ("paper_run", "cooldown"):
+        if args.config_name in ("paper_run", "cooldown", *CURRICULUM_NAMES):
             try:
                 return PRESETS[args.config_name](args.task, arch)
-            except ValueError as e:
-                raise SystemExit(str(e)) from None
-        if args.config_name in CURRICULUM_NAMES:
-            try:
-                return tabpfn_v3.curriculum(CURRICULUM_NAMES[args.config_name], args.task, arch)
             except ValueError as e:
                 raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:

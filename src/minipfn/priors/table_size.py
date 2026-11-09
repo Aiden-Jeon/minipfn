@@ -96,15 +96,17 @@ LONG_TABLE_FEATURE_CAPS = (
     (60_000, 20),
     (65_000, 15),
 )
+# 위 표의 마지막 행 수보다 긴 표의 feature 상한 (TabICLv2 `adjust_max_features`의 else)
+LONG_TABLE_BEYOND_CAP = 10
 
 
 def long_table_feature_cap(n_rows: int, max_features: int) -> int:
     """행이 `n_rows`개인 표의 feature 상한 (TabICLv2 `adjust_max_features`). 65,000행을 넘는 표는
-    TabICLv2도 학습하지 않아 마지막 값(15)을 쓴다."""
+    TabICLv2처럼 10이다(`max_features`와 견주지 않는 것도 TabICLv2 그대로)."""
     for rows, cap in LONG_TABLE_FEATURE_CAPS:
         if n_rows <= rows:
             return max_features if cap is None else min(cap, max_features)
-    return min(LONG_TABLE_FEATURE_CAPS[-1][1], max_features)
+    return LONG_TABLE_BEYOND_CAP
 
 
 def check_split_sizes(
@@ -115,10 +117,15 @@ def check_split_sizes(
     max_train_fraction: float,
     max_features: int,
     max_cells: int,
+    min_train_rows: int = 1,
 ) -> None:
-    """ "train_fraction" 규칙의 설정이 말이 되는지 (`check_sizes`와 같은 일)."""
-    if min_rows < 2 or max_rows < min_rows:
-        raise ValueError(f"행 수는 2 ≤ min_rows ≤ max_rows여야 한다: {min_rows}, {max_rows}")
+    """ "train_fraction" 규칙의 설정이 말이 되는지 (`check_sizes`와 같은 일). 가장 짧은 표에도
+    학습 행 `min_train_rows`개(분류는 2)와 검증 행 하나가 남아야 한다."""
+    if min_rows < max(min_train_rows, 1) + 1 or max_rows < min_rows:
+        raise ValueError(
+            f"행 수는 min_train_rows + 1 ≤ min_rows ≤ max_rows여야 한다: {min_train_rows},"
+            f" {min_rows}, {max_rows}"
+        )
     if not 0.0 < min_train_fraction <= max_train_fraction < 1.0:
         raise ValueError(
             "학습 행 비율은 0 < min_train_fraction ≤ max_train_fraction < 1이어야 한다:"

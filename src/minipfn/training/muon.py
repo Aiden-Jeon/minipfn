@@ -46,6 +46,8 @@ import torch.distributed as dist
 from torch import nn
 
 MUON_MOMENTUM = 0.95
+# Muon이 맡는 파라미터 (`muon_parameters`): 블록 안 행렬만, 또는 모든 파라미터
+MUON_SCOPES = ("blocks", "all")
 # Newton–Schulz 5차 반복의 계수와 횟수 (Keller Jordan, `torch.optim.Muon`과 같은 값)
 NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 NS_STEPS = 5
@@ -58,8 +60,8 @@ def muon_parameters(
     """([(Muon이 맡을 파라미터, 나눌 조각 수)], Adam이 맡을 파라미터). 순서는 `model.parameters()`
     순서다. 조각 수는 q·k·v를 묶은 weight가 3, 나머지는 1이다. `scope="all"`이면 모든 파라미터가
     Muon이다(Adam 쪽은 빈 목록)."""
-    if scope not in ("blocks", "all"):
-        raise ValueError(f"Muon 범위는 blocks 또는 all이다: {scope}")
+    if scope not in MUON_SCOPES:
+        raise ValueError(f"Muon 범위는 {MUON_SCOPES} 가운데 하나다: {scope}")
     blocks = model.repeated_blocks() if hasattr(model, "repeated_blocks") else []
     splits: dict[int, int] = {}
     for block in blocks:

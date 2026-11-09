@@ -102,8 +102,10 @@ class GraphSCM:
         x, y = make()
         if not self.filter_unpredictable:
             return x, y
-        for _ in range(FILTER_ATTEMPTS - 1):
-            # NaN으로 버린 데이터셋(y가 모두 -100)은 DropInvalid가 다시 뽑는다
+        for _ in range(FILTER_ATTEMPTS):
+            # 처음 FILTER_ATTEMPTS개만 검사하고, 다 걸러지면 그 다음 것을 검사 없이 받는다
+            # (TabICL은 idx 0~5를 검사하고 idx 6을 받는다). NaN으로 버린 데이터셋(y가 모두 -100)은
+            # DropInvalid가 다시 뽑는다
             if (y == -100).all() or not self._should_filter(
                 x, y, self._config, is_classif=not self.regression
             ):

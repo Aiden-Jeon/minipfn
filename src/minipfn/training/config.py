@@ -20,6 +20,7 @@ from minipfn.models import (
 )
 from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_module
 from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
+from minipfn.training.muon import MUON_MOMENTUM, MUON_SCOPES
 
 N_BUCKETS = 5000
 # 학습 가속 옵션 (issue #46)과 optimizer 종류 (issue #28). 이어 학습하면 원래 run의 값을 따른다
@@ -39,8 +40,6 @@ SPEED_OPTIONS = (
     "phases",
 )
 OPTIMIZERS = ("adam", "muon")
-# Muon이 맡는 파라미터 (`training.muon.muon_parameters`): 블록 안 행렬만, 또는 모든 파라미터
-MUON_SCOPES = ("blocks", "all")
 # step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
 PHASE_KEYS = ("lr", "muon_weight_decay")
 # 분산 Muon의 범위 (issue #56, `muon_distributed`)
@@ -180,7 +179,7 @@ class TrainConfig:
     # 차원 × 나머지 행렬로 펴서 직교화한다). 그러면 muon_weight_decay가 모든 파라미터에 걸린다.
     # muon_momentum은 Muon momentum (TabICLv2 0.9 = `--beta1`, `torch.optim.Muon` 기본 0.95)
     muon_scope: Literal["blocks", "all"] = "blocks"
-    muon_momentum: float = 0.95
+    muon_momentum: float = MUON_MOMENTUM
     # 분산 Muon (issue #56, `training.muon`): Newton–Schulz 직교화를 GPU마다 똑같이 계산하지 않고
     # GPU끼리 행렬 조각을 나눠 맡은 뒤 all-gather로 모은다. "node"는 노드 안 GPU끼리, "all"은 모든
     # GPU끼리 나눈다. 갱신 결과는 "off"(기본, 모든 GPU가 다 계산)와 비트 단위로 같고 checkpoint
@@ -241,7 +240,9 @@ class TrainConfig:
             raise ValueError(f"muon_scope는 {MUON_SCOPES} 가운데 하나여야 한다: {self.muon_scope}")
         if not 0.0 <= self.muon_momentum < 1.0:
             raise ValueError(f"muon_momentum은 0 이상 1 미만이어야 한다: {self.muon_momentum}")
-        if self.optimizer != "muon" and (self.muon_scope != "blocks" or self.muon_momentum != 0.95):
+        if self.optimizer != "muon" and (
+            self.muon_scope != "blocks" or self.muon_momentum != MUON_MOMENTUM
+        ):
             raise ValueError("muon_scope·muon_momentum은 optimizer=muon일 때만 바꾼다")
         if not 0.0 <= self.binary_prob <= 1.0:
             raise ValueError(f"binary_prob는 0 이상 1 이하여야 한다: {self.binary_prob}")
