@@ -106,6 +106,7 @@ import pandas as pd
 import torch
 
 from minipfn.benchmarks import amlb as bm
+from minipfn.benchmarks import uncertainty as unc
 from minipfn.hub import load_model
 from minipfn.inference.diag_scale import DiagScale
 from minipfn.inference.distillation import (
@@ -866,13 +867,11 @@ def report_uncertainty(rows: list[dict], headline: str, out_dir: Path, use_mlflo
     per_dataset = summarize_uncertainty(rows, headline)
     per_dataset.to_csv(out_dir / "eval_uncertainty_per_dataset.csv", index=False)
     for suite, group in per_dataset.groupby("suite"):
-        values = group.drop(columns=["suite", "task_id", "dataset"]).dropna(axis=1, how="all")
-        unscaled = {c.removesuffix("_scaled") for c in values.columns if c.endswith("_scaled")}
-        means = values.drop(columns=[c for c in unscaled if c in values.columns]).mean()
+        means = unc.suite_means(group)
         print(f"{suite} uncertainty (one-hot {headline}, datasets {len(group)}):")
-        print(means.round(4).to_string())
+        print(pd.Series(means).round(4).to_string())
         if use_mlflow:
-            mlflow.log_metrics({f"{suite}_mean_{k}": float(v) for k, v in means.items()})
+            mlflow.log_metrics({f"{suite}_mean_{k}": v for k, v in means.items()})
 
 
 if __name__ == "__main__":

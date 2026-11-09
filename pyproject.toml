@@ -39,6 +39,14 @@ distill = [
     "lightgbm>=4.7",
     "xgboost>=3.0",
 ]
+# 예측 분포 baseline (minipfn.benchmarks.baselines, issue #48): GBDT와 공식 TabPFN v2 패키지.
+# TabICL은 기본 의존성에 있다. macOS의 OpenMP는 distill과 같다
+baselines = [
+    "catboost>=1.2.8",
+    "lightgbm>=4.7",
+    "tabpfn>=9.2",
+    "xgboost>=3.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]

@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+from scipy import special
 from sklearn.datasets import load_diabetes
 
 from minipfn.benchmarks import uncertainty as unc
@@ -24,8 +25,8 @@ def _sample(probs, borders, size, g, tails):
         out[i] = g.uniform(borders[k], borders[k + 1])
         if tails == "half_normal":
             d = np.abs(g.normal(size=size))
-            out[i] = np.where(k == 0, borders[1] - h.scale_left * d, out[i])
-            out[i] = np.where(k == len(p) - 1, borders[-2] + h.scale_right * d, out[i])
+            out[i] = np.where(k == 0, borders[1] - h.scale_left[i] * d, out[i])
+            out[i] = np.where(k == len(p) - 1, borders[-2] + h.scale_right[i] * d, out[i])
     return out
 
 
@@ -102,6 +103,85 @@ def test_calibrated_forecasts_cover_at_the_nominal_level(tails):
     # 분포를 한쪽으로 밀면 PIT가 균일에서 멀어지고 CRPS가 커진다
     shifted = unc.regression_metrics(probs, borders + 1.0, y, tails=tails)
     assert shifted["pit_ks"] > 0.2 and shifted["crps"] > out["crps"]
+
+
+@pytest.mark.parametrize("tails", unc.TAILS)
+def test_per_row_borders_match_shared_and_row_by_row(tails):
+    # 모든 행에 같은 경계를 (n, B + 1)로 줘도 (B + 1,)로 준 것과 같다
+    probs, borders = _random_histogram(n=6)
+    probs[:, [0, -1]] = 0.1
+    y = np.array([-4.0, -1.0, 0.3, 2.9, 5.0, 0.0])
+    shared = unc.bar_histogram(probs, borders, tails)
+    tiled = unc.bar_histogram(probs, np.tile(borders, (6, 1)), tails)
+    assert shared.shared_borders is not None and tiled.shared_borders is None
+    levels = [0.02, 0.3, 0.5, 0.99]
+    assert np.allclose(unc.crps(shared, y), unc.crps(tiled, y))
+    assert np.allclose(unc.pit(shared, y), unc.pit(tiled, y))
+    assert np.allclose(unc.quantile(shared, levels), unc.quantile(tiled, levels))
+    # 행마다 다른 경계는 행 하나씩 따로 계산한 것과 같다
+    g = np.random.default_rng(1)
+    per_row = np.sort(g.uniform(-3, 3, (6, len(borders))), axis=1)
+    h = unc.bar_histogram(probs, per_row, tails)
+    one = [unc.bar_histogram(probs[i : i + 1], per_row[i], tails) for i in range(6)]
+    assert np.allclose(unc.crps(h, y), [unc.crps(o, y[i : i + 1])[0] for i, o in enumerate(one)])
+    assert np.allclose(unc.pit(h, y), [unc.pit(o, y[i : i + 1])[0] for i, o in enumerate(one)])
+    assert np.allclose(
+        unc.quantile(h, levels), np.concatenate([unc.quantile(o, levels) for o in one])
+    )
+
+
+def test_bar_histogram_rejects_borders_of_the_wrong_shape():
+    probs, borders = _random_histogram(n=3)
+    with pytest.raises(ValueError, match="경계"):
+        unc.bar_histogram(probs, np.tile(borders, (2, 1)))
+
+
+def test_quantile_histogram_returns_the_quantiles_and_sorts_crossings():
+    levels = np.array([0.1, 0.5, 0.9])
+    values = np.array([[0.0, 1.0, 3.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]])  # 엇갈림, 모두 같음
+    probs, borders = unc.quantile_histogram(levels, values)
+    assert probs.shape == (3, 4) and borders.shape == (3, 5)
+    assert np.allclose(probs.sum(axis=1), 1.0)
+    for tails in unc.TAILS:
+        h = unc.bar_histogram(probs, borders, tails)
+        assert np.allclose(unc.quantile(h, levels), np.sort(values, axis=1))
+        assert np.allclose(unc.pit(h, [0.5, 1.5, 1.5]), [0.3, 0.7, 1.0], atol=1e-6)
+    # 모든 분위수가 같은 행은 그 점의 원자에 가깝다: CRPS가 절대 오차와 같다
+    h = unc.bar_histogram(probs, borders)
+    assert unc.crps(h, [0.0, 0.0, 4.0])[2] == pytest.approx(3.0, abs=1e-6)
+    with pytest.raises(ValueError, match="수준"):
+        unc.quantile_histogram([0.5, 0.1], values[:, :2])
+
+
+def test_quantile_histogram_tail_density_continues_the_inner_bucket():
+    # 꼬리의 맞닿은 점 밀도가 이웃한 안쪽 구간의 밀도와 같다
+    levels = np.array([0.05, 0.5, 0.95])
+    probs, borders = unc.quantile_histogram(levels, [[-1.0, 0.0, 2.0]])
+    h = unc.bar_histogram(probs, borders)
+    eps = 1e-6
+    for y, inner in ((-1.0, 0.45 / 1.0), (2.0, 0.45 / 2.0)):
+        density = (unc.pit(h, [y + eps]) - unc.pit(h, [y - eps]))[0] / (2 * eps)
+        assert density == pytest.approx(inner, rel=1e-3)
+
+
+def test_dense_gaussian_quantiles_give_the_gaussian_crps():
+    # 정규분포의 분위수 999개를 히스토그램으로 바꾸면 CRPS가 닫힌 식과 거의 같고 구간이 맞는다
+    g = np.random.default_rng(0)
+    n = 3000
+    mu, sigma = g.normal(size=n), g.uniform(0.5, 2.0, n)
+    y = mu + sigma * g.normal(size=n)
+    levels = np.linspace(0, 1, 1001)[1:-1]
+    values = mu[:, None] + sigma[:, None] * special.ndtri(levels)[None, :]
+    probs, borders = unc.quantile_histogram(levels, values)
+    z = (y - mu) / sigma
+    exact = sigma * (z * (2 * special.ndtr(z) - 1) + 2 * np.exp(-z * z / 2) / np.sqrt(2 * np.pi))
+    exact -= sigma / np.sqrt(np.pi)
+    h = unc.bar_histogram(probs, borders)
+    assert np.allclose(unc.crps(h, y), exact, rtol=2e-3, atol=1e-4)
+    out = unc.regression_metrics(probs, borders, y)
+    for level in unc.COVERAGE_LEVELS:
+        assert out[f"coverage_{round(level * 100)}"] == pytest.approx(level, abs=0.03)
+    assert out["pit_ks"] < 0.03
 
 
 def test_min_coverage_by_width_does_not_depend_on_row_order():
