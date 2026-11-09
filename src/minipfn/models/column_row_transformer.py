@@ -552,19 +552,20 @@ def _retrieve(q: torch.Tensor, k: torch.Tensor, onehot: torch.Tensor) -> torch.T
     """softmax(q·kᵀ/√d) @ onehot을 head마다 (B, H, T, n_classes)로, score 행렬 없이 float32로.
 
     q (B, H, T, d), k (B, H, N, d), onehot (B, N, n_classes). attention kernel의 value 폭을 q·k와
-    같게 하려고 one-hot을 d 열씩 잘라 batch 쪽으로 접는다(공식 TabPFN-3.5 추론 코드의
-    `_chunked_class_attention`과 같은 방법). autocast를 끄고 float32로 계산한다."""
+    같게 하려고 one-hot을 d 열씩 잘라 조각마다 attention한다(공식 TabPFN-3.5 추론 코드의
+    `_chunked_class_attention`과 같은 방법). q·k는 조각마다 같으므로 복사하지 않는다. autocast를
+    끄고 float32로 계산한다."""
     b, heads, t, d = q.shape
     n, n_classes = onehot.shape[1:]
     pieces = math.ceil(n_classes / d)
-    v = F.pad(onehot, (0, pieces * d - n_classes)).view(b, n, pieces, d).permute(0, 2, 1, 3)
-    v = v[:, :, None].expand(b, pieces, heads, n, d).reshape(b * pieces, heads, n, d)
-    q = q.float()[:, None].expand(b, pieces, heads, t, d).reshape(b * pieces, heads, t, d)
-    k = k.float()[:, None].expand(b, pieces, heads, n, d).reshape(b * pieces, heads, n, d)
+    v = F.pad(onehot, (0, pieces * d - n_classes)).view(b, n, pieces, d)
+    q, k = q.float(), k.float()
     with torch.autocast(q.device.type, enabled=False):
-        out = F.scaled_dot_product_attention(q, k, v.contiguous())  # (B × pieces, H, T, d)
-    out = out.view(b, pieces, heads, t, d).permute(0, 2, 3, 1, 4).reshape(b, heads, t, -1)
-    return out[..., :n_classes]
+        out = [  # 조각마다 (B, H, T, d)
+            F.scaled_dot_product_attention(q, k, v[:, None, :, j].expand(-1, heads, -1, -1))
+            for j in range(pieces)
+        ]
+    return torch.cat(out, dim=-1)[..., :n_classes]
 
 
 class ColumnRowTransformer(nn.Module):
@@ -658,8 +659,11 @@ class ColumnRowTransformer(nn.Module):
 
     @property
     def max_classes(self) -> int:
-        """추론에서 받는 클래스 수 상한 (`MAX_CLASSES`, 정답 embedding 수가 더 많으면 그 수)."""
-        return max(self.config.n_out, MAX_CLASSES)
+        """추론에서 받는 클래스 수 상한 (`MAX_CLASSES`, 정답 embedding 수가 더 많으면 그 수).
+        분류를 내지 않는 모델(회귀만)은 0이다."""
+        if "classification" not in self.config.tasks:
+            return 0
+        return max(self.config.output_size("classification"), MAX_CLASSES)
 
     def repeated_blocks(self) -> list[nn.Module]:
         """여러 번 쓰는 블록 (학습 가속 옵션 `compile`이 블록마다 compile한다)."""
@@ -751,8 +755,23 @@ class ColumnRowTransformer(nn.Module):
             task = cfg.task
         elif task not in cfg.tasks:
             raise ValueError(f"이 모델의 task는 {cfg.tasks}다: {task}")
+        if (y_classes is None) != (n_classes is None):
+            raise ValueError("y_classes와 n_classes는 같이 준다")
         if n_classes is not None and n_classes > self.max_classes:
             raise ValueError(f"클래스 {n_classes}개는 상한({self.max_classes}개)보다 많다")
+        if task == "classification" and not self.training:
+            # 정답 embedding 수보다 큰 번호는 embedding·decoder에서 마지막 클래스로 합쳐진다.
+            # 학습 중에는 prior가 범위를 지키므로 (GPU 동기화를 피해) 평가·추론에서만 본다
+            n_labels = cfg.output_size("classification") if y_classes is None else n_classes
+            labels = y_train if y_classes is None else y_classes
+            if labels.numel() and int(labels.max()) >= n_labels:
+                raise ValueError(
+                    f"클래스 번호 {int(labels.max())}는 {n_labels}개 범위 밖이다. 클래스가 정답 "
+                    f"embedding 수({cfg.output_size('classification')})보다 많으면 y_train에 묶은 "
+                    "번호를, y_classes·n_classes에 원래 번호를 준다"
+                )
+            if y_classes is not None and int(y_train.max()) >= cfg.output_size("classification"):
+                raise ValueError("y_classes를 주면 y_train은 정답 embedding 수 안의 묶은 번호다")
         b, r, c = x.shape
         n_train = y_train.shape[1]
         if inference and b * r * c > self.inference_chunk_cells:

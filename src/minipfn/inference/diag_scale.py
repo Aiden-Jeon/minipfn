@@ -171,6 +171,10 @@ def fit_diag_scale(
     start = time.perf_counter()
     seed = estimator.random_state
     regression = isinstance(estimator, EnsembleRegressor)
+    if getattr(estimator.model, "supports_inference_options", False):
+        # column_row_transformer(TabPFN-3·3.5)의 attention은 qkv.weight를 직접 써서 qkv의 forward
+        # hook(`add_diag_scale`)이 불리지 않는다. 클래스 묶음·task 인자도 아직 넘기지 않는다
+        raise ValueError("DiagScale은 아직 column_row_transformer를 받지 않는다")
     model = copy.deepcopy(estimator.model).to(estimator.device).eval()
     model.requires_grad_(False)
     deltas = add_diag_scale(model)

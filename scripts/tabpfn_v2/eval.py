@@ -389,7 +389,12 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             raise SystemExit(f"{suite}: {e}") from e
     log_path = Path(args.out_dir) / "test_time.jsonl"
     # 같은 out-dir에 다른 방법의 기록이 쌓여도 구분되도록 줄마다 남긴다
-    log_fields = {"suite": suite, "method": args.method_name, **test_time_params(args)}
+    log_fields = {
+        "suite": suite,
+        "method": args.method_name,
+        "seed": args.seed,
+        **test_time_params(args),
+    }
     fits_log = fits_path(args)
 
     def make(task: bm.OpenMLTask, one_hot: str):
@@ -433,6 +438,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
                 synthetic_ratio=args.synthetic_ratio,
                 alpha=args.distill_alpha,
                 categorical_features_indices=task.categorical_indices,
+                random_state=args.seed,
             )
         if args.distill != "none" or args.latency:
             record = {"suite": args.suite, "task": suite, "dataset": getattr(task, "name", None)}
@@ -588,6 +594,33 @@ def arena_limits(models: dict, args: argparse.Namespace) -> dict:
     return limits
 
 
+def arena_fingerprint(
+    args: argparse.Namespace, paths: dict, factories: dict, kinds: dict, one_hot: str
+) -> str:
+    """끝난 split을 다시 쓸지 정하는 값: 체크포인트와 추론 설정이 같을 때만 다시 쓴다. 기본값인
+    설정은 넣지 않아서 예전 결과를 그대로 다시 쓴다. 다만 추론 계산이 바뀐 모델
+    (`supports_inference_options`, column_row_transformer: 큰 표를 나눠 계산하고 분류 decoder를
+    float32 attention으로 바꿨다, issue #66)은 표시를 더해 예전 계산의 split과 섞이지 않게 한다."""
+    inference = any(
+        getattr(f.model, "supports_inference_options", False) for f in factories.values()
+    )
+    return json.dumps(
+        {
+            "paths": {t: paths[t] for t in factories},
+            "member_kinds": {t: list(k) for t, k in kinds.items()},
+            "one_hot": one_hot,
+            # 기본 추론(none)은 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
+            **({} if args.test_time == "none" else test_time_params(args)),
+            # 증류하지 않으면 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
+            **({} if args.distill == "none" else distill_params(args)),
+            # seed 0(기본)도 예전 fingerprint 그대로
+            **({"seed": args.seed} if args.seed else {}),
+            **({"inference": "chunked"} if inference else {}),
+        },
+        sort_keys=True,
+    )
+
+
 def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
     """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다. estimator는
     AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔 넘긴다)."""
@@ -613,21 +646,7 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
     # arena system은 이 함수를 받으므로 split의 group 번호를 넘길지도 여기에 단다
     make.fit_groups = any(getattr(f, "fit_groups", False) for f in factories.values())
 
-    # 끝난 split을 다시 쓸지 정하는 값: 체크포인트와 추론 설정이 같을 때만 다시 쓴다
-    fingerprint = json.dumps(
-        {
-            "paths": {t: paths[t] for t in factories},
-            "member_kinds": {t: list(k) for t, k in kinds.items()},
-            "one_hot": one_hot,
-            # 기본 추론(none)은 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
-            **({} if args.test_time == "none" else test_time_params(args)),
-            # 증류하지 않으면 예전 fingerprint 그대로 둔다 (끝난 split을 다시 쓴다)
-            **({} if args.distill == "none" else distill_params(args)),
-            # seed 0(기본)도 예전 fingerprint 그대로
-            **({"seed": args.seed} if args.seed else {}),
-        },
-        sort_keys=True,
-    )
+    fingerprint = arena_fingerprint(args, paths, factories, kinds, one_hot)
     models = {task: (f.model, f.borders) for task, f in factories.items()}
     datasets = None if args.datasets is None else args.datasets.split(",")
     summary = arena.run(

@@ -1,6 +1,7 @@
 """TabPFN-3·3.5 (`column_row_transformer` 모델, `recipes.tabpfn_v3`) 테스트."""
 
 import importlib.util
+import json
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -639,3 +640,43 @@ def test_eval_seed_changes_members_and_the_arena_fingerprint(monkeypatch, tmp_pa
 
     estimator = make(types.SimpleNamespace(categorical_indices=[]), "all")
     assert estimator.random_state == 3
+    # seed 0은 예전 fingerprint 그대로, 다른 seed는 따로. 추론 계산이 바뀐 column_row_transformer는
+    # 예전 계산의 split과 섞이지 않게 표시를 더한다
+    paths, kinds = {"classification": "unused"}, {"classification": ("standard",)}
+
+    def fingerprint(seed, model):
+        a = script.parse_args(["--seed", str(seed)])
+        factories = {"classification": types.SimpleNamespace(model=model)}
+        return json.loads(script.arena_fingerprint(a, paths, factories, kinds, "all"))
+
+    v2_model = TrainConfig.smoke("classification").build_model()
+    assert fingerprint(0, v2_model) == {
+        "paths": paths,
+        "member_kinds": {"classification": ["standard"]},
+        "one_hot": "all",
+    }
+    assert fingerprint(3, v2_model)["seed"] == 3
+    assert fingerprint(0, model)["inference"] == "chunked" and "seed" not in fingerprint(0, model)
+
+
+def test_forward_rejects_labels_outside_the_target_embeddings():
+    model = _model()  # 정답 embedding 10개
+    x, y = torch.randn(1, 30, 4), torch.arange(20).float()[None] % 13  # 클래스 13개
+    with pytest.raises(ValueError, match="범위 밖"):
+        model(x, y)  # 묶지 않으면 10~12번이 9번으로 합쳐진다
+    with pytest.raises(ValueError, match="같이 준다"):
+        model(x, y % 10, y_classes=y)
+    with pytest.raises(ValueError, match="묶은 번호"):
+        model(x, y, y_classes=y, n_classes=13)
+    assert model(x, y % 10, y_classes=y, n_classes=13).shape == (1, 10, 13)
+    # 회귀만 내는 모델은 분류 클래스를 받지 않는다 (n_out은 구간 수다)
+    assert _model("regression").max_classes == 0 and model.max_classes == 160
+
+
+def test_diag_scale_rejects_column_row_transformer():
+    # attention이 qkv.weight를 직접 써서 DiagScale hook이 불리지 않는다 (예전에는 autograd 에러)
+    from minipfn.inference.diag_scale import DiagScale
+
+    X, y = np.random.default_rng(0).normal(size=(60, 4)), np.arange(60) % 3
+    with pytest.raises(ValueError, match="column_row_transformer"):
+        DiagScale(EnsembleClassifier(_model(), n_estimators=1), epochs=1).fit(X, y)
