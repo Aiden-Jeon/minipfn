@@ -11,8 +11,6 @@ notebooks/02_tabpfn/02_random_scm_datasets.ipynb !filter
 notebooks/02_tabpfn/03_bnn_primer.ipynb !filter
 notebooks/02_tabpfn/04_tabpfn_paper_architecture.ipynb !filter
 notebooks/02_tabpfn/05_tabpfn_paper_prior.ipynb !filter
-notebooks/02_tabpfn/06_tabpfn_paper_results.ipynb !filter
-notebooks/02_tabpfn/07_tabpfn_reproduction.ipynb !filter
 notebooks/03_tabpfn_v2/01_cell_tokens_and_two_way_attention.ipynb !filter
 notebooks/03_tabpfn_v2/02_attention_properties_and_cost.ipynb !filter
 notebooks/03_tabpfn_v2/03_prior_graph_and_edges.ipynb !filter
