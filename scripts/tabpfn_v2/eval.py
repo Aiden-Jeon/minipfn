@@ -58,6 +58,11 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
 seed만 바꿔 다시 평가하면 benchmark 점수의 노이즈를 잴 수 있다(issue #67). arena 결과 cache는
 seed마다 따로다.
 
+`--max-features-per-member 6000`은 feature가 6,000개보다 많은 표에서 앙상블 멤버마다 6,000개를
+무작위로 골라 넣는다(공식 TabPFN의 `max_features_per_estimator`). 주면 TabArena·BeyondArena의
+feature 수 상한을 없애서, 권장 크기보다 넓은 split(BeyondArena의 6,772~22,215개)도
+돌린다(issue #66).
+
 `--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
 학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
 `--selection`·`--pool-size`), `diagscale`은 데이터셋마다 attention의 대각 scale만 학습한다
@@ -267,6 +272,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-features", type=int, help="TabArena·BeyondArena: feature 수 상한 (기본: 모델 구조)"
     )
     parser.add_argument(
+        "--max-features-per-member",
+        type=int,
+        default=None,
+        help="feature가 이보다 많으면 앙상블 멤버마다 이만큼만 무작위로 고른다(공식 TabPFN의"
+        " max_features_per_estimator). 주면 TabArena·BeyondArena의 feature 수 상한은 없앤다"
+        "(--max-features로 다시 둘 수 있다)",
+    )
+    parser.add_argument(
         "--method-name", default="minipfn-tabpfn-v2", help="TabArena·BeyondArena 결과의 방법 이름"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -405,6 +418,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "member_kinds": member_kinds,
             "device": args.device,
             "random_state": args.seed,
+            "max_features_per_member": args.max_features_per_member,
         }
         if "greedy" in args.test_time:
             # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
@@ -586,6 +600,8 @@ def arena_limits(models: dict, args: argparse.Namespace) -> dict:
             size["max_train_rows"] = args.max_train_rows
         if args.max_features is not None:
             size["max_features"] = args.max_features
+        elif getattr(args, "max_features_per_member", None) is not None:
+            size["max_features"] = None  # 멤버마다 feature를 골라 넣으므로 상한이 없다
         if task == "classification":
             lim = ModelLimits(**size, max_classes=max_classes_of(model))
             limits.update(binary=lim, multiclass=lim)
@@ -616,6 +632,12 @@ def arena_fingerprint(
             # seed 0(기본)도 예전 fingerprint 그대로
             **({"seed": args.seed} if args.seed else {}),
             **({"inference": "chunked"} if inference else {}),
+            # 주지 않으면(기본) 예전 fingerprint 그대로
+            **(
+                {"max_features_per_member": args.max_features_per_member}
+                if args.max_features_per_member is not None
+                else {}
+            ),
         },
         sort_keys=True,
     )
@@ -696,6 +718,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
             "seed": args.seed,
+            "max_features_per_member": args.max_features_per_member,
             **test_time_params(args),
             **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
@@ -795,6 +818,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
                 "seed": args.seed,
+                "max_features_per_member": args.max_features_per_member,
                 **test_time_params(args),
                 **distill_params(args),
             }

@@ -474,3 +474,39 @@ def test_split_groups_reads_string_and_ordered_category_times():
     # 구간을 2개 만들 수 없으면 (상수, 읽을 수 없는 값) 무작위 fold
     assert arena.split_groups(pd.DataFrame({"when": [5, 5, 5]}), meta) is None
     assert arena.split_groups(pd.DataFrame({"when": ["a", "b", "c"]}), meta) is None
+
+
+def test_members_take_feature_subsets_above_the_cap():
+    from minipfn.inference.preprocessing import feature_subset, select_features
+
+    # 상한 안이면 None(전부), 넘으면 멤버 seed로 정한 열 상한 개 (정렬, 중복 없음)
+    assert feature_subset(8, None, 0) is None and feature_subset(8, 8, 0) is None
+    cols = feature_subset(30, 6, 5)
+    assert len(cols) == 6 and np.array_equal(cols, np.unique(cols))
+    assert np.array_equal(cols, feature_subset(30, 6, 5))
+    assert not np.array_equal(cols, feature_subset(30, 6, 6))
+    x, cat = select_features(np.arange(12.0).reshape(2, 6), [1, 4], np.array([0, 4, 5]))
+    assert x.tolist() == [[0, 4, 5], [6, 10, 11]] and cat == [1]
+
+    X, y = _classification()
+    model = _tiny_model()
+    full = EnsembleClassifier(model, n_estimators=3).fit(X[:90], y[:90])
+    # 상한이 feature 수 이상이면 예전과 같다
+    same = EnsembleClassifier(model, n_estimators=3, max_features_per_member=8).fit(X[:90], y[:90])
+    assert np.array_equal(same.predict_proba(X[90:]), full.predict_proba(X[90:]))
+    sub = EnsembleClassifier(model, n_estimators=3, max_features_per_member=3).fit(X[:90], y[:90])
+    proba = sub.predict_proba(X[90:])
+    assert proba.shape == (30, 2) and np.allclose(proba.sum(1), 1)
+    assert all(len(c) == 3 for c in sub.feature_subsets_)
+    assert len({tuple(c) for c in sub.feature_subsets_}) > 1  # 멤버마다 다르다
+    assert not np.allclose(proba, full.predict_proba(X[90:]))
+    # greedy: fold와 마지막 fit에서 같은 멤버는 같은 열을 쓴다 (멤버 seed로 정한다)
+    greedy = GreedyEnsembleClassifier(
+        model, n_estimators=2, pool_size=5, n_folds=2, max_features_per_member=3
+    ).fit(X[:90], y[:90])
+    for prep, cols in zip(greedy.preprocessors_, greedy.feature_subsets_, strict=True):
+        assert np.array_equal(cols, feature_subset(8, 3, prep.member.seed + 4))
+    assert greedy.predict_proba(X[90:]).shape == (30, 2)
+    # DiagScale의 학습 episode도 같은 상한을 쓴다
+    clf = DiagScale(EnsembleClassifier(model, n_estimators=2, max_features_per_member=3), epochs=1)
+    assert clf.fit(X[:90], y[:90]).predict_proba(X[90:]).shape == (30, 2)

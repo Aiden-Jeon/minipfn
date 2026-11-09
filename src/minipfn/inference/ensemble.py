@@ -38,6 +38,9 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   학습 행으로 z-정규화하므로 따로 하지 않는다.
   범주형 열은 power 멤버처럼 번호 그대로다. recipe의 `MEMBER_KINDS_V2_5 = ("quantile", "robust")`
   (2.5가 Yeo-Johnson을 계속 쓰는지는 적혀 있지 않다)
+- (`max_features_per_member`를 주면) feature가 그보다 많은 표에서 멤버마다 그만큼의 원래 열을
+  무작위로 고른다(`minipfn.inference.preprocessing.feature_subset`, 공식 TabPFN 추론 코드의
+  `max_features_per_estimator`와 v2·2.5의 "random" 방법). 기본은 None(모든 열)
 - 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
@@ -75,7 +78,9 @@ from minipfn.inference.preprocessing import (
     Member,
     MemberPreprocessor,
     apply_encoder,
+    feature_subset,
     one_hot_kinds,
+    select_features,
     to_numeric,
 )
 from minipfn.priors.table_size import MAX_FEATURES
@@ -141,6 +146,7 @@ class _Base:
         member_kinds: tuple[str, ...] | str = DEFAULT_MEMBER_KINDS,
         softmax_temperature: float = SOFTMAX_TEMPERATURE,
         max_one_hot_width: int | None = None,
+        max_features_per_member: int | None = None,
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
@@ -153,6 +159,8 @@ class _Base:
         if max_one_hot_width is None:
             max_one_hot_width = max_features_of(model)
         self.max_one_hot_width = max_one_hot_width
+        # 멤버 하나가 쓰는 원래 feature 수 상한 (None이면 전부, `feature_subsets`)
+        self.max_features_per_member = max_features_per_member
         self.model = model
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -165,14 +173,19 @@ class _Base:
 
     def _fit_members(self, X: Any, members: list[Member]) -> None:
         X_num, self.cat_ix_, self.encoder_ = to_numeric(X, self.categorical_features_indices)
-        self.preprocessors_ = [
-            MemberPreprocessor(m, self.cat_ix_, self.max_one_hot_width).fit(X_num) for m in members
+        # 멤버마다 쓸 열 (feature가 상한보다 많을 때만. 멤버 seed로 정해 같은 멤버는 늘 같다)
+        self.feature_subsets_ = [
+            feature_subset(X_num.shape[1], self.max_features_per_member, m.seed + 4)
+            for m in members
         ]
-        # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
-        self.X_trains_ = [
-            prep.transform(X_num, np.random.default_rng(prep.member.seed + 2))
-            for prep in self.preprocessors_
-        ]
+        self.preprocessors_ = []
+        self.X_trains_ = []
+        for m, cols in zip(members, self.feature_subsets_, strict=True):
+            x, cat_ix = select_features(X_num, self.cat_ix_, cols)
+            prep = MemberPreprocessor(m, cat_ix, self.max_one_hot_width).fit(x)
+            self.preprocessors_.append(prep)
+            # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
+            self.X_trains_.append(prep.transform(x, np.random.default_rng(m.seed + 2)))
 
     def _model_targets(self, y: torch.Tensor) -> tuple[torch.Tensor, dict]:
         """모델에 줄 학습 행 정답 (1, 학습 행)과 forward에 더 줄 인자."""
@@ -185,7 +198,8 @@ class _Base:
         """멤버마다 (번호, 모델 입력 x (1, 학습 행 + 테스트 행, F), y_train (1, 학습 행))."""
         X_test = apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
         for i, (prep, y_train) in enumerate(zip(self.preprocessors_, y_trains, strict=True)):
-            x_test = prep.transform(X_test, np.random.default_rng(prep.member.seed + 3))
+            x_test, _ = select_features(X_test, self.cat_ix_, self.feature_subsets_[i])
+            x_test = prep.transform(x_test, np.random.default_rng(prep.member.seed + 3))
             x = np.concatenate([self.X_trains_[i], x_test])
             x = torch.as_tensor(x, dtype=torch.float32, device=self.device).unsqueeze(0)
             y = torch.as_tensor(y_train, dtype=torch.float32, device=self.device).unsqueeze(0)
