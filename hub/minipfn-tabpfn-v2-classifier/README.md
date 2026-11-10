@@ -38,7 +38,7 @@ This is not the official TabPFN v2 checkpoint, and it uses no official code or w
 - Compute: 8×H100 for steps 0–300k and 16×H100 for 300k–500k. About 35 hours of wall-clock time, roughly 370 H100-hours.
 - The loss collapsed suddenly 4 times. Each time, an automatic guard rewound to a healthy state saved 2k–4k steps earlier and resumed on fresh data.
 
-Figures and numbers on this card come from checkpoint `runs:/a1df9e34774d49e7869eb381bf65509b/checkpoints/step_0500000.pt`. It was trained in 100k-step chunks, each resuming the previous one. Train CE is the mean over 1,000 steps; every step samples new prior tables. Val CE is computed on 64 fixed prior tables every 5,000 steps. Final val CE is 0.740.
+Figures and numbers on this card come from the weights in this repo (`sha256:8642571d2504`, the first 12 hex digits of the SHA-256 of `model.safetensors`). It was trained in 100k-step chunks, each resuming the previous one. Train CE is the mean over 1,000 steps; every step samples new prior tables. Val CE is computed on 64 fixed prior tables every 5,000 steps. Final val CE is 0.740.
 
 ![Training curves](images/training_curves.png)
 
@@ -104,13 +104,13 @@ Add `--one-hot off,power,all` to also score the other one-hot modes. The headlin
 
 The checkpoints from the Results table are kept as branches of this repo. Each branch holds the weights, config and a short README that points back here; this card on `main` describes all of them.
 
-| Branch | Training checkpoint | Mean ROC AUC |
+| Branch | Weights | Mean ROC AUC |
 | --- | --- | --- |
-| `step-100k` | `runs:/8e83c33e525b4477ac7ca520974b448a/checkpoints/latest.pt` | 0.9175 |
-| `step-200k` | `runs:/630bf9cacfc14480b9c4a5c433f35c72/checkpoints/latest.pt` | 0.9225 |
-| `step-300k` | `runs:/56838e7535724969a298245e10639d8d/checkpoints/step_0300000.pt` | 0.9208 |
-| `step-400k` | `runs:/87a5aab6216e4908ad5247885fdad94f/checkpoints/step_0400000.pt` | 0.9197 |
-| `main` (500k) | `runs:/a1df9e34774d49e7869eb381bf65509b/checkpoints/step_0500000.pt` | 0.9238 |
+| `step-100k` | `sha256:52d1a1cbdfa7` | 0.9175 |
+| `step-200k` | `sha256:cba2d1645afc` | 0.9225 |
+| `step-300k` | `sha256:8921c9aa5e01` | 0.9208 |
+| `step-400k` | `sha256:a0e20b918710` | 0.9197 |
+| `main` (500k) | `sha256:8642571d2504` | 0.9238 |
 
 ```python
 clf = TabPFNv2Classifier("aiden-jeon/minipfn-tabpfn-v2-classifier@step-100k")
@@ -121,7 +121,7 @@ In the benchmark script, write the branch after `@`: `--classifier-path hf://aid
 ## Files
 
 - `model.safetensors`: weights
-- `config.json`: model size (`CellTransformerConfig` fields), task, and the training checkpoint the weights came from
+- `config.json`: model size (`CellTransformerConfig` fields) and task
 - `images/`: figures used in this card
 
 ## License

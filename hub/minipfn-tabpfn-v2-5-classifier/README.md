@@ -41,7 +41,7 @@ Compute: 8×H100 for 0–100k, 16×H100 for 100k–300k, 32×H100 for 300k–500
 
 **QK-clip.** Row-attention heads can grow their query–key logits without limit until all weight goes to one row (an attention sink). Layer inputs come out of a LayerNorm, so a head's logits are bounded by σ_max(W_qᵀW_k)·E/√d (E = emsize). Every 50 steps, any head whose bound exceeds τ has its W_q and W_k scaled down to meet it. The bound had reached about 2,500 by 100k, so τ was set to 3000 to stop further growth without cutting the trained attention; it started clipping at about 230k. This changes training only.
 
-Figures and numbers on this card come from checkpoint `runs:/62eab3b975c545689f7fa50488deb821/checkpoints/step_0020000.pt` (long tables), which started from `runs:/1bcc8d8dfbdb4cc695e1d8f2e78ebbe9/checkpoints/step_0500000.pt`. Train CE is the mean over 1,000 steps; every step samples new prior tables. Val CE is computed every 5,000 steps on fixed prior tables: 64 at the paper sizes (final 0.705) and 32 long tables in the second stage (final 0.499). The two val sets differ, so their values are not comparable. The spike near 445k is a collapse that the guard rewound.
+Figures and numbers on this card come from the long-table checkpoint in this repo (`sha256:833059512de5`, the first 12 hex digits of the SHA-256 of `model.safetensors`), which started from the 500k-step checkpoint (branch `step-500k`). Train CE is the mean over 1,000 steps; every step samples new prior tables. Val CE is computed every 5,000 steps on fixed prior tables: 64 at the paper sizes (final 0.705) and 32 long tables in the second stage (final 0.499). The two val sets differ, so their values are not comparable. The spike near 445k is a collapse that the guard rewound.
 
 ![Training curves](images/training_curves.png)
 
@@ -137,14 +137,14 @@ uv run python scripts/tabpfn_v2/eval.py --suite classification \
 
 The prior-fitting checkpoints from the Results table are kept as branches of this repo. Each branch holds the weights, config and a short README that points back here; this card on `main` describes all of them.
 
-| Branch | Training checkpoint | Mean ROC AUC |
+| Branch | Weights | Mean ROC AUC |
 | --- | --- | --- |
-| `step-100k` | `runs:/00e8ae4c5cbf4de1a89039b032fabb72/checkpoints/step_0100000.pt` | 0.9191 |
-| `step-200k` | `runs:/e18bbf4869644bae954190262751173a/checkpoints/step_0200000.pt` | 0.9279 |
-| `step-300k` | `runs:/78ed9e4fff3941b7a5b282afe0ed27fc/checkpoints/step_0300000.pt` | 0.9291 |
-| `step-400k` | `runs:/edc26725fa8b40ee876fc0a6b0f22d99/checkpoints/step_0400000.pt` | 0.9322 |
-| `step-500k` | `runs:/1bcc8d8dfbdb4cc695e1d8f2e78ebbe9/checkpoints/step_0500000.pt` | 0.9325 |
-| `main` (500k + long tables 20k) | `runs:/62eab3b975c545689f7fa50488deb821/checkpoints/step_0020000.pt` | 0.9343 |
+| `step-100k` | `sha256:8a5413649365` | 0.9191 |
+| `step-200k` | `sha256:53ff20811d73` | 0.9279 |
+| `step-300k` | `sha256:29121d7b1b19` | 0.9291 |
+| `step-400k` | `sha256:ddd895289539` | 0.9322 |
+| `step-500k` | `sha256:f279bedd1db9` | 0.9325 |
+| `main` (500k + long tables 20k) | `sha256:833059512de5` | 0.9343 |
 
 ```python
 clf = TabPFNv2_5Classifier("aiden-jeon/minipfn-tabpfn-v2-5-classifier@step-500k")
@@ -155,7 +155,7 @@ In the benchmark script, write the branch after `@`: `--classifier-path hf://aid
 ## Files
 
 - `model.safetensors`: weights
-- `config.json`: model size (`CellTransformerConfig` fields), task, inference settings, and the training checkpoint the weights came from
+- `config.json`: model size (`CellTransformerConfig` fields), task and inference settings
 - `images/`: figures used in this card
 
 ## License

@@ -49,6 +49,8 @@ WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 BORDERS_KEY = "borders"
 HUB_PREFIX = "hf://"
+# `download_artifact`가 받은 artifact를 적어 두는 파일 (같은 폴더에 다시 받지 않도록)
+DOWNLOADED_NAME = ".downloaded.json"
 # 모델 설정을 checkpoint에 남기기 전의 학습 run에서 꼭 있어야 하는 param
 _REQUIRED_RUN_PARAMS = ("emsize", "nlayers", "nhead")
 
@@ -83,7 +85,7 @@ def save_pretrained(
     model: nn.Module, borders: torch.Tensor | None, out_dir: str | Path, **extra
 ) -> Path:
     """`out_dir`에 `model.safetensors`와 `config.json`을 쓴다. `extra`는 config.json에 더 적는다
-    (`source`: 가중치를 만든 checkpoint, `inference`: 이 weight의 추론 설정)."""
+    (`inference`: 이 weight의 추론 설정)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tensors = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
@@ -173,10 +175,33 @@ def _v1_model(config: dict) -> RowTransformer:
     return RowTransformer(**{k: v for k, v in config.items() if k in names})
 
 
+def download_artifact(uri: str, dst: str | Path) -> Path:
+    """MLflow artifact(`runs:/<run_id>/<경로>`)를 `dst` 아래에 받아 그 경로를 돌려준다.
+
+    같은 `dst`에 같은 `uri`를 다 받아 둔 적이 있으면 다시 받지 않는다. 업로드 스크립트를 카드를
+    고친 뒤 다시 돌릴 때 큰 checkpoint를 또 받지 않도록. 기록은 다 받은 뒤에 쓰므로 받다 만
+    파일은 다시 쓰지 않는다."""
+    import mlflow
+
+    dst = Path(dst)
+    record = dst / DOWNLOADED_NAME
+    if record.is_file():
+        saved = json.loads(record.read_text())
+        if saved.get("uri") == uri and Path(saved["path"]).exists():
+            print(f"이미 받은 artifact를 다시 쓴다: {saved['path']}")
+            return Path(saved["path"])
+    dst.mkdir(parents=True, exist_ok=True)
+    record.unlink(missing_ok=True)
+    path = Path(mlflow.artifacts.download_artifacts(artifact_uri=uri, dst_path=str(dst)))
+    record.write_text(json.dumps({"uri": uri, "path": str(path)}) + "\n")
+    return path
+
+
 def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.Tensor | None]:
     """체크포인트를 CPU로 읽는다. `spec`은 다음 가운데 하나다.
 
-    - `runs:/<run_id>/<경로>`: 학습 run이 MLflow에 남긴 파일 또는 폴더 (`dst`로 받는다)
+    - `runs:/<run_id>/<경로>`: 학습 run이 MLflow에 남긴 파일 또는 폴더 (`dst`로 받는다. 같은
+      `dst`에 받아 둔 것이 있으면 다시 쓴다, `download_artifact`)
     - `hf://owner/name`: Hub repo (`save_pretrained`로 올린 것). `@<revision>`을 붙이면 그
       branch·tag·commit에서 받는다(예: `hf://owner/name@step-100k`)
     - `save_pretrained`로 만든 로컬 폴더, `minipfn.models.save_checkpoint`로 저장한 파일
@@ -195,7 +220,7 @@ def load_model(spec: str, task: str, dst: str | Path) -> tuple[nn.Module, torch.
     run_id, path = None, Path(spec)
     if spec.startswith("runs:/"):
         run_id = spec.removeprefix("runs:/").split("/", 1)[0]
-        path = Path(mlflow.artifacts.download_artifacts(artifact_uri=spec, dst_path=str(dst)))
+        path = download_artifact(spec, dst)
     elif not path.exists():
         raise SystemExit(f"{spec}가 없다 (Hub repo면 {HUB_PREFIX}owner/name으로 준다).")
     if path.is_dir():

@@ -36,8 +36,8 @@ def _training_state(tmp_path, model):
 
 def test_save_and_load_pretrained_keeps_weights_and_borders(tmp_path):
     clf = _model()
-    out = hub.save_pretrained(clf, None, tmp_path / "clf", source="runs:/abc/x.pt")
-    assert json.loads((out / hub.CONFIG_NAME).read_text())["source"] == "runs:/abc/x.pt"
+    out = hub.save_pretrained(clf, None, tmp_path / "clf", inference={"n_estimators": 2})
+    assert json.loads((out / hub.CONFIG_NAME).read_text())["inference"] == {"n_estimators": 2}
     loaded, borders = hub.from_pretrained(out)
     assert borders is None and not loaded.training
     _same_weights(clf, loaded)
