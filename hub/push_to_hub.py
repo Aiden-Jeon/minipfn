@@ -12,10 +12,10 @@
 
 - `tabpfn`: `save_tabpfn`으로 저장한 `tabpfn_final.pt`(파일 또는
   `runs:/<run_id>/model/tabpfn_final.pt`). 저장소 루트의 `NOTICE`(공식 TabPFN v1 코드의 저작권
-  표기)를 함께 올리고, 체크포인트는 `source.json`에 적는다(`minipfn.hub.tabpfn_v1` 참고).
+  표기)를 함께 올린다.
 - `tabpfn_v2`: `minipfn.hub.load_model`이 읽는 체크포인트면 무엇이든(v2·2.5, TabPFN-3·3.5 모델
-  포함). `--task`가 필요하다. 체크포인트는 `config.json`의 `source`에, 이 weight의 추론 설정(멤버
-  수, 멤버 전처리 종류)은 `inference`에 적는다. 추론 설정은 모델 종류의 recipe가 구조로 정하고
+  포함). `--task`가 필요하다. 이 weight의 추론 설정(멤버 수, 멤버 전처리 종류)은 `config.json`의
+  `inference`에 적는다. 추론 설정은 모델 종류의 recipe가 구조로 정하고
   (`minipfn.recipes.default_inference`: 2.5 구조면 v2.5, TabPFN-3.5면 standard 8개 등), 카드의
   수치를 다른 멤버 종류로 냈으면 `--member-kinds`로 준다.
 
@@ -25,14 +25,16 @@
 파일은 지운다. `--dry-run`이면 폴더만 만들고 올리지 않는다.
 
 공개 repo를 실수로 덮어쓰지 않도록 `--repo-id`는 기본값 없이 받는다. 카드의 그림과 수치가 다른
-체크포인트의 것이 되지 않도록, 카드에 `--checkpoint`가 `` `...` ``로 그대로 적혀 있어야 올린다
-(그림은 `scripts/<paper>/plot_card.py`로 다시 만든다). 이미 있는 repo의 공개 여부는 바꾸지
-않으므로, `--private`인데 repo가 공개면 올리지 않는다.
+체크포인트의 것이 되지 않도록, 바꾼 `model.safetensors`의 가중치 id(`` `sha256:<SHA-256 앞
+12자리>` ``)가 카드에 적혀 있어야 올린다(그림은 `scripts/<paper>/plot_card.py`로 다시 만든다).
+id는 체크포인트를 바꿔 봐야 알 수 있으므로 처음에는 `--dry-run`으로 돌려 출력된 id를 카드에
+적는다. 카드·Hub 파일·Hub commit 메시지에는 학습 run id(MLflow)를 남기지 않는다. 이미 있는
+repo의 공개 여부는 바꾸지 않으므로, `--private`인데 repo가 공개면 올리지 않는다.
 
 학습 중간 checkpoint는 `--revision step-100k`처럼 같은 repo의 branch로 올린다. `main`(모델 카드가
 설명하는 최종 가중치)을 먼저 올려 repo가 있어야 한다. branch는 repo의 첫 commit에서 만들어
 `main`의 카드와 그림을 물려받지 않고, 가중치·설정과 함께 그 step을 설명하는 짧은 README를 둔다.
-이때는 `main` 카드의 한 줄(중간 checkpoint 표의 행)에 branch와 `--checkpoint`가 함께 적혀
+이때는 `main` 카드의 한 줄(중간 checkpoint 표의 행)에 branch와 그 가중치 id가 함께 적혀
 있어야 한다 — branch 이름과 다른 step의 가중치가 올라가지 않도록. v2만 지원한다.
 """
 
@@ -48,7 +50,7 @@ import torch
 from huggingface_hub import HfApi
 
 # 스크립트 폴더(hub/)가 sys.path에 들어가므로 같은 폴더의 카드 동기화 스크립트를 그대로 쓴다.
-from sync_hub_card import card_images, names_checkpoint
+from sync_hub_card import WEIGHTS_NAME, card_images, file_sha256, names_weights, weights_id
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HUB_DIR = Path(__file__).resolve().parent
@@ -114,13 +116,13 @@ def resolve_model_card(repo_id: str, model_card: Path | None) -> Path:
     return card
 
 
-def check_card_checkpoint(card: Path, checkpoint: str, paper: str) -> None:
-    """카드의 그림과 수치가 올리는 체크포인트의 것인지 확인한다."""
-    if not names_checkpoint(card, checkpoint):
+def check_card_weights(card: Path, sha256: str, paper: str) -> None:
+    """카드의 그림과 수치가 올리는 가중치의 것인지 확인한다."""
+    if not names_weights(card.read_text(), sha256):
         raise SystemExit(
-            f"모델 카드에 `{checkpoint}`가 없습니다. 카드는 다른 체크포인트의 결과를 적고 있을 수"
-            f" 있으니 scripts/{paper}/plot_card.py로 그림을 다시 만들고 카드의 수치와 체크포인트를"
-            " 고쳐 주세요."
+            f"모델 카드에 가중치 id `{weights_id(sha256)}`가 없습니다. 이 체크포인트의 결과를 적은"
+            f" 카드라면 그 id를 카드에 적어 주세요. 다른 체크포인트의 결과라면"
+            f" scripts/{paper}/plot_card.py로 그림을 다시 만들고 카드의 수치와 id를 고쳐 주세요."
         )
 
 
@@ -152,7 +154,7 @@ def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
             " runs:/<run_id>/model/tabpfn_final.pt를 주세요."
         )
     model, config = tabpfn_from_state(state["config"], state["state_dict"])
-    save_pretrained(model, config, upload_dir, source=args.checkpoint)
+    save_pretrained(model, config, upload_dir)
     shutil.copy(NOTICE, upload_dir / "NOTICE")
     reloaded, _ = from_pretrained(upload_dir)
     return model, reloaded
@@ -169,7 +171,7 @@ def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path)
         inference["member_kinds"] = args.member_kinds
     inference["member_kinds"] = list(inference["member_kinds"])
     print("inference:", inference)
-    save_pretrained(model, borders, upload_dir, source=args.checkpoint, inference=inference)
+    save_pretrained(model, borders, upload_dir, inference=inference)
     reloaded, reloaded_borders = from_pretrained(upload_dir)
     if (borders is None) != (reloaded_borders is None) or (
         borders is not None and not torch.equal(borders.cpu(), reloaded_borders)
@@ -186,19 +188,29 @@ PREPARE = {"tabpfn": prepare_tabpfn, "tabpfn_v2": prepare_tabpfn_v2}
 FRONT_MATTER = re.compile(r"\A---\r?\n.*?^---[ \t]*(?:\r?\n|\Z)", re.S | re.M)
 
 
-def check_card_revision(card: Path, revision: str, checkpoint: str) -> None:
-    """main 카드의 한 줄에 branch와 체크포인트가 함께 있는지. 다른 step의 가중치를 막는다."""
-    if not any(
-        f"`{revision}`" in line and f"`{checkpoint}`" in line
-        for line in card.read_text().splitlines()
-    ):
+def revision_lines(card: Path, revision: str) -> list[str]:
+    """main 카드에서 branch를 적은 줄 (중간 checkpoint 표의 행)."""
+    return [line for line in card.read_text().splitlines() if f"`{revision}`" in line]
+
+
+def check_card_revision(card: Path, revision: str, sha256: str | None = None) -> None:
+    """main 카드의 한 줄에 branch와 가중치 id가 함께 있는지. 다른 step의 가중치를 막는다.
+
+    `sha256`이 없으면(체크포인트를 받기 전) branch의 행이 있는지만 본다."""
+    lines = revision_lines(card, revision)
+    if not lines:
         raise SystemExit(
-            f"모델 카드에 `{revision}`와 `{checkpoint}`를 함께 적은 줄이 없습니다. 카드의 중간"
-            " checkpoint 표에 그 branch의 행을 추가하거나 branch 이름을 확인해 주세요."
+            f"모델 카드에 `{revision}`를 적은 줄이 없습니다. 카드의 중간 checkpoint 표에 그"
+            " branch의 행을 추가하거나 branch 이름을 확인해 주세요."
+        )
+    if sha256 is not None and not any(names_weights(line, sha256) for line in lines):
+        raise SystemExit(
+            f"모델 카드에 `{revision}`와 가중치 id `{weights_id(sha256)}`를 함께 적은 줄이"
+            " 없습니다. 그 branch의 행에 이 id를 적거나 branch 이름·체크포인트를 확인해 주세요."
         )
 
 
-def revision_card(model_card: Path, repo_id: str, revision: str, checkpoint: str) -> str:
+def revision_card(model_card: Path, repo_id: str, revision: str, sha256: str) -> str:
     """중간 checkpoint branch의 README. main 카드의 front matter를 그대로 쓰고 본문은 짧게 둔다."""
     match = FRONT_MATTER.match(model_card.read_text())
     front = match.group(0).rstrip() + "\n\n" if match else ""
@@ -207,7 +219,8 @@ def revision_card(model_card: Path, repo_id: str, revision: str, checkpoint: str
         f"{front}# {repo_id} @ `{revision}`\n\n"
         f"An intermediate training checkpoint, kept for comparison. The model card, benchmark"
         f" numbers for every checkpoint, and usage are on the [main branch]({url}).\n\n"
-        f"Weights come from checkpoint `{checkpoint}`.\n\n"
+        f"Weights: `{weights_id(sha256)}` (first 12 hex digits of the SHA-256 of"
+        f" `{WEIGHTS_NAME}`).\n\n"
         "```python\n"
         "from minipfn import from_pretrained\n\n"
         f'model, borders = from_pretrained("{repo_id}", revision="{revision}")\n'
@@ -225,12 +238,11 @@ def create_revision(api: HfApi, repo_id: str, revision: str) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    # 큰 artifact를 받기 전에 카드부터 확인한다.
+    # 큰 artifact를 받기 전에 카드부터 확인한다. 가중치 id는 체크포인트를 바꾼 뒤에 본다.
     model_card = resolve_model_card(args.repo_id, args.model_card)
     images = card_images(model_card)
-    check_card_checkpoint(model_card, args.checkpoint, args.paper)
     if args.revision is not None:
-        check_card_revision(model_card, args.revision, args.checkpoint)
+        check_card_revision(model_card, args.revision)
     api = None if args.dry_run else HfApi()
     if api is not None:
         check_visibility(api, args.repo_id, args.private)
@@ -249,13 +261,19 @@ def main(argv: list[str] | None = None) -> None:
     ):
         if not torch.equal(a.cpu(), b.cpu()):
             raise RuntimeError(f"변환한 가중치가 원본과 다릅니다: {name}")
+    sha256 = file_sha256(upload_dir / WEIGHTS_NAME)
+    print("weights:", weights_id(sha256))
+    if args.revision is None:
+        check_card_weights(model_card, sha256, args.paper)
+    else:
+        check_card_revision(model_card, args.revision, sha256)
     if args.revision is None:
         shutil.copy(model_card, upload_dir / "README.md")
         for rel in images:
             (upload_dir / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(model_card.parent / rel, upload_dir / rel)
     else:
-        card = revision_card(model_card, args.repo_id, args.revision, args.checkpoint)
+        card = revision_card(model_card, args.repo_id, args.revision, sha256)
         (upload_dir / "README.md").write_text(card)
     prepared = sorted(str(p.relative_to(upload_dir)) for p in upload_dir.rglob("*") if p.is_file())
     print("prepared:", prepared)
@@ -271,7 +289,7 @@ def main(argv: list[str] | None = None) -> None:
         repo_id=args.repo_id,
         folder_path=upload_dir,
         revision=args.revision,
-        commit_message=f"Upload {TITLE[args.paper]} weights from {args.checkpoint}",
+        commit_message=f"Upload {TITLE[args.paper]} weights {weights_id(sha256)}",
         delete_patterns=["images/*"],
     )
     print("uploaded:", commit.commit_url)

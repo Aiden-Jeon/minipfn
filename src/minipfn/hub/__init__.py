@@ -83,7 +83,7 @@ def save_pretrained(
     model: nn.Module, borders: torch.Tensor | None, out_dir: str | Path, **extra
 ) -> Path:
     """`out_dir`에 `model.safetensors`와 `config.json`을 쓴다. `extra`는 config.json에 더 적는다
-    (`source`: 가중치를 만든 checkpoint, `inference`: 이 weight의 추론 설정)."""
+    (`inference`: 이 weight의 추론 설정)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tensors = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}

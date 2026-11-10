@@ -1,9 +1,8 @@
 """학습한 TabPFN을 Hugging Face Hub에 올리고 받는다.
 
 Hub에는 pickle 없이 읽을 수 있도록 가중치는 `model.safetensors`, 설정은 `config.json`으로 둔다.
-가중치를 만든 체크포인트는 `source.json`에 따로 적는다. `config.json`에 넣지 않는 까닭은 예전에
-설치한 minipfn의 `from_pretrained`가 `config.json`을 `TabPFNConfig(**config)`로 읽어서, 모르는
-키가 있으면 깨지기 때문이다.
+`config.json`에는 `TabPFNConfig` 필드만 둔다. 예전에 설치한 minipfn의 `from_pretrained`가
+`config.json`을 `TabPFNConfig(**config)`로 읽어서, 모르는 키가 있으면 깨지기 때문이다.
 
     from minipfn.hub.tabpfn_v1 import from_pretrained
     model, config = from_pretrained()  # aiden-jeon/minipfn-tabpfn-v1
@@ -26,20 +25,15 @@ from minipfn.recipes.tabpfn_v1 import HUB_REPO, TabPFNConfig, tabpfn_from_state
 HUB_REPO_ID = HUB_REPO
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
-SOURCE_NAME = "source.json"
 
 
-def save_pretrained(
-    model: torch.nn.Module, config: TabPFNConfig, out_dir: str | Path, source: str | None = None
-) -> Path:
-    """`out_dir`에 `model.safetensors`와 `config.json`을, `source`를 주면 `source.json`도 쓴다."""
+def save_pretrained(model: torch.nn.Module, config: TabPFNConfig, out_dir: str | Path) -> Path:
+    """`out_dir`에 `model.safetensors`와 `config.json`을 쓴다."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_dict = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
     save_file(state_dict, out_dir / WEIGHTS_NAME)
     (out_dir / CONFIG_NAME).write_text(json.dumps(asdict(config), indent=2) + "\n")
-    if source is not None:
-        (out_dir / SOURCE_NAME).write_text(json.dumps({"source": source}, indent=2) + "\n")
     return out_dir
 
 

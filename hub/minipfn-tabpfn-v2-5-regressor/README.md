@@ -44,7 +44,7 @@ Two training changes from our TabPFN v2 regressor carry over; neither is in the 
 - **Dequantized targets.** Held-out targets that repeat within a table are spread uniformly over the 100 neighbouring buckets during training, so a discrete target does not push the output layer to grow without bound. Validation uses the original targets.
 - **QK-clip (τ = 250).** Row-attention heads can grow their query–key logits until all weight goes to one row (an attention sink). Every 50 steps, any head whose logit bound σ_max(W_qᵀW_k)·E/√d exceeds 250 has its W_q and W_k scaled down to meet it. The bound reached 250 at about 30k and stayed capped. This changes training only.
 
-Figures and numbers on this card come from checkpoint `runs:/544cea90fe364d3c8bca1880e4e2aa59/checkpoints/step_0020000.pt` (long tables), which started from `runs:/837ee152f75e42419f47beb9cbdbc43c/checkpoints/step_0500000.pt`. Train NLL is the mean over 1,000 steps; every step samples new prior tables. Val NLL is computed every 5,000 steps on fixed prior tables: 64 at the paper sizes (final −1.405) and 32 long tables in the second stage (final −1.680). The two val sets differ, so their values are not comparable.
+Figures and numbers on this card come from the long-table checkpoint in this repo (`sha256:bd16883255f1`, the first 12 hex digits of the SHA-256 of `model.safetensors`), which started from the 500k-step checkpoint (branch `step-500k`). Train NLL is the mean over 1,000 steps; every step samples new prior tables. Val NLL is computed every 5,000 steps on fixed prior tables: 64 at the paper sizes (final −1.405) and 32 long tables in the second stage (final −1.680). The two val sets differ, so their values are not comparable.
 
 ![Training curves](images/training_curves.png)
 
@@ -147,14 +147,14 @@ uv run python scripts/tabpfn_v2/eval.py --suite regression \
 
 The prior-fitting checkpoints from the Results table are kept as branches of this repo. Each branch holds the weights, config and a short README that points back here; this card on `main` describes all of them.
 
-| Branch | Training checkpoint | RMSE ratio, geo. mean |
+| Branch | Weights | RMSE ratio, geo. mean |
 | --- | --- | --- |
-| `step-100k` | `runs:/a70966f2a47f428f9261a33a6e6e2662/checkpoints/step_0100000.pt` | 1.127 |
-| `step-200k` | `runs:/254f42f84f4b46b9ad478dd958503ccd/checkpoints/step_0200000.pt` | 1.129 |
-| `step-300k` | `runs:/0d55244e39c54ad8b4f1dfeccd89f50e/checkpoints/step_0300000.pt` | 1.128 |
-| `step-400k` | `runs:/69f62dfc19eb41159924949f1d75fdbd/checkpoints/step_0400000.pt` | 1.109 |
-| `step-500k` | `runs:/837ee152f75e42419f47beb9cbdbc43c/checkpoints/step_0500000.pt` | 1.102 |
-| `main` (500k + long tables 20k) | `runs:/544cea90fe364d3c8bca1880e4e2aa59/checkpoints/step_0020000.pt` | 1.105 |
+| `step-100k` | `sha256:91eadcb0d28d` | 1.127 |
+| `step-200k` | `sha256:8873ec91bcdc` | 1.129 |
+| `step-300k` | `sha256:eb652f32b2fc` | 1.128 |
+| `step-400k` | `sha256:dc3bcc028381` | 1.109 |
+| `step-500k` | `sha256:7d7471cb23c5` | 1.102 |
+| `main` (500k + long tables 20k) | `sha256:bd16883255f1` | 1.105 |
 
 ```python
 reg = TabPFNv2_5Regressor("aiden-jeon/minipfn-tabpfn-v2-5-regressor@step-500k")
@@ -165,7 +165,7 @@ In the benchmark script, write the branch after `@`: `--regressor-path hf://aide
 ## Files
 
 - `model.safetensors`: weights and bucket borders
-- `config.json`: model size (`CellTransformerConfig` fields), task, inference settings, and the training checkpoint the weights came from
+- `config.json`: model size (`CellTransformerConfig` fields), task and inference settings
 - `images/`: figures used in this card
 
 ## License

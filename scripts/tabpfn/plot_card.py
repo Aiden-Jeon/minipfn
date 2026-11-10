@@ -6,8 +6,8 @@
 
 학습 run의 `history.json`과 평가 run의 `eval/eval_per_dataset.csv`(`eval.py`가 남긴다)를
 내려받아 `--out-dir`(기본 `hub/minipfn-tabpfn-v1/images/`)에 두 그림을 쓴다. `--eval-run-id`를
-주지 않으면 학습 run의 `eval_table1/eval_per_dataset.csv`를 읽는다(지금 카드의 run
-`977614dce2104e44915f81b02705a178`처럼 평가를 학습 run에 남기던 때의 위치).
+주지 않으면 학습 run의 `eval_table1/eval_per_dataset.csv`를 읽는다(지금 카드의 run처럼 평가를
+학습 run에 남기던 때의 위치).
 
 - `training_curves.png`: train CE(25 step 평균)와 val CE, val accuracy
 - `table1_roc_auc.png`: Table 1 데이터셋별 ROC AUC, TabPFN과 sklearn 기본값 중 가장 좋은 것

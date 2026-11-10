@@ -178,7 +178,7 @@ Hub의 가중치에는 optimizer 상태가 없어서 이어서 학습하는 데 
 
 ### Hugging Face Hub에 올리기
 
-`hub/`에는 Hub repo마다 모델 카드 폴더(`hub/<repo 이름>/README.md`와 `images/`)를 두고, Hub에 올리는 스크립트도 함께 둡니다. `hub/push_to_hub.py`는 v1·v2 체크포인트를 `model.safetensors`와 `config.json`으로 바꾸고 카드를 붙여 올립니다. 카드의 그림과 수치가 다른 체크포인트의 것이 되지 않도록, 카드에 `--checkpoint`가 백틱(`` ` ``)으로 감싸 그대로 적혀 있어야 올립니다. 가중치를 만든 체크포인트는 Hub에도 남깁니다(v2는 `config.json`의 `source`, v1은 `source.json`). 카드만 동기화할 때도 이 값과 카드를 맞춰 봅니다. 그림은 논문별 `scripts/<paper>/plot_card.py`로 다시 만듭니다. 다른 카드는 `--model-card`로 줍니다.
+`hub/`에는 Hub repo마다 모델 카드 폴더(`hub/<repo 이름>/README.md`와 `images/`)를 두고, Hub에 올리는 스크립트도 함께 둡니다. `hub/push_to_hub.py`는 v1·v2 체크포인트를 `model.safetensors`와 `config.json`으로 바꾸고 카드를 붙여 올립니다. 카드의 그림과 수치가 다른 체크포인트의 것이 되지 않도록, 바꾼 `model.safetensors`의 가중치 id(`` `sha256:<SHA-256 앞 12자리>` ``)가 카드에 적혀 있어야 올립니다. id는 `--dry-run`이 출력합니다. 카드만 동기화할 때도 Hub에 올라가 있는 `model.safetensors`의 SHA-256과 카드를 맞춰 봅니다. 카드와 Hub에는 MLflow run id를 적지 않습니다. 그림은 논문별 `scripts/<paper>/plot_card.py`로 다시 만듭니다. 다른 카드는 `--model-card`로 줍니다.
 
 ```bash
 uv run python scripts/tabpfn/plot_card.py --run-id <학습 run_id> --eval-run-id <평가 run_id>

@@ -44,7 +44,7 @@ Three changes that are not in the paper keep regression training stable. Earlier
 - **QK-clip (τ = 250).** Row attention heads learn to send almost all their weight to one row (an attention sink) by growing the query–key logits without limit. Layer inputs come out of a LayerNorm, so every token has norm √E (E = emsize), and a head's logits are bounded by σ_max(W_qᵀW_k)·E/√d. Every 50 steps, any attention head whose bound exceeds 250 has its W_q and W_k scaled down to meet it. The first layer's feature attention is skipped because its inputs are not normalized. This changes only training; the architecture and inference stay as in the paper.
 - **Collapse guard.** If the loss jumps and stays high, training rewinds to a healthy in-memory snapshot and continues on fresh data. It never fired in this run.
 
-Figures and numbers on this card come from checkpoint `runs:/0b8800ff3ff741f59996c6265e2d8771/checkpoints/step_0500000.pt`. It was trained in 100k-step chunks, each resuming the previous one. Train NLL is the mean over 1,000 steps; every step samples new prior tables. Val NLL is computed on 64 fixed prior tables every 5,000 steps. Final val NLL is −1.401.
+Figures and numbers on this card come from the weights in this repo (`sha256:2c205bace1d1`, the first 12 hex digits of the SHA-256 of `model.safetensors`). It was trained in 100k-step chunks, each resuming the previous one. Train NLL is the mean over 1,000 steps; every step samples new prior tables. Val NLL is computed on 64 fixed prior tables every 5,000 steps. Final val NLL is −1.401.
 
 ![Training curves](images/training_curves.png)
 
@@ -108,13 +108,13 @@ Add `--one-hot off,power,all` to also score the other one-hot modes. The headlin
 
 The checkpoints from the Results table are kept as branches of this repo. Each branch holds the weights, bucket borders, config and a short README that points back here; this card on `main` describes all of them.
 
-| Branch | Training checkpoint | RMSE ratio, geo. mean |
+| Branch | Weights | RMSE ratio, geo. mean |
 | --- | --- | --- |
-| `step-100k` | `runs:/332757a95eb84dd1be8024857cc38e67/checkpoints/step_0100000.pt` | 1.167 |
-| `step-200k` | `runs:/907e98c6a3054eceb1804f42c4780926/checkpoints/step_0200000.pt` | 1.183 |
-| `step-300k` | `runs:/5f8d224cc0da44508a4b20ada64bc404/checkpoints/step_0300000.pt` | 1.159 |
-| `step-400k` | `runs:/de823880b51740259b2a4fc19ff3bb8d/checkpoints/step_0400000.pt` | 1.172 |
-| `main` (500k) | `runs:/0b8800ff3ff741f59996c6265e2d8771/checkpoints/step_0500000.pt` | 1.118 |
+| `step-100k` | `sha256:32de217b027e` | 1.167 |
+| `step-200k` | `sha256:d1021734f535` | 1.183 |
+| `step-300k` | `sha256:afb7457953c6` | 1.159 |
+| `step-400k` | `sha256:24e07260753f` | 1.172 |
+| `main` (500k) | `sha256:2c205bace1d1` | 1.118 |
 
 ```python
 reg = TabPFNv2Regressor("aiden-jeon/minipfn-tabpfn-v2-regressor@step-100k")
@@ -125,7 +125,7 @@ In the benchmark script, write the branch after `@`: `--regressor-path hf://aide
 ## Files
 
 - `model.safetensors`: weights and the 5,001 bucket borders (`borders`)
-- `config.json`: model size (`CellTransformerConfig` fields), task, and the training checkpoint the weights came from
+- `config.json`: model size (`CellTransformerConfig` fields) and task
 - `images/`: figures used in this card
 
 ## License
