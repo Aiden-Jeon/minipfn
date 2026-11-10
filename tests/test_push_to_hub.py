@@ -30,7 +30,9 @@ def no_download(monkeypatch):
     def fail(**kwargs):
         raise AssertionError("카드 확인 전에 artifact를 받으면 안 된다")
 
-    monkeypatch.setattr(push.mlflow.artifacts, "download_artifacts", fail)
+    import mlflow
+
+    monkeypatch.setattr(mlflow.artifacts, "download_artifacts", fail)
 
 
 def _card(tmp_path, sha256="0" * 64):
@@ -58,9 +60,27 @@ def test_default_model_card_follows_repo_name():
 def test_cards_name_the_weights_they_describe():
     v1 = (push.HUB_DIR / "minipfn-tabpfn-v1" / "README.md").read_text()
     v2 = (push.HUB_DIR / "minipfn-tabpfn-v2-classifier" / "README.md").read_text()
-    assert sync_hub_card.names_weights(v1, V1_WEIGHTS)
-    assert sync_hub_card.names_weights(v2, V2_WEIGHTS)
-    assert not sync_hub_card.names_weights(v1, V2_WEIGHTS)
+    assert sync_hub_card.names_main_weights(v1, V1_WEIGHTS)
+    assert sync_hub_card.names_main_weights(v2, V2_WEIGHTS)
+    assert not sync_hub_card.names_main_weights(v1, V2_WEIGHTS)
+
+
+def test_branch_rows_do_not_pass_for_main_and_body_lines_do_not_pass_for_branches():
+    # main 카드의 표에는 모든 branch의 id가 있다. 중간 step 가중치가 main으로 통과하면 안 된다
+    v2 = (push.HUB_DIR / "minipfn-tabpfn-v2-classifier" / "README.md").read_text()
+    step_100k = sync_hub_card.branch_rows(v2)["step-100k"][0].split("`sha256:")[1][:12]
+    assert not sync_hub_card.names_main_weights(v2, step_100k + "0" * 52)
+    assert sync_hub_card.names_branch_weights(v2, "step-100k", step_100k + "0" * 52)
+    # 2.5 카드 본문은 `step-500k`와 main id를 한 줄에 적는다. main 가중치가 step-500k로 통과하면
+    # 안 된다
+    v25 = (push.HUB_DIR / "minipfn-tabpfn-v2-5-classifier" / "README.md").read_text()
+    main = "833059512de597c4edf6509e99a4d10765b2c8331fb1e621f8d66f39ad61a137"
+    assert any(
+        "`step-500k`" in line and "`sha256:833059512de5`" in line for line in v25.split("\n")
+    )
+    assert sync_hub_card.names_main_weights(v25, main)
+    assert not sync_hub_card.names_branch_weights(v25, "step-500k", main)
+    assert sync_hub_card.names_branch_weights(v25, "main", main)
 
 
 @pytest.mark.parametrize("card", CARDS, ids=lambda p: p.parent.name)
@@ -104,7 +124,7 @@ def test_weights_not_on_card_fail_with_the_id_to_write(tmp_path):
     save_checkpoint(checkpoint, model, None)
     expected = sync_hub_card.weights_id(_v2_weights(tmp_path, model))
     out = tmp_path / "out"
-    with pytest.raises(SystemExit, match=f"모델 카드에 가중치 id `{expected}`가 없습니다"):
+    with pytest.raises(SystemExit, match=f"main 가중치로 id `{expected}`가 없습니다"):
         push.main(
             ["--paper", "tabpfn_v2", "--task", "classification", "--checkpoint", checkpoint]
             + ["--repo-id", "a/b", "--model-card", str(_card(tmp_path)), "--out-dir", str(out)]
@@ -271,22 +291,29 @@ def test_v2_revision_dry_run_writes_a_short_card(tmp_path, monkeypatch):
         assert torch.equal(a, b), name
 
 
-def test_revision_must_sit_on_the_same_card_line_as_its_weights(tmp_path, no_download):
-    main, step = "a" * 64, "b" * 64
+def test_revision_needs_its_weights_on_its_table_row(tmp_path, no_download):
+    main, step, step_200k = "a" * 64, "b" * 64, "e" * 64
     card = tmp_path / "README.md"
     card.write_text(
-        f"Main `{sync_hub_card.weights_id(main)}`.\n"
+        f"Main `{sync_hub_card.weights_id(main)}` continued `step-200k`"
+        f" (`{sync_hub_card.weights_id(step_200k)}`).\n"
         f"| `step-100k` | `{sync_hub_card.weights_id(step)}` |\n"
+        f"| `main` (500k) | `{sync_hub_card.weights_id(main)}` |\n"
     )
-    # 카드에 없는 branch는 체크포인트를 받기 전에 막는다
+    # 표에 행이 없는 branch는 체크포인트를 받기 전에 막는다 (본문에만 적힌 branch 포함)
     base = ["--paper", "tabpfn_v2", "--task", "classification", "--repo-id", "a/b"]
     base += ["--model-card", str(card), "--dry-run", "--checkpoint", "runs:/a/x.pt"]
-    with pytest.raises(SystemExit, match="적은 줄이 없습니다"):
-        push.main(base + ["--revision", "step-200k"])
+    for revision in ("step-200k", "step-300k"):
+        with pytest.raises(SystemExit, match=f"`{revision}` 행이 없습니다"):
+            push.main(base + ["--revision", revision])
     push.check_card_revision(card, "step-100k")
     push.check_card_revision(card, "step-100k", step)
-    with pytest.raises(SystemExit, match="함께 적은 줄"):
+    with pytest.raises(SystemExit, match="행에 가중치 id"):
         push.check_card_revision(card, "step-100k", main)
+    # main 확인은 다른 branch의 행을 치지 않는다
+    push.check_card_weights(card, main, "tabpfn_v2")
+    with pytest.raises(SystemExit, match="main 가중치로"):
+        push.check_card_weights(card, step, "tabpfn_v2")
     with pytest.raises(SystemExit):
         push.parse_args(
             ["--paper", "tabpfn", "--checkpoint", "x", "--repo-id", "a/b", "--revision", "s"]
@@ -350,23 +377,39 @@ def test_private_push_to_an_existing_public_repo_is_refused():
 
 
 class _PathsApi:
-    """`get_paths_info`만 흉내 낸 HfApi. `sha256`이 None이면 repo에 가중치가 없다."""
+    """`get_paths_info`·`list_repo_refs`만 흉내 낸 HfApi. `sha256`은 main 가중치(None이면 없음),
+    `branches`는 branch마다 가중치의 SHA-256. `lfs=False`면 LFS가 아닌 일반 파일로 올라가 있다."""
 
-    def __init__(self, sha256, exists=True):
+    def __init__(self, sha256, exists=True, branches=None, lfs=True):
         self.sha256, self.exists, self.uploads = sha256, exists, []
+        self.branches, self.lfs = dict(branches or {}), lfs
 
     def repo_exists(self, repo_id):
         return self.exists
 
+    def list_repo_refs(self, repo_id):
+        class Ref:
+            def __init__(self, name):
+                self.name = name
+
+        class Refs:
+            branches = [Ref(name) for name in ["main", *self.branches]]
+
+        return Refs()
+
     def get_paths_info(self, repo_id, paths, revision=None):
+        sha256 = self.sha256 if revision in (None, "main") else self.branches[revision]
+
         class Lfs:
-            sha256 = self.sha256
+            pass
+
+        Lfs.sha256 = sha256
 
         class Info:
             path = "model.safetensors"
-            lfs = Lfs()
+            lfs = Lfs() if self.lfs else None
 
-        return [] if self.sha256 is None else [Info()]
+        return [] if sha256 is None else [Info()]
 
     def upload_folder(self, **kwargs):
         self.uploads.append(kwargs)
@@ -380,6 +423,11 @@ class _PathsApi:
 def test_hub_weights_sha256_reads_the_lfs_hash():
     assert sync_hub_card.hub_weights_sha256(_PathsApi("c" * 64), "a/b") == "c" * 64
     assert sync_hub_card.hub_weights_sha256(_PathsApi(None), "a/b") is None
+    api = _PathsApi("c" * 64, branches={"step-100k": "d" * 64})
+    assert sync_hub_card.hub_weights_sha256(api, "a/b", "step-100k") == "d" * 64
+    # 가중치가 있는데 LFS 정보가 없으면 확인 없이 넘어가지 않는다
+    with pytest.raises(SystemExit, match="LFS SHA-256이 없어"):
+        sync_hub_card.hub_weights_sha256(_PathsApi("c" * 64, lfs=False), "a/b")
 
 
 def test_sync_needs_the_hub_weights_on_the_card(tmp_path, monkeypatch):
@@ -396,6 +444,64 @@ def test_sync_needs_the_hub_weights_on_the_card(tmp_path, monkeypatch):
     api.sha256 = None
     sync_hub_card.main(argv)
     assert len(api.uploads) == 2
+
+
+def test_sync_checks_branch_rows_against_hub_branches(tmp_path, monkeypatch):
+    main, step = "c" * 64, "d" * 64
+    card = _card(tmp_path, main)
+    card.write_text(
+        card.read_text()
+        + f"| `step-100k` | `{sync_hub_card.weights_id(step)}` | 0.9 |\n"
+        + f"| `step-200k` | `{sync_hub_card.weights_id('e' * 64)}` | 0.9 |\n"
+        + f"| `main` (500k) | `{sync_hub_card.weights_id(main)}` | 0.9 |\n"
+    )
+    argv = ["--card-dir", str(card.parent), "--repo-id", "a/b", "--dry-run"]
+    # step-200k는 Hub에 아직 없어 건너뛴다 (카드에 행을 먼저 넣고 나중에 올린다)
+    api = _PathsApi(main, branches={"step-100k": step})
+    monkeypatch.setattr(sync_hub_card, "HfApi", lambda: api)
+    sync_hub_card.main(argv)
+    assert sync_hub_card.check_branch_rows(api, "a/b", card.read_text()) == ["step-100k"]
+    # 카드의 step-100k 행이 Hub의 그 branch와 다르다 (오타, 다른 step의 가중치)
+    api.branches["step-100k"] = "f" * 64
+    with pytest.raises(SystemExit, match="`step-100k` 행이 Hub step-100k branch"):
+        sync_hub_card.main(argv)
+
+
+def test_runs_checkpoint_is_downloaded_once_per_out_dir(tmp_path, monkeypatch):
+    # 카드에 id가 없어 멈춘 뒤 카드를 고쳐 다시 돌려도 큰 checkpoint를 또 받지 않는다
+    import mlflow
+
+    from minipfn.hub.tabpfn_v1 import save_pretrained
+    from minipfn.recipes.tabpfn_v1 import TabPFNConfig, build_tabpfn_model, save_tabpfn
+
+    config = TabPFNConfig.smoke()
+    torch.manual_seed(0)
+    model = build_tabpfn_model(config)
+    source = tmp_path / "remote" / "tabpfn_final.pt"
+    source.parent.mkdir()
+    save_tabpfn(model, config, str(source))
+    calls = []
+
+    def download(artifact_uri, dst_path):
+        calls.append(artifact_uri)
+        dst = Path(dst_path) / source.name
+        dst.write_bytes(source.read_bytes())
+        return str(dst)
+
+    monkeypatch.setattr(mlflow.artifacts, "download_artifacts", download)
+    card = _card(tmp_path)
+    argv = ["--paper", "tabpfn", "--checkpoint", "runs:/r/model/tabpfn_final.pt"]
+    argv += ["--repo-id", "a/b", "--model-card", str(card), "--out-dir", str(tmp_path / "out")]
+    argv += ["--dry-run"]
+    with pytest.raises(SystemExit, match="main 가중치로 id"):
+        push.main(argv)
+    expected = save_pretrained(model, config, tmp_path / "expected") / "model.safetensors"
+    card.write_text(f"weights `{sync_hub_card.weights_id(sync_hub_card.file_sha256(expected))}`\n")
+    push.main(argv)
+    assert calls == ["runs:/r/model/tabpfn_final.pt"]
+    # 다른 체크포인트는 새로 받는다 (이 가짜 download는 같은 파일을 주므로 카드 확인은 통과한다)
+    push.main([*argv[:3], "runs:/other/model/tabpfn_final.pt", *argv[4:]])
+    assert calls == ["runs:/r/model/tabpfn_final.pt", "runs:/other/model/tabpfn_final.pt"]
 
 
 def test_v3_inference_comes_from_its_recipe(tmp_path):

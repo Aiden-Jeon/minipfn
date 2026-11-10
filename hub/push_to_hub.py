@@ -28,7 +28,9 @@
 체크포인트의 것이 되지 않도록, 바꾼 `model.safetensors`의 가중치 id(`` `sha256:<SHA-256 앞
 12자리>` ``)가 카드에 적혀 있어야 올린다(그림은 `scripts/<paper>/plot_card.py`로 다시 만든다).
 id는 체크포인트를 바꿔 봐야 알 수 있으므로 처음에는 `--dry-run`으로 돌려 출력된 id를 카드에
-적는다. 카드·Hub 파일·Hub commit 메시지에는 학습 run id(MLflow)를 남기지 않는다. 이미 있는
+적는다. `runs:/` 체크포인트는 `--out-dir`에 받아 두고 다음 실행에서 다시 쓰므로, 카드를 고친 뒤
+다시 돌려도 또 받지 않는다. 중간 checkpoint 표의 다른 branch 행에 적힌 id는 main의 확인에 치지
+않는다. 카드·Hub 파일·Hub commit 메시지에는 학습 run id(MLflow)를 남기지 않는다. 이미 있는
 repo의 공개 여부는 바꾸지 않으므로, `--private`인데 repo가 공개면 올리지 않는다.
 
 학습 중간 checkpoint는 `--revision step-100k`처럼 같은 repo의 branch로 올린다. `main`(모델 카드가
@@ -45,12 +47,20 @@ import re
 import shutil
 from pathlib import Path
 
-import mlflow
 import torch
 from huggingface_hub import HfApi
 
 # 스크립트 폴더(hub/)가 sys.path에 들어가므로 같은 폴더의 카드 동기화 스크립트를 그대로 쓴다.
-from sync_hub_card import WEIGHTS_NAME, card_images, file_sha256, names_weights, weights_id
+from sync_hub_card import (
+    WEIGHTS_ID_HEX,
+    WEIGHTS_NAME,
+    branch_rows,
+    card_images,
+    file_sha256,
+    names_branch_weights,
+    names_main_weights,
+    weights_id,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HUB_DIR = Path(__file__).resolve().parent
@@ -117,11 +127,13 @@ def resolve_model_card(repo_id: str, model_card: Path | None) -> Path:
 
 
 def check_card_weights(card: Path, sha256: str, paper: str) -> None:
-    """카드의 그림과 수치가 올리는 가중치의 것인지 확인한다."""
-    if not names_weights(card.read_text(), sha256):
+    """카드의 그림과 수치가 올리는 가중치의 것인지 확인한다. 중간 checkpoint 표에서 다른 branch의
+    행에 적힌 id는 치지 않는다 (중간 step의 가중치가 main으로 올라가지 않도록)."""
+    if not names_main_weights(card.read_text(), sha256):
         raise SystemExit(
-            f"모델 카드에 가중치 id `{weights_id(sha256)}`가 없습니다. 이 체크포인트의 결과를 적은"
-            f" 카드라면 그 id를 카드에 적어 주세요. 다른 체크포인트의 결과라면"
+            f"모델 카드에 main 가중치로 id `{weights_id(sha256)}`가 없습니다 (다른 branch의 행은"
+            " 치지 않습니다). 이 체크포인트의 결과를 적은 카드라면 그 id를 카드에 적어 주세요."
+            " 다른 체크포인트의 결과라면"
             f" scripts/{paper}/plot_card.py로 그림을 다시 만들고 카드의 수치와 id를 고쳐 주세요."
         )
 
@@ -139,14 +151,13 @@ def check_visibility(api: HfApi, repo_id: str, private: bool) -> None:
 
 def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
     """v1: `tabpfn_final.pt`를 변환하고, 원본 모델과 변환한 파일에서 다시 읽은 모델을 돌려준다."""
+    from minipfn.hub import download_artifact
     from minipfn.hub.tabpfn_v1 import from_pretrained, save_pretrained
     from minipfn.recipes.tabpfn_v1 import tabpfn_from_state
 
     path = args.checkpoint
     if path.startswith("runs:/"):
-        path = mlflow.artifacts.download_artifacts(
-            artifact_uri=path, dst_path=str(out_dir / "checkpoint")
-        )
+        path = download_artifact(path, out_dir / "checkpoint")
     state = torch.load(path, map_location="cpu", weights_only=True)
     if "config" not in state:
         raise SystemExit(
@@ -188,25 +199,22 @@ PREPARE = {"tabpfn": prepare_tabpfn, "tabpfn_v2": prepare_tabpfn_v2}
 FRONT_MATTER = re.compile(r"\A---\r?\n.*?^---[ \t]*(?:\r?\n|\Z)", re.S | re.M)
 
 
-def revision_lines(card: Path, revision: str) -> list[str]:
-    """main 카드에서 branch를 적은 줄 (중간 checkpoint 표의 행)."""
-    return [line for line in card.read_text().splitlines() if f"`{revision}`" in line]
-
-
 def check_card_revision(card: Path, revision: str, sha256: str | None = None) -> None:
-    """main 카드의 한 줄에 branch와 가중치 id가 함께 있는지. 다른 step의 가중치를 막는다.
+    """main 카드의 중간 checkpoint 표에서 branch 행(`` | `step-100k` | ``로 시작하는 줄)이 그
+    가중치 id를 적고 있는지. 본문에서 branch와 다른 가중치를 함께 적은 줄은 치지 않는다 — 다른
+    step의 가중치가 그 branch로 올라가지 않도록.
 
     `sha256`이 없으면(체크포인트를 받기 전) branch의 행이 있는지만 본다."""
-    lines = revision_lines(card, revision)
-    if not lines:
+    text = card.read_text()
+    if revision not in branch_rows(text):
         raise SystemExit(
-            f"모델 카드에 `{revision}`를 적은 줄이 없습니다. 카드의 중간 checkpoint 표에 그"
-            " branch의 행을 추가하거나 branch 이름을 확인해 주세요."
+            f"모델 카드의 중간 checkpoint 표에 `{revision}` 행이 없습니다. 그 branch의 행"
+            f" (| `{revision}` | `sha256:...` | ...)을 추가하거나 branch 이름을 확인해 주세요."
         )
-    if sha256 is not None and not any(names_weights(line, sha256) for line in lines):
+    if sha256 is not None and not names_branch_weights(text, revision, sha256):
         raise SystemExit(
-            f"모델 카드에 `{revision}`와 가중치 id `{weights_id(sha256)}`를 함께 적은 줄이"
-            " 없습니다. 그 branch의 행에 이 id를 적거나 branch 이름·체크포인트를 확인해 주세요."
+            f"모델 카드의 `{revision}` 행에 가중치 id `{weights_id(sha256)}`가 없습니다. 그 행에"
+            " 이 id를 적거나 branch 이름·체크포인트를 확인해 주세요."
         )
 
 
@@ -219,7 +227,7 @@ def revision_card(model_card: Path, repo_id: str, revision: str, sha256: str) ->
         f"{front}# {repo_id} @ `{revision}`\n\n"
         f"An intermediate training checkpoint, kept for comparison. The model card, benchmark"
         f" numbers for every checkpoint, and usage are on the [main branch]({url}).\n\n"
-        f"Weights: `{weights_id(sha256)}` (first 12 hex digits of the SHA-256 of"
+        f"Weights: `{weights_id(sha256)}` (first {WEIGHTS_ID_HEX} hex digits of the SHA-256 of"
         f" `{WEIGHTS_NAME}`).\n\n"
         "```python\n"
         "from minipfn import from_pretrained\n\n"
