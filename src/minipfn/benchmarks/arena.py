@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import pickle
 import sys
 import urllib.parse
 from collections.abc import Callable
@@ -209,6 +210,8 @@ def run(
     datasets: list[str] | None = None,
     breakdown: bool = True,
     fingerprint: str = "",
+    results: list | None = None,
+    results_path: str | Path | None = None,
 ) -> dict:
     """suite의 split을 돌리고 점수를 낸다. 결과는 `out_dir`에 쓰고 요약을 돌려준다.
 
@@ -228,6 +231,13 @@ def run(
       설정 (공개 CSV를 못 받으면
       `comparison.csv`의 공개 쪽 열은 비어 있다)
     - `compare.log`: `tabarena` 집계의 출력
+
+    여러 GPU에 나눠 돌릴 때(`shard_datasets`, 평가 스크립트의 `--shards`):
+    - `results_path`를 주면 split을 돌린 뒤 그 결과(`run_jobs`가 낸 dict 목록)를 그 파일에 pickle로
+      남기고 점수는 내지 않는다(빈 dict를 돌려준다). 데이터셋을 나눠 맡은 worker가 쓴다
+    - `results`를 주면 split을 돌리지 않고 그 결과로 점수만 낸다. worker들의 결과를 모은 것이다.
+      `run_jobs`는 캐시가 있어도 task 데이터를 먼저 받으므로(materialize) 캐시를 다시 읽는 대신
+      결과를 넘긴다
     """
     from minipfn.benchmarks import _arena_system as system
 
@@ -253,8 +263,9 @@ def run(
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "fingerprint.txt").write_text(f"{method}\nbagging={bagging}\n{fingerprint}\n")
 
-    results = []
-    if len(todo):
+    if results is not None:
+        results = list(results)
+    elif len(todo):
         key = system.register_factory(make_estimator)
         experiments = system.experiments(suite, method, key, bagging)
         jobs = context.build_jobs(
@@ -273,6 +284,12 @@ def run(
             debug_mode=True,
             raise_on_failure=False,
         )
+    else:
+        results = []
+    if results_path is not None:
+        with open(results_path, "wb") as f:
+            pickle.dump(results, f)
+        return {}
     if results:
         context.register(results, scope_to_valid_tasks=False)
     pool = model_pool(context, method)
@@ -340,6 +357,23 @@ def run(
         json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
     )
     return summary
+
+
+def shard_datasets(grid: pd.DataFrame, n_shards: int) -> list[list[str]]:
+    """돌릴 split(`skip_reason`이 없는 것)이 있는 데이터셋을 `n_shards`개 묶음으로. 데이터셋 하나의
+    비용은 그 split들의 셀 수(학습 행 × feature) 합이고, 비용이 큰 데이터셋부터 지금까지 비용이 가장
+    적은 묶음에 넣는다(LPT, 같으면 번호가 작은 묶음). 같은 grid면 늘 같은 답이다. 빈 묶음은 뺀다."""
+    todo = grid[grid["skip_reason"].isna()]
+    cells = todo["max_train_rows"].astype(float) * todo["n_features"].clip(lower=1).astype(float)
+    cost = cells.groupby(todo["dataset"]).sum()
+    order = sorted(cost.index, key=lambda d: (-cost[d], d))
+    shards: list[list[str]] = [[] for _ in range(n_shards)]
+    loads = [0.0] * n_shards
+    for dataset in order:
+        i = min(range(n_shards), key=lambda j: (loads[j], j))
+        shards[i].append(dataset)
+        loads[i] += cost[dataset]
+    return [sorted(s) for s in shards if s]
 
 
 def _run_id(fingerprint: str, method: str, bagging: int) -> str:

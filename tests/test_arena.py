@@ -278,3 +278,53 @@ def test_post_predict_calls_after_predict_with_one_test_row():
     model.post_predict()
     assert len(seen) == 1 and len(seen[0]) == 1
     assert seen[0]["x"].iloc[0] == 3.0 and seen[0]["when"].dtype.kind == "f"  # 같은 전처리
+
+
+def test_shard_datasets_balances_cells_and_skips_unrun_splits():
+    # 데이터셋 비용 = 돌릴 split의 셀 수 합. 큰 것부터 가장 가벼운 묶음에 (같은 grid면 같은 답)
+    rows = []
+    for name, n_rows, n_features, splits in [
+        ("big", 100_000, 50, 1),
+        ("mid_a", 10_000, 100, 3),
+        ("mid_b", 20_000, 50, 3),
+        ("small", 1_000, 10, 30),
+        ("tiny", 100, 5, 10),
+    ]:
+        rows += [
+            {
+                "dataset": name,
+                "max_train_rows": n_rows,
+                "n_features": n_features,
+                "skip_reason": None,
+            }
+        ] * splits
+    rows.append(
+        {"dataset": "skipped", "max_train_rows": 10**7, "n_features": 10, "skip_reason": "x"}
+    )
+    grid = pd.DataFrame(rows)
+    shards = arena.shard_datasets(grid, 3)
+    assert shards == arena.shard_datasets(grid, 3)
+    assert sorted(sum(shards, [])) == ["big", "mid_a", "mid_b", "small", "tiny"]
+    assert ["big"] in shards  # 가장 비싼 데이터셋(셀 5백만)은 혼자
+    # 데이터셋보다 묶음이 많으면 빈 묶음은 뺀다
+    assert len(arena.shard_datasets(grid, 10)) == 5
+
+
+def test_shard_commands_replace_dataset_and_output_flags(tmp_path):
+    script = _eval_script()
+    argv = [
+        "--suite", "beyondarena", "--classifier-path", "c.pt", "--shards", "4",
+        "--datasets=a,b", "--out-dir", "out", "--mlflow", "--method-name", "m",
+    ]  # fmt: skip
+    cmds = script.shard_commands(argv, [["a"], ["b", "c"]], tmp_path)
+    assert len(cmds) == 2
+    cmd, worker_dir, results = cmds[1]
+    assert worker_dir == tmp_path / "shards" / "shard1" and results == worker_dir / "results.pkl"
+    assert cmd == [
+        "--suite", "beyondarena", "--classifier-path", "c.pt", "--method-name", "m",
+        "--datasets", "b,c", "--out-dir", str(worker_dir), "--shard-results", str(results),
+    ]  # fmt: skip
+    args = script.parse_args(cmd)
+    assert args.shard_results == str(results) and args.shards == 1
+    with pytest.raises(SystemExit):
+        script.main(["--suite", "classification", "--shards", "2"])
