@@ -264,6 +264,11 @@ def source_speed_options(params: dict[str, str]) -> dict:
                 if phases := normalize_phases(text):
                     out[name] = phases
                 continue
+            if name == "logit_softcap":
+                # 켠 run에서만 잇는다 (끈 run에서 가져와도 preset의 soft-cap을 지우지 않도록)
+                if text != "None":
+                    out[name] = float(text)
+                continue
             out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
     return out
 

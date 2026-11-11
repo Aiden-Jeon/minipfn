@@ -11,8 +11,10 @@ TabICL은 numpy·torch의 전역 난수를 쓴다(`Rng`를 쓰지 않는다). �
 `filter_unpredictable`(TabICLv2 학습 스크립트의 `--filter_unpredictable_graphs True
 --filter_unpredictable_datasets True`): x 노드와 y 노드에 공통 조상이 없는 그래프를 다시 뽑고
 (graph filter, 생성기 안), 만든 데이터셋을 ExtraTrees OOB 예측이 평균보다 낫지 않으면(bootstrap
-p ≥ 0.05) 버린다(dataset filter, `tabicl.prior._dataset.should_filter`). TabICLv2처럼 데이터셋마다
-처음 `FILTER_ATTEMPTS`번만 걸러 그 뒤에는 받는다. 논문: stage 1에서 분류 약 35%, 회귀 약 25%가
+p ≥ 0.05) 버린다(dataset filter, `tabicl.prior._dataset.should_filter`). TabICLv2의 graph prior
+(`tabicl.prior._dataset.GraphPrior`)처럼 예측할 수 있는 데이터셋이 나올 때까지 다시 뽑는다(그쪽은
+`while True`. 여기서는 멈추지 않는 것을 막으려 `FILTER_ATTEMPTS`번 뒤에는 받는다. mlp·tree prior인
+`SCMPrior`는 처음 6번만 거른다). 논문: stage 1에서 분류 약 35%, 회귀 약 25%가
 걸러지고 학습 수렴이 좋아진다. 기본은 끔(예전과 같은 데이터셋).
 """
 
@@ -27,8 +29,9 @@ import torch
 
 from minipfn.priors.pipeline import Rng
 
-# 데이터셋 하나에서 dataset filter를 적용하는 시도 수 (TabICLv2 `PriorDataset`의 `idx <= 5`)
-FILTER_ATTEMPTS = 6
+# 데이터셋 하나에서 dataset filter를 적용하는 시도 수의 상한 (TabICL `GraphPrior`는 상한 없음,
+# 멈추지 않는 것만 막는다). PR #74의 첫 두 stage 1 run은 6(`SCMPrior`의 `idx <= 5`)으로 돌았다
+FILTER_ATTEMPTS = 1000
 
 
 def _graph_scm_classes():
@@ -103,9 +106,8 @@ class GraphSCM:
         if not self.filter_unpredictable:
             return x, y
         for _ in range(FILTER_ATTEMPTS):
-            # 처음 FILTER_ATTEMPTS개만 검사하고, 다 걸러지면 그 다음 것을 검사 없이 받는다
-            # (TabICL은 idx 0~5를 검사하고 idx 6을 받는다). NaN으로 버린 데이터셋(y가 모두 -100)은
-            # DropInvalid가 다시 뽑는다
+            # 예측할 수 있을 때까지 다시 만든다(FILTER_ATTEMPTS개를 다 거르면 그 다음 것을 받는다).
+            # NaN으로 버린 데이터셋(y가 모두 -100)은 DropInvalid가 다시 뽑는다
             if (y == -100).all() or not self._should_filter(
                 x, y, self._config, is_classif=not self.regression
             ):

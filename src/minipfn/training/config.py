@@ -24,8 +24,10 @@ from minipfn.training.muon import MUON_MOMENTUM, MUON_SCOPES
 
 N_BUCKETS = 5000
 # 학습 가속 옵션 (issue #46)과 optimizer 종류 (issue #28). 이어 학습하면 원래 run의 값을 따른다
-# (학습 스크립트, `check_resume_step`)
+# (학습 스크립트, `check_resume_step`). logit_softcap은 모델 구조(`run_architecture`)가 아닌
+# 모델 설정(INFO_FIELDS)이라 여기서 잇는다 (켠 run에서만, 학습 스크립트 `source_speed_options`)
 SPEED_OPTIONS = (
+    "logit_softcap",
     "compile",
     "fused_adam",
     "tf32",
@@ -248,6 +250,12 @@ class TrainConfig:
             raise ValueError("muon_scope·muon_momentum은 optimizer=muon일 때만 바꾼다")
         if not 0.0 <= self.binary_prob <= 1.0:
             raise ValueError(f"binary_prob는 0 이상 1 이하여야 한다: {self.binary_prob}")
+        if self.logit_softcap is not None:
+            if not self.logit_softcap > 0:
+                raise ValueError(f"logit_softcap은 0보다 커야 한다: {self.logit_softcap}")
+            if "logit_softcap" not in config_fields(self.model_type):
+                # 모델 설정으로 옮길 때(`model_config`) 조용히 빠지지 않도록
+                raise ValueError(f"logit_softcap은 {self.model_type} 모델에 없다")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
         if self.grad_cosine and self.task != "multitask":

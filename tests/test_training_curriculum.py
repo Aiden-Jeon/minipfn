@@ -149,7 +149,7 @@ def test_size_rule_checks():
 
 def test_prior_filter_retries_unpredictable_datasets(monkeypatch):
     # graph·dataset filter를 켜면 TabICL PriorConfig에 넘기고, dataset filter가 계속 걸러도 데이터셋
-    # 하나에 FILTER_ATTEMPTS번까지만 다시 만든다
+    # 하나에 FILTER_ATTEMPTS번까지만 다시 만든다 (상한을 줄여 본다)
     prior = _prior(filter_unpredictable=True)
     generator = prior.pipeline.generator
     assert generator._config.filter_unpredictable_graphs
@@ -161,9 +161,11 @@ def test_prior_filter_retries_unpredictable_datasets(monkeypatch):
         return True
 
     monkeypatch.setattr(generator, "_should_filter", always)
+    monkeypatch.setattr(G, "FILTER_ATTEMPTS", 6)
     batch = prior.sample_batch(2)
     assert batch.x.shape[0] == 2
-    assert len(calls) >= 2 * (G.FILTER_ATTEMPTS - 1) and all(calls)
+    assert len(calls) >= 2 * 6 and all(calls)
+    assert len(calls) % 6 == 0  # 데이터셋마다 정확히 상한만큼 (그 뒤에는 받는다)
     off = _prior()
     assert not off.pipeline.generator._config.filter_unpredictable_datasets
 
@@ -402,6 +404,9 @@ def test_train_script_stages(monkeypatch):
     # 이어 학습하면 Muon 범위·momentum을 원래 run에서 잇는다
     options = script.source_speed_options({"muon_scope": "all", "muon_momentum": "0.9"})
     assert options == {"muon_scope": "all", "muon_momentum": 0.9}
+    # soft-cap은 모델 구조 param이 아니라 여기서 잇는다. 끈 run("None")은 preset 값을 두고 간다
+    assert script.source_speed_options({"logit_softcap": "50.0"}) == {"logit_softcap": 50.0}
+    assert script.source_speed_options({"logit_softcap": "None"}) == {}
 
 
 def test_logit_softcap():
@@ -430,6 +435,25 @@ def test_logit_softcap():
     model = capped.build_model()
     model.load_state_dict(config.build_model().state_dict())
     assert all(m.logit_softcap == 50.0 for m in model.modules() if isinstance(m, Attention))
+    # 0은 NaN을 내고, soft-cap이 없는 모델에 주면 조용히 빠지므로 막는다
+    with pytest.raises(ValueError, match="logit_softcap"):
+        replace(config, logit_softcap=0.0)
+    with pytest.raises(ValueError, match="logit_softcap"):
+        replace(TrainConfig.smoke("classification"), logit_softcap=50.0)
+
+
+def test_logit_softcap_inference_chunks(monkeypatch):
+    # 추론(gradient 없음)에서 logit 행렬이 크면 query를 나눠 계산해도 결과가 같다
+    from minipfn.models import column_row_transformer as M
+
+    torch.manual_seed(0)
+    attn = M.Attention(16, 2, qk_norm=True, zero_out=False, logit_softcap=5.0)
+    x = torch.randn(2, 37, 16) * 10
+    with torch.no_grad():
+        whole = attn(x, n_context=29)
+        monkeypatch.setattr(M, "SOFTCAP_CHUNK_LOGITS", 50)
+        chunked = attn(x, n_context=29)
+    assert torch.allclose(whole, chunked, atol=1e-6)
 
 
 def test_logit_softcap_trains_from_uncapped_weights(tmp_path, monkeypatch):
