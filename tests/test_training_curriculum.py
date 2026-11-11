@@ -311,7 +311,7 @@ def test_curriculum_recipe():
         assert c.warmup_steps == c.steps // 100
         assert c.max_cells == c.max_rows * 100
         assert tabpfn_v3.architecture_name(c) == "v3.5"
-    assert (s1.steps, s1.lr, s1.grad_clip, s1.micro_batch) == (250_000, 8e-4, 10.0, 8)
+    assert (s1.steps, s1.lr, s1.grad_clip, s1.micro_batch) == (250_000, 4e-4, 10.0, 8)
     assert (s1.min_rows, s1.max_rows, s1.min_train_fraction, s1.max_train_fraction) == (
         1024,
         1024,
@@ -320,12 +320,13 @@ def test_curriculum_recipe():
     )
     assert (s2.steps, s2.lr, s2.grad_clip, s2.max_rows, s2.log_uniform_rows) == (
         20_000,
-        1e-4,
+        5e-5,
         10.0,
         10_240,
         True,
     )
-    assert (s3.steps, s3.lr, s3.grad_clip, s3.max_rows) == (5_000, 2e-5, 1.0, 60_000)
+    assert (s3.steps, s3.lr, s3.grad_clip, s3.max_rows) == (5_000, 1e-5, 1.0, 60_000)
+    assert all(c.logit_softcap == 50.0 for c in (s1, s2, s3))
     # task당 데이터셋 수가 TabICLv2(500K step × batch 64)와 같다
     assert s1.steps * s1.batch_size // 2 == 500_000 * 64
     assert s2.steps * s2.batch_size // 2 == 40_000 * 64
@@ -340,9 +341,8 @@ def _smoke_curriculum(**changes):
     # 작은 크기로 stage 1의 코드 경로 전부: 모든 파라미터 Muon, train_fraction, binary, filter
     config = tabpfn_v3.with_architecture(TrainConfig.smoke("multitask"), "v3.5", keep_size=True)
     stage = {k: v for k, v in tabpfn_v3.CURRICULUM_COMMON.items() if k != "batch_size"}
-    return replace(
-        config,
-        **{**stage, "max_features": 8},
+    small = dict(
+        max_features=8,
         min_rows=48,
         max_rows=80,
         log_uniform_rows=True,
@@ -355,8 +355,8 @@ def _smoke_curriculum(**changes):
         keep_every=None,
         collapse_threshold=None,
         border_datasets=20,
-        **changes,
     )
+    return replace(config, **{**stage, **small, **changes})  # 인자로 준 값이 recipe 값을 덮는다
 
 
 def test_curriculum_trains_and_resumes(tmp_path, monkeypatch):
@@ -402,3 +402,44 @@ def test_train_script_stages(monkeypatch):
     # 이어 학습하면 Muon 범위·momentum을 원래 run에서 잇는다
     options = script.source_speed_options({"muon_scope": "all", "muon_momentum": "0.9"})
     assert options == {"muon_scope": "all", "muon_momentum": 0.9}
+
+
+def test_logit_softcap():
+    # 끄면 SDPA와 같고, 아주 큰 c면 거의 같으며, 작은 c면 attention이 덜 날카롭다
+    from minipfn.models import config_dict
+    from minipfn.models.column_row_transformer import Attention
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 7, 16) * 30
+    base = Attention(16, 2, qk_norm=True, zero_out=False)
+    loose = Attention(16, 2, qk_norm=True, zero_out=False, logit_softcap=1e6)
+    tight = Attention(16, 2, qk_norm=True, zero_out=False, logit_softcap=0.01)
+    for m in (loose, tight):
+        m.load_state_dict(base.state_dict())
+    with torch.no_grad():
+        ref, near, flat = base(x, n_context=5), loose(x, n_context=5), tight(x, n_context=5)
+    assert torch.allclose(ref, near, atol=1e-4)
+    # c가 아주 작으면 logit이 거의 0이 되어 attention이 평균에 가깝다
+    assert (flat - ref).abs().max() > 1e-3
+    # 모델 설정: 기본값(None)이면 저장하지 않고, 켠 값은 저장한다. 가중치 모양과 상관없어
+    # 다른 값의 checkpoint에서도 가중치를 가져온다(INFO_FIELDS)
+    config = tabpfn_v3.with_architecture(TrainConfig.smoke("multitask"), "v3.5", keep_size=True)
+    assert "logit_softcap" not in config_dict(config.model_config())
+    capped = replace(config, logit_softcap=50.0)
+    assert config_dict(capped.model_config())["logit_softcap"] == 50.0
+    model = capped.build_model()
+    model.load_state_dict(config.build_model().state_dict())
+    assert all(m.logit_softcap == 50.0 for m in model.modules() if isinstance(m, Attention))
+
+
+def test_logit_softcap_trains_from_uncapped_weights(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    # soft-cap 없이 학습한 가중치를 soft-cap을 켜고 가져온다 (모델 설정의 INFO_FIELDS)
+    train(_smoke_curriculum(stop_step=2, logit_softcap=None), tmp_path / "a", mlflow_log=False)
+    out = train(
+        _smoke_curriculum(logit_softcap=50.0, stop_step=2),
+        tmp_path / "b",
+        init_from=tmp_path / "a" / "latest.pt",
+        mlflow_log=False,
+    )
+    assert all(np.isfinite(out["history"]["train_loss"]))

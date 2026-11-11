@@ -75,6 +75,8 @@ class TrainConfig:
     n_inducing: int = 128
     n_cls: int = 4
     qk_norm: bool = False
+    # attention logit soft-cap (`ColumnRowTransformerConfig.logit_softcap`, None이면 끔)
+    logit_softcap: float | None = None
     target_norm: bool = False
     head_mlp: bool = False
     # prior / 표 크기 (논문 Methods, `minipfn.priors.table_size`). max_features는 모델 설정에도

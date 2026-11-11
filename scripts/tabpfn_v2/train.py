@@ -179,6 +179,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--muon-weight-decay", type=float, default=_env("TABPFN_V2_MUON_WEIGHT_DECAY", float)
     )
     parser.add_argument(
+        "--logit-softcap",
+        type=float,
+        default=_env("TABPFN_V2_LOGIT_SOFTCAP", float),
+        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)",
+    )
+    parser.add_argument(
         "--muon-distributed",
         choices=["off", "node", "all"],
         default=os.environ.get("TABPFN_V2_MUON_DISTRIBUTED") or None,
@@ -381,6 +387,7 @@ def _override_values(args: argparse.Namespace) -> dict:
         "optimizer": args.optimizer,
         "muon_weight_decay": args.muon_weight_decay,
         "muon_distributed": args.muon_distributed,
+        "logit_softcap": args.logit_softcap,
         **{
             name: True
             for name in (

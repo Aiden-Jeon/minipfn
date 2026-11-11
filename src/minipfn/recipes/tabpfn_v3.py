@@ -194,14 +194,21 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
 # 스크립트와 같은 것:
 # - Muon을 모든 파라미터에(`muon_scope="all"`), momentum 0.9, weight decay 0.01 (스크립트 주석:
 #   논문은 cautious라고 적었지만 공개 checkpoint run은 일반 weight decay였다)
-# - grad clip 10 / 10 / 1, lr 8e-4 / 1e-4 / 2e-5
+# - grad clip 10 / 10 / 1 (lr은 아래 "여기서 바꾼 것")
 # - 표 크기: 행 1,024개 고정·학습 30~90% → 400~10,240행 log 균등·학습 79~81% → 400~60,000행
 #   (행이 많으면 feature 상한을 줄인다). feature 수 U(1, 100)
 # - 분류 클래스 수의 절반은 2 (`binary_prob` 0.5), 예측할 수 없는 그래프·데이터셋 다시 뽑기
 # 여기서 바꾼 것 (여기서 정함):
 # - batch 256 (GPU 32장). TabICLv2는 분류·회귀 모델이 따로이고 batch 64다. multitask는 step마다
 #   task를 번갈아 쓰므로 step 수를 task당 데이터셋 수가 같게 정했다: 500K × 64 = 250K × 256 / 2.
-#   stage 2·3도 같은 규칙으로 20K·5K. lr은 스크립트 값 그대로(batch를 키운 만큼 바꾸지 않는다)
+#   stage 2·3도 같은 규칙으로 20K·5K
+# - lr은 스크립트 값의 절반: 4e-4 / 5e-5 / 1e-5. 스크립트 값(8e-4)으로 돈 첫 stage 1 run이 105k부터
+#   불안정해져 140k 뒤로 무너졌다(PR #74). 50k에서 갈라 본 8×H100 batch 64 실험에서는 soft-cap과
+#   함께 lr을 절반으로 둔 것이 분류·회귀 검증 손실 모두 가장 좋았다. 단계 사이의 비율은 그대로다
+# - attention logit soft-cap 50 (`logit_softcap`, logit <- 50·tanh(logit / 50)). 이 모델은 q·k에
+#   QK-norm을 건 뒤 QASSMax를 곱해서 attention 온도가 QK-norm gain과 QASSMax 배율로만 커지고, 첫
+#   run에서는 ICL 앞쪽 층부터 한 층씩 logit이 수십만~수백만이 되며 무너졌다(TabICLv2에는 QK-norm이
+#   없다). soft-cap을 건 실험에서는 cap 전 logit과 QASSMax 배율이 50k 수준에 머물렀다
 # - 모델은 TabPFN-3.5 구조(219M), 분류·회귀 한 모델. 결측값(`missing_dataset_prob`)·회귀 bar
 #   distribution·붕괴 되돌리기 규칙은 `paper`의 것 그대로
 # - micro batch 8 / 1 / 1 (스크립트는 4 / 1 / 1). stage 1을 4로 돌린 8×H100 smoke가 GPU당 21~24 GB만
@@ -217,12 +224,13 @@ CURRICULUM_COMMON = {
     "max_features": 100,
     "binary_prob": 0.5,
     "filter_unpredictable": True,
+    "logit_softcap": 50.0,
     "phases": (),
 }
 CURRICULUM = {
     1: {
         "steps": 250_000,
-        "lr": 8e-4,
+        "lr": 4e-4,
         "grad_clip": 10.0,
         "min_rows": 1024,
         "max_rows": 1024,
@@ -233,7 +241,7 @@ CURRICULUM = {
     },
     2: {
         "steps": 20_000,
-        "lr": 1e-4,
+        "lr": 5e-5,
         "grad_clip": 10.0,
         "min_rows": 400,
         "max_rows": 10_240,
@@ -246,7 +254,7 @@ CURRICULUM = {
     },
     3: {
         "steps": 5_000,
-        "lr": 2e-5,
+        "lr": 1e-5,
         "grad_clip": 1.0,
         "min_rows": 400,
         "max_rows": 60_000,

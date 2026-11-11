@@ -114,8 +114,15 @@ class ColumnRowTransformerConfig:
     n_buckets: int = 5000  # multitask의 회귀 구간 수
     # 학습 때 본 feature 수 상한 (`TrainConfig.max_features`). 구조와 상관없고 추론이 읽는다
     max_features: int = 160
+    # attention logit soft-cap (Gemma 2: logit <- c * tanh(logit / c), 여기서 정함). None이면 끔
+    # (예전과 같은 SDPA). QK-norm 뒤에 QASSMax 배율과 QK-norm gain이 커지면 logit에 상한이 없어
+    # ICL 앞쪽 층이 하나씩 one-hot attention이 되며 학습이 무너졌다(PR #74 stage 1, 75k~150k).
+    # 가중치 모양과 상관없어 checkpoint의 값과 달라도 가중치를 가져올 수 있다
+    logit_softcap: float | None = None
 
-    INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features",)
+    INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features", "logit_softcap")
+    # 첫 공개 뒤에 더한 필드: 기본값이면 checkpoint·config.json에 적지 않는다
+    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("logit_softcap",)
 
     def __post_init__(self) -> None:
         if self.task not in TASKS:
@@ -275,9 +282,11 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         rope_base: float | None = None,
         zero_out: bool = True,
+        logit_softcap: float | None = None,
     ) -> None:
         super().__init__()
         self.nhead, self.qk_norm, self.rope_base = nhead, qk_norm, rope_base
+        self.logit_softcap = logit_softcap
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         if qk_norm:
@@ -313,18 +322,27 @@ class Attention(nn.Module):
         if self.qassmax is not None:
             q = self.qassmax(q, k.shape[2])
         if n_context is None:
-            out = F.scaled_dot_product_attention(q, k, v)
+            out = self._sdpa(q, k, v)
         else:
-            train = F.scaled_dot_product_attention(q[:, :, :n_context], k, v)
+            train = self._sdpa(q[:, :, :n_context], k, v)
             # 테스트 행: 모든 query head가 첫 head의 key·value를 본다. head를 query 길이로 접어
             # key·value head 하나로 계산한다(key·value를 head 수만큼 늘리지 않도록)
             test_q = q[:, :, n_context:]
             h, t, d = test_q.shape[1:]
-            test = F.scaled_dot_product_attention(
-                test_q.reshape(n, 1, h * t, d), k[:, :1], v[:, :1]
-            ).view(n, h, t, d)
+            test = self._sdpa(test_q.reshape(n, 1, h * t, d), k[:, :1], v[:, :1])
+            test = test.view(n, h, t, d)
             out = torch.cat([train, test], dim=2)
         return self.out(out.transpose(1, 2).reshape(n, length, dim))
+
+    def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """scaled dot-product attention. soft-cap이 있으면 logit을 직접 만들어 c * tanh(logit / c)를
+        거친다(fused kernel을 못 써서 느리고 logit 행렬만큼 메모리를 더 쓴다)."""
+        if self.logit_softcap is None:
+            return F.scaled_dot_product_attention(q, k, v)
+        cap = self.logit_softcap
+        logits = (q @ k.transpose(-1, -2)) * q.shape[-1] ** -0.5
+        logits = cap * torch.tanh(logits / cap)
+        return logits.softmax(-1, dtype=torch.float32).to(v.dtype) @ v
 
 
 def _mlp(dim: int, ff_factor: int) -> nn.Sequential:
@@ -608,6 +626,7 @@ class ColumnRowTransformer(nn.Module):
                 config.ff_factor,
                 config.qassmax_hidden,
                 qk_norm=config.qk_norm,
+                logit_softcap=config.logit_softcap,
             )
             for _ in range(config.column_blocks)
         )
@@ -621,12 +640,17 @@ class ColumnRowTransformer(nn.Module):
                 config.ff_factor,
                 qk_norm=config.qk_norm,
                 rope_base=config.rope_base,
+                logit_softcap=config.logit_softcap,
                 zero_out=False,  # 모듈 docstring "여기서 정한 것"
             )
             for _ in range(config.row_blocks)
         )
         self.row_norm = nn.RMSNorm(e)
-        qassmax = {"qassmax": True, "qassmax_hidden": config.qassmax_hidden}
+        qassmax = {
+            "qassmax": True,
+            "qassmax_hidden": config.qassmax_hidden,
+            "logit_softcap": config.logit_softcap,
+        }
         self.icl_layers = nn.ModuleList(
             Block(d, config.nhead, config.ff_factor, qk_norm=config.qk_norm, **qassmax)
             for _ in range(config.nlayers)
