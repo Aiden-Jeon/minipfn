@@ -187,6 +187,104 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
     return replace(paper_run(task, arch), **COOLDOWN)
 
 
+# TabICLv2의 3단계 학습(arXiv 2602.11139 §4.1·Appendix B.1)을 공개 학습 스크립트
+# (soda-inria/tabicl `scripts/train_v2_clf_stage{1,2,3}.sh`) 값 그대로 옮긴 것. 단계마다 가중치만
+# 넘겨(`init_from`) 새 optimizer로, warmup 1% 뒤 cosine으로 내린다. TabPFN-3·3.5 보고서에 학습
+# 설정이 없어서, 구조가 같은 계열(열 → 행 → 행 ICL, QASSMax, graph SCM prior)의 공개 recipe를 쓴다.
+# 스크립트와 같은 것:
+# - Muon을 모든 파라미터에(`muon_scope="all"`), momentum 0.9, weight decay 0.01 (스크립트 주석:
+#   논문은 cautious라고 적었지만 공개 checkpoint run은 일반 weight decay였다)
+# - grad clip 10 / 10 / 1 (lr은 아래 "여기서 바꾼 것")
+# - 표 크기: 행 1,024개 고정·학습 30~90% → 400~10,240행 log 균등·학습 79~81% → 400~60,000행
+#   (행이 많으면 feature 상한을 줄인다). feature 수 U(1, 100)
+# - 분류 클래스 수의 절반은 2 (`binary_prob` 0.5), 예측할 수 없는 그래프·데이터셋 다시 뽑기
+# 여기서 바꾼 것 (여기서 정함):
+# - batch 256 (GPU 32장). TabICLv2는 분류·회귀 모델이 따로이고 batch 64다. multitask는 step마다
+#   task를 번갈아 쓰므로 step 수를 task당 데이터셋 수가 같게 정했다: 500K × 64 = 250K × 256 / 2.
+#   stage 2·3도 같은 규칙으로 20K·5K
+# - lr은 스크립트 값의 절반: 4e-4 / 5e-5 / 1e-5. 스크립트 값(8e-4)으로 돈 첫 stage 1 run이 105k부터
+#   불안정해져 140k 뒤로 무너졌다(PR #74). 50k에서 갈라 본 8×H100 batch 64 실험에서는 soft-cap과
+#   함께 lr을 절반으로 둔 것이 분류·회귀 검증 손실 모두 가장 좋았다. 단계 사이의 비율은 그대로다
+# - attention logit soft-cap 50 (`logit_softcap`, logit <- 50·tanh(logit / 50)). 이 모델은 q·k에
+#   QK-norm을 건 뒤 QASSMax를 곱해서 attention 온도가 QK-norm gain과 QASSMax 배율로만 커지고, 첫
+#   run에서는 ICL 앞쪽 층부터 한 층씩 logit이 수십만~수백만이 되며 무너졌다(TabICLv2에는 QK-norm이
+#   없다). soft-cap을 건 실험에서는 cap 전 logit과 QASSMax 배율이 50k 수준에 머물렀다
+# - 모델은 TabPFN-3.5 구조(219M), 분류·회귀 한 모델. 결측값(`missing_dataset_prob`)·회귀 bar
+#   distribution·붕괴 되돌리기 규칙은 `paper`의 것 그대로
+# - micro batch 8 / 1 / 1 (스크립트는 4 / 1 / 1). stage 1을 4로 돌린 8×H100 smoke가 GPU당 21~24 GB만
+#   써서(run 2c3d25a9…) 8로 올려 GPU 32장에서 accumulation 없이 간다. 한 forward의 데이터셋 8개가
+#   학습 행 비율·feature 수를 같이 쓴다(TabICLv2는 4개씩)
+CURRICULUM_COMMON = {
+    "batch_size": 256,
+    "optimizer": "muon",
+    "muon_scope": "all",
+    "muon_momentum": 0.9,
+    "muon_weight_decay": 0.01,
+    "size_rule": "train_fraction",
+    "max_features": 100,
+    "binary_prob": 0.5,
+    "filter_unpredictable": True,
+    "logit_softcap": 50.0,
+    "phases": (),
+}
+CURRICULUM = {
+    1: {
+        "steps": 250_000,
+        "lr": 4e-4,
+        "grad_clip": 10.0,
+        "min_rows": 1024,
+        "max_rows": 1024,
+        "min_train_fraction": 0.3,
+        "max_train_fraction": 0.9,
+        "log_uniform_rows": False,
+        "micro_batch": 8,
+    },
+    2: {
+        "steps": 20_000,
+        "lr": 5e-5,
+        "grad_clip": 10.0,
+        "min_rows": 400,
+        "max_rows": 10_240,
+        "min_train_fraction": 0.79,
+        "max_train_fraction": 0.81,
+        "log_uniform_rows": True,
+        "micro_batch": 1,
+        "checkpoint_every": 1_000,
+        "keep_every": 5_000,
+    },
+    3: {
+        "steps": 5_000,
+        "lr": 1e-5,
+        "grad_clip": 1.0,
+        "min_rows": 400,
+        "max_rows": 60_000,
+        "min_train_fraction": 0.79,
+        "max_train_fraction": 0.81,
+        "log_uniform_rows": True,
+        "micro_batch": 1,
+        "val_every": 1_000,
+        "checkpoint_every": 1_000,
+        "keep_every": 1_000,
+    },
+}
+# warmup은 단계 길이의 1% (스크립트 `--warmup_proportion 0.01`)
+CURRICULUM_WARMUP = 0.01
+
+
+def curriculum(stage: int, task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
+    """TabICLv2 3단계 학습의 `stage`(1·2·3)번째 단계 설정 (`CURRICULUM`). stage 2·3은 앞 단계
+    checkpoint에서 가중치만 가져와(`init_from`) 시작한다(학습 스크립트가 막는다). v3.5
+    multitask만."""
+    if (task, arch) != ("multitask", "v3.5"):
+        raise ValueError(f"curriculum은 v3.5 multitask만 있다 (task {task}, arch {arch})")
+    if stage not in CURRICULUM:
+        raise ValueError(f"curriculum stage는 {tuple(CURRICULUM)} 가운데 하나다: {stage}")
+    changes = {**CURRICULUM_COMMON, **CURRICULUM[stage]}
+    changes["max_cells"] = changes["max_rows"] * changes["max_features"]
+    changes["warmup_steps"] = int(CURRICULUM_WARMUP * changes["steps"])
+    return replace(paper(task, arch), **changes)
+
+
 # ---------------------------------------------------------------------------
 # 추론
 # ---------------------------------------------------------------------------

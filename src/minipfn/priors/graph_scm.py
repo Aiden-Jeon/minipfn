@@ -11,6 +11,12 @@
 3. 결측값(v2 논문 "Post-processing", `Missing`): 일부 데이터셋에서 셀마다 같은 확률로 값을
    지운다(MCAR). 비율은 논문에 없어서 여기서 정했다(`missing_dataset_prob`, `max_missing_rate`).
 
+TabICLv2 학습 스크립트에 맞추는 옵션 (기본은 모두 꺼져 예전과 같은 데이터셋):
+- `size_rule="train_fraction"`: 표 크기를 행 수(학습 + 검증)와 학습 행 비율로 뽑는다
+  (`table_size.sample_split_size`). 검증 행 수가 batch마다 달라진다
+- `binary_prob`: 분류 클래스 수를 이 확률로 2로 (`ClassCount`)
+- `filter_unpredictable`: 예측할 수 없는 그래프·데이터셋을 다시 뽑는다 (`generators.graph_scm`)
+
     prior = GraphSCMPrior(task="classification", seed=0)
     batch = prior.sample_batch(8)  # x (8, 행, feature), y (8, 행), n_train
 
@@ -33,7 +39,10 @@ from minipfn.priors.table_size import (
     MAX_FEATURES,
     MAX_TRAIN_ROWS,
     N_EVAL_ROWS,
+    SIZE_RULES,
     check_sizes,
+    check_split_sizes,
+    sample_split_size,
     sample_table_size,
 )
 from minipfn.priors.transforms import CoverClasses, DropInvalid, Missing
@@ -58,17 +67,29 @@ class GraphSCMPrior:
         log_uniform_rows: bool = False,
         max_cells: int = MAX_CELLS,
         feature_scale: int = MAX_FEATURES,
+        size_rule: str = "eval_rows",
+        min_rows: int = 1024,
+        max_rows: int = 1024,
+        min_train_fraction: float = 0.3,
+        max_train_fraction: float = 0.9,
+        binary_prob: float = 0.0,
+        filter_unpredictable: bool = False,
     ) -> None:
         self._task = task
         if task == "classification":
             min_train_rows = max(min_train_rows, 2)  # 클래스가 2개 이상 학습 행에 나오려면
-        check_sizes(
+        _check(
+            size_rule=size_rule,
             min_train_rows=min_train_rows,
             max_train_rows=max_train_rows,
             n_eval_rows=n_eval_rows,
             max_features=max_features,
             max_cells=max_cells,
             feature_scale=feature_scale,
+            min_rows=min_rows,
+            max_rows=max_rows,
+            min_train_fraction=min_train_fraction,
+            max_train_fraction=max_train_fraction,
         )
         # 크기 설정은 batch마다 읽는다. task와 결측값 설정은 부품에 들어가므로 읽기 전용 속성이다
         self.min_train_rows = min_train_rows
@@ -78,8 +99,14 @@ class GraphSCMPrior:
         self.log_uniform_rows = log_uniform_rows
         self.max_cells = max_cells
         self.feature_scale = feature_scale
+        self.size_rule = size_rule
+        self.min_rows = min_rows
+        self.max_rows = max_rows
+        self.min_train_fraction = min_train_fraction
+        self.max_train_fraction = max_train_fraction
         self.rng = Rng.from_seed(seed)
-        generator = GraphSCM(task, seed=seed)  # TabICL의 전역 난수 시드도 여기서 고정한다
+        # TabICL의 전역 난수 시드도 여기서 고정한다
+        generator = GraphSCM(task, seed=seed, filter_unpredictable=filter_unpredictable)
         classification = task == "classification"
         # 결측값을 넣기 전까지 (회귀 구간 경계와 `_one_dataset`은 여기까지만 거친다)
         self._accept = [DropInvalid(), CoverClasses()] if classification else [DropInvalid()]
@@ -87,7 +114,7 @@ class GraphSCMPrior:
         self.pipeline = Pipeline(
             generator,
             rng=self.rng,
-            hyperparameters=ClassCount(MAX_CLASSES) if classification else None,
+            hyperparameters=ClassCount(MAX_CLASSES, binary_prob) if classification else None,
             transforms=[*self._accept, self._missing],
             max_attempts=MAX_ATTEMPTS,
         )
@@ -104,7 +131,29 @@ class GraphSCMPrior:
     def max_missing_rate(self) -> float:
         return self._missing.max_rate
 
+    def sample_shape(self) -> tuple[int, int, int]:
+        """(학습 행 수, feature 수, 검증 행 수) — `sample_batch`의 `size`와 같은 순서. "eval_rows"
+        규칙이면 검증 행 수는 늘 `n_eval_rows`다."""
+        if self.size_rule == "train_fraction":
+            n_train, n_eval, n_features = sample_split_size(
+                self.rng.numpy,
+                min_rows=self.min_rows,
+                max_rows=self.max_rows,
+                min_train_fraction=self.min_train_fraction,
+                max_train_fraction=self.max_train_fraction,
+                max_features=self.max_features,
+                log_uniform_rows=self.log_uniform_rows,
+                max_cells=self.max_cells,
+                min_train_rows=self.min_train_rows,
+            )
+            return n_train, n_features, n_eval
+        n_train, n_features = self.sample_size()
+        return n_train, n_features, self.n_eval_rows
+
     def sample_size(self) -> tuple[int, int]:
+        """ "eval_rows" 규칙의 (학습 행 수, feature 수)."""
+        if self.size_rule != "eval_rows":
+            raise ValueError("sample_size는 eval_rows 규칙의 것이다 (sample_shape를 쓴다)")
         n_train, n_features = sample_table_size(
             self.rng.numpy,
             self.max_train_rows,
@@ -117,18 +166,21 @@ class GraphSCMPrior:
         )
         return max(n_train, self.min_train_rows), n_features
 
-    def _one_dataset(self, n_train: int, n_features: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _one_dataset(
+        self, n_train: int, n_features: int, n_eval: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """결측값을 넣기 전의 데이터셋 하나: x (행, feature), y (행)."""
-        n_rows = n_train + self.n_eval_rows
+        n_rows = n_train + (self.n_eval_rows if n_eval is None else n_eval)
         group = self.pipeline.sample_group(n_rows, n_train, n_features, transforms=self._accept)
         return group.x[:, 0], group.y[:, 0]
 
-    def sample_batch(self, batch_size: int, size: tuple[int, int] | None = None) -> PriorBatch:
-        n_train, n_features = size or self.sample_size()
+    def sample_batch(self, batch_size: int, size: tuple[int, ...] | None = None) -> PriorBatch:
+        """`size`는 (학습 행 수, feature 수) 또는 (학습 행 수, feature 수, 검증 행 수). 주지 않으면
+        `sample_shape`로 뽑는다."""
+        n_train, n_features, *rest = self.sample_shape() if size is None else size
+        n_eval = rest[0] if rest else self.n_eval_rows
         n_train = max(n_train, self.min_train_rows)
-        return self.pipeline.sample_batch(
-            batch_size, n_train + self.n_eval_rows, n_train, n_features
-        )
+        return self.pipeline.sample_batch(batch_size, n_train + n_eval, n_train, n_features)
 
 
 # 데이터셋 크기 규칙 필드와 기본값 (`GraphSCMPrior`의 크기 인자와 같다). 필드 추가는 여기서만
@@ -140,8 +192,50 @@ SIZE_DEFAULTS = {
     "log_uniform_rows": False,
     "max_cells": MAX_CELLS,
     "feature_scale": MAX_FEATURES,
+    "size_rule": "eval_rows",
+    "min_rows": 1024,
+    "max_rows": 1024,
+    "min_train_fraction": 0.3,
+    "max_train_fraction": 0.9,
 }
 SIZE_FIELDS = tuple(SIZE_DEFAULTS)
+# 학습 데이터 분포를 바꾸는 prior 옵션 (회귀 구간 경계는 크기 규칙만 따른다)
+PRIOR_FIELDS = ("binary_prob", "filter_unpredictable")
+
+
+def _check(*, size_rule: str, **sizes) -> None:
+    """크기 규칙과 그 규칙의 설정을 검사한다 (prior와 학습 설정이 같이 쓴다)."""
+    if size_rule not in SIZE_RULES:
+        raise ValueError(f"size_rule은 {SIZE_RULES} 가운데 하나여야 한다: {size_rule}")
+    if size_rule == "train_fraction":
+        check_split_sizes(
+            **{
+                k: sizes[k]
+                for k in (
+                    "min_rows",
+                    "max_rows",
+                    "min_train_fraction",
+                    "max_train_fraction",
+                    "max_features",
+                    "max_cells",
+                    "min_train_rows",
+                )
+            }
+        )
+        return
+    check_sizes(
+        **{
+            k: sizes[k]
+            for k in (
+                "min_train_rows",
+                "max_train_rows",
+                "n_eval_rows",
+                "max_features",
+                "max_cells",
+                "feature_scale",
+            )
+        }
+    )
 
 
 def _sizes(config) -> dict:
@@ -154,31 +248,45 @@ def check_config(config) -> None:
     sizes = {k: v for k, v in _sizes(config).items() if k != "log_uniform_rows"}
     if config.task == "classification":
         sizes["min_train_rows"] = max(sizes["min_train_rows"], 2)
-    check_sizes(**sizes)
+    _check(**sizes)
 
 
 def make_prior(config, seed: int) -> GraphSCMPrior:
     """학습 설정(`minipfn.training.config.TrainConfig`)의 데이터셋 크기로 prior를 만든다."""
     return GraphSCMPrior(
-        config.task, seed=seed, missing_dataset_prob=config.missing_dataset_prob, **_sizes(config)
+        config.task,
+        seed=seed,
+        missing_dataset_prob=config.missing_dataset_prob,
+        **_sizes(config),
+        **{name: getattr(config, name) for name in PRIOR_FIELDS},
     )
 
 
 def make_borders(config, n_buckets: int, seed: int, n_jobs: int = 1) -> torch.Tensor:
     """학습 설정과 같은 데이터셋 크기로 뽑은 회귀 구간 경계 (`regression_borders`)."""
     return regression_borders(
-        n_buckets, config.border_datasets, seed, n_jobs=n_jobs, **_sizes(config)
+        n_buckets,
+        config.border_datasets,
+        seed,
+        n_jobs=n_jobs,
+        filter_unpredictable=config.filter_unpredictable,
+        **_sizes(config),
     )
 
 
-def _border_targets(args: tuple[int, int, dict]) -> torch.Tensor:
+def _border_targets(args: tuple[int, int, dict, bool]) -> torch.Tensor:
     # 회귀 데이터셋 n개의 고유한 target 값 (결측값은 넣지 않는다)
-    n_datasets, seed, sizes = args
-    prior = GraphSCMPrior("regression", seed=seed, missing_dataset_prob=0.0, **sizes)
+    n_datasets, seed, sizes, filter_unpredictable = args
+    prior = GraphSCMPrior(
+        "regression",
+        seed=seed,
+        missing_dataset_prob=0.0,
+        filter_unpredictable=filter_unpredictable,
+        **sizes,
+    )
     values = []
     for _ in range(n_datasets):
-        n_train, n_features = prior.sample_size()
-        _, y = prior._one_dataset(n_train, n_features)
+        _, y = prior._one_dataset(*prior.sample_shape())
         values.append(torch.unique(y.float()))
     return torch.cat(values)
 
@@ -189,6 +297,7 @@ def regression_borders(
     seed: int = 0,
     *,
     n_jobs: int = 1,
+    filter_unpredictable: bool = False,
     **sizes,
 ) -> torch.Tensor:
     """회귀 출력 구간의 경계 (Methods "Regression details").
@@ -199,6 +308,7 @@ def regression_borders(
     구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함).
     데이터셋 크기 인자는 `SIZE_FIELDS` 이름의 키워드로 주고, 빠지면 `SIZE_DEFAULTS`를 쓴다.
     `GraphSCMPrior`와 같은 뜻이며, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
+    `filter_unpredictable`도 학습 prior와 같게 둔다(걸러진 데이터셋의 target은 학습에 안 나온다).
     """
     unknown = set(sizes) - set(SIZE_DEFAULTS)
     if unknown:
@@ -206,7 +316,7 @@ def regression_borders(
     # n_jobs개 프로세스로 나눠 만든다 (프로세스마다 시드가 다르다)
     counts = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]
     table = {**SIZE_DEFAULTS, **sizes}
-    jobs = [(n, seed + i, table) for i, n in enumerate(counts)]
+    jobs = [(n, seed + i, table, filter_unpredictable) for i, n in enumerate(counts)]
     if n_jobs == 1:
         targets = _border_targets(jobs[0])
     else:

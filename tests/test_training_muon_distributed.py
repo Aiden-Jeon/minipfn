@@ -27,24 +27,27 @@ def _model():
     return config.build_model()
 
 
-def _run(process_group=None) -> dict:
+def _run(process_group=None, scope: str = "blocks") -> dict:
     """같은 gradient로 STEPS번 갱신한 가중치와 optimizer 상태. step 1에서는 Muon 파라미터 하나와
-    Adam 파라미터 하나에 gradient가 없다(multitask에서 그 step에 쓰지 않은 층)."""
+    마지막 파라미터 하나에 gradient가 없다(multitask에서 그 step에 쓰지 않은 층). `scope="all"`이면
+    1차원 파라미터(편 행렬 (n, 1))도 나눠 계산한다."""
     model = _model()
-    opt = MuonAdam(model, lr=1e-2, weight_decay=0.01, process_group=process_group)
-    muon, adam = muon_parameters(model)
+    opt = MuonAdam(model, lr=1e-2, weight_decay=0.01, process_group=process_group, scope=scope)
+    muon, adam = muon_parameters(model, scope)
     for step in range(STEPS):
         gen = torch.Generator().manual_seed(step)
         for p in model.parameters():
             p.grad = torch.randn(p.shape, generator=gen)
         if step == 1:
             muon[0][0].grad = None
-            adam[-1].grad = None
+            (adam or [p for p, _ in muon])[-1].grad = None
         opt.step()
     return {"model": model.state_dict(), "optimizer": opt.state_dict()}
 
 
-def _worker(rank: int, world: int, port: int, group_size: int, threads: int, out: str) -> None:
+def _worker(
+    rank: int, world: int, port: int, group_size: int, threads: int, out: str, scope: str
+) -> None:
     # CPU matmul은 thread 수에 따라 더하는 순서가 달라진다. 1 process 계산과 같은 수로 맞춘다
     # (앞선 테스트가 prior worker 없이 학습하면 `PriorBatches`가 이 process를 1 thread로 바꾼다)
     torch.set_num_threads(threads)
@@ -54,7 +57,7 @@ def _worker(rank: int, world: int, port: int, group_size: int, threads: int, out
         group = dist.group.WORLD
         if group_size < world:
             group, _ = dist.new_subgroups(group_size=group_size)
-        torch.save(_run(group), Path(out) / f"rank{rank}.pt")
+        torch.save(_run(group, scope), Path(out) / f"rank{rank}.pt")
     finally:
         dist.destroy_process_group()
 
@@ -80,12 +83,14 @@ def _assert_same(a, b, path="") -> None:
         assert a == b, path
 
 
-@pytest.mark.parametrize(("world", "group_size"), [(3, 3), (4, 2)])
-def test_sharded_muon_matches_one_process(tmp_path, world, group_size):
+@pytest.mark.parametrize(
+    ("world", "group_size", "scope"), [(3, 3, "blocks"), (4, 2, "blocks"), (3, 3, "all")]
+)
+def test_sharded_muon_matches_one_process(tmp_path, world, group_size, scope):
     # 모든 GPU끼리(3개, 조각 수가 나눠떨어지지 않는다) 또는 노드 안끼리(4개를 2개씩) 나눠도, 모든
-    # process의 가중치·momentum·Adam 상태가 1 process 계산과 비트 단위로 같다
-    reference = _run()
-    args = (world, _free_port(), group_size, torch.get_num_threads(), str(tmp_path))
+    # process의 가중치·momentum·Adam 상태가 1 process 계산과 비트 단위로 같다. 모든 파라미터 Muon도
+    reference = _run(scope=scope)
+    args = (world, _free_port(), group_size, torch.get_num_threads(), str(tmp_path), scope)
     mp.spawn(_worker, args=args, nprocs=world)
     for rank in range(world):
         _assert_same(torch.load(tmp_path / f"rank{rank}.pt", weights_only=True), reference)

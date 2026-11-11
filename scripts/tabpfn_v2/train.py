@@ -49,6 +49,9 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 구간 설정이 있는 run을 이어 학습하면 그 구간 설정을 따르고, lr은 `--lr`이 아니라 구간이 정한다.
 `--config-name cooldown`은 그 가중치를 `--init-run-id`로 가져와 lr 1e-4 → 0으로 20k step 마무리
 학습한다(`recipes.tabpfn_v3.cooldown`).
+`--config-name stage1|stage2|stage3`(`--arch v3.5 --task multitask`)은 TabICLv2 3단계 학습을 옮긴
+것이다(`recipes.tabpfn_v3.curriculum`: 모든 파라미터 Muon, 표 크기 curriculum, prior filter).
+stage2·3은 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -58,6 +61,7 @@ import argparse
 import os
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import matplotlib
@@ -86,8 +90,12 @@ PRESETS = {
     # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,
     # --init-run-id와 같이)
     "cooldown": tabpfn_v3.cooldown,
+    # TabICLv2 3단계 학습을 옮긴 것 (`recipes.tabpfn_v3.curriculum`, --arch v3.5 --task multitask).
+    # stage2·3은 앞 단계 run에서 가중치를 가져온다(--init-run-id)
+    **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
 }
 CONFIG_NAMES = tuple(PRESETS)
+CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
@@ -171,6 +179,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--muon-weight-decay", type=float, default=_env("TABPFN_V2_MUON_WEIGHT_DECAY", float)
     )
     parser.add_argument(
+        "--logit-softcap",
+        type=float,
+        default=_env("TABPFN_V2_LOGIT_SOFTCAP", float),
+        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)",
+    )
+    parser.add_argument(
         "--muon-distributed",
         choices=["off", "node", "all"],
         default=os.environ.get("TABPFN_V2_MUON_DISTRIBUTED") or None,
@@ -201,6 +215,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.config_name == "cooldown" and not (args.init_run_id or args.resume_run_id):
         # 학습한 가중치를 마무리하는 설정이다. 회귀 구간 경계도 가져온 checkpoint의 것을 쓴다
         parser.error("cooldown은 --init-run-id(paper_run run)나 --resume-run-id와 같이 줘야 한다")
+    if (
+        args.config_name in CURRICULUM_NAMES
+        and CURRICULUM_NAMES[args.config_name] > 1
+        and not (args.init_run_id or args.resume_run_id)
+    ):
+        # 단계마다 앞 단계의 가중치에서 새 optimizer로 시작한다 (TabICLv2 `--only_load_model True`)
+        parser.error(
+            f"{args.config_name}는 --init-run-id(앞 단계 run)나 --resume-run-id와 같이 줘야 한다"
+        )
     if (
         args.config_name == "long_tables"
         and args.arch is not None
@@ -241,6 +264,11 @@ def source_speed_options(params: dict[str, str]) -> dict:
                 if phases := normalize_phases(text):
                     out[name] = phases
                 continue
+            if name == "logit_softcap":
+                # 켠 run에서만 잇는다 (끈 run에서 가져와도 preset의 soft-cap을 지우지 않도록)
+                if text != "None":
+                    out[name] = float(text)
+                continue
             out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
     return out
 
@@ -258,6 +286,8 @@ OPTIMIZER_OPTIONS = (
     "schedule_free",
     "muon_weight_decay",
     "muon_distributed",
+    "muon_scope",
+    "muon_momentum",
     "phases",
 )
 
@@ -294,7 +324,7 @@ def build_config(
     def preset(arch: str) -> TrainConfig:
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
-        if args.config_name in ("paper_run", "cooldown"):
+        if args.config_name in ("paper_run", "cooldown", *CURRICULUM_NAMES):
             try:
                 return PRESETS[args.config_name](args.task, arch)
             except ValueError as e:
@@ -362,6 +392,7 @@ def _override_values(args: argparse.Namespace) -> dict:
         "optimizer": args.optimizer,
         "muon_weight_decay": args.muon_weight_decay,
         "muon_distributed": args.muon_distributed,
+        "logit_softcap": args.logit_softcap,
         **{
             name: True
             for name in (
