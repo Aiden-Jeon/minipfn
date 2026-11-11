@@ -759,33 +759,54 @@ def run_shards(args, suite, limits, datasets, out_dir: Path) -> list:
     n_gpus = torch.cuda.device_count()
     if n_gpus and args.shards > n_gpus:
         raise SystemExit(f"--shards {args.shards}가 GPU 수 {n_gpus}보다 많다.")
+    # 부모가 이미 GPU를 골라 두었으면(CUDA_VISIBLE_DEVICES) worker i는 그 목록의 i번째를 쓴다
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = visible.split(",") if visible else [str(i) for i in range(max(n_gpus, args.shards))]
     grid = arena.task_grid(arena.make_context(suite), suite, limits)
     if datasets is not None:
+        # worker를 띄우기 전에 멈춘다 (점수를 낼 때의 `arena.run`도 같은 이유로 멈춘다)
+        unknown = sorted(set(datasets) - set(grid["dataset"]))
+        if unknown:
+            raise SystemExit(f"{suite.name}에 없는 데이터셋: {unknown}")
         grid = grid[grid["dataset"].isin(datasets)]
     shards = arena.shard_datasets(grid, args.shards)
+    if not shards:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
+        return []
     commands = shard_commands(args.argv, shards, out_dir)
     threads = max(1, (os.cpu_count() or 1) // len(commands))
+    # 부모가 받아 둔 checkpoint(runs:/)를 worker가 다시 받지 않도록 같은 폴더를 가리킨다
+    checkpoints = (out_dir / "checkpoints").resolve()
     procs = []
-    for i, (cmd, worker_dir, _) in enumerate(commands):
-        worker_dir.mkdir(parents=True, exist_ok=True)
-        env = {k: v for k, v in os.environ.items() if k != "MLFLOW_RUN_ID"}
-        env.update(CUDA_VISIBLE_DEVICES=str(i), OMP_NUM_THREADS=str(threads))
-        log = open(out_dir / "shards" / f"shard{i}.log", "w")  # noqa: SIM115 (끝날 때까지 연다)
-        print(f"shard {i}: {len(shards[i])} datasets → GPU {i}", flush=True)
-        procs.append(
-            (
-                subprocess.Popen(
-                    [sys.executable, __file__, *cmd], env=env, stdout=log, stderr=subprocess.STDOUT
-                ),
-                log,
+    try:
+        for i, (cmd, worker_dir, results_file) in enumerate(commands):
+            worker_dir.mkdir(parents=True, exist_ok=True)
+            # 지난 실행의 기록·결과가 이 실행의 파일에 섞이지 않도록
+            for stale in (worker_dir / "test_time.jsonl", results_file):
+                stale.unlink(missing_ok=True)
+            link = worker_dir / "checkpoints"
+            if checkpoints.is_dir() and not link.exists():
+                link.symlink_to(checkpoints, target_is_directory=True)
+            env = {k: v for k, v in os.environ.items() if k != "MLFLOW_RUN_ID"}
+            env.update(CUDA_VISIBLE_DEVICES=devices[i], OMP_NUM_THREADS=str(threads))
+            log = open(out_dir / "shards" / f"shard{i}.log", "w")  # noqa: SIM115 (끝날 때까지 연다)
+            print(f"shard {i}: {len(shards[i])} datasets → GPU {devices[i]}", flush=True)
+            proc = subprocess.Popen(
+                [sys.executable, __file__, *cmd], env=env, stdout=log, stderr=subprocess.STDOUT
             )
-        )
-    failed = []
-    for i, (proc, log) in enumerate(procs):
-        code = proc.wait()
-        log.close()
-        if code:
-            failed.append(i)
+            procs.append((proc, log))
+        failed = []
+        for i, (proc, log) in enumerate(procs):
+            code = proc.wait()
+            log.close()
+            if code:
+                failed.append(i)
+    finally:
+        # 부모가 도중에 멈추면(예외, Ctrl-C) worker가 GPU를 잡고 남지 않도록
+        for proc, log in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            log.close()
     if failed:
         tails = {
             i: (out_dir / "shards" / f"shard{i}.log").read_text().splitlines()[-20:] for i in failed
