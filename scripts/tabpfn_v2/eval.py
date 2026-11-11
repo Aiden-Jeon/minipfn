@@ -106,6 +106,7 @@ import argparse
 import functools
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -265,6 +266,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--datasets", help="TabArena·BeyondArena: 쉼표로 구분한 데이터셋 이름 (나머지는 imputed)"
     )
+    parser.add_argument(
+        "--shards",
+        type=int,
+        default=1,
+        help="TabArena·BeyondArena: 데이터셋을 이만큼 나눠 GPU마다 worker 하나로 동시에 돌린다"
+        " (GPU 수 이하, 1이면 지금처럼 한 프로세스)",
+    )
+    # 내부용: worker가 split 결과를 남길 파일 (`--shards`가 넘긴다)
+    parser.add_argument("--shard-results", help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-train-rows", type=int, help="TabArena·BeyondArena: 학습 행 상한 (기본: 모델 구조)"
     )
@@ -671,20 +681,148 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
     fingerprint = arena_fingerprint(args, paths, factories, kinds, one_hot)
     models = {task: (f.model, f.borders) for task, f in factories.items()}
     datasets = None if args.datasets is None else args.datasets.split(",")
+    limits = arena_limits(models, args)
+    common = dict(
+        limits=limits, method=args.method_name, bagging=args.bagging, fingerprint=fingerprint
+    )
+    if args.shard_results:  # worker: 맡은 데이터셋만 돌리고 결과를 남긴다
+        arena.run(
+            suite,
+            make,
+            out_dir=out_dir / args.suite,
+            datasets=datasets,
+            results_path=args.shard_results,
+            **common,
+        )
+        return {}
+    results = None
+    if args.shards > 1:
+        results = run_shards(args, suite, limits, datasets, out_dir)
     summary = arena.run(
-        suite,
-        make,
-        limits=arena_limits(models, args),
-        out_dir=out_dir / args.suite,
-        method=args.method_name,
-        bagging=args.bagging,
-        datasets=datasets,
-        fingerprint=fingerprint,
+        suite, make, out_dir=out_dir / args.suite, datasets=datasets, results=results, **common
     )
     print_arena_summary(summary)
     if use_mlflow:
         log_arena_mlflow(args, summary, out_dir / args.suite, kinds, one_hot)
     return summary
+
+
+def _strip_flags(argv: list[str], flags: dict[str, int]) -> list[str]:
+    """`argv`에서 `flags`(이름: 값 개수)를 뺀다. `--name=value` 꼴도 뺀다."""
+    out, i = [], 0
+    while i < len(argv):
+        name = argv[i].split("=", 1)[0]
+        if name in flags:
+            i += 1 if "=" in argv[i] else 1 + flags[name]
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
+def shard_commands(
+    argv: list[str], shards: list[list[str]], out_dir: Path
+) -> list[tuple[list[str], Path, Path]]:
+    """worker마다 (명령 인자, out-dir, 결과 파일). 원래 인자에서 나누는 데 쓰는 인자와 MLflow 기록을
+    빼고 맡은 데이터셋·자기 out-dir·결과 파일을 더한다."""
+    base = _strip_flags(
+        argv,
+        {"--shards": 1, "--datasets": 1, "--out-dir": 1, "--mlflow": 0, "--shard-results": 1},
+    )
+    out = []
+    for i, names in enumerate(shards):
+        worker_dir = out_dir / "shards" / f"shard{i}"
+        results = worker_dir / "results.pkl"
+        cmd = [
+            *base,
+            "--datasets",
+            ",".join(names),
+            "--out-dir",
+            str(worker_dir),
+            "--shard-results",
+            str(results),
+        ]
+        out.append((cmd, worker_dir, results))
+    return out
+
+
+def run_shards(args, suite, limits, datasets, out_dir: Path) -> list:
+    """데이터셋을 `--shards`개로 나눠(`arena.shard_datasets`) GPU마다 worker 프로세스 하나로 동시에
+    돌리고, worker들의 split 결과를 모아 돌려준다. worker의 출력은 `<out-dir>/shards/shard<i>.log`,
+    test-time·증류 기록(jsonl)은 끝나면 이 실행의 파일 뒤에 붙인다. worker가 하나라도 실패하면
+    멈춘다(그 데이터셋이 조용히 imputed가 되지 않도록)."""
+    import pickle
+    import subprocess
+
+    from minipfn.benchmarks import arena
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus and args.shards > n_gpus:
+        raise SystemExit(f"--shards {args.shards}가 GPU 수 {n_gpus}보다 많다.")
+    # 부모가 이미 GPU를 골라 두었으면(CUDA_VISIBLE_DEVICES) worker i는 그 목록의 i번째를 쓴다
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = visible.split(",") if visible else [str(i) for i in range(max(n_gpus, args.shards))]
+    grid = arena.task_grid(arena.make_context(suite), suite, limits)
+    if datasets is not None:
+        # worker를 띄우기 전에 멈춘다 (점수를 낼 때의 `arena.run`도 같은 이유로 멈춘다)
+        unknown = sorted(set(datasets) - set(grid["dataset"]))
+        if unknown:
+            raise SystemExit(f"{suite.name}에 없는 데이터셋: {unknown}")
+        grid = grid[grid["dataset"].isin(datasets)]
+    shards = arena.shard_datasets(grid, args.shards)
+    if not shards:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
+        return []
+    commands = shard_commands(args.argv, shards, out_dir)
+    threads = max(1, (os.cpu_count() or 1) // len(commands))
+    # 부모가 받아 둔 checkpoint(runs:/)를 worker가 다시 받지 않도록 같은 폴더를 가리킨다
+    checkpoints = (out_dir / "checkpoints").resolve()
+    procs = []
+    try:
+        for i, (cmd, worker_dir, results_file) in enumerate(commands):
+            worker_dir.mkdir(parents=True, exist_ok=True)
+            # 지난 실행의 기록·결과가 이 실행의 파일에 섞이지 않도록
+            for stale in (worker_dir / "test_time.jsonl", results_file):
+                stale.unlink(missing_ok=True)
+            link = worker_dir / "checkpoints"
+            if checkpoints.is_dir() and not link.exists():
+                link.symlink_to(checkpoints, target_is_directory=True)
+            env = {k: v for k, v in os.environ.items() if k != "MLFLOW_RUN_ID"}
+            env.update(CUDA_VISIBLE_DEVICES=devices[i], OMP_NUM_THREADS=str(threads))
+            log = open(out_dir / "shards" / f"shard{i}.log", "w")  # noqa: SIM115 (끝날 때까지 연다)
+            print(f"shard {i}: {len(shards[i])} datasets → GPU {devices[i]}", flush=True)
+            proc = subprocess.Popen(
+                [sys.executable, __file__, *cmd], env=env, stdout=log, stderr=subprocess.STDOUT
+            )
+            procs.append((proc, log))
+        failed = []
+        for i, (proc, log) in enumerate(procs):
+            code = proc.wait()
+            log.close()
+            if code:
+                failed.append(i)
+    finally:
+        # 부모가 도중에 멈추면(예외, Ctrl-C) worker가 GPU를 잡고 남지 않도록
+        for proc, log in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            log.close()
+    if failed:
+        tails = {
+            i: (out_dir / "shards" / f"shard{i}.log").read_text().splitlines()[-20:] for i in failed
+        }
+        raise SystemExit(f"shard {failed}가 실패했다: {tails}")
+    results = []
+    for _, worker_dir, path in commands:
+        with open(path, "rb") as f:
+            results.extend(pickle.load(f))
+        for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
+            part = worker_dir / name
+            if part.exists():
+                with open(out_dir / name, "a") as f:
+                    f.write(part.read_text())
+    print(f"shards: {len(results)} split results from {len(commands)} workers", flush=True)
+    return results
 
 
 def print_arena_summary(summary: dict) -> None:
@@ -777,6 +915,11 @@ def mlflow_run(use_mlflow: bool):
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)  # `--shards`의 worker 명령에 쓴다
+    if args.shards < 1:
+        raise SystemExit("--shards는 1 이상이어야 한다.")
+    if args.shards > 1 and args.suite not in ARENA_SUITES:
+        raise SystemExit("--shards는 TabArena·BeyondArena suite에서만 쓴다.")
     if args.uncertainty and args.suite in ARENA_SUITES:
         # arena는 공식 패키지의 지표만 낸다. 조용히 무시하지 않고 멈춘다
         raise SystemExit("--uncertainty는 AMLB suite(classification, regression, all)에서만 쓴다.")
