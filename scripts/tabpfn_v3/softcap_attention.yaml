@@ -1,0 +1,29 @@
+# soft-cap attention: flex attention kernel과 logit을 직접 만드는 구현을 견준다 (issue #77,
+# scripts/tabpfn_v3/softcap_attention.py): float32 출력·gradient가 같은지, attention 종류마다의
+# micro 측정, curriculum stage 1·2·3의 가장 큰 표에서 forward·backward 메모리·시간(compile 끔·켬).
+#   databricks air run -f scripts/tabpfn_v3/softcap_attention.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 일부만: --override env_variables.SOFTCAP_ARGS="--skip-micro --variants none,flex --stages 1,2"
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-5-softcap-attention
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v3/softcap_attention.py
+env_variables:
+  SOFTCAP_ARGS: ""
+max_retries: 0
+timeout_minutes: 120
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v3/softcap_attention.py --out /tmp/softcap_attention.json
+  $SOFTCAP_ARGS

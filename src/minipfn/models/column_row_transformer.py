@@ -64,6 +64,7 @@ TabPFN-3.5가 바꾼 것은 설정으로 켠다 (recipe `ARCHITECTURES["v3.5"]`)
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import asdict, dataclass
 from typing import Any, ClassVar
@@ -82,9 +83,33 @@ N_HARMONICS = 4  # TabPFN-3.5 ECDF의 sin·cos 차수
 # 파라미터가 없어서, 정답 embedding 수(`n_out`)보다 많은 클래스는 embedding을 묶어 받는다
 # (`forward`의 `y_classes`)
 MAX_CLASSES = 160
-# soft-cap attention(`Attention._sdpa`)이 추론에서 한 번에 만드는 logit 수 상한. 넘으면 query를
-# 나눠 계산한다(행마다 따로라 결과는 같다). 2^28개 = float32 1 GiB
+# soft-cap attention(`Attention._sdpa`)을 GPU 밖에서 logit을 직접 만들어 계산할 때, 추론에서 한
+# 번에 만드는 logit 수 상한. 넘으면 query를 나눠 계산한다(행마다 따로라 결과는 같다).
+# 2^28개 = float32 1 GiB
 SOFTCAP_CHUNK_LOGITS = 1 << 28
+# flex attention kernel의 grid 둘째 축이 batch라 CUDA 상한(65,535)을 넘으면 batch를 나눠 부른다
+# (추론에서 행 단계의 batch = 행 수가 이보다 클 수 있다)
+FLEX_MAX_BATCH = 65_535
+# flex attention kernel을 쓰는 가장 작은 head 폭 (Triton 행렬곱의 최소 폭). 더 좁으면(작은 smoke
+# 모델) logit을 직접 만든다
+FLEX_MIN_HEAD_DIM = 16
+# compile 밖에서 부르는 flex attention의 recompile 한도 (`_compiled_flex_attention`)
+FLEX_RECOMPILE_LIMIT = 64
+# head 폭이 이보다 작으면(열·행 단계, 16) flex attention kernel의 block을 줄인다. H100에서
+# 기본값(128)보다 forward·backward가 1.5~2배 빨랐고 autotune과 같았다. 행 ICL(64)은 기본값이
+# 더 빨랐다 (issue #77, `scripts/tabpfn_v3/softcap_attention.py`의 micro)
+FLEX_SMALL_HEAD_DIM = 32
+FLEX_SMALL_BLOCKS = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_M1": 32,
+    "BLOCK_N1": 64,
+    "BLOCK_M2": 64,
+    "BLOCK_N2": 32,
+}
+# GPU에서 soft-cap attention을 계산하는 방법 (`Attention._sdpa`): "flex"(flex attention kernel)
+# 또는 "manual"(logit을 다 만든다, GPU 밖과 같은 구현). 테스트·측정에서 바꿔 견준다
+SOFTCAP_KERNEL = "flex"
 
 
 @dataclass
@@ -293,6 +318,8 @@ class Attention(nn.Module):
         super().__init__()
         self.nhead, self.qk_norm, self.rope_base = nhead, qk_norm, rope_base
         self.logit_softcap = logit_softcap
+        if logit_softcap is not None:
+            _softcap_score_mod(float(logit_softcap))  # compile 밖에서 미리 만든다
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         if qk_norm:
@@ -341,10 +368,20 @@ class Attention(nn.Module):
         return self.out(out.transpose(1, 2).reshape(n, length, dim))
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """scaled dot-product attention. soft-cap이 있으면 logit을 직접 만들어 c * tanh(logit / c)를
-        거친다(fused kernel을 못 써서 느리고 logit 행렬만큼 메모리를 더 쓴다)."""
+        """scaled dot-product attention. soft-cap이 있으면 logit에 c * tanh(logit / c)를 거친다.
+
+        GPU에서는 flex attention kernel의 `score_mod`로 넣어 logit 행렬을 만들지 않는다(issue #77:
+        학습에서 층마다 (B, H, Lq, Lk) logit을 backward용으로 들고 있으면 stage 2·3의 큰 표에서
+        OOM이다). 그 밖(CPU·MPS: flex attention의 backward가 없다)에서는 logit을 직접 만든다."""
         if self.logit_softcap is None:
             return F.scaled_dot_product_attention(q, k, v)
+        if (
+            SOFTCAP_KERNEL == "flex"
+            and q.is_cuda
+            and q.shape[-2] > 0
+            and q.shape[-1] >= FLEX_MIN_HEAD_DIM
+        ):
+            return _flex_softcap(q, k, v, self.logit_softcap)
         n_queries, n_keys = q.shape[-2], k.shape[-2]
         # query 행 하나의 logit 수 (batch × head × key)
         per_query = q.numel() // max(1, n_queries * q.shape[-1]) * n_keys
@@ -363,6 +400,86 @@ class Attention(nn.Module):
         logits = (q @ k.transpose(-1, -2)) * q.shape[-1] ** -0.5
         logits = cap * torch.tanh(logits / cap)
         return logits.softmax(-1, dtype=torch.float32).to(v.dtype) @ v
+
+
+# cap마다 flex attention `score_mod` 하나 (`_softcap_score_mod`)
+_SCORE_MODS: dict[float, Any] = {}
+
+
+def _softcap_score_mod(cap: float):
+    """flex attention의 `score_mod`: (scale을 곱한) logit → cap · tanh(logit / cap). cap마다 한
+    함수만 만든다(compile이 함수가 바뀔 때마다 다시 compile하지 않도록).
+
+    cap은 closure 변수가 아니라 코드 안의 상수로 넣는다. dynamic shape compile은 closure의 Python
+    float도 기호로 바꾸는데, 그러면 flex attention을 추적할 때 그 값을 읽는(`.item()`) 곳에서
+    graph가 끊기고 backward가 실패한다(torch 2.11). 함수는 compile 밖(`Attention` 생성)에서 미리
+    만들어 두어, compile 안에서는 dict에서 꺼내기만 한다(`exec`은 추적하지 못해 graph가 끊긴다)."""
+    if cap not in _SCORE_MODS:
+        namespace = {"torch": torch}
+        exec(  # 코드에 넣는 것은 cap(float) 하나다
+            f"def score_mod(score, b, h, q_idx, kv_idx):\n"
+            f"    return {cap!r} * torch.tanh(score / {cap!r})",
+            namespace,
+        )
+        _SCORE_MODS[cap] = namespace["score_mod"]
+    return _SCORE_MODS[cap]
+
+
+@functools.cache
+def _compiled_flex_attention(cap: float):
+    """cap을 넣은 flex attention을 compile한 것. compile하지 않은 flex attention은 logit 행렬을 다
+    만드는 느린 참고 구현이라, compile 밖(가속 옵션 compile을 끈 학습, 추론)에서는 이것을 부른다.
+    표 크기가 batch마다 달라 dynamic shape로. `flex_attention` 자체를 dynamic으로 compile하면
+    torch 2.11에서 fake tensor 단계가 실패해 감싼 함수를 compile한다.
+
+    head 수·head 폭(flex attention이 고정한다), batch 1(dynamic shape도 1은 따로), gradient 여부마다
+    graph가 하나씩이라 기본 recompile 한도(8)를 넘는다. 넘으면 조용히 compile하지 않은 구현으로
+    돌아가 logit 행렬을 다 만들므로 부를 때 한도를 `FLEX_RECOMPILE_LIMIT`로 올린다."""
+    from torch.nn.attention.flex_attention import flex_attention
+
+    score_mod = _softcap_score_mod(cap)
+
+    def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return flex_attention(q, k, v, score_mod=score_mod, kernel_options=_flex_blocks(q))
+
+    compiled = torch.compile(attend, dynamic=True)
+
+    def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        limit = max(FLEX_RECOMPILE_LIMIT, torch._dynamo.config.recompile_limit)
+        with torch._dynamo.config.patch(recompile_limit=limit):
+            return compiled(q, k, v)
+
+    return call
+
+
+def _flex_blocks(q: torch.Tensor) -> dict | None:
+    """flex attention kernel의 block 크기 (`FLEX_SMALL_BLOCKS`). head 폭은 compile이 고정하는 값이라
+    graph마다 정해진다."""
+    return dict(FLEX_SMALL_BLOCKS) if q.shape[-1] < FLEX_SMALL_HEAD_DIM else None
+
+
+def _flex_softcap(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cap: float) -> torch.Tensor:
+    """soft-cap attention을 flex attention kernel로 (GPU). logit·softmax는 kernel 안에서 float32로
+    계산하고, 메모리는 fused SDPA처럼 query·key 길이에 선형이다(backward도 logit을 다시 계산).
+    q·k·v는 v의 dtype으로 맞춘다(autocast의 SDPA처럼. QK-norm 출력이 float32일 수 있다)."""
+    cap = float(cap)
+    if torch.compiler.is_compiling():  # 가속 옵션 compile: 블록 compile 안에서 그대로 쓴다
+        from torch.nn.attention.flex_attention import flex_attention
+
+        score_mod = _softcap_score_mod(cap)
+
+        def attend(q, k, v):
+            return flex_attention(q, k, v, score_mod=score_mod, kernel_options=_flex_blocks(q))
+    else:
+        attend = _compiled_flex_attention(cap)
+    q, k = q.to(v.dtype), k.to(v.dtype)
+    if q.shape[0] <= FLEX_MAX_BATCH:
+        return attend(q, k, v)
+    parts = [
+        attend(q[i : i + FLEX_MAX_BATCH], k[i : i + FLEX_MAX_BATCH], v[i : i + FLEX_MAX_BATCH])
+        for i in range(0, q.shape[0], FLEX_MAX_BATCH)
+    ]
+    return torch.cat(parts)
 
 
 def _mlp(dim: int, ff_factor: int) -> nn.Sequential:
@@ -712,6 +829,15 @@ class ColumnRowTransformer(nn.Module):
     def repeated_blocks(self) -> list[nn.Module]:
         """여러 번 쓰는 블록 (학습 가속 옵션 `compile`이 블록마다 compile한다)."""
         return [*self.column_blocks, *self.row_blocks, *self.icl_layers]
+
+    def compile_options(self) -> dict | None:
+        """블록 compile(`repeated_blocks`)에 줄 inductor 설정. soft-cap을 켜면 memory coalescing
+        tiling 분석을 끈다: torch 2.11에서 stage 1 표(데이터셋 8개 × 1,024행)의 flex attention
+        backward를 compile할 때 그 분석의 assert가 실패했다(issue #77). 끈 것과 켠 것의 soft-cap
+        없는 step 시간은 같았다. soft-cap이 없으면 설정을 바꾸지 않는다(계산이 예전과 같게)."""
+        if self.config.logit_softcap is None:
+            return None
+        return {"triton.coalesce_tiling_analysis": False}
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

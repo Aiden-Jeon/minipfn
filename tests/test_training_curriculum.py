@@ -456,6 +456,49 @@ def test_logit_softcap_inference_chunks(monkeypatch):
     assert torch.allclose(whole, chunked, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention backward는 GPU만")
+def test_logit_softcap_gpu_kernels_match_manual(monkeypatch):
+    # GPU의 flex attention kernel이 logit을 다 만드는 구현과 출력·gradient가 같다 (issue #77).
+    # multi-query 테스트 행 경로, cap이 걸리는 큰 logit, batch를 나누는 경로, head 폭 16(작은
+    # block)과 64(기본 block)
+    from minipfn.models import column_row_transformer as M
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(0)
+    for dim, heads in ((64, 4), (256, 4)):
+        attn = M.Attention(
+            dim, heads, qk_norm=True, qassmax=True, zero_out=False, logit_softcap=5.0
+        )
+        attn = attn.cuda()
+        x = torch.randn(5, 150, dim, device="cuda") * 10
+        runs = []
+        for kernel, max_batch in (("manual", 65_535), ("flex", 65_535), ("flex", 2)):
+            monkeypatch.setattr(M, "SOFTCAP_KERNEL", kernel)
+            monkeypatch.setattr(M, "FLEX_MAX_BATCH", max_batch)
+            x_ = x.clone().requires_grad_()
+            attn.zero_grad(set_to_none=True)
+            out = attn(x_, n_context=120)
+            out.square().mean().backward()
+            grads = [p.grad for p in attn.parameters() if p.grad is not None]
+            runs.append([out, x_.grad, *grads])
+        for other in runs[1:]:
+            for a, b in zip(runs[0], other, strict=True):
+                assert torch.allclose(a, b, rtol=1e-4, atol=1e-5 * a.abs().max().item())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention backward는 GPU만")
+def test_logit_softcap_flex_trains_compiled(tmp_path, monkeypatch):
+    # 가속 옵션 compile(블록마다 dynamic shape)로 soft-cap 학습이 돈다: 블록 compile 안의 flex
+    # attention과 모델의 inductor 설정(`compile_options`). 표 크기가 step마다 다르다
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    out = train(
+        _smoke_curriculum(logit_softcap=50.0, compile=True, stop_step=3),
+        tmp_path,
+        mlflow_log=False,
+    )
+    assert all(np.isfinite(out["history"]["train_loss"]))
+
+
 def test_logit_softcap_trains_from_uncapped_weights(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONHASHSEED", "0")
     # soft-cap 없이 학습한 가중치를 soft-cap을 켜고 가져온다 (모델 설정의 INFO_FIELDS)
