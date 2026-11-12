@@ -476,7 +476,7 @@ def _train(
         for block in blocks:
             block.compile(dynamic=True, options=options)
         if not blocks:
-            train_forward = torch.compile(ddp_model, dynamic=True)
+            train_forward = torch.compile(ddp_model, dynamic=True, options=options)
     # rank 0의 검증용 사본: schedule-free의 평균 x나 LAWA 평균을 담는다
     # (학습 가중치는 건드리지 않는다)
     eval_copy_model = None

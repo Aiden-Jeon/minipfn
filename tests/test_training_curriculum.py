@@ -438,6 +438,14 @@ def test_logit_softcap():
     # 0은 NaN을 내고, soft-cap이 없는 모델에 주면 조용히 빠지므로 막는다
     with pytest.raises(ValueError, match="logit_softcap"):
         replace(config, logit_softcap=0.0)
+    with pytest.raises(ValueError, match="logit_softcap"):  # 끄려면 inf가 아니라 None
+        replace(config, logit_softcap=float("inf"))
+    # 생성 뒤에 cap을 정해도 flex attention의 score_mod를 compile 밖에서 미리 만든다
+    from minipfn.models import column_row_transformer as M
+
+    attn = Attention(16, 2)
+    attn.logit_softcap = 37.5
+    assert 37.5 in M._SCORE_MODS and attn.logit_softcap == 37.5
     with pytest.raises(ValueError, match="logit_softcap"):
         replace(TrainConfig.smoke("classification"), logit_softcap=50.0)
 
@@ -489,13 +497,15 @@ def test_logit_softcap_gpu_kernels_match_manual(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention backward는 GPU만")
 def test_logit_softcap_flex_trains_compiled(tmp_path, monkeypatch):
     # 가속 옵션 compile(블록마다 dynamic shape)로 soft-cap 학습이 돈다: 블록 compile 안의 flex
-    # attention과 모델의 inductor 설정(`compile_options`). 표 크기가 step마다 다르다
+    # attention과 모델의 inductor 설정(`compile_options`). 표 크기가 step마다 다르다. 폭은
+    # TabPFN-3.5와 같게 해서 열·행 단계(head 폭 16, 작은 block)와 ICL(64)이 모두 flex를 쓴다.
+    # GPU 노드의 pytest에서는 OMP_NUM_THREADS=1로 돌린다(회귀 구간 경계의 process pool이 멈춘다)
     monkeypatch.setenv("PYTHONHASHSEED", "0")
-    out = train(
-        _smoke_curriculum(logit_softcap=50.0, compile=True, stop_step=3),
-        tmp_path,
-        mlflow_log=False,
-    )
+    config = _smoke_curriculum(logit_softcap=50.0, compile=True, stop_step=3, emsize=128, nhead=16)
+    model_config = config.model_config()
+    assert model_config.emsize // model_config.column_heads == 16
+    assert model_config.icl_dim // model_config.nhead == 64
+    out = train(config, tmp_path, mlflow_log=False)
     assert all(np.isfinite(out["history"]["train_loss"]))
 
 

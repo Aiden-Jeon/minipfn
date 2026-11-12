@@ -88,8 +88,9 @@ def main(argv=None) -> None:
     forward = ddp
     if args.compile:
         torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
+        options = model.compile_options()  # 학습 루프와 같은 inductor 설정
         for block in model.repeated_blocks():
-            block.compile(dynamic=True)
+            block.compile(dynamic=True, options=options)
     # 시간만 재므로 회귀 구간 경계는 고르게 둔다 (학습은 prior에서 계산한다)
     bar = FullSupportBarDistribution(torch.linspace(-4, 4, N_BUCKETS + 1)).to(device)
     workers = max(1, config.num_workers // len(config.tasks))
