@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from dataclasses import dataclass, fields, replace
 from typing import Literal
 
@@ -251,8 +252,8 @@ class TrainConfig:
         if not 0.0 <= self.binary_prob <= 1.0:
             raise ValueError(f"binary_prob는 0 이상 1 이하여야 한다: {self.binary_prob}")
         if self.logit_softcap is not None:
-            if not self.logit_softcap > 0:
-                raise ValueError(f"logit_softcap은 0보다 커야 한다: {self.logit_softcap}")
+            if not (math.isfinite(self.logit_softcap) and self.logit_softcap > 0):
+                raise ValueError(f"logit_softcap은 유한한 양수다: {self.logit_softcap}")
             if "logit_softcap" not in config_fields(self.model_type):
                 # 모델 설정으로 옮길 때(`model_config`) 조용히 빠지지 않도록
                 raise ValueError(f"logit_softcap은 {self.model_type} 모델에 없다")

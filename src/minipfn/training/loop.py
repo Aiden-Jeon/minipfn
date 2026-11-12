@@ -471,10 +471,12 @@ def _train(
         # compile된다. 기본 cache 한도(8)를 넘으면 조용히 eager로 돌아가므로 넉넉히 둔다
         torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
         blocks = model.repeated_blocks() if hasattr(model, "repeated_blocks") else []
+        # 모델이 요구하는 inductor 설정 (soft-cap attention의 flex attention, issue #77)
+        options = model.compile_options() if hasattr(model, "compile_options") else None
         for block in blocks:
-            block.compile(dynamic=True)
+            block.compile(dynamic=True, options=options)
         if not blocks:
-            train_forward = torch.compile(ddp_model, dynamic=True)
+            train_forward = torch.compile(ddp_model, dynamic=True, options=options)
     # rank 0의 검증용 사본: schedule-free의 평균 x나 LAWA 평균을 담는다
     # (학습 가중치는 건드리지 않는다)
     eval_copy_model = None
