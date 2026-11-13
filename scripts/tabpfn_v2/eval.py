@@ -696,6 +696,9 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
         for line in iter(sys.stdin.readline, ""):
             job = json.loads(line)
             print(f"shard worker: {job['dataset']} ({job['splits']} splits)", flush=True)
+            # 받았다는 표시: 이것 없이 죽으면 부모가 이 일을 다른 worker에게 다시 준다
+            Path(job["out_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(job["started"]).touch()
             arena.run(
                 suite,
                 make,
@@ -707,7 +710,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
         return {}
     results = None
     if args.shards > 1:
-        results = run_shards(args, suite, limits, datasets, out_dir)
+        cache_id = arena._run_id(fingerprint, args.method_name, args.bagging)  # 진행률 표시용
+        results = run_shards(args, suite, limits, datasets, out_dir, cache_id)
     summary = arena.run(
         suite, make, out_dir=out_dir / args.suite, datasets=datasets, results=results, **common
     )
@@ -747,13 +751,21 @@ def shard_worker_command(argv: list[str], worker_dir: Path) -> list[str]:
     return [*base, "--out-dir", str(worker_dir), "--shard-worker"]
 
 
-def shard_jobs(queue: list[tuple[str, int]], out_dir: Path, suite: str) -> list[dict]:
-    """큐의 데이터셋마다 worker에 넘길 일: 데이터셋, split 수, `arena.run`의 out-dir, 결과 파일.
+def shard_jobs(
+    queue: list[tuple[str, int]], out_dir: Path, suite: str, cache_id: str = ""
+) -> list[dict]:
+    """큐의 데이터셋마다 worker에 넘길 일: 데이터셋, split 수, `arena.run`의 out-dir, 결과 파일,
+    받았다는 표시 파일, 이 실행의 split 캐시 폴더(`runs/<cache_id>`, 진행률 표시용).
+
     out-dir은 worker가 아니라 데이터셋으로 정한다. 그래서 다시 돌리면 어느 worker가 받아도 끝난
-    split(캐시)을 다시 쓴다."""
+    split(캐시)을 다시 쓴다. 폴더 이름에는 이름의 hash를 붙인다(`a/b`와 `a_b`, 대소문자만 다른
+    이름이 한 폴더가 되지 않도록)."""
+    import hashlib
+
     jobs = []
     for dataset, splits in queue:
-        folder = re.sub(r"[^\w.-]", "_", dataset)
+        digest = hashlib.sha1(dataset.encode()).hexdigest()[:8]
+        folder = f"{re.sub(r'[^\w.-]', '_', dataset)}-{digest}"
         dataset_dir = out_dir / "shards" / "datasets" / folder / suite
         jobs.append(
             {
@@ -761,6 +773,8 @@ def shard_jobs(queue: list[tuple[str, int]], out_dir: Path, suite: str) -> list[
                 "splits": splits,
                 "out_dir": str(dataset_dir),
                 "results": str(dataset_dir / "results.pkl"),
+                "started": str(dataset_dir / "started"),
+                "cache": str(dataset_dir / "runs" / cache_id),
             }
         )
     return jobs
@@ -772,9 +786,10 @@ def _clock(seconds: float) -> str:
 
 
 def _splits_cached(job: dict) -> int:
-    # 진행률 표시용: tabarena가 끝난 split마다 남기는 캐시
+    # 진행률 표시용: tabarena가 이 실행의 끝난 split마다 남기는 캐시
     # (`runs/<id>/data/<method>/<task>/<repeat>_<fold>/results.pkl`)
-    return sum(1 for _ in Path(job["out_dir"]).glob("runs/*/data/*/*/*/results.pkl*"))
+    found = sum(1 for _ in Path(job["cache"]).glob("data/*/*/*/results.pkl*"))
+    return min(found, job["splits"])
 
 
 def run_queue(
@@ -788,11 +803,13 @@ def run_queue(
 ) -> tuple[list[str], dict[int, str]]:
     """worker `n_workers`개(`spawn(i)`가 stdin이 PIPE인 Popen을 돌려준다)에 `jobs`를 앞에서부터
     하나씩 나눠 준다. 일을 받은 worker가 결과 파일(`job["results"]`)을 남기면 다음 일을 준다.
-    남은 일이 없으면 stdin을 닫아 끝낸다. `heartbeat_s`마다 끝난 split 수와 worker별 데이터셋·경과
-    시간을 찍는다(플랫폼이 로그 없는 job을 죽이지 않도록, 사람이 진행률을 보도록).
+    모든 일이 끝나면 stdin을 닫아 worker를 끝낸다. `heartbeat_s`마다 끝난 split 수와 worker별
+    데이터셋·경과 시간을 찍는다(플랫폼이 로그 없는 job을 죽이지 않도록, 사람이 진행률을 보도록).
 
-    worker가 하나 죽어도 남은 일은 나머지 worker가 받는다. 돌려주는 것: 결과가 없는 데이터셋(죽은
-    worker가 잡고 있던 것 등)과 실패한 worker {번호: 이유}. 둘 다 비어야 성공이다."""
+    worker가 죽으면 남은 일은 나머지 worker가 받는다. 죽은 worker가 받았다는 표시
+    (`job["started"]`)를 남기기 전이면 그 일도 다시 준다. 표시를 남긴 뒤면 다시 주지 않는다(같은
+    데이터셋이 worker를 하나씩 다 죽이지 않도록). 돌려주는 것: 결과가 없는 데이터셋과 실패한 worker
+    {번호: 이유}. 둘 다 비어야 성공이다."""
     labels = labels or [f"worker {i}" for i in range(n_workers)]
     pending = list(jobs)
     total = sum(j["splits"] for j in jobs)
@@ -802,44 +819,46 @@ def run_queue(
     start = last_beat = time.monotonic()
 
     def assign(i: int, proc) -> None:
-        if not pending:
-            proc.stdin.close()
-            return
         job = pending.pop(0)
-        Path(job["results"]).unlink(missing_ok=True)  # 지난 실행의 결과를 끝난 것으로 보지 않도록
+        # 지난 실행의 것을 이 실행의 것으로 보지 않도록
+        for stale in (job["results"], job["started"]):
+            Path(stale).unlink(missing_ok=True)
         try:
             proc.stdin.write(json.dumps(job) + "\n")
             proc.stdin.flush()
-        except (BrokenPipeError, OSError):  # 이미 죽었다: 일은 다른 worker에게 돌려준다
+        except OSError:  # 이미 죽었다 (BrokenPipeError 등): 일은 다른 worker에게 돌려준다
             pending.insert(0, job)
             failed.setdefault(i, "stdin closed")
             return
         current[i] = (job, time.monotonic())
         print(f"shards: {labels[i]} ← {job['dataset']} ({job['splits']} splits)", flush=True)
 
+    def close(proc) -> None:
+        if not proc.stdin.closed:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
     def heartbeat(now: float) -> None:
-        running = sum(min(_splits_cached(job), job["splits"]) for job, _ in current.values())
+        cached = {i: _splits_cached(job) for i, (job, _) in current.items()}
         finished = sum(j["splits"] for j in jobs if j["dataset"] in done)
         print(
-            f"[heartbeat {_clock(now - start)}] splits {finished + running}/{total} "
+            f"[heartbeat {_clock(now - start)}] splits {finished + sum(cached.values())}/{total} "
             f"(datasets {len(done)}/{len(jobs)}, queue {len(pending)})",
             flush=True,
         )
         for i in range(n_workers):
             if i in current:
                 job, since = current[i]
-                state = (
-                    f"{job['dataset']} splits {min(_splits_cached(job), job['splits'])}"
-                    f"/{job['splits']}, {_clock(now - since)}"
-                )
+                elapsed = _clock(now - since)
+                state = f"{job['dataset']} splits {cached[i]}/{job['splits']}, {elapsed}"
             else:
-                state = "failed" if i in failed else "done"
+                state = "failed" if i in failed else ("idle" if pending else "done")
             print(f"  {labels[i]}: {state}", flush=True)
 
     procs = [spawn(i) for i in range(n_workers)]
     try:
-        for i, proc in enumerate(procs):
-            assign(i, proc)
         while True:
             for i, proc in enumerate(procs):
                 if i in current and Path(current[i][0]["results"]).exists():
@@ -851,20 +870,25 @@ def run_queue(
                         f"({len(done)}/{len(jobs)} datasets)",
                         flush=True,
                     )
-                    assign(i, proc)
                 code = proc.poll()
                 if code is not None and (code or i in current):
                     failed.setdefault(i, f"exit {code}")
                     if i in current:
-                        failed[i] += f" while running {current.pop(i)[0]['dataset']}"
-                        # 결과 없이 죽은 데이터셋은 다시 주지 않는다 (아래에서 실패로 낸다)
-                    if not proc.stdin.closed:
-                        try:
-                            proc.stdin.close()
-                        except OSError:
-                            pass
-            if all(p.poll() is not None for p in procs):
-                break
+                        job, _ = current.pop(i)
+                        if Path(job["started"]).exists():
+                            failed[i] += f" while running {job['dataset']}"
+                        else:  # 받기 전에 죽었다: 다른 worker에게
+                            pending.insert(0, job)
+                    close(proc)
+            # 쉬는 worker(살아 있고 일이 없다)에게 남은 일을 준다
+            for i, proc in enumerate(procs):
+                if pending and i not in current and i not in failed and proc.poll() is None:
+                    assign(i, proc)
+            if not current and (not pending or all(i in failed for i in range(n_workers))):
+                for proc in procs:
+                    close(proc)
+                if all(p.poll() is not None for p in procs):
+                    break
             now = time.monotonic()
             if now - last_beat >= heartbeat_s:
                 heartbeat(now)
@@ -881,7 +905,7 @@ def run_queue(
     return missing, failed
 
 
-def run_shards(args, suite, limits, datasets, out_dir: Path) -> list:
+def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "") -> list:
     """GPU마다 worker 프로세스를 하나씩 띄우고, 데이터셋을 비싼 것부터(`arena.dataset_queue`) 큐에서
     하나씩 나눠 준다(`run_queue`). 하나 끝낸 worker가 바로 다음 것을 받으므로 먼저 끝난 GPU가 놀지
     않는다. worker들의 split 결과를 모아 돌려준다. worker의 출력은 `<out-dir>/shards/shard<i>.log`,
@@ -905,7 +929,7 @@ def run_shards(args, suite, limits, datasets, out_dir: Path) -> list:
         if unknown:
             raise SystemExit(f"{suite.name}에 없는 데이터셋: {unknown}")
         grid = grid[grid["dataset"].isin(datasets)]
-    jobs = shard_jobs(arena.dataset_queue(grid), out_dir, args.suite)
+    jobs = shard_jobs(arena.dataset_queue(grid), out_dir, args.suite, cache_id)
     if not jobs:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
         return []
     n_workers = min(args.shards, len(jobs))

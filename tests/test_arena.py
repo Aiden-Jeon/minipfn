@@ -323,31 +323,44 @@ def test_shard_worker_command_replaces_dataset_and_output_flags(tmp_path):
     ]  # fmt: skip
     args = script.parse_args(cmd)
     assert args.shard_worker and args.shards == 1 and args.datasets is None
-    jobs = script.shard_jobs([("big/one", 2), ("b", 1)], tmp_path, "beyondarena")
+    names = [("big/one", 2), ("big_one", 1), ("Big_one", 1)]
+    jobs = script.shard_jobs(names, tmp_path, "beyondarena", "abc")
     # out-dir은 worker가 아니라 데이터셋으로 정한다 (다시 돌리면 어느 worker든 캐시를 쓴다)
-    dataset_dir = tmp_path / "shards" / "datasets" / "big_one" / "beyondarena"
+    dataset_dir = Path(jobs[0]["out_dir"])
+    assert dataset_dir.parent.parent == tmp_path / "shards" / "datasets"
+    assert dataset_dir.name == "beyondarena" and dataset_dir.parent.name.startswith("big_one-")
     assert jobs[0] == {
         "dataset": "big/one",
         "splits": 2,
         "out_dir": str(dataset_dir),
         "results": str(dataset_dir / "results.pkl"),
+        "started": str(dataset_dir / "started"),
+        "cache": str(dataset_dir / "runs" / "abc"),
     }
+    # 이름을 바꾸면 같아지는 이름, 대소문자만 다른 이름도 폴더가 다르다
+    assert len({Path(j["out_dir"]).parent.name.lower() for j in jobs}) == 3
     with pytest.raises(SystemExit):
         script.main(["--suite", "classification", "--shards", "2"])
 
 
-# 가짜 worker: stdin으로 일을 받아 `sleep`초 쉰 뒤 결과 파일을 남긴다. "bad"를 받으면 죽는다
+# 가짜 worker: stdin으로 일을 받아 받았다는 표시를 남기고 `sleep`초 쉰 뒤 결과 파일을 남긴다.
+# "bad"는 표시를 남긴 뒤 죽고, "early"는 표시 전에 죽고, "last_words"는 결과를 남긴 뒤 죽는다
 FAKE_WORKER = """
 import json, pickle, sys, time
 from pathlib import Path
 for line in iter(sys.stdin.readline, ""):
     job = json.loads(line)
+    if job["dataset"] == "early" and sys.argv[1] == "0":
+        sys.exit(4)
+    Path(job["out_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(job["started"]).touch()
     if job["dataset"] == "bad":
         sys.exit(3)
     time.sleep(job["sleep"])
-    Path(job["out_dir"]).mkdir(parents=True, exist_ok=True)
     with open(job["results"], "wb") as f:
         pickle.dump([{"dataset": job["dataset"], "worker": sys.argv[1]}], f)
+    if job["dataset"] == "last_words":
+        sys.exit(5)
 """
 
 
@@ -361,6 +374,8 @@ def _fake_jobs(tmp_path, spec):
                 "splits": splits,
                 "out_dir": str(out),
                 "results": str(out / "results.pkl"),
+                "started": str(out / "started"),
+                "cache": str(out / "runs" / "id"),
                 "sleep": sleep,
             }
         )
@@ -407,6 +422,22 @@ def test_run_queue_reports_a_dead_worker_and_its_dataset(tmp_path):
     assert missing == ["bad"]
     assert failed == {0: "exit 3 while running bad"}
     assert all(Path(j["results"]).exists() for j in jobs[1:])
+
+
+@pytest.mark.parametrize("first", ["early", "last_words"])
+def test_run_queue_gives_unstarted_work_of_a_dead_worker_to_another(tmp_path, first):
+    import pickle
+
+    script = _eval_script()
+    # worker 0이 받기 전에 죽거나(early) 결과를 남긴 뒤 죽는다(last_words). 남은 일은 worker 1이
+    # 받고, 시작하지 않은 일은 결과 없음으로 버리지 않는다
+    jobs = _fake_jobs(tmp_path, [(first, 1, 0.0), ("a", 1, 0.3), ("b", 1, 0.0), ("c", 1, 0.0)])
+    missing, failed = script.run_queue(jobs, _fake_spawn, 2, heartbeat_s=60, poll_s=0.01)
+    assert missing == []
+    assert list(failed) == [0] and "while running" not in failed[0]
+    for job in jobs:
+        with open(job["results"], "rb") as f:
+            assert pickle.load(f)[0]["dataset"] == job["dataset"]
 
 
 def test_register_factory_gives_the_same_key_to_the_same_function():
