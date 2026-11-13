@@ -1,0 +1,30 @@
+# soft-cap 모델의 추론 시간: SDPA(cap 끔)·manual(logit 직접)·flex(#78)를 실제 평가와 같은 앙상블
+# fit + predict로 견준다 (scripts/tabpfn_v3/infer_softcap_speed.py). checkpoint는 꼭 준다:
+#   databricks air run -f scripts/tabpfn_v3/infer_softcap_speed.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override "env_variables.SPEED_ARGS=--checkpoint runs:/<run_id>/checkpoints/step_0250000.pt"
+# 일부만: SPEED_ARGS에 --tasks classification --variants none,flex --sizes 10000x2000x100 --skip-profile
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-5-infer-softcap-speed
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+  dependencies:
+    - huggingface-hub>=0.34
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v3/infer_softcap_speed.py
+env_variables:
+  SPEED_ARGS: ""
+max_retries: 0
+timeout_minutes: 90
+command: >-
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v3/infer_softcap_speed.py --out /tmp/infer_softcap_speed.json
+  $SPEED_ARGS
