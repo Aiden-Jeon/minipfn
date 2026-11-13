@@ -50,8 +50,9 @@ env_variables:
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v2-classifier
     --regressor-path hf://aiden-jeon/minipfn-tabpfn-v2-regressor
   TABPFN_V2_EXTRA_ARGS: ""
-  # 데이터셋을 나눠 GPU마다 worker 하나로 동시에 돌린다 (eval.py --shards). 8로 줄 때는
-  # compute를 GPU_8xH100·8장으로 바꾼다
+  # GPU마다 worker 하나를 띄워 데이터셋을 큐에서 비싼 것부터 하나씩 나눠 준다 (eval.py --shards).
+  # 본 프로세스가 5분마다 진행률을 찍는다(--heartbeat-minutes). 8로 줄 때는 compute를
+  # GPU_8xH100·8장으로 바꾼다
   TABPFN_V2_SHARDS: "1"
 max_retries: 0
 # BeyondArena core2k(split 2,000개)는 v2 크기 상한 안의 1,685개를 돌린다
