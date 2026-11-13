@@ -72,6 +72,7 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from minipfn.models.cell_transformer import NAN_INDICATOR, standardize_cells
 
@@ -110,6 +111,11 @@ FLEX_SMALL_BLOCKS = {
 # GPU에서 soft-cap attention을 계산하는 방법 (`Attention._sdpa`): "flex"(flex attention kernel)
 # 또는 "manual"(logit을 다 만든다, GPU 밖과 같은 구현). 테스트·측정에서 바꿔 견준다
 SOFTCAP_KERNEL = "flex"
+# activation checkpointing(`ColumnRowTransformer.activation_checkpointing_rows`)을 켠 학습
+# forward에서 분류 retrieval decoder가 score 행렬을 만들지 않는지(`RetrievalDecoder`의 `fused`).
+# 60,000행 표에서 그 행렬은 float32로 13 GB이고 softmax까지 몇 벌이 생긴다(issue #79). 측정에서
+# 바꿔 견준다
+CHECKPOINT_FUSED_DECODER = True
 
 
 @dataclass
@@ -517,6 +523,16 @@ def _flex_softcap(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cap: float)
     return torch.cat(parts)
 
 
+def _call(block: nn.Module, ckpt: bool, *args, **kwargs) -> torch.Tensor:
+    """블록 하나를 부른다. `ckpt`면 activation checkpointing: forward에서는 블록 안의 activation을
+    backward까지 들지 않고(입력만 둔다), backward에서 블록 forward를 다시 계산한다. 가속 옵션
+    compile이 블록마다 compile한 것도 그대로 부른다(다시 계산할 때도 compile한 forward다).
+    non-reentrant 방식이라 DDP와 같이 쓴다. forward에 난수가 없어 RNG 상태는 저장하지 않는다."""
+    if not ckpt:
+        return block(*args, **kwargs)
+    return checkpoint(block, *args, use_reentrant=False, preserve_rng_state=False, **kwargs)
+
+
 def _mlp(dim: int, ff_factor: int) -> nn.Sequential:
     mlp = nn.Sequential(
         nn.Linear(dim, ff_factor * dim, bias=False),
@@ -770,6 +786,12 @@ class ColumnRowTransformer(nn.Module):
     # forward가 추론용 인자(`inference`, `y_classes`·`n_classes`)를 받는다
     # (`minipfn.inference.ensemble.forward_kwargs`)
     supports_inference_options = True
+    # activation checkpointing (학습 설정 `TrainConfig.activation_checkpointing_rows`, issue #79).
+    # 표의 행 수(학습 + 테스트)가 이 값보다 많은 학습 forward에서 열 단계·행 단계 블록과 행 ICL 층의
+    # activation을 backward까지 들지 않고 다시 계산한다(`torch.utils.checkpoint`). 분류 decoder는
+    # score 행렬을 만들지 않는다(`CHECKPOINT_FUSED_DECODER`). None이면 끈다(기본). 모델 설정이
+    # 아니라 학습 루프가 정하는 값이라 checkpoint 파일·config.json에 남지 않는다
+    activation_checkpointing_rows: int | None = None
 
     def __init__(self, config: ColumnRowTransformerConfig | None = None) -> None:
         super().__init__()
@@ -860,6 +882,12 @@ class ColumnRowTransformer(nn.Module):
         if "classification" not in self.config.tasks:
             return 0
         return max(self.config.output_size("classification"), MAX_CLASSES)
+
+    def _checkpointing(self, rows: int) -> bool:
+        """이 forward에서 activation checkpointing을 쓰는지: 켰고, 행 수가 기준보다 많고, gradient를
+        계산하는 학습 forward일 때."""
+        limit = self.activation_checkpointing_rows
+        return limit is not None and rows > limit and self.training and torch.is_grad_enabled()
 
     def repeated_blocks(self) -> list[nn.Module]:
         """여러 번 쓰는 블록 (학습 가속 옵션 `compile`이 블록마다 compile한다)."""
@@ -985,15 +1013,16 @@ class ColumnRowTransformer(nn.Module):
                 raise ValueError("y_classes를 주면 y_train은 정답 embedding 수 안의 묶은 번호다")
         b, r, c = x.shape
         n_train = y_train.shape[1]
+        ckpt = self._checkpointing(r)
         if inference and b * r * c > self.inference_chunk_cells:
             rows = self._rows_chunked(x, y_train, task)
         else:
-            rows = self._rows(x, y_train, task)
+            rows = self._rows(x, y_train, task, ckpt=ckpt)
 
         # 3) 행 ICL: 학습 행 벡터에 정답 embedding을 한 번 더 더한다
         rows = rows + self._target("icl", task, y_train, r, rows)
         for layer in self.icl_layers:
-            rows = layer(rows, n_context=n_train)
+            rows = _call(layer, ckpt, rows, n_context=n_train)
         rows = self.icl_norm(rows)
 
         # 4) 출력
@@ -1001,11 +1030,15 @@ class ColumnRowTransformer(nn.Module):
             rows = self.pre_head[task](rows)
         if task == "classification":
             labels = y_train if y_classes is None else y_classes
-            return self.heads[task](rows, labels, n_train, n_classes=n_classes, fused=inference)
+            fused = inference or (ckpt and CHECKPOINT_FUSED_DECODER)
+            return self.heads[task](rows, labels, n_train, n_classes=n_classes, fused=fused)
         return self.heads[task](rows[:, n_train:])
 
-    def _rows(self, x: torch.Tensor, y_train: torch.Tensor, task: str) -> torch.Tensor:
-        """단계 0~2 (셀 encoder, 열 단계, 행 단계): x (B, R, C) → 행 벡터 (B, R, n_cls × E)."""
+    def _rows(
+        self, x: torch.Tensor, y_train: torch.Tensor, task: str, *, ckpt: bool = False
+    ) -> torch.Tensor:
+        """단계 0~2 (셀 encoder, 열 단계, 행 단계): x (B, R, C) → 행 벡터 (B, R, n_cls × E).
+        `ckpt`면 블록마다 activation checkpointing (`_call`)."""
         b, r, c = x.shape
         n_train = y_train.shape[1]
         cells = self._embed_cells(x, n_train)  # (B, R, C, E)
@@ -1015,11 +1048,11 @@ class ColumnRowTransformer(nn.Module):
         # 1) 열 단계: (B × C, R, E)
         h = cells.permute(0, 2, 1, 3).reshape(b * c, r, e)
         for block in self.column_blocks:
-            h = block(h, n_train)
+            h = _call(block, ckpt, h, n_train)
         # 2) 행 단계
-        return self._row_stage(h.view(b, c, r, e).transpose(1, 2))
+        return self._row_stage(h.view(b, c, r, e).transpose(1, 2), ckpt=ckpt)
 
-    def _row_stage(self, h: torch.Tensor) -> torch.Tensor:
+    def _row_stage(self, h: torch.Tensor, *, ckpt: bool = False) -> torch.Tensor:
         """행 단계: 셀 토큰 (B, R, C, E) → (B × R, n_cls + C, E) → CLS 출력을 이어 붙인 행 벡터
         (B, R, n_cls × E). 마지막 블록은 CLS만 query다(그 뒤에 쓰는 것은 CLS뿐)."""
         cfg = self.config
@@ -1027,8 +1060,8 @@ class ColumnRowTransformer(nn.Module):
         h = h.reshape(b * r, c, e)
         h = torch.cat([self.cls_tokens.to(h.dtype).expand(b * r, -1, -1), h], dim=1)
         for block in self.row_blocks[:-1]:
-            h = block(h)
-        h = self.row_blocks[-1](h, n_queries=cfg.n_cls)
+            h = _call(block, ckpt, h)
+        h = _call(self.row_blocks[-1], ckpt, h, n_queries=cfg.n_cls)
         return self.row_norm(h).reshape(b, r, cfg.icl_dim)
 
     def _rows_chunked(self, x: torch.Tensor, y_train: torch.Tensor, task: str) -> torch.Tensor:

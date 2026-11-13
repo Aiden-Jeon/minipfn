@@ -1,0 +1,29 @@
+# activation checkpointing: 켠 학습 step과 끈 학습 step을 견준다 (issue #79,
+# scripts/tabpfn_v3/activation_checkpointing.py): float32 손실·gradient가 같은지, stage 2·3의 가장 큰
+# 표에서 학습 step(Muon 포함) 메모리·시간, 검증 batch의 메모리(학습 경로·추론 경로).
+#   databricks air run -f scripts/tabpfn_v3/activation_checkpointing.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 일부만: --override env_variables.CHECKPOINTING_ARGS="--skip-check --tables 2,3_60k"
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-5-activation-checkpointing
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v3/activation_checkpointing.py
+env_variables:
+  CHECKPOINTING_ARGS: ""
+max_retries: 0
+timeout_minutes: 120
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v3/activation_checkpointing.py --out /tmp/activation_checkpointing.json
+  $CHECKPOINTING_ARGS

@@ -214,6 +214,10 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
 # - micro batch 8 / 1 / 1 (스크립트는 4 / 1 / 1). stage 1을 4로 돌린 8×H100 smoke가 GPU당 21~24 GB만
 #   써서(run 2c3d25a9…) 8로 올려 GPU 32장에서 accumulation 없이 간다. 한 forward의 데이터셋 8개가
 #   학습 행 비율·feature 수를 같이 쓴다(TabICLv2는 4개씩)
+# - stage 3은 10,240행보다 긴 표에서 activation checkpointing(`activation_checkpointing_rows`,
+#   issue #79). 1×H100에서 끄면 30,000×60 분류부터 OOM이고, 켜면 60,000×20까지 step 최대 메모리가
+#   16~19 GB다(optimizer 상태 포함, `scripts/tabpfn_v3/activation_checkpointing.py`). 켠 표는 step이
+#   23~27% 느리다. stage 2 크기(끄고 36~38 GB)까지는 끈다
 CURRICULUM_COMMON = {
     "batch_size": 256,
     "optimizer": "muon",
@@ -265,6 +269,8 @@ CURRICULUM = {
         "val_every": 1_000,
         "checkpoint_every": 1_000,
         "keep_every": 1_000,
+        # stage 2의 가장 큰 표(10,240행)까지는 끈다 (위 주석)
+        "activation_checkpointing_rows": 10_240,
     },
 }
 # warmup은 단계 길이의 1% (스크립트 `--warmup_proportion 0.01`)
