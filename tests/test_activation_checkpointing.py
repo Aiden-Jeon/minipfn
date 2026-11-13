@@ -2,6 +2,7 @@
 설정 `TrainConfig.activation_checkpointing_rows`. 켜도 손실·gradient가 같고, 기준보다 작은 표·검증·
 추론에서는 쓰지 않는다."""
 
+import inspect
 from dataclasses import replace
 
 import numpy as np
@@ -142,8 +143,12 @@ def test_checkpointing_trains_same(tmp_path, monkeypatch):
     inference_calls = []
     real = loop._validate
 
+    signature = inspect.signature(real)
+
     def recording(*args, **kwargs):
-        inference_calls.append(kwargs.get("inference_rows", args[7] if len(args) > 7 else None))
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        inference_calls.append(bound.arguments["inference_rows"])
         return real(*args, **kwargs)
 
     monkeypatch.setattr(loop, "_validate", recording)

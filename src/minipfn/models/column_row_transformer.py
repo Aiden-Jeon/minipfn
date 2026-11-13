@@ -113,8 +113,9 @@ FLEX_SMALL_BLOCKS = {
 SOFTCAP_KERNEL = "flex"
 # activation checkpointing(`ColumnRowTransformer.activation_checkpointing_rows`)을 켠 학습
 # forward에서 분류 retrieval decoder가 score 행렬을 만들지 않는지(`RetrievalDecoder`의 `fused`).
-# 60,000행 표에서 그 행렬은 float32로 13 GB이고 softmax까지 몇 벌이 생긴다(issue #79). 측정에서
-# 바꿔 견준다
+# 60,000행 표에서 그 행렬은 float32로 13 GB이고 softmax까지 몇 벌이 생긴다(issue #79). bf16
+# autocast에서 score 행렬 경로는 q·k 곱을 bf16으로, 이 경로는 float32로 계산해 값이 조금 다르다.
+# 측정에서 바꿔 견준다
 CHECKPOINT_FUSED_DECODER = True
 
 

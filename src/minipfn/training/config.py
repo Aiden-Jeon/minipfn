@@ -209,9 +209,10 @@ class TrainConfig:
     # activation checkpointing (issue #79): 표의 행 수(학습 + 검증)가 이 값보다 많은 batch에서
     # 블록마다 activation을 backward까지 들지 않고 다시 계산한다
     # (`ColumnRowTransformer.activation_checkpointing_rows`, 0이면 모든 batch). 그 크기의 검증
-    # batch는 추론 경로(`inference=True`, 행 묶음·score 행렬 없는 decoder)로 계산한다. 값은 계산
-    # 순서만 다르다. None이면 끈다(기본, 예전 학습과 비트 단위로 같다). curriculum stage 3의 긴
-    # 표(30,000행 이상)가 GPU 한 장에 들어가도록 켠다
+    # batch는 추론 경로(`inference=True`, 행 묶음·score 행렬 없는 decoder)로 계산한다. 블록 값은
+    # 계산 순서만 다르고, 분류 decoder의 score는 bf16 autocast에서도 float32로 계산해(끄면 q·k
+    # 곱이 bf16) 조금 더 정확하다. None이면 끈다(기본, 예전 학습과 비트 단위로 같다).
+    # curriculum stage 3의 긴 표(30,000행 이상)가 GPU 한 장에 들어가도록 켠다
     activation_checkpointing_rows: int | None = None
 
     def __post_init__(self) -> None:
