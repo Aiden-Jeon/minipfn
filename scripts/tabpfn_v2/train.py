@@ -26,6 +26,10 @@ decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed 
 GPU끼리 나눠 계산한다(결과·checkpoint 형식 같음, 이어 학습하면 원래 run의 값을 따르고 `off`로
 끈다). 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
+TabICLv2의 표 크기·prior 설정(`TrainConfig` 주석, issue #74·#81)은 `TABPFN_V2_SIZE_RULE=train_fraction`
+(`TABPFN_V2_MIN_ROWS`·`TABPFN_V2_MAX_ROWS`·`TABPFN_V2_MIN_TRAIN_FRACTION`·
+`TABPFN_V2_MAX_TRAIN_FRACTION`), `TABPFN_V2_BINARY_PROB`, `TABPFN_V2_FILTER_UNPREDICTABLE=1`로
+켠다(주지 않으면 preset 그대로, v2·2.5는 논문 규칙).
 학습 진단 지표(`minipfn.training.diagnostics`)는 묶음별 가중치·gradient norm을 늘 남기고,
 `--grad-cosine`(`TABPFN_V2_GRAD_COSINE=1`, multitask만, issue #64)은 두 task gradient의 묶음별
 cosine을, `--rank-timing`(`TABPFN_V2_RANK_TIMING=1`, issue #68)은 GPU마다 forward·backward 시간과
@@ -196,6 +200,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rewind-lr-factor", type=float, default=_env("TABPFN_V2_REWIND_LR_FACTOR", float)
     )
     parser.add_argument("--qk-clip", default=os.environ.get("TABPFN_V2_QK_CLIP") or None)
+    # TabICLv2 표 크기·prior 설정 (TrainConfig 주석, issue #74·#81). 주지 않으면 preset 그대로다
+    parser.add_argument(
+        "--size-rule",
+        choices=["eval_rows", "train_fraction"],
+        default=os.environ.get("TABPFN_V2_SIZE_RULE") or None,
+    )
+    for name in ("min-rows", "max-rows"):
+        env = "TABPFN_V2_" + name.upper().replace("-", "_")
+        parser.add_argument(f"--{name}", type=int, default=_env(env, int))
+    for name in ("min-train-fraction", "max-train-fraction", "binary-prob"):
+        env = "TABPFN_V2_" + name.upper().replace("-", "_")
+        parser.add_argument(f"--{name}", type=float, default=_env(env, float))
+    parser.add_argument(
+        "--filter-unpredictable",
+        action="store_true",
+        default=_env_flag("TABPFN_V2_FILTER_UNPREDICTABLE"),
+    )
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
     parser.add_argument("--init-run-id", default=os.environ.get("TABPFN_V2_INIT_RUN_ID"))
@@ -393,6 +414,12 @@ def _override_values(args: argparse.Namespace) -> dict:
         "muon_weight_decay": args.muon_weight_decay,
         "muon_distributed": args.muon_distributed,
         "logit_softcap": args.logit_softcap,
+        "size_rule": args.size_rule,
+        "min_rows": args.min_rows,
+        "max_rows": args.max_rows,
+        "min_train_fraction": args.min_train_fraction,
+        "max_train_fraction": args.max_train_fraction,
+        "binary_prob": args.binary_prob,
         **{
             name: True
             for name in (
@@ -402,6 +429,7 @@ def _override_values(args: argparse.Namespace) -> dict:
                 "schedule_free",
                 "grad_cosine",
                 "rank_timing",
+                "filter_unpredictable",
             )
             if getattr(args, name)
         },
