@@ -106,6 +106,7 @@ import argparse
 import functools
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -270,11 +271,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--shards",
         type=int,
         default=1,
-        help="TabArena·BeyondArena: 데이터셋을 이만큼 나눠 GPU마다 worker 하나로 동시에 돌린다"
-        " (GPU 수 이하, 1이면 지금처럼 한 프로세스)",
+        help="TabArena·BeyondArena: GPU마다 worker 하나를 띄워 데이터셋을 큐에서 하나씩 나눠 준다"
+        " (비싼 것부터. GPU 수 이하, 1이면 한 프로세스)",
     )
-    # 내부용: worker가 split 결과를 남길 파일 (`--shards`가 넘긴다)
-    parser.add_argument("--shard-results", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--heartbeat-minutes",
+        type=float,
+        default=5.0,
+        help="--shards: 이 간격(분)마다 진행률(끝난 split, worker별 데이터셋·경과 시간)을 찍는다",
+    )
+    # 내부용: stdin으로 받은 데이터셋을 하나씩 돌리는 worker (`--shards`가 띄운다)
+    parser.add_argument("--shard-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-train-rows", type=int, help="TabArena·BeyondArena: 학습 행 상한 (기본: 모델 구조)"
     )
@@ -685,15 +692,18 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
     common = dict(
         limits=limits, method=args.method_name, bagging=args.bagging, fingerprint=fingerprint
     )
-    if args.shard_results:  # worker: 맡은 데이터셋만 돌리고 결과를 남긴다
-        arena.run(
-            suite,
-            make,
-            out_dir=out_dir / args.suite,
-            datasets=datasets,
-            results_path=args.shard_results,
-            **common,
-        )
+    if args.shard_worker:  # worker: stdin으로 받은 데이터셋을 하나씩 돌리고 결과를 남긴다
+        for line in iter(sys.stdin.readline, ""):
+            job = json.loads(line)
+            print(f"shard worker: {job['dataset']} ({job['splits']} splits)", flush=True)
+            arena.run(
+                suite,
+                make,
+                out_dir=job["out_dir"],
+                datasets=[job["dataset"]],
+                results_path=job["results"],
+                **common,
+            )
         return {}
     results = None
     if args.shards > 1:
@@ -720,37 +730,163 @@ def _strip_flags(argv: list[str], flags: dict[str, int]) -> list[str]:
     return out
 
 
-def shard_commands(
-    argv: list[str], shards: list[list[str]], out_dir: Path
-) -> list[tuple[list[str], Path, Path]]:
-    """worker마다 (명령 인자, out-dir, 결과 파일). 원래 인자에서 나누는 데 쓰는 인자와 MLflow 기록을
-    빼고 맡은 데이터셋·자기 out-dir·결과 파일을 더한다."""
+def shard_worker_command(argv: list[str], worker_dir: Path) -> list[str]:
+    """worker의 명령 인자. 원래 인자에서 나누는 데 쓰는 인자와 MLflow 기록을 빼고 자기 out-dir과
+    `--shard-worker`를 더한다. 데이터셋은 stdin으로 하나씩 받는다."""
     base = _strip_flags(
         argv,
-        {"--shards": 1, "--datasets": 1, "--out-dir": 1, "--mlflow": 0, "--shard-results": 1},
+        {
+            "--shards": 1,
+            "--datasets": 1,
+            "--out-dir": 1,
+            "--mlflow": 0,
+            "--heartbeat-minutes": 1,
+            "--shard-worker": 0,
+        },
     )
-    out = []
-    for i, names in enumerate(shards):
-        worker_dir = out_dir / "shards" / f"shard{i}"
-        results = worker_dir / "results.pkl"
-        cmd = [
-            *base,
-            "--datasets",
-            ",".join(names),
-            "--out-dir",
-            str(worker_dir),
-            "--shard-results",
-            str(results),
-        ]
-        out.append((cmd, worker_dir, results))
-    return out
+    return [*base, "--out-dir", str(worker_dir), "--shard-worker"]
+
+
+def shard_jobs(queue: list[tuple[str, int]], out_dir: Path, suite: str) -> list[dict]:
+    """큐의 데이터셋마다 worker에 넘길 일: 데이터셋, split 수, `arena.run`의 out-dir, 결과 파일.
+    out-dir은 worker가 아니라 데이터셋으로 정한다. 그래서 다시 돌리면 어느 worker가 받아도 끝난
+    split(캐시)을 다시 쓴다."""
+    jobs = []
+    for dataset, splits in queue:
+        folder = re.sub(r"[^\w.-]", "_", dataset)
+        dataset_dir = out_dir / "shards" / "datasets" / folder / suite
+        jobs.append(
+            {
+                "dataset": dataset,
+                "splits": splits,
+                "out_dir": str(dataset_dir),
+                "results": str(dataset_dir / "results.pkl"),
+            }
+        )
+    return jobs
+
+
+def _clock(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def _splits_cached(job: dict) -> int:
+    # 진행률 표시용: tabarena가 끝난 split마다 남기는 캐시
+    # (`runs/<id>/data/<method>/<task>/<repeat>_<fold>/results.pkl`)
+    return sum(1 for _ in Path(job["out_dir"]).glob("runs/*/data/*/*/*/results.pkl*"))
+
+
+def run_queue(
+    jobs: list[dict],
+    spawn,
+    n_workers: int,
+    *,
+    heartbeat_s: float = 300.0,
+    poll_s: float = 2.0,
+    labels: list[str] | None = None,
+) -> tuple[list[str], dict[int, str]]:
+    """worker `n_workers`개(`spawn(i)`가 stdin이 PIPE인 Popen을 돌려준다)에 `jobs`를 앞에서부터
+    하나씩 나눠 준다. 일을 받은 worker가 결과 파일(`job["results"]`)을 남기면 다음 일을 준다.
+    남은 일이 없으면 stdin을 닫아 끝낸다. `heartbeat_s`마다 끝난 split 수와 worker별 데이터셋·경과
+    시간을 찍는다(플랫폼이 로그 없는 job을 죽이지 않도록, 사람이 진행률을 보도록).
+
+    worker가 하나 죽어도 남은 일은 나머지 worker가 받는다. 돌려주는 것: 결과가 없는 데이터셋(죽은
+    worker가 잡고 있던 것 등)과 실패한 worker {번호: 이유}. 둘 다 비어야 성공이다."""
+    labels = labels or [f"worker {i}" for i in range(n_workers)]
+    pending = list(jobs)
+    total = sum(j["splits"] for j in jobs)
+    current: dict[int, tuple[dict, float]] = {}  # worker → (일, 받은 시각)
+    done: set[str] = set()
+    failed: dict[int, str] = {}
+    start = last_beat = time.monotonic()
+
+    def assign(i: int, proc) -> None:
+        if not pending:
+            proc.stdin.close()
+            return
+        job = pending.pop(0)
+        Path(job["results"]).unlink(missing_ok=True)  # 지난 실행의 결과를 끝난 것으로 보지 않도록
+        try:
+            proc.stdin.write(json.dumps(job) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):  # 이미 죽었다: 일은 다른 worker에게 돌려준다
+            pending.insert(0, job)
+            failed.setdefault(i, "stdin closed")
+            return
+        current[i] = (job, time.monotonic())
+        print(f"shards: {labels[i]} ← {job['dataset']} ({job['splits']} splits)", flush=True)
+
+    def heartbeat(now: float) -> None:
+        running = sum(min(_splits_cached(job), job["splits"]) for job, _ in current.values())
+        finished = sum(j["splits"] for j in jobs if j["dataset"] in done)
+        print(
+            f"[heartbeat {_clock(now - start)}] splits {finished + running}/{total} "
+            f"(datasets {len(done)}/{len(jobs)}, queue {len(pending)})",
+            flush=True,
+        )
+        for i in range(n_workers):
+            if i in current:
+                job, since = current[i]
+                state = (
+                    f"{job['dataset']} splits {min(_splits_cached(job), job['splits'])}"
+                    f"/{job['splits']}, {_clock(now - since)}"
+                )
+            else:
+                state = "failed" if i in failed else "done"
+            print(f"  {labels[i]}: {state}", flush=True)
+
+    procs = [spawn(i) for i in range(n_workers)]
+    try:
+        for i, proc in enumerate(procs):
+            assign(i, proc)
+        while True:
+            for i, proc in enumerate(procs):
+                if i in current and Path(current[i][0]["results"]).exists():
+                    job, since = current.pop(i)
+                    done.add(job["dataset"])
+                    print(
+                        f"shards: {labels[i]} done {job['dataset']} "
+                        f"in {_clock(time.monotonic() - since)} "
+                        f"({len(done)}/{len(jobs)} datasets)",
+                        flush=True,
+                    )
+                    assign(i, proc)
+                code = proc.poll()
+                if code is not None and (code or i in current):
+                    failed.setdefault(i, f"exit {code}")
+                    if i in current:
+                        failed[i] += f" while running {current.pop(i)[0]['dataset']}"
+                        # 결과 없이 죽은 데이터셋은 다시 주지 않는다 (아래에서 실패로 낸다)
+                    if not proc.stdin.closed:
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+            if all(p.poll() is not None for p in procs):
+                break
+            now = time.monotonic()
+            if now - last_beat >= heartbeat_s:
+                heartbeat(now)
+                last_beat = now
+            time.sleep(poll_s)
+    finally:
+        # 부모가 도중에 멈추면(예외, Ctrl-C) worker가 GPU를 잡고 남지 않도록
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    heartbeat(time.monotonic())
+    missing = [j["dataset"] for j in jobs if j["dataset"] not in done]
+    return missing, failed
 
 
 def run_shards(args, suite, limits, datasets, out_dir: Path) -> list:
-    """데이터셋을 `--shards`개로 나눠(`arena.shard_datasets`) GPU마다 worker 프로세스 하나로 동시에
-    돌리고, worker들의 split 결과를 모아 돌려준다. worker의 출력은 `<out-dir>/shards/shard<i>.log`,
-    test-time·증류 기록(jsonl)은 끝나면 이 실행의 파일 뒤에 붙인다. worker가 하나라도 실패하면
-    멈춘다(그 데이터셋이 조용히 imputed가 되지 않도록)."""
+    """GPU마다 worker 프로세스를 하나씩 띄우고, 데이터셋을 비싼 것부터(`arena.dataset_queue`) 큐에서
+    하나씩 나눠 준다(`run_queue`). 하나 끝낸 worker가 바로 다음 것을 받으므로 먼저 끝난 GPU가 놀지
+    않는다. worker들의 split 결과를 모아 돌려준다. worker의 출력은 `<out-dir>/shards/shard<i>.log`,
+    test-time·증류 기록(jsonl)은 끝나면 이 실행의 파일 뒤에 붙인다. worker가 하나라도 실패하거나
+    결과가 없는 데이터셋이 있으면 멈춘다(그 데이터셋이 조용히 imputed가 되지 않도록)."""
     import pickle
     import subprocess
 
@@ -769,59 +905,67 @@ def run_shards(args, suite, limits, datasets, out_dir: Path) -> list:
         if unknown:
             raise SystemExit(f"{suite.name}에 없는 데이터셋: {unknown}")
         grid = grid[grid["dataset"].isin(datasets)]
-    shards = arena.shard_datasets(grid, args.shards)
-    if not shards:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
+    jobs = shard_jobs(arena.dataset_queue(grid), out_dir, args.suite)
+    if not jobs:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
         return []
-    commands = shard_commands(args.argv, shards, out_dir)
-    threads = max(1, (os.cpu_count() or 1) // len(commands))
+    n_workers = min(args.shards, len(jobs))
+    threads = max(1, (os.cpu_count() or 1) // n_workers)
     # 부모가 받아 둔 checkpoint(runs:/)를 worker가 다시 받지 않도록 같은 폴더를 가리킨다
     checkpoints = (out_dir / "checkpoints").resolve()
-    procs = []
+    worker_dirs = [out_dir / "shards" / f"shard{i}" for i in range(n_workers)]
+    logs = []
+
+    def spawn(i: int):
+        worker_dir = worker_dirs[i]
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        # 지난 실행의 기록이 이 실행의 파일에 섞이지 않도록 (증류 기록은 worker의 main이 비운다)
+        (worker_dir / "test_time.jsonl").unlink(missing_ok=True)
+        link = worker_dir / "checkpoints"
+        if checkpoints.is_dir() and not link.exists():
+            link.symlink_to(checkpoints, target_is_directory=True)
+        env = {k: v for k, v in os.environ.items() if k != "MLFLOW_RUN_ID"}
+        env.update(CUDA_VISIBLE_DEVICES=devices[i], OMP_NUM_THREADS=str(threads))
+        log = open(out_dir / "shards" / f"shard{i}.log", "w")  # noqa: SIM115 (끝날 때까지 연다)
+        logs.append(log)
+        cmd = shard_worker_command(args.argv, worker_dir)
+        return subprocess.Popen(
+            [sys.executable, __file__, *cmd],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    total = sum(j["splits"] for j in jobs)
+    print(f"shards: {len(jobs)} datasets ({total} splits) → {n_workers} workers", flush=True)
+    labels = [f"shard {i} (GPU {devices[i]})" for i in range(n_workers)]
     try:
-        for i, (cmd, worker_dir, results_file) in enumerate(commands):
-            worker_dir.mkdir(parents=True, exist_ok=True)
-            # 지난 실행의 기록·결과가 이 실행의 파일에 섞이지 않도록
-            for stale in (worker_dir / "test_time.jsonl", results_file):
-                stale.unlink(missing_ok=True)
-            link = worker_dir / "checkpoints"
-            if checkpoints.is_dir() and not link.exists():
-                link.symlink_to(checkpoints, target_is_directory=True)
-            env = {k: v for k, v in os.environ.items() if k != "MLFLOW_RUN_ID"}
-            env.update(CUDA_VISIBLE_DEVICES=devices[i], OMP_NUM_THREADS=str(threads))
-            log = open(out_dir / "shards" / f"shard{i}.log", "w")  # noqa: SIM115 (끝날 때까지 연다)
-            print(f"shard {i}: {len(shards[i])} datasets → GPU {devices[i]}", flush=True)
-            proc = subprocess.Popen(
-                [sys.executable, __file__, *cmd], env=env, stdout=log, stderr=subprocess.STDOUT
-            )
-            procs.append((proc, log))
-        failed = []
-        for i, (proc, log) in enumerate(procs):
-            code = proc.wait()
-            log.close()
-            if code:
-                failed.append(i)
+        missing, failed = run_queue(
+            jobs, spawn, n_workers, heartbeat_s=args.heartbeat_minutes * 60, labels=labels
+        )
     finally:
-        # 부모가 도중에 멈추면(예외, Ctrl-C) worker가 GPU를 잡고 남지 않도록
-        for proc, log in procs:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+        for log in logs:
             log.close()
-    if failed:
+    if failed or missing:
         tails = {
             i: (out_dir / "shards" / f"shard{i}.log").read_text().splitlines()[-20:] for i in failed
         }
-        raise SystemExit(f"shard {failed}가 실패했다: {tails}")
+        raise SystemExit(
+            f"shard {sorted(failed)}가 실패했다 ({failed}), 결과가 없는 데이터셋 {missing}: {tails}"
+        )
     results = []
-    for _, worker_dir, path in commands:
-        with open(path, "rb") as f:
+    # 결과는 데이터셋 이름 순으로 모은다 (어느 worker가 받았는지와 상관없이 같은 순서)
+    for job in sorted(jobs, key=lambda j: j["dataset"]):
+        with open(job["results"], "rb") as f:
             results.extend(pickle.load(f))
+    for worker_dir in worker_dirs:
         for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
             part = worker_dir / name
             if part.exists():
                 with open(out_dir / name, "a") as f:
                     f.write(part.read_text())
-    print(f"shards: {len(results)} split results from {len(commands)} workers", flush=True)
+    print(f"shards: {len(results)} split results from {n_workers} workers", flush=True)
     return results
 
 

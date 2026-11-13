@@ -25,6 +25,11 @@ _FACTORIES: dict[str, Callable[[str, list[int]], Any]] = {}
 
 
 def register_factory(make_estimator: Callable[[str, list[int]], Any]) -> str:
+    # 같은 함수는 같은 이름: 데이터셋마다 `arena.run`을 부르는 worker(`--shards`)도 `--shards 1`과
+    # 같은 설정(factory0)으로 돌린다
+    for key, registered in _FACTORIES.items():
+        if registered is make_estimator:
+            return key
     key = f"factory{len(_FACTORIES)}"
     _FACTORIES[key] = make_estimator
     return key

@@ -280,8 +280,8 @@ def test_post_predict_calls_after_predict_with_one_test_row():
     assert seen[0]["x"].iloc[0] == 3.0 and seen[0]["when"].dtype.kind == "f"  # 같은 전처리
 
 
-def test_shard_datasets_balances_cells_and_skips_unrun_splits():
-    # 데이터셋 비용 = 돌릴 split의 셀 수 합. 큰 것부터 가장 가벼운 묶음에 (같은 grid면 같은 답)
+def test_dataset_queue_puts_expensive_datasets_first_and_skips_unrun_splits():
+    # 데이터셋 비용 = 돌릴 split의 셀 수 합. 비싼 것부터 (같은 grid면 같은 답)
     rows = []
     for name, n_rows, n_features, splits in [
         ("big", 100_000, 50, 1),
@@ -302,29 +302,120 @@ def test_shard_datasets_balances_cells_and_skips_unrun_splits():
         {"dataset": "skipped", "max_train_rows": 10**7, "n_features": 10, "skip_reason": "x"}
     )
     grid = pd.DataFrame(rows)
-    shards = arena.shard_datasets(grid, 3)
-    assert shards == arena.shard_datasets(grid, 3)
-    assert sorted(sum(shards, [])) == ["big", "mid_a", "mid_b", "small", "tiny"]
-    assert ["big"] in shards  # 가장 비싼 데이터셋(셀 5백만)은 혼자
-    # 데이터셋보다 묶음이 많으면 빈 묶음은 뺀다
-    assert len(arena.shard_datasets(grid, 10)) == 5
+    queue = arena.dataset_queue(grid)
+    assert queue == arena.dataset_queue(grid.sample(frac=1, random_state=0))
+    # mid_a·mid_b는 셀 3백만으로 같다: 이름 순
+    assert queue == [("big", 1), ("mid_a", 3), ("mid_b", 3), ("small", 30), ("tiny", 10)]
 
 
-def test_shard_commands_replace_dataset_and_output_flags(tmp_path):
+def test_shard_worker_command_replaces_dataset_and_output_flags(tmp_path):
     script = _eval_script()
     argv = [
         "--suite", "beyondarena", "--classifier-path", "c.pt", "--shards", "4",
         "--datasets=a,b", "--out-dir", "out", "--mlflow", "--method-name", "m",
+        "--heartbeat-minutes", "1",
     ]  # fmt: skip
-    cmds = script.shard_commands(argv, [["a"], ["b", "c"]], tmp_path)
-    assert len(cmds) == 2
-    cmd, worker_dir, results = cmds[1]
-    assert worker_dir == tmp_path / "shards" / "shard1" and results == worker_dir / "results.pkl"
+    worker_dir = tmp_path / "shards" / "shard1"
+    cmd = script.shard_worker_command(argv, worker_dir)
     assert cmd == [
         "--suite", "beyondarena", "--classifier-path", "c.pt", "--method-name", "m",
-        "--datasets", "b,c", "--out-dir", str(worker_dir), "--shard-results", str(results),
+        "--out-dir", str(worker_dir), "--shard-worker",
     ]  # fmt: skip
     args = script.parse_args(cmd)
-    assert args.shard_results == str(results) and args.shards == 1
+    assert args.shard_worker and args.shards == 1 and args.datasets is None
+    jobs = script.shard_jobs([("big/one", 2), ("b", 1)], tmp_path, "beyondarena")
+    # out-dir은 worker가 아니라 데이터셋으로 정한다 (다시 돌리면 어느 worker든 캐시를 쓴다)
+    dataset_dir = tmp_path / "shards" / "datasets" / "big_one" / "beyondarena"
+    assert jobs[0] == {
+        "dataset": "big/one",
+        "splits": 2,
+        "out_dir": str(dataset_dir),
+        "results": str(dataset_dir / "results.pkl"),
+    }
     with pytest.raises(SystemExit):
         script.main(["--suite", "classification", "--shards", "2"])
+
+
+# 가짜 worker: stdin으로 일을 받아 `sleep`초 쉰 뒤 결과 파일을 남긴다. "bad"를 받으면 죽는다
+FAKE_WORKER = """
+import json, pickle, sys, time
+from pathlib import Path
+for line in iter(sys.stdin.readline, ""):
+    job = json.loads(line)
+    if job["dataset"] == "bad":
+        sys.exit(3)
+    time.sleep(job["sleep"])
+    Path(job["out_dir"]).mkdir(parents=True, exist_ok=True)
+    with open(job["results"], "wb") as f:
+        pickle.dump([{"dataset": job["dataset"], "worker": sys.argv[1]}], f)
+"""
+
+
+def _fake_jobs(tmp_path, spec):
+    jobs = []
+    for name, splits, sleep in spec:
+        out = tmp_path / name
+        jobs.append(
+            {
+                "dataset": name,
+                "splits": splits,
+                "out_dir": str(out),
+                "results": str(out / "results.pkl"),
+                "sleep": sleep,
+            }
+        )
+    return jobs
+
+
+def _fake_spawn(i):
+    import subprocess
+    import sys
+
+    return subprocess.Popen(
+        [sys.executable, "-c", FAKE_WORKER, str(i)], stdin=subprocess.PIPE, text=True
+    )
+
+
+def test_run_queue_gives_the_next_dataset_to_the_worker_that_is_free(tmp_path, capsys):
+    import pickle
+
+    script = _eval_script()
+    # worker 0이 비싼 것(1초)을 잡는 동안 worker 1이 나머지를 모두 돈다 (고정 분배라면 반씩)
+    spec = [("big", 4, 1.0)] + [(f"small{k}", 1, 0.01) for k in range(5)]
+    jobs = _fake_jobs(tmp_path, spec)
+    (tmp_path / "small0").mkdir()
+    (tmp_path / "small0" / "results.pkl").write_bytes(b"stale")  # 지난 실행의 결과는 지운다
+    missing, failed = script.run_queue(jobs, _fake_spawn, 2, heartbeat_s=0.2, poll_s=0.01)
+    assert missing == [] and failed == {}
+    workers = {}
+    for job in jobs:
+        with open(job["results"], "rb") as f:
+            (row,) = pickle.load(f)
+        workers[row["dataset"]] = row["worker"]
+    assert workers["big"] == "0"
+    assert all(workers[f"small{k}"] == "1" for k in range(5))
+    out = capsys.readouterr().out
+    assert "[heartbeat" in out and "splits 9/9 (datasets 6/6, queue 0)" in out
+    assert "worker 0: big splits 0/4" in out  # 일하는 동안 worker별 데이터셋·경과 시간
+
+
+def test_run_queue_reports_a_dead_worker_and_its_dataset(tmp_path):
+    script = _eval_script()
+    jobs = _fake_jobs(tmp_path, [("bad", 2, 0.0), ("a", 1, 0.2), ("b", 1, 0.01), ("c", 1, 0.01)])
+    missing, failed = script.run_queue(jobs, _fake_spawn, 2, heartbeat_s=60, poll_s=0.01)
+    # 죽은 worker의 데이터셋은 결과가 없다고 낸다 (조용히 imputed가 되지 않도록). 나머지는 끝난다
+    assert missing == ["bad"]
+    assert failed == {0: "exit 3 while running bad"}
+    assert all(Path(j["results"]).exists() for j in jobs[1:])
+
+
+def test_register_factory_gives_the_same_key_to_the_same_function():
+    pytest.importorskip("tabarena")
+    from minipfn.benchmarks import _arena_system as system
+
+    def make(problem_type, categorical):
+        return None
+
+    key = system.register_factory(make)
+    assert system.register_factory(make) == key
+    assert system.register_factory(lambda p, c: None) != key
