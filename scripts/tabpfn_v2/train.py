@@ -26,8 +26,8 @@ decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed 
 GPU끼리 나눠 계산한다(결과·checkpoint 형식 같음, 이어 학습하면 원래 run의 값을 따르고 `off`로
 끈다). 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
 `TABPFN_V2_DEQUANTIZE_BUCKETS`(기본 100, 0이면 끔)로 바꾼다.
-TabICLv2의 표 크기·prior 설정(`TrainConfig` 주석, issue #74·#81)은 `TABPFN_V2_SIZE_RULE=train_fraction`
-(`TABPFN_V2_MIN_ROWS`·`TABPFN_V2_MAX_ROWS`·`TABPFN_V2_MIN_TRAIN_FRACTION`·
+TabICLv2의 표 크기·prior 설정(`TrainConfig` 주석, issue #74·#81)은
+`TABPFN_V2_SIZE_RULE=train_fraction`(`TABPFN_V2_MIN_ROWS`·`TABPFN_V2_MAX_ROWS`·`TABPFN_V2_MIN_TRAIN_FRACTION`·
 `TABPFN_V2_MAX_TRAIN_FRACTION`), `TABPFN_V2_BINARY_PROB`, `TABPFN_V2_FILTER_UNPREDICTABLE=1`로
 켠다(주지 않으면 preset 그대로, v2·2.5는 논문 규칙).
 학습 진단 지표(`minipfn.training.diagnostics`)는 묶음별 가중치·gradient norm을 늘 남기고,
@@ -48,6 +48,8 @@ ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 
 `checkpoints/step_XXXXXXX.pt`에서 이어서 학습한다(`TABPFN_V2_KEEP_EVERY` step마다 남는다).
 `--init-run-id`(또는 `TABPFN_V2_INIT_RUN_ID`, 남긴 step은 `TABPFN_V2_INIT_STEP`)는 그 run의
 checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--config-name long_tables`로 긴 표 학습).
+`--config-name tuned`(`--arch v2.5`)은 issue #81의 medium 20k 실험으로 고른 학습 설정이다
+(`recipes.tabpfn_v2.tuned`: 300k step, compile·fused Adam·TF32, 분류는 TabICLv2 prior, 회귀는 Muon).
 `--config-name paper_run`(`--arch v3.5 --task multitask`)은 실제로 학습한 TabPFN-3.5 경로다
 (`recipes.tabpfn_v3.paper_run`: batch 256, Muon, step 구간별 lr·weight decay 변경 `phases`).
 구간 설정이 있는 run을 이어 학습하면 그 구간 설정을 따르고, lr은 `--lr`이 아니라 구간이 정한다.
@@ -89,6 +91,9 @@ PRESETS = {
     "medium": TrainConfig.medium,
     "paper": recipe.paper,
     "long_tables": recipe.long_tables,
+    # issue #81로 고른 TabPFN-2.5 학습 설정 (`recipes.tabpfn_v2.tuned`, --arch v2.5): 300k step,
+    # 가속 옵션, 분류는 TabICLv2 prior, 회귀는 Muon
+    "tuned": recipe.tuned,
     # 실제로 학습한 TabPFN-3.5 경로 (`recipes.tabpfn_v3.paper_run`, --arch v3.5 --task multitask)
     "paper_run": tabpfn_v3.paper_run,
     # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,

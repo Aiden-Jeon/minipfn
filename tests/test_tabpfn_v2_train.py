@@ -567,13 +567,49 @@ def test_train_script_sets_the_tabicl_prior_options_from_env(monkeypatch):
     assert (config.min_train_fraction, config.max_train_fraction) == (0.3, 0.9)
     assert config.binary_prob == 0.5 and config.filter_unpredictable
     # 그 밖의 설정은 그대로
-    assert replace(
-        config,
-        size_rule=base.size_rule,
-        min_rows=base.min_rows,
-        max_rows=base.max_rows,
-        min_train_fraction=base.min_train_fraction,
-        max_train_fraction=base.max_train_fraction,
-        binary_prob=base.binary_prob,
-        filter_unpredictable=base.filter_unpredictable,
-    ) == base
+    assert (
+        replace(
+            config,
+            size_rule=base.size_rule,
+            min_rows=base.min_rows,
+            max_rows=base.max_rows,
+            min_train_fraction=base.min_train_fraction,
+            max_train_fraction=base.max_train_fraction,
+            binary_prob=base.binary_prob,
+            filter_unpredictable=base.filter_unpredictable,
+        )
+        == base
+    )
+
+
+def test_tuned_preset_is_paper_with_the_options_chosen_in_issue_81(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    for task in ("classification", "regression"):
+        args = script.parse_args(["--config-name", "tuned", "--arch", "v2.5", "--task", task])
+        config, arch = script.build_config(args)
+        paper = recipe.with_architecture(recipe.paper(task), "v2.5")
+        assert arch == recipe.architecture_name(config) == "v2.5"
+        assert config.steps == 300_000 and config.warmup_steps == paper.warmup_steps
+        assert config.compile and config.fused_adam and config.tf32
+        assert not config.weight_average
+        # 안정화 설정은 paper 그대로 (회귀 QK-clip 250·rewind 0.5)
+        assert (config.qk_clip, config.rewind_lr_factor) == (paper.qk_clip, paper.rewind_lr_factor)
+        changed = {k for k in vars(paper) if getattr(paper, k) != getattr(config, k)}
+        if task == "classification":
+            assert config.optimizer == "adam" and config.filter_unpredictable
+            assert (config.size_rule, config.min_rows, config.max_rows) == (
+                "train_fraction",
+                1024,
+                1024,
+            )
+            assert config.binary_prob == 0.5
+            assert config.max_features == paper.max_features
+            assert config.max_cells == paper.max_cells
+            # 행 수·학습 비율은 TrainConfig 기본값이 이미 TabICLv2 stage 1 값이다
+            prior = {"size_rule", "binary_prob", "filter_unpredictable"}
+            assert changed == {"steps", "compile", "fused_adam", "tf32"} | prior
+        else:
+            assert config.optimizer == "muon" and config.size_rule == "eval_rows"
+            assert changed == {"steps", "compile", "fused_adam", "tf32", "optimizer"}
