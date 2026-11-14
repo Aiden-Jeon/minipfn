@@ -101,6 +101,41 @@ def paper(task: str = "classification") -> TrainConfig:
     return TrainConfig(task=task)
 
 
+# issue #81(v2.5 medium 20k A/B/C/D)로 고른 학습 설정. 논문에 없음
+TUNED_STEPS = 300_000  # TabICLv2 stage 1처럼 짧게, 스케줄이 이 step에서 끝난다
+TUNED_SPEED = {"compile": True, "fused_adam": True, "tf32": True}
+# 분류: TabICLv2 stage 1 표 크기·prior (`recipes.tabpfn_v3.CURRICULUM`). feature 상한·셀 수 상한은
+# 논문 그대로 둔다(추론의 one-hot 폭 상한과 학습 메모리가 같도록)
+TUNED_CLASSIFICATION_PRIOR = {
+    "size_rule": "train_fraction",
+    "min_rows": 1024,
+    "max_rows": 1024,
+    "min_train_fraction": 0.3,
+    "max_train_fraction": 0.9,
+    "binary_prob": 0.5,
+    "filter_unpredictable": True,
+}
+
+
+def tuned(task: str = "classification") -> TrainConfig:
+    """issue #81에서 고른 TabPFN-2.5 학습 설정 (논문에 없음). paper에서 바꾸는 것:
+
+    - 둘 다: 학습 가속 옵션 compile·fused Adam·TF32 (medium 20k에서 s/step −11~12%, Elo는 CI 안).
+      LAWA는 원래 가중치보다 낫지 않아 켜지 않는다
+    - 분류: TabICLv2 stage 1 표 크기·prior (`TUNED_CLASSIFICATION_PRIOR`). TabArena-Lite 분류 Elo
+      1191 → 1205, multiclass 1224 → 1349 (CI 안), s/step +40%
+    - 회귀: Muon (반복 블록 안 행렬, lr·스케줄은 Adam과 같음). 회귀 Elo 858 → 1135, 20k val
+      −1.11 → −1.23 (CI가 조금 겹침), s/step +33%. 분류는 Muon이 나빴다(1191 → 1067)
+    - 스케줄 길이 `TUNED_STEPS`(300k, warmup 10k + cosine으로 0까지)
+
+    QK-clip·rewind 같은 안정화 설정은 paper 그대로다. 구조는 `with_architecture`가 정한다(--arch).
+    """
+    config = replace(paper(task), steps=TUNED_STEPS, **TUNED_SPEED)
+    if task == "classification":
+        return replace(config, **TUNED_CLASSIFICATION_PRIOR)
+    return replace(config, optimizer="muon")
+
+
 def long_tables(task: str = "classification", arch: str = "v2") -> TrainConfig:
     """paper로 학습한 모델을 더 긴·넓은 표로 짧게 이어 학습한다 (논문에 없음, 값은 여기서 정함).
 
