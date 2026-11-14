@@ -107,15 +107,27 @@ def _forward_kwargs(config: TrainConfig, task: str) -> dict:
 
 @torch.no_grad()
 def _validate(
-    model, val_batches, device, autocast, task, bar, forward: dict | None = None
+    model,
+    val_batches,
+    device,
+    autocast,
+    task,
+    bar,
+    forward: dict | None = None,
+    inference_rows: int | None = None,
 ) -> dict[str, float]:
+    """검증 batch마다 손실(분류는 정확도도). `inference_rows`를 주면 행 수가 그보다 많은 batch는
+    모델의 추론 경로(`inference=True`)로 계산한다(`TrainConfig.activation_checkpointing_rows`)."""
     forward = forward or {}  # multitask 모델에 줄 task (`_forward_kwargs`)
     model.eval()
     total, correct, count = 0.0, 0, 0
     for batch in val_batches:
         x, y = batch.x.to(device), batch.y.to(device)
+        kwargs = forward
+        if inference_rows is not None and x.shape[1] > inference_rows:
+            kwargs = {**forward, "inference": True}
         with autocast():
-            logits = model(x, y[:, : batch.n_train], **forward)
+            logits = model(x, y[:, : batch.n_train], **kwargs)
         y_eval = y[:, batch.n_train :]
         total += prior_loss(logits, y_eval, task, bar).item()
         if task == "classification":
@@ -131,11 +143,15 @@ def _validate(
 def _validate_tasks(model, val_sets, device, autocast, config, bar) -> dict[str, float]:
     """task마다 검증. 한 task면 예전 지표 그대로, multitask면 지표 이름 뒤에 task를 붙이고
     `val_loss`는 두 task 손실의 평균이다."""
+    rows = config.activation_checkpointing_rows
     if config.task != "multitask":
-        return _validate(model, val_sets[config.task], device, autocast, config.task, bar)
+        return _validate(
+            model, val_sets[config.task], device, autocast, config.task, bar, inference_rows=rows
+        )
     out = {}
     for task, batches in val_sets.items():
-        val = _validate(model, batches, device, autocast, task, bar, _forward_kwargs(config, task))
+        forward = _forward_kwargs(config, task)
+        val = _validate(model, batches, device, autocast, task, bar, forward, rows)
         out.update({f"{k}_{task}": v for k, v in val.items()})
     out["val_loss"] = sum(out[f"val_loss_{t}"] for t in val_sets) / len(val_sets)
     return out
@@ -364,6 +380,8 @@ def _train(
 
     torch.manual_seed(config.seed)  # 모든 GPU가 같은 초기 가중치에서 시작한다
     model = config.build_model().to(device)
+    if config.activation_checkpointing_rows is not None:  # 모델 클래스는 설정 검사가 봤다
+        model.activation_checkpointing_rows = config.activation_checkpointing_rows
     if config.qk_clip is not None and not model.qk_clip_weights():
         raise ValueError(f"{config.model_type} 모델에는 QK-clip이 볼 attention이 없다")
     adam_kwargs = {"fused": True} if config.fused_adam and use_cuda else {}
