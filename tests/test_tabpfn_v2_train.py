@@ -538,3 +538,78 @@ def test_classification_outputs_come_from_the_prior(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "fake_prior_module", fake)
     assert TrainConfig(prior_type="fake").n_out == 20
     assert TrainConfig().n_out == 10 and TrainConfig(task="regression").n_out == 5000
+
+
+def test_train_script_sets_the_tabicl_prior_options_from_env(monkeypatch):
+    # issue #81 D: TabICLv2 표 크기·prior 설정을 환경변수로 켠다. 주지 않으면 preset 그대로
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    base, _ = script.build_config(script.parse_args(["--config-name", "medium", "--arch", "v2.5"]))
+    assert base.size_rule == "eval_rows" and not base.filter_unpredictable
+    env = {
+        "TABPFN_V2_SIZE_RULE": "train_fraction",
+        "TABPFN_V2_MIN_ROWS": "1024",
+        "TABPFN_V2_MAX_ROWS": "1024",
+        "TABPFN_V2_MIN_TRAIN_FRACTION": "0.3",
+        "TABPFN_V2_MAX_TRAIN_FRACTION": "0.9",
+        "TABPFN_V2_BINARY_PROB": "0.5",
+        "TABPFN_V2_FILTER_UNPREDICTABLE": "1",
+    }
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    script = _train_script()
+    config, arch = script.build_config(
+        script.parse_args(["--config-name", "medium", "--arch", "v2.5"])
+    )
+    assert arch == "v2.5"
+    assert (config.size_rule, config.min_rows, config.max_rows) == ("train_fraction", 1024, 1024)
+    assert (config.min_train_fraction, config.max_train_fraction) == (0.3, 0.9)
+    assert config.binary_prob == 0.5 and config.filter_unpredictable
+    # 그 밖의 설정은 그대로
+    assert (
+        replace(
+            config,
+            size_rule=base.size_rule,
+            min_rows=base.min_rows,
+            max_rows=base.max_rows,
+            min_train_fraction=base.min_train_fraction,
+            max_train_fraction=base.max_train_fraction,
+            binary_prob=base.binary_prob,
+            filter_unpredictable=base.filter_unpredictable,
+        )
+        == base
+    )
+
+
+def test_tuned_preset_is_paper_with_the_options_chosen_in_issue_81(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    for task in ("classification", "regression"):
+        args = script.parse_args(["--config-name", "tuned", "--arch", "v2.5", "--task", task])
+        config, arch = script.build_config(args)
+        paper = recipe.with_architecture(recipe.paper(task), "v2.5")
+        assert arch == recipe.architecture_name(config) == "v2.5"
+        assert config.steps == 300_000 and config.warmup_steps == paper.warmup_steps
+        assert config.compile and config.fused_adam and config.tf32
+        assert not config.weight_average
+        # 안정화 설정은 paper 그대로 (회귀 QK-clip 250·rewind 0.5)
+        assert (config.qk_clip, config.rewind_lr_factor) == (paper.qk_clip, paper.rewind_lr_factor)
+        changed = {k for k in vars(paper) if getattr(paper, k) != getattr(config, k)}
+        if task == "classification":
+            assert config.optimizer == "adam" and config.filter_unpredictable
+            assert (config.size_rule, config.min_rows, config.max_rows) == (
+                "train_fraction",
+                1024,
+                1024,
+            )
+            assert config.binary_prob == 0.5
+            assert config.max_features == paper.max_features
+            assert config.max_cells == paper.max_cells
+            # 행 수·학습 비율은 TrainConfig 기본값이 이미 TabICLv2 stage 1 값이다
+            prior = {"size_rule", "binary_prob", "filter_unpredictable"}
+            assert changed == {"steps", "compile", "fused_adam", "tf32"} | prior
+        else:
+            assert config.optimizer == "muon" and config.size_rule == "eval_rows"
+            assert changed == {"steps", "compile", "fused_adam", "tf32", "optimizer"}

@@ -110,15 +110,27 @@ class Attention(nn.Module):
         q, k, v = self.qkv(x).view(n, length, 3, self.nhead, e // self.nhead).unbind(2)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (N, H, L, D)
         if n_context is None:
-            out = F.scaled_dot_product_attention(q, k, v)
+            out = _sdpa(q, k, v)
         else:
             k, v = k[:, :, :n_context], v[:, :, :n_context]
-            train = F.scaled_dot_product_attention(q[:, :, :n_context], k, v)
+            train = _sdpa(q[:, :, :n_context], k, v)
             # 테스트 행: 모든 query head가 첫 head의 key·value를 본다
             first_k, first_v = k[:, :1].expand_as(k), v[:, :1].expand_as(v)
-            test = F.scaled_dot_product_attention(q[:, :, n_context:], first_k, first_v)
+            test = _sdpa(q[:, :, n_context:], first_k, first_v)
             out = torch.cat([train, test], dim=2)
         return self.out(out.transpose(1, 2).reshape(n, length, e))
+
+
+def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """scaled dot-product attention. compile 중이면 q·k·v를 contiguous로 만든다(issue #81).
+
+    q·k·v는 한 `qkv` 출력의 view(와 그 행 slice·head expand)라 메모리가 dense하지 않다. 그러면
+    flash attention backward가 실제로 내는 gradient stride((N, L, H, D) 순서)와 inductor의 meta
+    kernel이 예측하는 stride(contiguous)가 달라 compile한 backward의 `assert_size_stride`에서
+    멈춘다. eager는 그대로 둔다(compile을 끈 학습·추론은 예전과 비트 단위로 같다)."""
+    if torch.compiler.is_compiling():
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    return F.scaled_dot_product_attention(q, k, v)
 
 
 class CellTransformerLayer(nn.Module):
