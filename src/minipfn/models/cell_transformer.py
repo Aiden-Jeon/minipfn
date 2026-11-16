@@ -138,14 +138,10 @@ def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     n = q.shape[0]
     if n <= SDPA_MAX_BATCH:
         return F.scaled_dot_product_attention(q, k, v)
-    # batch를 나눠 부른다 (batch 원소마다 따로 계산하므로 값은 같다)
-    step = SDPA_MAX_BATCH
-    return torch.cat(
-        [
-            F.scaled_dot_product_attention(q[i : i + step], k[i : i + step], v[i : i + step])
-            for i in range(0, n, step)
-        ]
-    )
+    # batch를 나눠 부른다 (batch 원소마다 따로 계산하므로 값은 같다). `split`이라 compile(dynamic)은
+    # batch 크기가 아니라 조각 수에만 guard를 건다(`range(0, n, step)`은 크기마다 다시 compile한다)
+    chunks = zip(*(t.split(SDPA_MAX_BATCH) for t in (q, k, v)), strict=True)
+    return torch.cat([F.scaled_dot_product_attention(*c) for c in chunks])
 
 
 class CellTransformerLayer(nn.Module):

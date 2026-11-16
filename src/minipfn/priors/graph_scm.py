@@ -210,6 +210,9 @@ def _check(*, size_rule: str, **sizes) -> None:
     if size_rule not in SIZE_RULES:
         raise ValueError(f"size_rule은 {SIZE_RULES} 가운데 하나여야 한다: {size_rule}")
     if size_rule == "train_fraction":
+        # feature 수 상한은 min(max_features, feature_scale)이다 (`GraphSCMPrior.sample_shape`)
+        if sizes["feature_scale"] < 1:
+            raise ValueError(f"feature_scale는 1 이상이어야 한다: {sizes['feature_scale']}")
         check_split_sizes(
             **{
                 k: sizes[k]

@@ -248,17 +248,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.config_name == "cooldown" and not (args.init_run_id or args.resume_run_id):
         # 학습한 가중치를 마무리하는 설정이다. 회귀 구간 경계도 가져온 checkpoint의 것을 쓴다
         parser.error("cooldown은 --init-run-id(paper_run run)나 --resume-run-id와 같이 줘야 한다")
-    if (
-        args.config_name in CURRICULUM_NAMES
-        and CURRICULUM_NAMES[args.config_name] > 1
-        and not (args.init_run_id or args.resume_run_id)
-    ):
-        # 단계마다 앞 단계의 가중치에서 새 optimizer로 시작한다 (TabICLv2 `--only_load_model True`)
-        parser.error(
-            f"{args.config_name}는 --init-run-id(앞 단계 run)나 --resume-run-id와 같이 줘야 한다"
-        )
-    if args.config_name in TUNED_LONG_NAMES and not (args.init_run_id or args.resume_run_id):
-        # tuned 가중치(stage 1)나 앞 단계에서 새 optimizer로 시작한다. 회귀 구간 경계도 이어 쓴다
+    later_stage = (
+        CURRICULUM_NAMES.get(args.config_name, 1) > 1 or args.config_name in TUNED_LONG_NAMES
+    )
+    if later_stage and not (args.init_run_id or args.resume_run_id):
+        # 단계마다 앞 단계의 가중치에서 새 optimizer로 시작한다 (TabICLv2 `--only_load_model True`).
+        # tuned_stage2·3은 tuned 가중치(stage 1)나 앞 단계에서, 회귀 구간 경계도 이어 쓴다
         parser.error(
             f"{args.config_name}는 --init-run-id(앞 단계 run)나 --resume-run-id와 같이 줘야 한다"
         )
