@@ -310,7 +310,14 @@ class Attention(nn.Module):
       행)는 첫 head의 key·value만 본다(multi-query)
     - `qassmax`: QASSMax (모듈 docstring), `qk_norm`: q·k에 RMSNorm, `rope_base`: q·k에 RoPE
     - `zero_out`: 출력층을 0으로 시작한다 (처음에는 잔차에 아무것도 더하지 않는다)
+    - DiagScale(`minipfn.inference.diag_scale`)이 parameter `diag_scale`(δ, head × head 차원)을
+      붙이면 q·k 유사도를 qᵀ(I + diag(δ))k로 바꾼다. q·k에 RMSNorm·RoPE·QASSMax를 거친 뒤 q에
+      곱한다. 붙이지 않으면 계산은 그대로다
     """
+
+    # q·k·v를 `qkv`의 forward가 아니라 그 weight로 계산하므로 DiagScale의 δ를 여기서 곱한다
+    # (`minipfn.inference.diag_scale.add_diag_scale`은 qkv에 forward hook을 달지 않는다)
+    diag_scale_in_forward = True
 
     def __init__(
         self,
@@ -372,6 +379,10 @@ class Attention(nn.Module):
             q, k = _rope(q, self.rope_base), _rope(k, self.rope_base)
         if self.qassmax is not None:
             q = self.qassmax(q, k.shape[2])
+        delta = getattr(self, "diag_scale", None)  # DiagScale이 붙인 δ (클래스 docstring)
+        if delta is not None:
+            h, d = q.shape[1], q.shape[3]
+            q = (q.float() * (1.0 + delta.view(1, h, 1, d))).to(q.dtype)
         if n_context is None:
             out = self._sdpa(q, k, v)
         else:
