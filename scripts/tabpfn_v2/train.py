@@ -241,6 +241,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=_env_flag("TABPFN_V2_FILTER_UNPREDICTABLE"),
     )
+    # prior 변형 (issue #92, graph_scm prior. TrainConfig 주석). 주지 않으면 preset 그대로다.
+    # filter_unpredictable·binary_prob처럼 이어 학습할 때 원래 run에서 잇지 않으니 같은 값을
+    # 다시 준다
+    for name in ("tree-scm-prob", "mixture-root-prob"):
+        env = "TABPFN_V2_" + name.upper().replace("-", "_")
+        parser.add_argument(f"--{name}", type=float, default=_env(env, float))
+    parser.add_argument(
+        "--graph-scm-corrected",
+        action="store_true",
+        default=_env_flag("TABPFN_V2_GRAPH_SCM_CORRECTED"),
+    )
+    # 짧은 비교 학습용 (issue #92): seed는 초기 가중치·학습 데이터·검증 세트를 바꾸고, warmup은
+    # preset의 길이 대신 쓴다. 이어 학습할 때는 원래 run과 같은 값을 다시 준다
+    parser.add_argument("--seed", type=int, default=_env("TABPFN_V2_SEED", int))
+    parser.add_argument("--warmup-steps", type=int, default=_env("TABPFN_V2_WARMUP_STEPS", int))
     parser.add_argument("--resume-run-id", default=os.environ.get("TABPFN_V2_RESUME_RUN_ID"))
     parser.add_argument("--resume-step", type=int, default=_env("TABPFN_V2_RESUME_STEP", int))
     parser.add_argument("--init-run-id", default=os.environ.get("TABPFN_V2_INIT_RUN_ID"))
@@ -448,6 +463,10 @@ def _override_values(args: argparse.Namespace) -> dict:
         "min_train_fraction": args.min_train_fraction,
         "max_train_fraction": args.max_train_fraction,
         "binary_prob": args.binary_prob,
+        "tree_scm_prob": args.tree_scm_prob,
+        "mixture_root_prob": args.mixture_root_prob,
+        "seed": args.seed,
+        "warmup_steps": args.warmup_steps,
         **{
             name: True
             for name in (
@@ -458,6 +477,7 @@ def _override_values(args: argparse.Namespace) -> dict:
                 "grad_cosine",
                 "rank_timing",
                 "filter_unpredictable",
+                "graph_scm_corrected",
             )
             if getattr(args, name)
         },

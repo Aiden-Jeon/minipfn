@@ -1,0 +1,47 @@
+# prior 변형 비교 학습 (issue #92): curriculum stage 1을 작게 줄인 학습(8×H100, batch 64, 20k step,
+# warmup 200)으로 prior만 바꿔 견준다. 모델·optimizer·표 크기는 stage 1 그대로다(v3.5 multitask,
+# Muon, 1,024행). 학습 가속 옵션은 stage 1 run과 같다(compile·TF32·분산 Muon·worker 16).
+# 변형은 환경변수 하나씩으로 켠다(기본은 대조 A):
+#   databricks air run -f scripts/tabpfn_v3/prior_variants.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR \
+#     --override mlflow_run_name=tabpfn-v3-5-prior92-B-20k --override env_variables.TABPFN_V2_TREE_SCM_PROB=0.3
+#   A′(노이즈): TABPFN_V2_SEED=1 / B: TABPFN_V2_TREE_SCM_PROB=0.3 / C: TABPFN_V2_GRAPH_SCM_CORRECTED=1 /
+#   D: TABPFN_V2_MIXTURE_ROOT_PROB=0.3
+# 평가는 scripts/tabpfn_v2/eval_arena.yaml(TabArena-Lite, BeyondArena의 작은 표 --datasets)로 한다.
+experiment_name: tabpfn-v3-reproduction
+mlflow_run_name: tabpfn-v3-5-prior92-A-20k
+environment:
+  version: databricks_ai_v6
+  # TabICL prior, 그리고 tree SCM 변형(B)의 XGBoost 층 (uv.lock과 같은 버전)
+  dependencies:
+    - tabicl>=2.2
+    - xgboost==3.4.1
+compute:
+  accelerator_type: GPU_8xH100
+  num_accelerators: 8
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v2/train.py
+env_variables:
+  TABPFN_V2_ARCH: v3.5
+  TABPFN_V2_TASK: multitask
+  TABPFN_V2_CONFIG_NAME: stage1
+  TABPFN_V2_STEPS: "20000"
+  TABPFN_V2_BATCH_SIZE: "64"
+  TABPFN_V2_MICRO_BATCH: "8"
+  TABPFN_V2_WARMUP_STEPS: "200"
+  TABPFN_V2_COMPILE: "1"
+  TABPFN_V2_TF32: "1"
+  TABPFN_V2_MUON_DISTRIBUTED: all
+  TABPFN_V2_NUM_WORKERS: "16"
+max_retries: 0
+timeout_minutes: 360
+# scripts/tabpfn_v3/train.yaml과 같은 명령 (PYTHONHASHSEED=1 고정)
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONHASHSEED=1
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  torchrun --standalone --nproc_per_node=8 $CODE_SOURCE_PATH/scripts/tabpfn_v2/train.py

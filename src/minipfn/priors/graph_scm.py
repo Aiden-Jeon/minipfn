@@ -18,6 +18,13 @@ TabICLv2 학습 스크립트에 맞추는 옵션 (기본은 모두 꺼져 예전
 - `binary_prob`: 분류 클래스 수를 이 확률로 2로 (`ClassCount`)
 - `filter_unpredictable`: 예측할 수 없는 그래프·데이터셋을 다시 뽑는다 (`generators.graph_scm`)
 
+prior 변형 옵션 (issue #92, 기본은 모두 꺼져 예전과 같은 데이터셋):
+- `tree_scm_prob`: 데이터셋을 이 확률로 TabICL v1 tree SCM(`generators.tree_scm`, XGBoost 층)으로
+  만든다. 나머지는 graph SCM이다. 생성기 선택은 데이터셋마다 `Rng`로 뽑는다(`GeneratorChoice`)
+- `graph_scm_corrected`: graph SCM의 TabICL 보정 플래그를 켠다 (`generators.graph_scm`)
+- `mixture_root_prob`: graph SCM 데이터셋을 이 확률로 골라 root 노드를 Gaussian mixture(군집)에서
+  뽑는다 (`generators.graph_scm`)
+
     prior = GraphSCMPrior(task="classification", seed=0)
     batch = prior.sample_batch(8)  # x (8, 행, feature), y (8, 행), n_train
 
@@ -33,9 +40,9 @@ import numpy as np
 import torch
 
 from minipfn.priors.base import PriorBatch
-from minipfn.priors.generators.graph_scm import GraphSCM
+from minipfn.priors.generators.graph_scm import GraphSCM, check_probability
 from minipfn.priors.hyperparameters import ClassCount
-from minipfn.priors.pipeline import Pipeline, Rng
+from minipfn.priors.pipeline import Mixture, Pipeline, Rng
 from minipfn.priors.table_size import (
     MAX_CELLS,
     MAX_FEATURES,
@@ -77,7 +84,11 @@ class GraphSCMPrior:
         feature_cap_rule: str = "rows",
         binary_prob: float = 0.0,
         filter_unpredictable: bool = False,
+        tree_scm_prob: float = 0.0,
+        graph_scm_corrected: bool = False,
+        mixture_root_prob: float = 0.0,
     ) -> None:
+        check_probability("tree_scm_prob", tree_scm_prob)
         self._task = task
         if task == "classification":
             min_train_rows = max(min_train_rows, 2)  # 클래스가 2개 이상 학습 행에 나오려면
@@ -111,15 +122,28 @@ class GraphSCMPrior:
         self.feature_cap_rule = feature_cap_rule
         self.rng = Rng.from_seed(seed)
         # TabICL의 전역 난수 시드도 여기서 고정한다
-        generator = GraphSCM(task, seed=seed, filter_unpredictable=filter_unpredictable)
+        generator = GraphSCM(
+            task,
+            seed=seed,
+            filter_unpredictable=filter_unpredictable,
+            corrected=graph_scm_corrected,
+            mixture_root_prob=mixture_root_prob,
+        )
         classification = task == "classification"
+        hyperparameters = ClassCount(MAX_CLASSES, binary_prob) if classification else None
+        if tree_scm_prob:
+            from minipfn.priors.generators.tree_scm import TreeSCM
+
+            tree = TreeSCM(task, seed, filter_unpredictable=filter_unpredictable)
+            generator = Mixture({"graph_scm": generator, "tree_scm": tree}, choose=chosen_generator)
+            hyperparameters = GeneratorChoice(hyperparameters, tree_scm_prob)
         # 결측값을 넣기 전까지 (회귀 구간 경계와 `_one_dataset`은 여기까지만 거친다)
         self._accept = [DropInvalid(), CoverClasses()] if classification else [DropInvalid()]
         self._missing = Missing(missing_dataset_prob, max_missing_rate)
         self.pipeline = Pipeline(
             generator,
             rng=self.rng,
-            hyperparameters=ClassCount(MAX_CLASSES, binary_prob) if classification else None,
+            hyperparameters=hyperparameters,
             transforms=[*self._accept, self._missing],
             max_attempts=MAX_ATTEMPTS,
         )
@@ -210,8 +234,36 @@ SIZE_DEFAULTS = {
     "feature_cap_rule": "rows",
 }
 SIZE_FIELDS = tuple(SIZE_DEFAULTS)
-# 학습 데이터 분포를 바꾸는 prior 옵션 (회귀 구간 경계는 크기 규칙만 따른다)
-PRIOR_FIELDS = ("binary_prob", "filter_unpredictable")
+# 학습 데이터 분포를 바꾸는 prior 옵션
+PRIOR_FIELDS = (
+    "binary_prob",
+    "filter_unpredictable",
+    "tree_scm_prob",
+    "graph_scm_corrected",
+    "mixture_root_prob",
+)
+# 그 가운데 회귀 target 분포도 바꾸는 것 (회귀 구간 경계가 학습 prior와 같게 따른다. binary_prob는
+# 분류만 바꾼다)
+BORDER_PRIOR_FIELDS = tuple(name for name in PRIOR_FIELDS if name != "binary_prob")
+
+
+class GeneratorChoice:
+    """하이퍼파라미터 단계: 데이터셋(그룹)마다 생성기를 고른다 (`Mixture`가 읽는 `generator`).
+    `tree_scm_prob`의 확률로 "tree_scm", 아니면 "graph_scm"이다. 나머지 하이퍼파라미터는
+    `base`(없으면 빈 dict)의 것이다."""
+
+    def __init__(self, base, tree_scm_prob: float) -> None:
+        self.base = base
+        self.tree_scm_prob = tree_scm_prob
+
+    def __call__(self, rng: Rng, n_train: int, n_features: int) -> dict:
+        hp = self.base(rng, n_train, n_features) if self.base else {}
+        tree = rng.numpy.random() < self.tree_scm_prob
+        return {**hp, "generator": "tree_scm" if tree else "graph_scm"}
+
+
+def chosen_generator(hp: dict) -> str:
+    return hp["generator"]
 
 
 def _check(*, size_rule: str, **sizes) -> None:
@@ -286,19 +338,19 @@ def make_borders(config, n_buckets: int, seed: int, n_jobs: int = 1) -> torch.Te
         config.border_datasets,
         seed,
         n_jobs=n_jobs,
-        filter_unpredictable=config.filter_unpredictable,
+        **{name: getattr(config, name) for name in BORDER_PRIOR_FIELDS},
         **_sizes(config),
     )
 
 
-def _border_targets(args: tuple[int, int, dict, bool]) -> torch.Tensor:
+def _border_targets(args: tuple[int, int, dict, dict]) -> torch.Tensor:
     # 회귀 데이터셋 n개의 고유한 target 값 (결측값은 넣지 않는다)
-    n_datasets, seed, sizes, filter_unpredictable = args
+    n_datasets, seed, sizes, options = args
     prior = GraphSCMPrior(
         "regression",
         seed=seed,
         missing_dataset_prob=0.0,
-        filter_unpredictable=filter_unpredictable,
+        **options,
         **sizes,
     )
     values = []
@@ -314,8 +366,7 @@ def regression_borders(
     seed: int = 0,
     *,
     n_jobs: int = 1,
-    filter_unpredictable: bool = False,
-    **sizes,
+    **sizes_and_options,
 ) -> torch.Tensor:
     """회귀 출력 구간의 경계 (Methods "Regression details").
 
@@ -325,15 +376,19 @@ def regression_borders(
     구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함).
     데이터셋 크기 인자는 `SIZE_FIELDS` 이름의 키워드로 주고, 빠지면 `SIZE_DEFAULTS`를 쓴다.
     `GraphSCMPrior`와 같은 뜻이며, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
-    `filter_unpredictable`도 학습 prior와 같게 둔다(걸러진 데이터셋의 target은 학습에 안 나온다).
+    `filter_unpredictable`과 prior 변형 옵션(`BORDER_PRIOR_FIELDS` 이름의 키워드, 빠지면
+    `GraphSCMPrior`의 기본값)도 학습 prior와 같게 둔다(걸러진 데이터셋의 target은 학습에 안 나오고,
+    tree SCM·군집 root는 target 분포를 바꾼다).
     """
+    options = {k: v for k, v in sizes_and_options.items() if k in BORDER_PRIOR_FIELDS}
+    sizes = {k: v for k, v in sizes_and_options.items() if k not in BORDER_PRIOR_FIELDS}
     unknown = set(sizes) - set(SIZE_DEFAULTS)
     if unknown:
-        raise TypeError(f"regression_borders에 없는 크기 인자: {sorted(unknown)}")
+        raise TypeError(f"regression_borders에 없는 크기·prior 인자: {sorted(unknown)}")
     # n_jobs개 프로세스로 나눠 만든다 (프로세스마다 시드가 다르다)
     counts = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]
     table = {**SIZE_DEFAULTS, **sizes}
-    jobs = [(n, seed + i, table, filter_unpredictable) for i, n in enumerate(counts)]
+    jobs = [(n, seed + i, table, options) for i, n in enumerate(counts)]
     if n_jobs == 1:
         targets = _border_targets(jobs[0])
     else:

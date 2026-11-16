@@ -112,6 +112,12 @@ class TrainConfig:
     feature_cap_rule: Literal["rows", "cells"] = "rows"
     binary_prob: float = 0.0
     filter_unpredictable: bool = False
+    # prior 변형 (issue #92, `minipfn.priors.graph_scm`. 기본값이면 위 prior 그대로다):
+    # tree_scm_prob의 확률로 TabICL v1 tree SCM 데이터셋, graph_scm_corrected면 TabICL 보정
+    # 플래그, mixture_root_prob의 확률로 군집(Gaussian mixture) root
+    tree_scm_prob: float = 0.0
+    graph_scm_corrected: bool = False
+    mixture_root_prob: float = 0.0
     missing_dataset_prob: float = 0.3
     border_datasets: int = 20_000  # 회귀 구간 경계를 정할 때 뽑는 데이터셋 수 (여기서 정함)
     # 최적화 (논문: 약 200만 step × batch 64. warmup 길이와 lr은 여기서 정함)
@@ -270,8 +276,9 @@ class TrainConfig:
             self.muon_scope != "blocks" or self.muon_momentum != MUON_MOMENTUM
         ):
             raise ValueError("muon_scope·muon_momentum은 optimizer=muon일 때만 바꾼다")
-        if not 0.0 <= self.binary_prob <= 1.0:
-            raise ValueError(f"binary_prob는 0 이상 1 이하여야 한다: {self.binary_prob}")
+        for name in ("binary_prob", "tree_scm_prob", "mixture_root_prob"):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name}는 0 이상 1 이하여야 한다: {getattr(self, name)}")
         if self.logit_softcap is not None:
             if not (math.isfinite(self.logit_softcap) and self.logit_softcap > 0):
                 raise ValueError(f"logit_softcap은 유한한 양수다: {self.logit_softcap}")
