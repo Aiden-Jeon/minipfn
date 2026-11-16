@@ -692,3 +692,49 @@ def test_diag_scale_rejects_column_row_transformer():
     X, y = np.random.default_rng(0).normal(size=(60, 4)), np.arange(60) % 3
     with pytest.raises(ValueError, match="column_row_transformer"):
         DiagScale(EnsembleClassifier(_model(), n_estimators=1), epochs=1).fit(X, y)
+
+
+def test_v3_5_classes_share_the_multitask_repo(tmp_path, monkeypatch):
+    # 공개 가중치는 multitask 하나다. 분류·회귀 클래스가 같은 repo를 받아 각자 그 task를 쓴다
+    from minipfn import TabPFNv3_5Classifier, TabPFNv3_5Regressor
+
+    model = _multitask(logit_softcap=50.0)
+    borders = torch.linspace(-3, 3, model.config.n_buckets + 1)
+    folder = hub.save_pretrained(model, borders, tmp_path / "v35")
+    asked = []
+    real = hub.from_pretrained
+
+    def fake(spec, revision=None):
+        asked.append(str(spec))
+        repo = str(spec).partition("@")[0]
+        return real(folder if repo == recipe.HUB_REPO else spec, revision)
+
+    monkeypatch.setattr(hub, "from_pretrained", fake)
+    clf, reg = TabPFNv3_5Classifier(), TabPFNv3_5Regressor()
+    assert asked == [recipe.HUB_REPO, recipe.HUB_REPO]
+    for loaded in (clf.model, reg.model):
+        assert loaded.config == model.config and loaded.config.logit_softcap == 50.0
+        for name, tensor in model.state_dict().items():
+            assert torch.equal(loaded.state_dict()[name], tensor), name
+    assert torch.equal(reg.borders.cpu(), borders)
+    # 추론 설정은 3.5 recipe의 것 (standard 8개)
+    assert (clf.n_estimators, clf.member_kinds) == (8, ("standard",))
+    assert (reg.n_estimators, reg.member_kinds) == (8, ("standard",))
+    TabPFNv3_5Classifier(recipe.HUB_REPO + "@stage2-20k")
+    assert asked[-1] == recipe.HUB_REPO + "@stage2-20k"
+    # 경계 없는 분류 모델 폴더는 회귀로 받지 않는다
+    cls_only = hub.save_pretrained(_model(arch="v3.5"), None, tmp_path / "cls")
+    with pytest.raises(ValueError, match="regression 모델"):
+        TabPFNv3_5Regressor(str(cls_only))
+
+
+def test_v2_classes_take_inference_defaults_from_the_model_recipe():
+    # 모델을 직접 주면 추론 설정은 그 모델 종류의 recipe가 정한다 (v2 recipe의 v2 멤버가 아니다)
+    from minipfn import TabPFNv2Classifier, TabPFNv2Regressor
+
+    model = _multitask()
+    borders = torch.linspace(-3, 3, model.config.n_buckets + 1)
+    clf = TabPFNv2Classifier(model)
+    reg = TabPFNv2Regressor(model, borders)
+    assert (clf.n_estimators, clf.member_kinds) == (8, ("standard",))
+    assert (reg.n_estimators, reg.member_kinds) == (8, ("standard",))

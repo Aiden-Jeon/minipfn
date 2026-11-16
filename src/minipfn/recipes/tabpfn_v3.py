@@ -8,13 +8,16 @@
   paper 설정(`recipes.tabpfn_v2.paper`)에서 시작한다. 3은 task마다 모델이 따로이고, 3.5는
   분류·회귀를 한 모델로 같이 학습한다(`task="multitask"`: 학습 루프가 step마다 task를 번갈아 쓴다)
 - 추론: `minipfn.inference.ensemble`의 `EnsembleClassifier`·`EnsembleRegressor`에
-  `default_inference` (3은 2.5와 같은 전처리, 3.5는 standard 멤버 8개)
+  `default_inference` (3은 2.5와 같은 전처리, 3.5는 standard 멤버 8개). 공개 가중치는
+  `TabPFNv3_5Classifier`·`TabPFNv3_5Regressor`가 받는다
 
     config = with_architecture(paper("classification"), "v3")
     clf = EnsembleClassifier(model, **default_inference(model, "classification"))
+    clf = TabPFNv3_5Classifier().fit(x_train, y_train)  # 공개 가중치 (multitask 모델)
 
-공개 가중치가 생기면 `TabPFNv3Classifier`·`TabPFNv3Regressor`(3·3.5 공용, 기본 repo만 정하는 얇은
-클래스)를 여기에 더한다. repo가 생기기 전에는 만들지 않는다(인자 없이 부르면 404라서).
+TabPFN-3.5 공개 가중치(`HUB_REPO`)는 분류·회귀를 한 모델로 학습한 multitask 가중치 하나다.
+`TabPFNv3_5Classifier`와 `TabPFNv3_5Regressor`가 같은 repo를 받아 각자 그 task의 출력을 쓴다.
+TabPFN-3(task마다 모델)은 공개 가중치가 없어 클래스를 두지 않는다(인자 없이 부르면 404라서).
 
 학습 설정(`TrainConfig`)은 쓰는 함수 안에서 불러온다. 추론만 할 때 학습 스택을 불러오지 않도록.
 """
@@ -29,6 +32,7 @@ from torch import nn
 
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
 from minipfn.recipes import resolve_member_kinds
+from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
 
 if TYPE_CHECKING:
     from minipfn.training.config import TrainConfig
@@ -317,3 +321,32 @@ def default_inference(model: nn.Module, task: str) -> dict:
         "n_estimators": int(saved.get("n_estimators", preset["n_estimators"][task])),
         "member_kinds": resolve_member_kinds(saved.get("member_kinds") or preset["member_kinds"]),
     }
+
+
+# TabPFN-3.5 공개 가중치: curriculum 3단계(`CURRICULUM`)를 마친 v3.5 multitask 모델. 분류·회귀가
+# 같은 가중치를 쓴다 (`TabPFNv3_5Classifier()`·`TabPFNv3_5Regressor()`의 기본값). 앞 단계 가중치는
+# 같은 repo의 branch `stage1-250k`·`stage2-20k`에 있다
+HUB_REPO = "aiden-jeon/minipfn-tabpfn-v3-5"
+HUB_REPOS = {"classification": HUB_REPO, "regression": HUB_REPO}
+
+
+class TabPFNv3_5Classifier(TabPFNv2Classifier):
+    """TabPFN-3.5 분류. `TabPFNv2Classifier`(전처리 멤버 앙상블)와 같고 공개 가중치만 3.5의 것
+    (`HUB_REPO`)이다. multitask 모델의 분류 출력을 쓴다. 멤버 수·전처리(standard 8개)는 가중치의
+    config.json이 정한다.
+
+        clf = TabPFNv3_5Classifier().fit(x_train, y_train)
+        clf = TabPFNv3_5Classifier("aiden-jeon/minipfn-tabpfn-v3-5@stage2-20k")  # 앞 단계
+    """
+
+    hub_repos = HUB_REPOS
+
+
+class TabPFNv3_5Regressor(TabPFNv2Regressor):
+    """TabPFN-3.5 회귀. `TabPFNv2Regressor`와 같고 공개 가중치만 3.5의 것(`HUB_REPO`, 분류와 같은
+    가중치)이다. 회귀 구간 경계도 그 repo에서 받는다.
+
+        reg = TabPFNv3_5Regressor().fit(x_train, y_train)
+    """
+
+    hub_repos = HUB_REPOS

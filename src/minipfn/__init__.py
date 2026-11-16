@@ -11,8 +11,8 @@
 - `benchmarks`: 평가 (AMLB·CTR23, OpenML-CC18, GP 비교)
 - `hub`: Hugging Face Hub에 올리고 받기
 - `tabular`: 표 표준화·이상치 누르기 (prior 후처리와 v1 추론 전처리가 같이 쓴다)
-- `recipes`: 논문별 수치와 조합 (`pfn`, `tabpfn_v1`, `tabpfn_v2`). 논문에만 있는 학습 루프
-  (PFN, TabPFN v1)도 여기에 있다
+- `recipes`: 논문별 수치와 조합 (`pfn`, `tabpfn_v1`, `tabpfn_v2`, `tabpfn_v3`). 논문에만 있는
+  학습 루프(PFN, TabPFN v1)도 여기에 있다
 
 여기서는 PFN 챕터 노트북이 쓰는 이름을 바로 내보낸다. TabPFN 추론에 쓰는 이름(`from_pretrained`와
 논문 기본값을 붙인 추론 클래스)도 여기서 쓸 수 있다. 정의는 `hub`·`recipes`에 있고, 처음 쓸 때
@@ -55,6 +55,7 @@ if TYPE_CHECKING:
         TabPFNv2Classifier,
         TabPFNv2Regressor,
     )
+    from minipfn.recipes.tabpfn_v3 import TabPFNv3_5Classifier, TabPFNv3_5Regressor
 
 PFNTransformer = PointTransformer  # 예전 이름
 
@@ -66,6 +67,8 @@ _LAZY = {
     "TabPFNv2Regressor": "minipfn.recipes.tabpfn_v2",
     "TabPFNv2_5Classifier": "minipfn.recipes.tabpfn_v2",
     "TabPFNv2_5Regressor": "minipfn.recipes.tabpfn_v2",
+    "TabPFNv3_5Classifier": "minipfn.recipes.tabpfn_v3",
+    "TabPFNv3_5Regressor": "minipfn.recipes.tabpfn_v3",
 }
 
 
@@ -112,4 +115,6 @@ __all__ = [
     "TabPFNv2Regressor",
     "TabPFNv2_5Classifier",
     "TabPFNv2_5Regressor",
+    "TabPFNv3_5Classifier",
+    "TabPFNv3_5Regressor",
 ]
