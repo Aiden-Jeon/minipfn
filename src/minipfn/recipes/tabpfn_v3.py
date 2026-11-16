@@ -230,8 +230,8 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
 #   200,000행 20
 # - lr은 stage 3의 절반(5e-6), grad clip 1. 나머지는 stage 3과 같다(activation checkpointing
 #   10,240행 초과 포함)
-# - step 수는 STAGE4_STEPS(500~1,000, 기본 STAGE4_DEFAULT_STEPS). 처음 설계한 2,000 step은 32
-#   GPU에서 처음 20 step이 333 s/step이라 줄였다. warmup·cosine은 그 step 수에 맞춘다
+# - step 수는 STAGE4_STEPS(500~1,000) 안에서, 기본 500(task당 데이터셋 64K개). 처음 설계한 2,000
+#   step은 32 GPU에서 처음 20 step이 333 s/step이라 줄였다. warmup·cosine은 그 step 수에 맞춘다
 #   (`curriculum`의 `steps`)
 # - 표 크기를 GPU끼리 나눠 받는다(`balance_tables`, `training.table_balance`). 표 계산 시간이 행
 #   수의 제곱에 가까워 GPU마다 따로 뽑으면 가장 느린 GPU가 평균의 2~3배였다
@@ -291,7 +291,8 @@ CURRICULUM = {
         "activation_checkpointing_rows": 10_240,
     },
     4: {
-        "steps": 1_000,
+        # 500 step: 32 GPU 재측정 125~155 s/step에서 약 20시간·650 GPU-h (issue #91)
+        "steps": 500,
         "lr": 5e-6,
         "grad_clip": 1.0,
         "min_rows": 400,

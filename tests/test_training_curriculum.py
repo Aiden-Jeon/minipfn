@@ -372,13 +372,13 @@ def test_curriculum_recipe():
     )
     assert (s3.steps, s3.lr, s3.grad_clip, s3.max_rows) == (5_000, 1e-5, 1.0, 60_000)
     assert all(c.logit_softcap == 50.0 for c in (s1, s2, s3, s4))
-    # stage 4 (issue #91): 400~200,000행, 셀 상한 4M, stage 3의 절반 lr로 1,000 step(500~1,000),
+    # stage 4 (issue #91): 400~200,000행, 셀 상한 4M, stage 3의 절반 lr로 500 step(500~1,000),
     # GPU끼리 표 크기 나누기
     assert (s4.steps, s4.lr, s4.grad_clip, s4.warmup_steps, s4.micro_batch) == (
-        1_000,
+        500,
         5e-6,
         1.0,
-        10,
+        5,
         1,
     )
     assert s4.balance_tables and not any(c.balance_tables for c in (s1, s2, s3))
