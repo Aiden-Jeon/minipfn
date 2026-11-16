@@ -177,9 +177,7 @@ def low_cardinality_values(X: np.ndarray, cat_ix: list[int]) -> dict[int, np.nda
     for i in range(X.shape[1]):
         if i in cat:
             continue
-        col = X[:, i]
-        values = np.unique(col[~np.isnan(col)])
-        n_distinct = len(values) + int(np.isnan(col).any())
+        values, n_distinct = _distinct(X[:, i])
         if 1 < n_distinct < MIN_UNIQUE_NUMERICAL:
             out[i] = values
     return out
@@ -207,11 +205,16 @@ def constant_columns(X: np.ndarray, keep: list[int] | None = None) -> list[int]:
     for i in range(X.shape[1]):
         if i in keep_set:
             continue
-        col = X[:, i]
-        nan = np.isnan(col)
-        if len(np.unique(col[~nan])) + int(nan.any()) <= 1:
+        if _distinct(X[:, i])[1] <= 1:
             out.append(i)
     return out
+
+
+def _distinct(col: np.ndarray) -> tuple[np.ndarray, int]:
+    # (결측이 아닌 값(정렬), 서로 다른 값의 수 — 결측도 하나로 센다)
+    nan = np.isnan(col)
+    values = np.unique(col[~nan])
+    return values, len(values) + int(nan.any())
 
 
 def row_fingerprint(X: np.ndarray, salt: int, unique: bool) -> np.ndarray:
@@ -219,7 +222,8 @@ def row_fingerprint(X: np.ndarray, salt: int, unique: bool) -> np.ndarray:
     함께 hash한다. `unique`(학습 행)면 같은 행이 다시 나올 때 번호를 더해 다른 값으로 만든다(값이
     모두 결측인 행은 그대로 둔다). 테스트 행은 `unique=False`: 학습 행과 같은 행은 그 행과 같은
     값이다."""
-    rows = np.ascontiguousarray(np.round(np.asarray(X, dtype=np.float64), _HASH_DECIMALS))
+    # + 0.0: 반올림한 -0.0을 0.0으로 (bytes가 달라 같은 행이 다른 hash가 되지 않도록)
+    rows = np.ascontiguousarray(np.round(np.asarray(X, dtype=np.float64), _HASH_DECIMALS) + 0.0)
 
     def h(data: bytes, s: int) -> float:
         digest = hashlib.sha256(data + s.to_bytes(8, "little", signed=False)).digest()
@@ -248,6 +252,10 @@ def row_fingerprint(X: np.ndarray, salt: int, unique: bool) -> np.ndarray:
         seen.add(value)
         count[base] = k + 1
     return out
+
+
+def _inf_to_nan(X: np.ndarray) -> np.ndarray:
+    return np.where(np.isinf(X), np.nan, X)
 
 
 def select_features(
@@ -340,6 +348,8 @@ class MemberPreprocessor:
     def _bounds(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # 평균 ± σ배. soft면 그 밖의 값을 빼고 한 번 더 구한다 (모듈 docstring)
         sigma = self.member.outlier_sigma
+        if self.options.outlier_clip == "soft":
+            X = _inf_to_nan(X)
         mean, std = np.nanmean(X, axis=0), np.nanstd(X, axis=0)
         lower, upper = mean - sigma * std, mean + sigma * std
         if self.options.outlier_clip == "hard":
@@ -416,7 +426,9 @@ class MemberPreprocessor:
     def _clip(self, X: np.ndarray) -> np.ndarray:
         if self.options.outlier_clip == "hard":
             return np.clip(X, self.lower, self.upper)
-        # 경계 밖은 경계에서 log(1 + |x|)만큼 더 간 곳과 x 가운데 안쪽 (모듈 docstring)
+        # 경계 밖은 경계에서 log(1 + |x|)만큼 더 간 곳과 x 가운데 안쪽 (모듈 docstring).
+        # 무한대는 soft clip으로 줄지 않으므로 결측으로 둔다 (분위수·power 변환기가 받지 못한다)
+        X = _inf_to_nan(X)
         with np.errstate(invalid="ignore"):
             soft = np.log1p(np.abs(X))
             X = np.maximum(self.lower - soft, X)

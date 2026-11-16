@@ -226,20 +226,22 @@ class _Base:
             low_cardinality_values(X_num, cat_ix) if self.infer_categorical else {}
         )
         cat_ix = sorted({*cat_ix, *self.low_cardinality_})
+        # 학습 행: 미지 값이 없으므로 unseen 값과 상관없다
+        if self.low_cardinality_:
+            X_num = encode_low_cardinality(X_num, self.low_cardinality_)
         # 학습 행에서 값이 하나뿐인 열을 뺀다 (범주형으로 준 열은 남긴다)
         self.kept_columns_ = None
         if self.drop_constant:
-            X_low = encode_low_cardinality(X_num, self.low_cardinality_)  # 학습 행: 미지 값 없음
-            dropped = set(constant_columns(X_low, self.categorical_features_indices))
+            dropped = set(constant_columns(X_num, self.categorical_features_indices))
             if dropped:
                 self.kept_columns_ = np.array(
-                    [i for i in range(X_num.shape[1]) if i not in dropped]
+                    [i for i in range(X_num.shape[1]) if i not in dropped], dtype=int
                 )
         if self.kept_columns_ is None:
             self.cat_ix_ = cat_ix
-        else:
-            _, self.cat_ix_ = select_features(X_num, cat_ix, self.kept_columns_)
-        return self._columns(X_num)
+            return X_num
+        X_num, self.cat_ix_ = select_features(X_num, cat_ix, self.kept_columns_)
+        return X_num
 
     def _columns(self, X_num: np.ndarray) -> np.ndarray:
         # `_fit_columns`에서 정한 열 단계를 다른 행에도
@@ -690,8 +692,12 @@ class EnsembleRegressor(_Base):
         return probs
 
     def _mixture_mean(self, probs: list[torch.Tensor]) -> np.ndarray:
-        # 섞은 분포의 평균: 꼬리 구간은 half-normal의 평균 (`FullSupportBarDistribution`)
-        centers = FullSupportBarDistribution(self.borders).bucket_centers
+        # 섞은 분포의 평균: 꼬리 구간은 half-normal의 평균 (`FullSupportBarDistribution`).
+        # 경계는 fit 뒤에 바뀌지 않으므로 한 번만 만든다
+        centers = getattr(self, "mixture_centers_", None)
+        if centers is None:
+            centers = FullSupportBarDistribution(self.borders).bucket_centers
+            self.mixture_centers_ = centers
         p = torch.stack(probs).mean(0)
         return (p @ centers.to(p.device, p.dtype)).cpu().numpy() * self.y_std_ + self.y_mean_
 

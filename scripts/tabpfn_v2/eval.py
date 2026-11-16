@@ -428,6 +428,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if inference_option_params(args) and args.test_time != "none":
         # greedy pool·DiagScale의 view는 이 옵션을 넘기지 않는다
         parser.error("공식 3.5 추론 옵션은 --test-time none에서만 쓴다.")
+    if args.drop_group_columns and args.suite not in ARENA_SUITES:
+        # AMLB split에는 group 열이 없어 아무 일도 하지 않는다
+        parser.error("--drop-group-columns는 TabArena·BeyondArena suite에서만 쓴다.")
     return args
 
 
@@ -1421,7 +1424,13 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         start = time.time()
         task = bm.load_openml_task(task_id)
         scores = {}
-        expands = expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
+        # 열 단계 옵션(--infer-categorical·--drop-constant)은 범주형 열과 열 수를 바꾸므로
+        # expands_one_hot으로 알 수 없다: 범주형 열을 펼치는 멤버 종류로만 묶는다
+        expands = (
+            args.infer_categorical
+            or args.drop_constant
+            or expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
+        )
         for group in same_result_modes(args.one_hot, factories[suite].member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
             make = functools.partial(factories[suite], one_hot=group[0])
