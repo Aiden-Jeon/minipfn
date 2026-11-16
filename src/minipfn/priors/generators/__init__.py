@@ -7,6 +7,8 @@
 - `mlp.MLP`: 무작위 MLP (SCM prior / BNN prior, TabPFN v1)
 - `gp.GPTables`: RBF 커널 GP 표 (TabPFN v1 prior bag)
 - `graph_scm.GraphSCM`: TabICLv2 graph SCM (TabPFN v2 recipe가 쓴다. `tabicl` 패키지가 필요하다)
+- `tree_scm.TreeSCM`: TabICL v1 tree SCM (XGBoost 층. graph SCM에 섞는 prior 변형, issue #92.
+  `xgboost`가 필요하다)
 
 모듈은 쓸 때 import한다(`graph_scm`이 `tabicl`을 불러오지 않도록 여기서는 아무것도 import하지
 않는다).
