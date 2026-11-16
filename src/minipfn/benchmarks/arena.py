@@ -115,6 +115,16 @@ def split_groups(X: pd.DataFrame, metadata, n_intervals: int = TIME_INTERVALS) -
     return None
 
 
+def group_columns(X: pd.DataFrame, metadata) -> list[str]:
+    """task split의 group 열(`validation_metadata.group_on`) 가운데 X에 있는 것. grouped split이
+    아니면 빈 목록. `drop_group_columns` 진단(group 열을 빼고 평가)이 쓴다."""
+    group_on = getattr(metadata, "group_on", None)
+    if group_on is None:
+        return []
+    columns = list(group_on) if isinstance(group_on, list | tuple) else [group_on]
+    return [c for c in columns if c in X.columns]
+
+
 def _method_key(method: str) -> str:
     return str(method).removeprefix("TA-").upper()
 

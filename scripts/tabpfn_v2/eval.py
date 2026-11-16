@@ -63,6 +63,21 @@ seed마다 따로다.
 feature 수 상한을 없애서, 권장 크기보다 넓은 split(BeyondArena의 6,772~22,215개)도
 돌린다(issue #66).
 
+공식 TabPFN-3.5(PriorLabs/TabPFN v9 이후) checkpoint에 든 추론 설정에 맞추는 옵션은 항목마다 따로
+켠다(기본은 모두 main과 같다): `--softmax-temperature 1.0`, `--one-hot off --shuffle-categories`
+(범주를 번호로 두고 멤버마다 섞기), `--target-transform safepower`·`--regression-mean mixture`(회귀
+target 변환, 공통 경계로 옮긴 분포의 평균), `--max-features-per-member 768 --feature-subsampling
+balanced`, `--fingerprint-feature hash`·`--outlier-clip soft`·`--infer-categorical`·
+`--drop-constant`(`minipfn.inference.preprocessing`). `--official-v35`는 이것을 모두 켠다(따로 준
+옵션이 먼저). `--test-time none`에서만 쓴다. 진단용으로 `--unseen-category minus1`(학습에 없던
+범주를 결측 대신 번호 -1로, TabICLv2 방식. 공식 3.5는 NaN)과 `--drop-group-columns`
+(TabArena·BeyondArena grouped split의 group 열을 fit·예측에서 뺀다)가 있다.
+
+  uv run --no-dev --extra arena --group arena-dev python $EVAL --suite tabarena-lite \
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v3-5 \
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v3-5 \
+    --official-v35 --method-name minipfn-tabpfn-v3-5-official-inference
+
 `--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
 학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
 `--selection`·`--pool-size`), `diagscale`은 데이터셋마다 attention의 대각 scale만 학습한다
@@ -128,6 +143,9 @@ from minipfn.inference.distillation import (
 )
 from minipfn.inference.ensemble import (
     DEFAULT_ONE_HOT,
+    REGRESSION_MEANS,
+    SOFTMAX_TEMPERATURE,
+    TARGET_TRANSFORMS,
     EnsembleClassifier,
     EnsembleRegressor,
     max_classes_of,
@@ -142,7 +160,11 @@ from minipfn.inference.ensemble_selection import (
     check_selection,
 )
 from minipfn.inference.preprocessing import (
+    FEATURE_SUBSAMPLINGS,
+    FINGERPRINTS,
     ONE_HOT_MODES,
+    OUTLIER_CLIPS,
+    UNSEEN_CATEGORIES,
     one_hot_kinds,
     one_hot_sizes,
     to_numeric,
@@ -173,8 +195,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--one-hot",
         type=_one_hot_modes,
-        default=[DEFAULT_ONE_HOT],
-        help=f"평가할 one-hot 모드, 쉼표로 구분 (기본: {DEFAULT_ONE_HOT}, 비교: off,power,all)",
+        default=None,
+        help=f"평가할 one-hot 모드, 쉼표로 구분 (기본: {DEFAULT_ONE_HOT}, --official-v35면 off,"
+        " 비교: off,power,all)",
     )
     parser.add_argument(
         "--member-kinds",
@@ -304,6 +327,84 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         " max_features_per_estimator). 주면 TabArena·BeyondArena의 feature 수 상한은 없앤다"
         "(--max-features로 다시 둘 수 있다)",
     )
+    # 공식 TabPFN-3.5 추론 설정에 맞추는 옵션 (docstring). 주지 않으면 None → 기본값
+    # (`--official-v35`면 `OFFICIAL_V35`)
+    parser.add_argument(
+        "--official-v35",
+        action="store_true",
+        help="공식 TabPFN-3.5 checkpoint의 추론 설정을 모두 켠다"
+        " (아래 옵션을 따로 주면 그것이 먼저)",
+    )
+    parser.add_argument(
+        "--softmax-temperature",
+        type=float,
+        default=None,
+        help=f"logit을 나누는 온도 (기본 {SOFTMAX_TEMPERATURE}, 공식 3.5는 1.0)",
+    )
+    parser.add_argument(
+        "--shuffle-categories",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="분위수가 아닌 멤버도 범주 번호를 멤버마다 섞는다 (공식 3.5의 ordinal_shuffled)",
+    )
+    parser.add_argument(
+        "--fingerprint-feature",
+        choices=FINGERPRINTS,
+        default=None,
+        help="샘플 식별자 열: random(기본, 표준정규 난수) 또는 hash(공식, 행 값의 hash)",
+    )
+    parser.add_argument(
+        "--outlier-clip",
+        choices=OUTLIER_CLIPS,
+        default=None,
+        help="이상치: hard(기본, 평균 ± 12σ로 자름) 또는 soft(공식, 두 번 구한 경계 밖을"
+        " log로 누름)",
+    )
+    parser.add_argument(
+        "--infer-categorical",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="학습 행이 100개보다 많으면 값이 4개보다 적은 수치 열을 범주형으로 본다"
+        " (공식 type 추론)",
+    )
+    parser.add_argument(
+        "--drop-constant",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="학습 행에서 값이 하나뿐인 열을 뺀다 (공식 RemoveConstantFeaturesStep)",
+    )
+    parser.add_argument(
+        "--feature-subsampling",
+        choices=FEATURE_SUBSAMPLINGS,
+        default=None,
+        help="--max-features-per-member로 열을 고르는 방법: random(기본) 또는 balanced(공식 3.5)",
+    )
+    parser.add_argument(
+        "--target-transform",
+        choices=TARGET_TRANSFORMS,
+        default=None,
+        help="회귀 멤버 절반의 target 변환: power(기본, z에 Yeo-Johnson), safepower(공식), none",
+    )
+    parser.add_argument(
+        "--unseen-category",
+        choices=UNSEEN_CATEGORIES,
+        default=None,
+        help="학습 행에 없던 범주: nan(기본, 결측과 같게. 공식 3.5도 NaN) 또는 minus1(번호 -1,"
+        " TabICLv2 방식. one-hot 블록은 모두 0)",
+    )
+    parser.add_argument(
+        "--drop-group-columns",
+        action="store_true",
+        help="TabArena·BeyondArena 진단: grouped split의 group 열(validation_metadata.group_on)을"
+        " fit·예측 양쪽에서 뺀다",
+    )
+    parser.add_argument(
+        "--regression-mean",
+        choices=REGRESSION_MEANS,
+        default=None,
+        help="회귀 평균: member(기본, 멤버마다 자기 구간 값) 또는 mixture(공식, 공통 경계로 옮긴"
+        " 분포의 평균, half-normal 꼬리)",
+    )
     parser.add_argument(
         "--method-name", default="minipfn-tabpfn-v2", help="TabArena·BeyondArena 결과의 방법 이름"
     )
@@ -323,7 +424,78 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.min_improvement = MIN_IMPROVEMENT
     if args.oof_split is None:
         args.oof_split = "task"
+    resolve_inference_options(args)
+    if inference_option_params(args) and args.test_time != "none":
+        # greedy pool·DiagScale의 view는 이 옵션을 넘기지 않는다
+        parser.error("공식 3.5 추론 옵션은 --test-time none에서만 쓴다.")
+    if args.drop_group_columns and args.suite not in ARENA_SUITES:
+        # AMLB split에는 group 열이 없어 아무 일도 하지 않는다
+        parser.error("--drop-group-columns는 TabArena·BeyondArena suite에서만 쓴다.")
     return args
+
+
+# 공식 TabPFN-3.5 checkpoint(PriorLabs/TabPFN v9 이후)에 든 inference config에 맞춘 값
+# (`--official-v35`). 범주형 열은 one-hot 대신 번호로 두고(`--one-hot off`) 멤버마다 섞는다
+OFFICIAL_V35 = {
+    "softmax_temperature": 1.0,
+    "shuffle_categories": True,
+    "fingerprint_feature": "hash",
+    "outlier_clip": "soft",
+    "infer_categorical": True,
+    "drop_constant": True,
+    "feature_subsampling": "balanced",
+    "target_transform": "safepower",
+    "regression_mean": "mixture",
+}
+OFFICIAL_V35_MAX_FEATURES_PER_MEMBER = 768
+# 위 옵션의 기본값 (main의 추론 그대로)
+INFERENCE_DEFAULTS = {
+    "softmax_temperature": SOFTMAX_TEMPERATURE,
+    "shuffle_categories": False,
+    "fingerprint_feature": "random",
+    "outlier_clip": "hard",
+    "infer_categorical": False,
+    "drop_constant": False,
+    "feature_subsampling": "random",
+    "target_transform": "power",
+    "regression_mean": "member",
+    "unseen_category": "nan",
+}
+REGRESSION_ONLY = ("target_transform", "regression_mean")
+
+
+def resolve_inference_options(args: argparse.Namespace) -> None:
+    """주지 않은(None) 추론 옵션을 기본값으로 채운다. `--official-v35`면 공식 3.5의 값과
+    `--one-hot off`, `--max-features-per-member 768`로 (따로 준 옵션은 그대로)."""
+    official = getattr(args, "official_v35", False)
+    for name, default in INFERENCE_DEFAULTS.items():
+        if getattr(args, name, None) is None:
+            # 공식 3.5는 학습에 없던 범주를 NaN으로 둔다 (unseen_category 기본값과 같다)
+            setattr(args, name, OFFICIAL_V35.get(name, default) if official else default)
+    if getattr(args, "one_hot", None) is None:
+        args.one_hot = ["off"] if official else [DEFAULT_ONE_HOT]
+    if official and args.max_features_per_member is None:
+        args.max_features_per_member = OFFICIAL_V35_MAX_FEATURES_PER_MEMBER
+
+
+def inference_option_params(args: argparse.Namespace) -> dict:
+    """기본값과 다른 추론 옵션 (arena fingerprint·MLflow param에 남긴다. 기본이면 빈 dict라 예전
+    fingerprint 그대로)."""
+    return {
+        name: getattr(args, name)
+        for name, default in INFERENCE_DEFAULTS.items()
+        if getattr(args, name, default) != default
+    }
+
+
+def estimator_options(args: argparse.Namespace, suite: str) -> dict:
+    """estimator에 줄 추론 옵션 (회귀 전용 옵션은 회귀에만). 기본값인 것은 넘기지 않는다."""
+    out = {}
+    for name, value in inference_option_params(args).items():
+        if name in REGRESSION_ONLY and suite != "regression":
+            continue
+        out["fingerprint" if name == "fingerprint_feature" else name] = value
+    return out
 
 
 def _one_hot_modes(value: str) -> list[str]:
@@ -444,6 +616,7 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "device": args.device,
             "random_state": args.seed,
             "max_features_per_member": args.max_features_per_member,
+            **estimator_options(args, suite),
         }
         if "greedy" in args.test_time:
             # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
@@ -663,6 +836,9 @@ def arena_fingerprint(
                 if args.max_features_per_member is not None
                 else {}
             ),
+            # 공식 3.5 추론 옵션: 기본값과 다른 것만 (모두 기본이면 예전 fingerprint 그대로)
+            **inference_option_params(args),
+            **({"drop_group_columns": True} if getattr(args, "drop_group_columns", False) else {}),
         },
         sort_keys=True,
     )
@@ -687,6 +863,8 @@ def arena_estimator_factory(args: argparse.Namespace, paths: dict):
 
     # arena system은 이 함수를 받으므로 split의 group 번호를 넘길지도 여기에 단다
     make.fit_groups = any(getattr(f, "fit_groups", False) for f in factories.values())
+    # 진단: grouped split의 group 열을 빼고 fit·예측 (`--drop-group-columns`)
+    make.drop_group_columns = getattr(args, "drop_group_columns", False)
     make.one_hot = one_hot
     make.kinds = {task: f.member_kinds for task, f in factories.items()}
     return make, factories
@@ -1107,6 +1285,8 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             **test_time_params(args),
             **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
+            **inference_option_params(args),
+            "drop_group_columns": getattr(args, "drop_group_columns", False),
         }
     )
     paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
@@ -1221,6 +1401,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "max_features_per_member": args.max_features_per_member,
                 **test_time_params(args),
                 **distill_params(args),
+                **inference_option_params(args),
             }
         )
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
@@ -1243,7 +1424,13 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         start = time.time()
         task = bm.load_openml_task(task_id)
         scores = {}
-        expands = expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
+        # 열 단계 옵션(--infer-categorical·--drop-constant)은 범주형 열과 열 수를 바꾸므로
+        # expands_one_hot으로 알 수 없다: 범주형 열을 펼치는 멤버 종류로만 묶는다
+        expands = (
+            args.infer_categorical
+            or args.drop_constant
+            or expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
+        )
         for group in same_result_modes(args.one_hot, factories[suite].member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다
             make = functools.partial(factories[suite], one_hot=group[0])

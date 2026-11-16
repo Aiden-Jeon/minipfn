@@ -40,7 +40,14 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   (2.5가 Yeo-Johnson을 계속 쓰는지는 적혀 있지 않다)
 - (`max_features_per_member`를 주면) feature가 그보다 많은 표에서 멤버마다 그만큼의 원래 열을
   무작위로 고른다(`minipfn.inference.preprocessing.feature_subset`, 공식 TabPFN 추론 코드의
-  `max_features_per_estimator`와 v2·2.5의 "random" 방법). 기본은 None(모든 열)
+  `max_features_per_estimator`와 v2·2.5의 "random" 방법). 기본은 None(모든 열).
+  `feature_subsampling="balanced"`는 열이 고르게 쓰이도록 나눈다(공식 3.5의 "balanced")
+- 공식 TabPFN-3.5 추론에 맞추는 옵션(기본은 모두 끔, 예전과 비트 동일): 멤버 전처리
+  (`shuffle_categories`·`fingerprint`·`outlier_clip`, `minipfn.inference.preprocessing`), 모든
+  멤버가 같이 쓰는 열 단계(`infer_categorical`: 값이 몇 개뿐인 수치 열을 범주형으로,
+  `drop_constant`: 상수 열 빼기), 회귀 `target_transform`·`regression_mean`(`EnsembleRegressor`).
+  `unseen_category="minus1"`은 학습 행에 없던 범주를 결측(NaN, 기본. 공식 3.5도 멤버의
+  `ordinal_shuffled` 단계에서 NaN이 된다) 대신 번호 -1로 둔다(TabICLv2 방식, 진단용)
 - 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
@@ -64,6 +71,7 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -73,21 +81,33 @@ from sklearn.preprocessing import LabelEncoder, PowerTransformer
 from torch import nn
 
 from minipfn.inference.preprocessing import (
+    FEATURE_SUBSAMPLINGS,
     MEMBER_KINDS,
     ONE_HOT_MODES,
     Member,
     MemberPreprocessor,
+    PreprocessOptions,
     apply_encoder,
+    balanced_feature_subsets,
+    constant_columns,
+    encode_low_cardinality,
     feature_subset,
+    low_cardinality_values,
     one_hot_kinds,
     select_features,
     to_numeric,
+    unseen_value,
 )
+from minipfn.models.bar_distribution import FullSupportBarDistribution
 from minipfn.priors.table_size import MAX_FEATURES
 
 DEFAULT_ONE_HOT = "all"
 SOFTMAX_TEMPERATURE = 0.9
 DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2 논문의 두 가지
+TARGET_TRANSFORMS = ("power", "safepower", "none")
+REGRESSION_MEANS = ("member", "mixture")
+# 공식 3.5의 회귀 경계 되돌리기: z가 이 범위 밖이거나 유한하지 않은 경계는 망가진 것으로 본다
+BROKEN_BORDER_LIMIT = 1e3
 
 
 def resolve_member_kinds(
@@ -147,11 +167,34 @@ class _Base:
         softmax_temperature: float = SOFTMAX_TEMPERATURE,
         max_one_hot_width: int | None = None,
         max_features_per_member: int | None = None,
+        shuffle_categories: bool = False,
+        fingerprint: str = "random",
+        outlier_clip: str = "hard",
+        infer_categorical: bool = False,
+        drop_constant: bool = False,
+        feature_subsampling: str = "random",
+        unseen_category: str = "nan",
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
         if one_hot not in ONE_HOT_MODES:
             raise ValueError(f"one_hot은 {ONE_HOT_MODES} 가운데 하나여야 한다: {one_hot}")
+        if feature_subsampling not in FEATURE_SUBSAMPLINGS:
+            raise ValueError(
+                f"feature_subsampling은 {FEATURE_SUBSAMPLINGS} 가운데 하나다: {feature_subsampling}"
+            )
+        # 공식 3.5 추론 옵션 (모듈 docstring. 기본은 모두 예전 동작)
+        self.preprocess_options = PreprocessOptions(
+            shuffle_categories=shuffle_categories,
+            fingerprint=fingerprint,
+            outlier_clip=outlier_clip,
+            unseen_category=unseen_category,
+        )
+        self.infer_categorical = infer_categorical
+        self.drop_constant = drop_constant
+        self.feature_subsampling = feature_subsampling
+        unseen_value(unseen_category)  # 값 확인
+        self.unseen_category = unseen_category
         self.one_hot = one_hot
         self.member_kinds = resolve_member_kinds(member_kinds)
         self.softmax_temperature = softmax_temperature
@@ -171,18 +214,64 @@ class _Base:
         # `one_hot` 모드에서 이 종류의 멤버가 범주형 열을 one-hot으로 펼치는지
         return kind in one_hot_kinds(self.one_hot, self.member_kinds)
 
+    def _fit_columns(self, X: Any) -> np.ndarray:
+        """학습 행을 수치 배열로 (모든 멤버가 같이 쓰는 열 단계). `cat_ix_`는 그 배열의 범주형 열,
+        `encoded_ix_`는 문자열·범주를 번호로 바꾼 원래 열이다. 옵션을 끄면 둘은 같다."""
+        X_num, self.encoded_ix_, self.encoder_ = to_numeric(
+            X, self.categorical_features_indices, self.unseen_category
+        )
+        cat_ix = list(self.encoded_ix_)
+        # 수치 열 가운데 값이 몇 개뿐인 것을 범주형으로 (공식 3.5의 type 추론)
+        self.low_cardinality_ = (
+            low_cardinality_values(X_num, cat_ix) if self.infer_categorical else {}
+        )
+        cat_ix = sorted({*cat_ix, *self.low_cardinality_})
+        # 학습 행: 미지 값이 없으므로 unseen 값과 상관없다
+        if self.low_cardinality_:
+            X_num = encode_low_cardinality(X_num, self.low_cardinality_)
+        # 학습 행에서 값이 하나뿐인 열을 뺀다 (범주형으로 준 열은 남긴다)
+        self.kept_columns_ = None
+        if self.drop_constant:
+            dropped = set(constant_columns(X_num, self.categorical_features_indices))
+            if dropped:
+                self.kept_columns_ = np.array(
+                    [i for i in range(X_num.shape[1]) if i not in dropped], dtype=int
+                )
+        if self.kept_columns_ is None:
+            self.cat_ix_ = cat_ix
+            return X_num
+        X_num, self.cat_ix_ = select_features(X_num, cat_ix, self.kept_columns_)
+        return X_num
+
+    def _columns(self, X_num: np.ndarray) -> np.ndarray:
+        # `_fit_columns`에서 정한 열 단계를 다른 행에도
+        if self.low_cardinality_:
+            unseen = unseen_value(self.unseen_category)
+            X_num = encode_low_cardinality(X_num, self.low_cardinality_, unseen)
+        if self.kept_columns_ is not None:
+            X_num = X_num[:, self.kept_columns_]
+        return X_num
+
     def _fit_members(self, X: Any, members: list[Member]) -> None:
-        X_num, self.cat_ix_, self.encoder_ = to_numeric(X, self.categorical_features_indices)
+        X_num = self._fit_columns(X)
         # 멤버마다 쓸 열 (feature가 상한보다 많을 때만. 멤버 seed로 정해 같은 멤버는 늘 같다)
-        self.feature_subsets_ = [
-            feature_subset(X_num.shape[1], self.max_features_per_member, m.seed + 4)
-            for m in members
-        ]
+        if self.feature_subsampling == "balanced":
+            rng = np.random.default_rng([m.seed for m in members])
+            self.feature_subsets_ = balanced_feature_subsets(
+                X_num.shape[1], self.max_features_per_member, len(members), rng
+            )
+        else:
+            self.feature_subsets_ = [
+                feature_subset(X_num.shape[1], self.max_features_per_member, m.seed + 4)
+                for m in members
+            ]
         self.preprocessors_ = []
         self.X_trains_ = []
         for m, cols in zip(members, self.feature_subsets_, strict=True):
             x, cat_ix = select_features(X_num, self.cat_ix_, cols)
-            prep = MemberPreprocessor(m, cat_ix, self.max_one_hot_width).fit(x)
+            prep = MemberPreprocessor(
+                m, cat_ix, self.max_one_hot_width, self.preprocess_options
+            ).fit(x)
             self.preprocessors_.append(prep)
             # 학습 행의 변환 결과는 바뀌지 않으므로 멤버마다 한 번만 계산해 둔다
             self.X_trains_.append(prep.transform(x, np.random.default_rng(m.seed + 2)))
@@ -196,10 +285,12 @@ class _Base:
 
     def _iter_inputs(self, X: Any, y_trains: list[np.ndarray]):
         """멤버마다 (번호, 모델 입력 x (1, 학습 행 + 테스트 행, F), y_train (1, 학습 행))."""
-        X_test = apply_encoder(pd.DataFrame(X), self.cat_ix_, self.encoder_)
+        X_test = self._columns(apply_encoder(pd.DataFrame(X), self.encoded_ix_, self.encoder_))
         for i, (prep, y_train) in enumerate(zip(self.preprocessors_, y_trains, strict=True)):
             x_test, _ = select_features(X_test, self.cat_ix_, self.feature_subsets_[i])
-            x_test = prep.transform(x_test, np.random.default_rng(prep.member.seed + 3))
+            x_test = prep.transform(
+                x_test, np.random.default_rng(prep.member.seed + 3), is_test=True
+            )
             x = np.concatenate([self.X_trains_[i], x_test])
             x = torch.as_tensor(x, dtype=torch.float32, device=self.device).unsqueeze(0)
             y = torch.as_tensor(y_train, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -336,13 +427,161 @@ def _bucket_values(borders: torch.Tensor, u_train: np.ndarray) -> np.ndarray:
     return values
 
 
+_HALF_NORMAL_MEDIAN = float(torch.distributions.HalfNormal(1.0).icdf(torch.tensor(0.5)))
+
+
+def _probs_on_full_support_borders(
+    probs: torch.Tensor, frm: torch.Tensor, to: torch.Tensor
+) -> torch.Tensor:
+    """`_probs_on_borders`와 같지만 frm의 양 끝 구간을 half-normal 꼬리로 본다 (공식 3.5가 멤버를
+    공통 경계로 옮기는 방식). 첫 구간의 확률은 frm[1]에서 왼쪽으로, 마지막 구간의 확률은 frm[-2]에서
+    오른쪽으로 퍼진다(scale은 그 구간 폭이 중앙값이 되도록, `FullSupportBarDistribution`과 같다).
+    to의 첫·마지막 구간은 to 밖의 확률을 모두 받는다. 위치 계산은 float64로 한다."""
+    f, t = frm.double().cpu(), to.double().cpu()
+    n = len(f) - 1
+    idx = (torch.searchsorted(f, t) - 1).clamp(0, n - 1)
+    width = (f[idx + 1] - f[idx]).clamp_min(1e-12)
+    share = ((t - f[idx]) / width).clamp(0, 1)
+    scale_low = float((f[1] - f[0]).clamp_min(1e-12)) / _HALF_NORMAL_MEDIAN
+    scale_high = float((f[-1] - f[-2]).clamp_min(1e-12)) / _HALF_NORMAL_MEDIAN
+    # half-normal 꼬리에서 그 위치보다 더 바깥에 있을 확률
+    beyond_low = torch.erfc((f[1] - t).clamp_min(0) / (scale_low * 2**0.5))
+    beyond_high = torch.erfc((t - f[-2]).clamp_min(0) / (scale_high * 2**0.5))
+    dev, dtype = probs.device, probs.dtype
+    low, high = (t < f[1]).to(dev), (t >= f[-2]).to(dev)
+    idx, share = idx.to(dev), share.to(dev, dtype)
+    cdf = torch.cat([torch.zeros_like(probs[:, :1]), probs.cumsum(-1)], dim=-1)
+    at_to = cdf[:, idx] + probs[:, idx] * share
+    at_to = torch.where(low, probs[:, :1] * beyond_low.to(dev, dtype), at_to)
+    at_to = torch.where(high, 1.0 - probs[:, -1:] * beyond_high.to(dev, dtype), at_to)
+    at_to[:, 0], at_to[:, -1] = 0.0, 1.0
+    return (at_to[:, 1:] - at_to[:, :-1]).clamp_min(0)
+
+
+def _official_border_map(transform: Any, borders: np.ndarray):
+    """target 변환 멤버의 경계를 z 공간으로 되돌린다 (공식 3.5 방식, `regression_mean="mixture"`).
+
+    학습 target 범위로 자르지 않고 역변환한다. 결측·무한이거나 |z| > `BROKEN_BORDER_LIMIT`인 경계는
+    망가진 것으로 보고, 양 끝에 몰린 망가진 경계는 가장 가까운 성한 경계로 채운 뒤(맨 끝은 1만큼
+    바깥) 그 경계에 닿는 구간의 logit을 지운다. 경계가 내림차순이면 뒤집는다. 끝 구간 폭이 0이면
+    조금 넓힌다. 돌려주는 값: (z 경계, 지울 구간 mask 또는 None, 뒤집었는지)."""
+    # 정의역 밖의 경계는 결측이 된다 (아래에서 고친다. sklearn의 경고는 끈다)
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        z = np.asarray(transform.inverse_transform(borders.reshape(-1, 1)), dtype=np.float64)
+    z = z.ravel()
+    broken = ~np.isfinite(z) | (np.abs(z) > BROKEN_BORDER_LIMIT)
+    usable = z[~broken]
+    descending = len(usable) > 1 and bool((np.diff(usable) < 0).all())
+    if descending:
+        z, broken = z[::-1].copy(), broken[::-1].copy()
+    cancel = None
+    if broken.any():
+        if broken.all():
+            raise ValueError("target 변환을 되돌린 경계가 모두 망가졌다")
+        ok = np.flatnonzero(~broken)
+        first, last = ok[0], ok[-1]
+        z[:first] = z[first]
+        z[last + 1 :] = z[last]
+        if first > 0:
+            z[0] = z[1] - 1.0
+        if last < len(z) - 1:
+            z[-1] = z[-2] + 1.0
+        # 가운데의 망가진 경계(드물다)는 앞 경계로 채워 폭 0 구간으로 둔다
+        for i in np.flatnonzero(broken[first : last + 1]) + first:
+            z[i] = z[i - 1]
+        cancel = broken[1:] | broken[:-1]
+    if z[-1] - z[-2] < 1e-6:
+        z[-1] += abs(z[-1] * 0.1)
+    if z[0] == z[1]:
+        z[0] -= abs(z[0] * 0.1)
+    return torch.as_tensor(z, dtype=torch.float32), cancel, descending
+
+
+def _yeo_johnson_inverse(t: np.ndarray, lam: float) -> np.ndarray:
+    """Yeo-Johnson 역변환. 지수의 인자를 float64 최댓값 안으로 잘라 넘침을 막는다. 정의역 밖은
+    결측."""
+    t = np.asarray(t, dtype=np.float64)
+    out = np.empty_like(t)
+    pos = t >= 0
+    cap = np.log(np.finfo(np.float64).max) - 1e-6
+    eps = np.spacing(1.0)
+    with np.errstate(all="ignore"):
+        if abs(lam) < eps:
+            out[pos] = np.expm1(np.clip(t[pos], -cap, cap))
+        else:
+            out[pos] = np.expm1(np.clip(np.log1p(t[pos] * lam) / lam, -cap, cap))
+        if abs(lam - 2) < eps:
+            out[~pos] = -np.expm1(np.clip(-t[~pos], -cap, cap))
+        else:
+            out[~pos] = -np.expm1(np.clip(np.log1p(-(2 - lam) * t[~pos]) / (2 - lam), -cap, cap))
+    return out
+
+
+class SafePowerTarget:
+    """공식 3.5의 회귀 target "safepower" (`target_transform="safepower"`): z를 받지만 원래 단위의
+    y에 Yeo-Johnson을 하고 표준화한다. λ는 scipy의 범위를 둔 최대우도(`yeojohnson_normmax`,
+    넘침을 막는 범위)이고, 거의 상수인 target은 λ = 1. 역변환도 넘치지 않게 한다
+    (`_yeo_johnson_inverse`). `PowerTransformer`(z에 맞추고 λ 범위가 없다)와 같은
+    `fit_transform`·`inverse_transform`을 준다."""
+
+    def __init__(self, y_mean: float, y_std: float) -> None:
+        self.y_mean, self.y_std = y_mean, y_std
+
+    def fit_transform(self, z: np.ndarray) -> np.ndarray:
+        from scipy import stats
+
+        y = np.asarray(z, dtype=np.float64).ravel() * self.y_std + self.y_mean
+        eps = np.finfo(np.float64).eps
+        var, mean = y.var(), y.mean()
+        if var <= len(y) * eps * var + (len(y) * mean * eps) ** 2:
+            self.lam = 1.0
+        else:
+            self.lam = float(stats.yeojohnson_normmax(y))
+        t = stats.yeojohnson(y, lmbda=self.lam)
+        self.t_mean, self.t_std = float(t.mean()), float(t.std())
+        if not (np.isfinite(self.t_std) and self.t_std > 0):
+            self.t_std = 1.0
+        return ((t - self.t_mean) / self.t_std).reshape(-1, 1)
+
+    def inverse_transform(self, u: np.ndarray) -> np.ndarray:
+        t = np.asarray(u, dtype=np.float64) * self.t_std + self.t_mean
+        return (_yeo_johnson_inverse(t, self.lam) - self.y_mean) / self.y_std
+
+
 class EnsembleRegressor(_Base):
-    """회귀: 구간 확률을 멤버마다 자기 공간에서 계산해 평균한다 (모듈 docstring)."""
+    """회귀: 구간 확률을 멤버마다 자기 공간에서 계산해 평균한다 (모듈 docstring).
+
+    `target_transform`: 멤버 절반의 target 변환. `"power"`(기본)는 z에 맞춘 Yeo-Johnson,
+    `"safepower"`는 공식 3.5의 것(`SafePowerTarget`), `"none"`은 모든 멤버가 변환 없이.
+    `regression_mean`: `"member"`(기본)는 위의 멤버별 평균(모듈 docstring), `"mixture"`는 공식
+    3.5처럼 멤버 경계를 학습 범위로 자르지 않고 되돌려(`_official_border_map`) half-normal 꼬리째
+    공통 경계로 옮긴(`_probs_on_full_support_borders`) 분포를 평균하고, 그 분포의 평균(꼬리 구간은
+    half-normal의 평균, `FullSupportBarDistribution`)을 낸다. 분포(`predict_distribution`)도 그 섞은
+    분포다.
+    """
 
     task = "regression"
 
-    def __init__(self, model: nn.Module, borders: torch.Tensor, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        borders: torch.Tensor,
+        target_transform: str = "power",
+        regression_mean: str = "member",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(model, **kwargs)
+        if target_transform not in TARGET_TRANSFORMS:
+            raise ValueError(
+                f"target_transform은 {TARGET_TRANSFORMS} 가운데 하나다: {target_transform}"
+            )
+        if regression_mean not in REGRESSION_MEANS:
+            raise ValueError(
+                f"regression_mean은 {REGRESSION_MEANS} 가운데 하나다: {regression_mean}"
+            )
+        self.target_transform = target_transform
+        self.regression_mean = regression_mean
         self.borders = borders.float().cpu()  # 계산할 때만 장치로 옮기고, 결과는 CPU로 돌려준다
 
     def fit(self, X: Any, y: Any) -> EnsembleRegressor:
@@ -355,7 +594,8 @@ class EnsembleRegressor(_Base):
                 kind=self._kind(i),
                 class_permutation=None,
                 # max(2, 종류 수)개마다 켜고 끈다 (종류 1~2개는 예전과 같은 끔, 끔, 켬, 켬)
-                target_power=(i // max(2, len(self.member_kinds))) % 2 == 1,
+                target_power=self.target_transform != "none"
+                and (i // max(2, len(self.member_kinds))) % 2 == 1,
                 seed=int(rng.integers(0, 2**31 - 1)),
                 one_hot=self._expands(self._kind(i)),
             )
@@ -370,11 +610,14 @@ class EnsembleRegressor(_Base):
         self._fit_members(X, members)
         b = self.borders.double().numpy()
         self.y_trains_, self.bucket_values_, self.border_maps_ = [], [], []
+        self.official_maps_ = []  # regression_mean="mixture"에서 쓴다
         for m in members:
-            u, values, border_map = z, _bucket_values(self.borders, z), None
+            u, values, border_map, official = z, _bucket_values(self.borders, z), None, None
             if m.target_power:
-                transform = PowerTransformer(method="yeo-johnson", standardize=True)
-                u = transform.fit_transform(z.reshape(-1, 1)).ravel()
+                transform = self._make_target_transform()
+                u = np.asarray(transform.fit_transform(z.reshape(-1, 1))).ravel()
+                if self.regression_mean == "mixture":
+                    official = _official_border_map(transform, b)
                 inverse = _clipped_inverse(transform, u)
                 # 멤버 공간의 구간 값과 경계를 z 공간으로 (경계는 predict_distribution에서 쓴다)
                 values = np.clip(inverse(_bucket_values(self.borders, u)), b[0], b[-1])
@@ -383,7 +626,13 @@ class EnsembleRegressor(_Base):
             self.y_trains_.append(u)
             self.bucket_values_.append(torch.as_tensor(values, dtype=torch.float32))
             self.border_maps_.append(border_map)
+            self.official_maps_.append(official)
         return self
+
+    def _make_target_transform(self):
+        if self.target_transform == "safepower":
+            return SafePowerTarget(self.y_mean_, self.y_std_)
+        return PowerTransformer(method="yeo-johnson", standardize=True)
 
     def predict_distribution(self, X: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """(구간 log 확률 (n, 구간 수), 원래 단위의 경계 (float64)).
@@ -393,17 +642,25 @@ class EnsembleRegressor(_Base):
         안쪽 구간은 z 폭이 1e-6까지 좁아서, target의 평균이 크고 퍼짐이 작으면 float32에서는 여러
         경계가 한 값으로 뭉친다.
         """
+        if self.regression_mean == "mixture":
+            return self._mixture(self._official_probs(X))
         probs = [self._on_common_borders(i, p) for i, p in self._member_probs(X)]
         return self._mixture(probs)
 
     def predict(self, X: Any) -> np.ndarray:
         """예측분포의 평균. 멤버를 섞은 분포의 평균은 멤버 평균의 평균이라, 공통 경계로 옮기지 않고
-        멤버마다 자기 구간 값(`bucket_values_`)으로 계산한다."""
+        멤버마다 자기 구간 값(`bucket_values_`)으로 계산한다 (`regression_mean="mixture"`면 클래스
+        docstring)."""
+        if self.regression_mean == "mixture":
+            return self._mixture_mean(self._official_probs(X))
         return self._mean([self._member_mean(i, p) for i, p in self._member_probs(X)])
 
     def predict_full(self, X: Any) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         """(`predict`의 평균, `predict_distribution`의 log 확률과 경계)를 forward 한 번으로 낸다.
         분포 품질을 평가할 때(`minipfn.benchmarks.uncertainty`) 점 예측과 분포를 같이 쓴다."""
+        if self.regression_mean == "mixture":
+            probs = self._official_probs(X)
+            return (self._mixture_mean(probs), *self._mixture(probs))
         means, probs = [], []
         for i, p in self._member_probs(X):
             means.append(self._member_mean(i, p))
@@ -414,6 +671,35 @@ class EnsembleRegressor(_Base):
         """멤버마다 (번호, 자기 공간의 구간 확률)."""
         for i, logits in self._iter_logits(X, self.y_trains_):
             yield i, torch.softmax(logits / self.softmax_temperature, dim=-1)
+
+    def _official_probs(self, X: Any) -> list[torch.Tensor]:
+        """`regression_mean="mixture"`: 멤버마다 공통 경계 위의 구간 확률 (클래스 docstring)."""
+        probs = []
+        for i, logits in self._iter_logits(X, self.y_trains_):
+            logits = logits / self.softmax_temperature
+            official = self.official_maps_[i]
+            if official is None:  # target 변환이 없는 멤버는 경계가 공통 경계 그대로다
+                probs.append(torch.softmax(logits, dim=-1))
+                continue
+            frm, cancel, descending = official
+            if descending:
+                logits = logits.flip(-1)
+            if cancel is not None:
+                mask = torch.as_tensor(cancel, device=logits.device)
+                logits = logits.masked_fill(mask, -torch.inf)
+            p = torch.softmax(logits, dim=-1)
+            probs.append(_probs_on_full_support_borders(p, frm, self.borders))
+        return probs
+
+    def _mixture_mean(self, probs: list[torch.Tensor]) -> np.ndarray:
+        # 섞은 분포의 평균: 꼬리 구간은 half-normal의 평균 (`FullSupportBarDistribution`).
+        # 경계는 fit 뒤에 바뀌지 않으므로 한 번만 만든다
+        centers = getattr(self, "mixture_centers_", None)
+        if centers is None:
+            centers = FullSupportBarDistribution(self.borders).bucket_centers
+            self.mixture_centers_ = centers
+        p = torch.stack(probs).mean(0)
+        return (p @ centers.to(p.device, p.dtype)).cpu().numpy() * self.y_std_ + self.y_mean_
 
     def _member_mean(self, i: int, p: torch.Tensor) -> torch.Tensor:
         return p @ self.bucket_values_[i].to(p.device)

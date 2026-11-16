@@ -9,6 +9,8 @@ estimator를 만드는 함수에 `fit_groups = True`를 달면 fit에 `groups`(�
 (`minipfn.benchmarks.arena.split_groups`). `bag_pool`(`minipfn.benchmarks.bag_pool.BagPool`)을
 달면 bagging의 bag을 이 프로세스가 아니라 pool의 GPU worker들이 동시에 맞추고 예측한다. bag을
 나누는 방법과 예측을 평균하는 방법은 같다.
+`drop_group_columns = True`면 split의 group 열(`validation_metadata.group_on`)을 fit과 예측
+양쪽에서 뺀다 (원인 확인용 진단, 기본은 끔).
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
 from tabarena.benchmark.exec_models import ExternalSystemModel
 
-from minipfn.benchmarks.arena import split_groups
+from minipfn.benchmarks.arena import group_columns, split_groups
 
 _FACTORIES: dict[str, Callable[[str, list[int]], Any]] = {}
 
@@ -102,7 +104,13 @@ class EstimatorSystem(ExternalSystemModel):
             split_groups(X, validation_metadata) if getattr(make, "fit_groups", False) else None
         )
         self.grouped_ = groups is not None
-        X, categorical = prepare_frame(X)
+        # 진단: group 열을 빼고 fit·예측한다 (`drop_group_columns`, 모듈 docstring)
+        self.dropped_columns_ = (
+            group_columns(X, validation_metadata)
+            if getattr(make, "drop_group_columns", False)
+            else []
+        )
+        X, categorical = prepare_frame(self._kept(X))
         y = y.reset_index(drop=True)
         self.problem_type_ = problem_type
         self.categorical_ = categorical
@@ -136,7 +144,12 @@ class EstimatorSystem(ExternalSystemModel):
 
     def post_fit(self, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame):
         # 예측이 끝난 뒤(post_predict) 쓸 테스트 행 하나
-        self.test_row_ = X_test.iloc[:1]
+        self.test_row_ = self._kept(X_test).iloc[:1]
+
+    def _kept(self, X: pd.DataFrame) -> pd.DataFrame:
+        # fit에서 뺀 열(`dropped_columns_`)을 예측할 행에서도 뺀다. 없으면 X 그대로
+        dropped = getattr(self, "dropped_columns_", [])
+        return X.drop(columns=dropped) if dropped else X
 
     def post_predict(self):
         """학습·추론 시간을 재지 않는 hook. estimator에 `after_predict(X_row)`가 있으면 테스트 행
@@ -159,7 +172,7 @@ class EstimatorSystem(ExternalSystemModel):
         return [train_ix for train_ix, _ in splitter.split(X, y)]
 
     def _predict(self, X: pd.DataFrame) -> pd.Series:
-        Xp, _ = prepare_frame(X)
+        Xp, _ = prepare_frame(self._kept(X))
         Xp = Xp.reset_index(drop=True)
         if getattr(self, "pool_", None) is not None:
             preds = self._pool_predict(Xp, proba=False)
@@ -169,7 +182,7 @@ class EstimatorSystem(ExternalSystemModel):
         return pd.Series(pred, index=X.index)
 
     def _predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
-        Xp, _ = prepare_frame(X)
+        Xp, _ = prepare_frame(self._kept(X))
         Xp = Xp.reset_index(drop=True)
         # bag마다 본 클래스가 다를 수 있다: 모든 bag의 클래스로 열을 맞추고 없는 클래스는 0.
         # 열 순서는 라벨의 자연 순서(np.unique, estimator의 LabelEncoder와 같다)여야 한다.
