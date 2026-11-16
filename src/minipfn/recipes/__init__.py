@@ -64,8 +64,13 @@ def architecture_name(config: Any) -> str | None:
 
 
 def default_inference(model: Any, task: str) -> dict:
-    """모델의 추론 설정 `{"n_estimators", "member_kinds"}`. 모델 종류의 recipe가 정한다."""
-    return recipe_for_model_type(model.model_type).default_inference(model, task)
+    """모델의 추론 설정 `{"n_estimators", "member_kinds"}`. 모델 종류의 recipe가 정한다. 어느
+    recipe에도 없는 모델 종류(registry에 더한 모델)와 종류가 없는 모델은 v2의 것(`tabpfn_v2`)."""
+    try:
+        recipe = recipe_for_model_type(getattr(model, "model_type", None) or "")
+    except ValueError:
+        recipe = importlib.import_module("minipfn.recipes.tabpfn_v2")
+    return recipe.default_inference(model, task)
 
 
 def supported_size(model: Any, task: str) -> dict:

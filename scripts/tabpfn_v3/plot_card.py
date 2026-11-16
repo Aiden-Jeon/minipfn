@@ -63,7 +63,7 @@ STAGE_ROWS = {1: "1,024 rows", 2: "400-10k rows", 3: "400-60k rows"}
 # train loss는 100 step마다 남는다. 단계 길이가 달라 평균하는 step 수를 단계마다 정한다
 SMOOTH_STEPS = {1: 2_000, 2: 500, 3: 500}
 # 같은 leaderboard에 있는 공개 방법 (그림에 기준선으로 둔다). 이름은 suite마다 조금 달라서
-# 대소문자를 무시한 접두어("TA-"를 뗀 것)로 찾는다
+# 대소문자와 앞의 "TA-"를 무시하고 이름 전체가 같은 것을 찾는다
 REFERENCES = {
     "TabPFN-3.5 (official)": "TABPFN-3.5 (DEFAULT)",
     "TabICLv2": "TABICLV2 (DEFAULT)",
@@ -209,12 +209,13 @@ def plot_by_stage(bench: dict, v25: dict, path: Path) -> None:
     for ax, task in zip(axes, TASKS, strict=True):
         ours = [score(bench[s][task], task) for s in STAGES]
         ref = score(v25[task], task)
+        n = len(bench[STAGES[-1]][task])
         if task == "classification":
             paper = float(bench[STAGES[-1]][task]["paper"].mean())
-            fmt, ylabel = "{:.4f}", "mean ROC AUC (29 datasets)"
+            fmt, ylabel = "{:.4f}", f"mean ROC AUC ({n} datasets)"
             title, paper_label = "Classification (higher is better)", f"TabPFN v2 paper {paper:.4f}"
         else:
-            paper, fmt, ylabel = 1.0, "{:.3f}", "RMSE / paper RMSE (geo. mean, 28 datasets)"
+            paper, fmt, ylabel = 1.0, "{:.3f}", f"RMSE / paper RMSE (geo. mean, {n} datasets)"
             title, paper_label = "Regression (lower is better)", "TabPFN v2 paper (ratio 1)"
         ax.axhline(paper, color=GRAY, lw=1.5, ls="--", label=paper_label)
         ax.axhline(ref, color=ORANGE, lw=1.5, ls=":", label=f"minipfn TabPFN-2.5 {fmt.format(ref)}")
@@ -264,8 +265,10 @@ def reference_rows(board: pd.DataFrame) -> dict[str, pd.Series]:
     out = {}
     for label, name in REFERENCES.items():
         hit = board[names == name]
-        if len(hit) == 1:
-            out[label] = hit.iloc[0]
+        if len(hit) != 1:
+            # 그림에서 기준선이 조용히 빠지면 카드의 수치와 어긋난다
+            raise SystemExit(f"leaderboard에서 {name}을 하나로 찾지 못했다 ({len(hit)}개)")
+        out[label] = hit.iloc[0]
     return out
 
 

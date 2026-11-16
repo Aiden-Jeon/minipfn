@@ -265,3 +265,16 @@ def test_max_features_is_saved_only_when_it_differs_and_not_compared_on_resume(t
         "borders": None,
     }
     check_checkpoint(state, wide, "init_from")
+
+
+def test_inference_defaults_for_a_model_type_no_recipe_covers(tiny):
+    # recipe가 없는 모델 종류도 추론 클래스·평가가 v2 기본값으로 쓴다
+    from minipfn.recipes import default_inference
+
+    model = TinyModel(TinyConfig())
+    assert default_inference(model, "classification") == recipe.default_inference(
+        model, "classification"
+    )
+    clf = recipe.TabPFNv2Classifier(model)
+    assert clf.member_kinds == recipe.MEMBER_KINDS_V2
+    assert clf.n_estimators == recipe.N_ESTIMATORS["classification"]

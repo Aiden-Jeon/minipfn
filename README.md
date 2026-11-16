@@ -102,10 +102,15 @@ uv run python scripts/tabpfn_v2/eval.py \
 TabPFN-3.5는 `TabPFNv3_5Classifier`·`TabPFNv3_5Regressor`로 씁니다. 두 클래스가 같은 repo의 같은 가중치를 받고, 분류는 분류 출력을, 회귀는 회귀 출력(구간 경계도 같은 파일에 있습니다)을 씁니다. 앙상블 설정(standard 멤버 8개)은 v2처럼 가중치의 `config.json`이 정합니다. 219M 모델이라 GPU(`device="cuda"`)를 권합니다.
 
 ```python
-from minipfn import TabPFNv3_5Classifier, TabPFNv3_5Regressor
+from minipfn import TabPFNv3_5Classifier, TabPFNv3_5Regressor, from_pretrained
 
 clf = TabPFNv3_5Classifier(device="cuda").fit(x_train, y_train)
 reg = TabPFNv3_5Regressor(device="cuda").fit(x_train, y_train)
+
+# 두 클래스를 함께 쓸 때 가중치를 한 번만 읽으려면 모델을 받아 넘긴다 (추론 설정도 모델에 붙어 온다)
+model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v3-5")
+clf = TabPFNv3_5Classifier(model, device="cuda")
+reg = TabPFNv3_5Regressor(model, borders, device="cuda")
 ```
 
 평가 스크립트에는 같은 repo를 분류·회귀에 함께 줍니다: `--classifier-path hf://aiden-jeon/minipfn-tabpfn-v3-5 --regressor-path hf://aiden-jeon/minipfn-tabpfn-v3-5`.
@@ -224,6 +229,6 @@ uv run python hub/push_to_hub.py --paper tabpfn_v2 --task regression --repo-id <
 
 ## 5. 라이선스
 
-코드와 Hugging Face Hub의 가중치는 [Apache-2.0](LICENSE)입니다. Hub의 가중치는 모두 이 저장소 코드로 TabICL prior(BSD-3-Clause, 코드는 포함하지 않음)에서 직접 학습한 것이며, 공식 TabPFN v2·2.5·3·3.5의 코드나 가중치는 들어 있지 않습니다. 공식 가중치는 Prior Labs의 라이선스를 따릅니다([PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)). TabPFN-3·3.5 구조 가운데 보고서에 없는 부분은 Prior Labs의 공개 추론 코드(Apache-2.0)에서 설계만 확인해 새로 구현했습니다(`src/minipfn/models/column_row_transformer.py` docstring). TabPFN v1 재현 코드(`src/minipfn/`의 `*/tabpfn_v1.py`, `benchmarks/cc18.py`)는 공식 TabPFN v1 코드([automl/TabPFN](https://github.com/automl/TabPFN) `tabpfn_v1`, Apache-2.0)를 옮긴 부분이 있어 원 저작권 표기를 [NOTICE](NOTICE)에 함께 둡니다.
+코드와 Hugging Face Hub의 가중치는 [Apache-2.0](LICENSE)입니다. Hub의 가중치는 모두 이 저장소 코드로 직접 학습한 것입니다. v1은 v1 prior bag으로, v2 이후는 TabICL prior(BSD-3-Clause, 코드는 포함하지 않음)로 학습했습니다. 공식 TabPFN v2·2.5·3·3.5의 코드나 가중치는 들어 있지 않습니다. 공식 가중치는 Prior Labs의 라이선스를 따릅니다([PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN)). TabPFN-3·3.5 구조 가운데 보고서에 없는 부분은 Prior Labs의 공개 추론 코드(Apache-2.0)에서 설계만 확인해 새로 구현했습니다(`src/minipfn/models/column_row_transformer.py` docstring). TabPFN v1 재현 코드(`src/minipfn/`의 `*/tabpfn_v1.py`, `benchmarks/cc18.py`)는 공식 TabPFN v1 코드([automl/TabPFN](https://github.com/automl/TabPFN) `tabpfn_v1`, Apache-2.0)를 옮긴 부분이 있어 원 저작권 표기를 [NOTICE](NOTICE)에 함께 둡니다.
 
 `notebooks/*/images/`의 논문 그림(`pfn_fig1a.png`, `tabpfn_fig1.png`, `tabpfn_fig2.png`)은 각 논문 저자에게 저작권이 있으며 Apache-2.0 대상이 아닙니다. 설명을 위해 출처(Müller et al. 2022, Hollmann et al. 2023)를 밝혀 인용했습니다. `notebooks/03_tabpfn_v2/images/`의 그림(`tabpfn_v2_fig1.png`\~`tabpfn_v2_fig4.png`)은 Hollmann et al. 2025([Nature 637:319](https://doi.org/10.1038/s41586-024-08328-6))의 Fig. 1\~4를 줄인 것으로, 원 논문의 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 라이선스를 따릅니다. 직접 그린 `pfn_encoder_arch.svg`는 Apache-2.0입니다.

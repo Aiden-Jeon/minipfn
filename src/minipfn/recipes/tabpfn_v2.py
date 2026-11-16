@@ -190,12 +190,9 @@ def default_inference(model: nn.Module, task: str) -> dict:
 
 def _inference_kwargs(model: nn.Module, task: str, n_estimators, member_kinds) -> dict:
     # 인자로 준 값이 먼저, 없으면 모델의 추론 설정. 모델 종류의 recipe가 정한다
-    # (`minipfn.recipes.default_inference`: TabPFN-3.5 모델이면 `tabpfn_v3`의 것). 모델 종류가
-    # 없는 모델(registry 규약만 지키는 것)은 v2 기본값
-    if hasattr(model, "model_type"):
-        defaults = recipe_inference(model, task)
-    else:
-        defaults = default_inference(model, task)
+    # (`minipfn.recipes.default_inference`: TabPFN-3.5 모델이면 `tabpfn_v3`의 것, 어느 recipe에도
+    # 없는 모델 종류는 v2의 것)
+    defaults = recipe_inference(model, task)
     return {
         "n_estimators": defaults["n_estimators"] if n_estimators is None else n_estimators,
         "member_kinds": defaults["member_kinds"]

@@ -140,6 +140,16 @@ reg = TabPFNv3_5Regressor(device="cuda").fit(x_train, y_train)
 pred = reg.predict(x_test)  # mean of the predictive distribution
 ```
 
+Each class above loads its own copy of the 219M weights. To use both tasks with one copy, load the model once and pass it in (the inference settings come with it):
+
+```python
+from minipfn import from_pretrained
+
+model, borders = from_pretrained("aiden-jeon/minipfn-tabpfn-v3-5")
+clf = TabPFNv3_5Classifier(model, device="cuda")
+reg = TabPFNv3_5Regressor(model, borders, device="cuda")
+```
+
 `fit` does not train weights. It fits each ensemble member's preprocessing on the training rows, which then serve as context at prediction time. To reproduce the benchmark (downloads the OpenML tasks):
 
 ```bash

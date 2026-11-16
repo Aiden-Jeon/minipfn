@@ -235,7 +235,13 @@ def prepare_tabpfn_v3(args: argparse.Namespace, out_dir: Path, upload_dir: Path)
     돌려준다. 회귀 구간 경계(같은 파일)와 두 task의 추론 설정을 확인한다."""
     from minipfn.hub import load_model, served_tasks
 
-    model, borders = load_model(args.checkpoint, MULTITASK[0], out_dir / "checkpoint")
+    try:
+        model, borders = load_model(args.checkpoint, MULTITASK[0], out_dir / "checkpoint")
+    except SystemExit as e:  # 회귀만 내는 모델 등: 왜 안 되는지와 다른 길을 함께 알려 준다
+        raise SystemExit(
+            f"{e} --paper tabpfn_v3는 분류·회귀를 함께 내는 TabPFN-3.5 multitask 체크포인트만"
+            " 받습니다. 한 task 모델은 --paper tabpfn_v2로 올려 주세요."
+        ) from e
     if (
         getattr(model, "model_type", None) != "column_row_transformer"
         or served_tasks(model, borders) != MULTITASK

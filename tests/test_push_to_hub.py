@@ -621,6 +621,13 @@ def test_v3_needs_a_multitask_checkpoint_and_v2_refuses_one(tmp_path):
             ["--paper", "tabpfn_v2", "--task", "classification", "--checkpoint", multitask]
             + ["--out-dir", str(tmp_path / "o2"), *common]
         )
+    (tmp_path / "r").mkdir()
+    _, _, regression = _multitask_checkpoint(tmp_path / "r", task="regression")
+    with pytest.raises(SystemExit, match="multitask 체크포인트만"):
+        push.main(
+            ["--paper", "tabpfn_v3", "--checkpoint", regression, "--out-dir", str(tmp_path / "o3")]
+            + common
+        )
 
 
 def test_v3_revision_dry_run_for_a_curriculum_stage(tmp_path):
