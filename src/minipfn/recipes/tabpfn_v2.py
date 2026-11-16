@@ -145,10 +145,11 @@ TUNED_LONG_COMMON = {
     "min_train_fraction": 0.79,
     "max_train_fraction": 0.81,
     "log_uniform_rows": True,
-    # 추론의 one-hot 폭 상한(`max_features`)은 옛 long_tables처럼 500으로 넓힌다. 표마다 feature
-    # 수는 셀 상한(max_cells)이 행 수에 맞춰 줄인다: 짧은 표는 넓게, 긴 표는 TabICLv2처럼 좁게
+    # 추론의 one-hot 폭 상한(`max_features`)은 옛 long_tables처럼 500으로 넓힌다. 학습 표의 feature
+    # 수는 TabICLv2처럼 U(1, 100)(`feature_scale`)에서 뽑고, 셀 상한이 긴 표에서 더 줄인다. 500까지
+    # 뽑으면 짧은 표가 넓어져 16 GPU stage 2가 분류 4.1·회귀 3.4 s/step이었다
     "max_features": 500,
-    "feature_scale": 500,
+    "feature_scale": 100,
     "micro_batch": 1,
     "val_batch": 4,
     "val_every": 1_000,

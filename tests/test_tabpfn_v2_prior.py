@@ -155,3 +155,24 @@ def test_prior_rejects_sizes_it_cannot_draw():
         )
     with pytest.raises(ValueError, match="max_train_rows"):
         P.GraphSCMPrior("regression", min_train_rows=4096, max_train_rows=2048, max_cells=400_000)
+
+
+def test_train_fraction_features_follow_feature_scale_when_smaller():
+    # issue #81 tuned_long: one-hot 폭 상한(max_features)은 넓게, 학습 표 feature 수는 feature_scale까지
+    from minipfn.priors.graph_scm import GraphSCMPrior
+
+    sizes = dict(
+        size_rule="train_fraction",
+        min_rows=40,
+        max_rows=80,
+        log_uniform_rows=True,
+        min_train_fraction=0.79,
+        max_train_fraction=0.81,
+        max_cells=80 * 500,
+    )
+    narrow = GraphSCMPrior("regression", seed=3, max_features=500, feature_scale=12, **sizes)
+    assert max(narrow.sample_shape()[1] for _ in range(200)) <= 12
+    # feature_scale이 max_features 이상이면 예전과 같은 크기를 뽑는다
+    wide = GraphSCMPrior("regression", seed=3, max_features=30, feature_scale=160, **sizes)
+    same = GraphSCMPrior("regression", seed=3, max_features=30, feature_scale=30, **sizes)
+    assert [wide.sample_shape() for _ in range(50)] == [same.sample_shape() for _ in range(50)]

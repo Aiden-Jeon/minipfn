@@ -96,8 +96,8 @@ class TrainConfig:
     # 위의 v2 논문 규칙 그대로다 (`minipfn.priors.graph_scm`)
     # - size_rule "train_fraction": 행 수(학습 + 검증)를 [min_rows, max_rows]에서
     #   (log_uniform_rows면 log 균등) 뽑고, 학습 행은 그 U(min_train_fraction, max_train_fraction)
-    #   비율, feature 수는 U(1, max_features). 이 규칙에서는 max_train_rows·n_eval_rows·
-    #   min_train_rows 하한 밖의 eval_rows 필드와 feature_scale을 쓰지 않는다
+    #   비율, feature 수는 U(1, min(max_features, feature_scale)). 이 규칙에서는 max_train_rows·
+    #   n_eval_rows·min_train_rows 하한 밖의 eval_rows 필드를 쓰지 않는다
     # - binary_prob: 분류 클래스 수를 이 확률로 2로 (TabICLv2 0.5)
     # - filter_unpredictable: 예측할 수 없는 그래프·데이터셋을 다시 뽑는다
     size_rule: Literal["eval_rows", "train_fraction"] = "eval_rows"

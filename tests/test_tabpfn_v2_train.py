@@ -696,6 +696,7 @@ def test_tuned_long_stages_follow_the_tabicl_curriculum(monkeypatch):
             assert config.size_rule == "train_fraction" and config.log_uniform_rows
             assert (config.min_train_fraction, config.max_train_fraction) == (0.79, 0.81)
             assert config.max_features == 500 and config.micro_batch == 1
+            assert config.feature_scale == 100
             # task별 optimizer·prior·가속 옵션은 tuned 그대로
             assert config.optimizer == tuned.optimizer and config.compile
             assert config.filter_unpredictable == tuned.filter_unpredictable

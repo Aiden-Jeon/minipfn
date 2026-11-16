@@ -141,7 +141,9 @@ class GraphSCMPrior:
                 max_rows=self.max_rows,
                 min_train_fraction=self.min_train_fraction,
                 max_train_fraction=self.max_train_fraction,
-                max_features=self.max_features,
+                # feature 수 U(1, 상한)의 상한. feature_scale이 더 작으면 그것 (TabPFN-2.5 긴 표:
+                # 추론의 one-hot 폭 상한은 넓게 두고 학습 표는 TabICLv2처럼 좁게, issue #81)
+                max_features=min(self.max_features, self.feature_scale),
                 log_uniform_rows=self.log_uniform_rows,
                 max_cells=self.max_cells,
                 min_train_rows=self.min_train_rows,
