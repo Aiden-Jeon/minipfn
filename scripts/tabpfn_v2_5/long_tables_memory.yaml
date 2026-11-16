@@ -1,0 +1,28 @@
+# TabPFN-2.5 긴 표 단계(tuned_stage2·3)의 학습 step 메모리·시간 (issue #81,
+# scripts/tabpfn_v2_5/long_tables_memory.py): 가장 큰 표마다 activation checkpointing 끔·켬, 검증 batch.
+#   databricks air run -f scripts/tabpfn_v2_5/long_tables_memory.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
+# 일부만: --override env_variables.MEMORY_ARGS="--tables 2_10k,3_50k --tasks classification"
+experiment_name: tabpfn-v2-5-reproduction
+mlflow_run_name: tabpfn-v2-5-long-tables-memory
+environment:
+  # AI v6: Python 3.12, torch 2.11.0+cu130 (pyproject.toml의 torch 고정 범위와 같다)
+  version: databricks_ai_v6
+compute:
+  accelerator_type: GPU_1xH100
+  num_accelerators: 1
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: ../..
+    include_paths:
+      - src
+      - scripts/tabpfn_v2_5/long_tables_memory.py
+env_variables:
+  MEMORY_ARGS: ""
+max_retries: 0
+timeout_minutes: 120
+command: >-
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  PYTHONPATH=$CODE_SOURCE_PATH/src
+  python $CODE_SOURCE_PATH/scripts/tabpfn_v2_5/long_tables_memory.py --out /tmp/long_tables_memory.json
+  $MEMORY_ARGS

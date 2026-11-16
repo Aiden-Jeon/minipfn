@@ -538,3 +538,183 @@ def test_classification_outputs_come_from_the_prior(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "fake_prior_module", fake)
     assert TrainConfig(prior_type="fake").n_out == 20
     assert TrainConfig().n_out == 10 and TrainConfig(task="regression").n_out == 5000
+
+
+def test_train_script_sets_the_tabicl_prior_options_from_env(monkeypatch):
+    # issue #81 D: TabICLv2 표 크기·prior 설정을 환경변수로 켠다. 주지 않으면 preset 그대로
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    base, _ = script.build_config(script.parse_args(["--config-name", "medium", "--arch", "v2.5"]))
+    assert base.size_rule == "eval_rows" and not base.filter_unpredictable
+    env = {
+        "TABPFN_V2_SIZE_RULE": "train_fraction",
+        "TABPFN_V2_MIN_ROWS": "1024",
+        "TABPFN_V2_MAX_ROWS": "1024",
+        "TABPFN_V2_MIN_TRAIN_FRACTION": "0.3",
+        "TABPFN_V2_MAX_TRAIN_FRACTION": "0.9",
+        "TABPFN_V2_BINARY_PROB": "0.5",
+        "TABPFN_V2_FILTER_UNPREDICTABLE": "1",
+    }
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    script = _train_script()
+    config, arch = script.build_config(
+        script.parse_args(["--config-name", "medium", "--arch", "v2.5"])
+    )
+    assert arch == "v2.5"
+    assert (config.size_rule, config.min_rows, config.max_rows) == ("train_fraction", 1024, 1024)
+    assert (config.min_train_fraction, config.max_train_fraction) == (0.3, 0.9)
+    assert config.binary_prob == 0.5 and config.filter_unpredictable
+    # 그 밖의 설정은 그대로
+    assert (
+        replace(
+            config,
+            size_rule=base.size_rule,
+            min_rows=base.min_rows,
+            max_rows=base.max_rows,
+            min_train_fraction=base.min_train_fraction,
+            max_train_fraction=base.max_train_fraction,
+            binary_prob=base.binary_prob,
+            filter_unpredictable=base.filter_unpredictable,
+        )
+        == base
+    )
+
+
+def test_tuned_preset_is_paper_with_the_options_chosen_in_issue_81(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    for task in ("classification", "regression"):
+        args = script.parse_args(["--config-name", "tuned", "--arch", "v2.5", "--task", task])
+        config, arch = script.build_config(args)
+        paper = recipe.with_architecture(recipe.paper(task), "v2.5")
+        assert arch == recipe.architecture_name(config) == "v2.5"
+        assert config.steps == 300_000 and config.warmup_steps == paper.warmup_steps
+        assert config.compile and config.fused_adam and config.tf32
+        assert not config.weight_average
+        # 안정화 설정은 paper 그대로 (회귀 QK-clip 250·rewind 0.5)
+        assert (config.qk_clip, config.rewind_lr_factor) == (paper.qk_clip, paper.rewind_lr_factor)
+        changed = {k for k in vars(paper) if getattr(paper, k) != getattr(config, k)}
+        if task == "classification":
+            assert config.optimizer == "adam" and config.filter_unpredictable
+            assert (config.size_rule, config.min_rows, config.max_rows) == (
+                "train_fraction",
+                1024,
+                1024,
+            )
+            assert config.binary_prob == 0.5
+            assert config.max_features == paper.max_features
+            assert config.max_cells == paper.max_cells
+            # 행 수·학습 비율은 TrainConfig 기본값이 이미 TabICLv2 stage 1 값이다
+            prior = {"size_rule", "binary_prob", "filter_unpredictable"}
+            assert changed == {"steps", "compile", "fused_adam", "tf32"} | prior
+        else:
+            assert config.optimizer == "muon" and config.size_rule == "eval_rows"
+            assert changed == {"steps", "compile", "fused_adam", "tf32", "optimizer"}
+
+
+def test_cell_transformer_activation_checkpointing_gives_the_same_gradients():
+    # issue #81 tuned_stage3: 긴 표에서 층마다 activation을 다시 계산해도 손실·gradient가 같다
+    config = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5", keep_size=True)
+    torch.manual_seed(0)
+    model = config.build_model()
+    assert isinstance(model, CellTransformer)
+    # 잔차 출력층이 0으로 시작하면 gradient가 대부분 0이라 같은지 보기 어렵다
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    x, y = torch.randn(2, 40, 7), torch.randn(2, 40)
+
+    def grads(rows):
+        model.activation_checkpointing_rows = rows
+        model.zero_grad()
+        loss = model(x, y[:, :30]).square().mean()
+        loss.backward()
+        return loss.detach(), [p.grad.clone() for p in model.parameters()]
+
+    loss, ref = grads(None)
+    assert model._checkpointing(40) is False
+    loss_ckpt, got = grads(0)
+    assert model._checkpointing(40)
+    assert torch.equal(loss, loss_ckpt)
+    assert all(torch.equal(a, b) for a, b in zip(ref, got, strict=True))
+    # 기준보다 짧은 표·평가 forward에서는 쓰지 않는다
+    model.activation_checkpointing_rows = 40
+    assert not model._checkpointing(40)
+    model.activation_checkpointing_rows = 0
+    model.eval()
+    assert not model._checkpointing(40)
+
+
+def test_validation_with_checkpointing_rows_keeps_the_cell_transformer_forward():
+    # cell_transformer에는 추론 경로(`inference=True`)가 없다: 검증은 학습 forward 그대로
+    from minipfn.training.loop import _validate
+
+    config = replace(
+        recipe.with_architecture(TrainConfig.smoke("classification"), "v2.5", keep_size=True),
+        val_batch=2,
+    )
+    import contextlib
+
+    model = config.build_model()
+    batches = _make_val_batches(config, n_batches=1)
+    out = _validate(
+        model,
+        batches,
+        torch.device("cpu"),
+        contextlib.nullcontext,
+        "classification",
+        None,
+        inference_rows=0,
+    )
+    assert "val_loss" in out and "val_acc" in out
+
+
+def test_tuned_long_stages_follow_the_tabicl_curriculum(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    # 앞 단계 run 없이는 시작하지 않는다
+    with pytest.raises(SystemExit):
+        script.parse_args(["--config-name", "tuned_stage2", "--arch", "v2.5"])
+    for task in ("classification", "regression"):
+        tuned = recipe.with_architecture(recipe.tuned(task), "v2.5")
+        for stage, (steps, rows, factor) in {
+            2: (20_000, 10_240, 8),
+            3: (5_000, 50_000, 40),
+        }.items():
+            args = script.parse_args(
+                [f"--config-name=tuned_stage{stage}", "--arch=v2.5", f"--task={task}"]
+                + ["--init-run-id=r"]
+            )
+            config, arch = script.build_config(args)
+            assert arch == recipe.architecture_name(config) == "v2.5"
+            assert (config.steps, config.max_rows, config.min_rows) == (steps, rows, 400)
+            assert config.lr == pytest.approx(tuned.lr / factor)
+            assert config.warmup_steps == steps // 100
+            assert config.size_rule == "train_fraction" and config.log_uniform_rows
+            assert (config.min_train_fraction, config.max_train_fraction) == (0.79, 0.81)
+            assert config.max_features == 500 and config.micro_batch == 1
+            assert config.feature_scale == 100
+            # task별 optimizer·prior·가속 옵션은 tuned 그대로
+            assert config.optimizer == tuned.optimizer and config.compile
+            assert config.filter_unpredictable == tuned.filter_unpredictable
+            assert config.binary_prob == tuned.binary_prob
+            assert config.activation_checkpointing_rows == 4_096
+            expected_clip = 60_000.0 if task == "classification" else tuned.qk_clip
+            assert config.qk_clip == expected_clip and config.rewind_lr_factor == 0.5
+
+
+def test_cell_transformer_splits_large_attention_batches(monkeypatch):
+    # issue #81: SDPA batch가 CUDA 상한을 넘으면 나눠 부른다. 값은 같다
+    from minipfn.models import cell_transformer as ct
+
+    config = recipe.with_architecture(TrainConfig.smoke("classification"), "v2.5", keep_size=True)
+    torch.manual_seed(0)
+    model = config.build_model().eval()
+    x, y = torch.randn(3, 30, 7), torch.randint(0, 3, (3, 22)).float()
+    with torch.no_grad():
+        ref = model(x, y)
+        monkeypatch.setattr(ct, "SDPA_MAX_BATCH", 7)
+        assert torch.equal(model(x, y), ref)

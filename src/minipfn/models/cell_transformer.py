@@ -34,9 +34,13 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 NAN_INDICATOR = -2.0  # 결측 칸의 표시 값 (아닌 칸은 0)
 ENCODERS = ("linear", "mlp")
+# SDPA kernel이 batch 축 하나로 받는 크기의 상한 (CUDA grid의 y·z 축 상한). feature attention의
+# batch는 표 수 × 행 수라 긴 표 여러 개(예: 검증 4개 × 20,000행)면 넘는다 (issue #81)
+SDPA_MAX_BATCH = 65_535
 
 
 @dataclass
@@ -110,15 +114,34 @@ class Attention(nn.Module):
         q, k, v = self.qkv(x).view(n, length, 3, self.nhead, e // self.nhead).unbind(2)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (N, H, L, D)
         if n_context is None:
-            out = F.scaled_dot_product_attention(q, k, v)
+            out = _sdpa(q, k, v)
         else:
             k, v = k[:, :, :n_context], v[:, :, :n_context]
-            train = F.scaled_dot_product_attention(q[:, :, :n_context], k, v)
+            train = _sdpa(q[:, :, :n_context], k, v)
             # 테스트 행: 모든 query head가 첫 head의 key·value를 본다
             first_k, first_v = k[:, :1].expand_as(k), v[:, :1].expand_as(v)
-            test = F.scaled_dot_product_attention(q[:, :, n_context:], first_k, first_v)
+            test = _sdpa(q[:, :, n_context:], first_k, first_v)
             out = torch.cat([train, test], dim=2)
         return self.out(out.transpose(1, 2).reshape(n, length, e))
+
+
+def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """scaled dot-product attention. compile 중이면 q·k·v를 contiguous로 만든다(issue #81).
+
+    q·k·v는 한 `qkv` 출력의 view(와 그 행 slice·head expand)라 메모리가 dense하지 않다. 그러면
+    flash attention backward가 실제로 내는 gradient stride((N, L, H, D) 순서)와 inductor의 meta
+    kernel이 예측하는 stride(contiguous)가 달라 compile한 backward의 `assert_size_stride`에서
+    멈춘다. eager는 그대로 둔다(compile을 끈 학습·추론은 예전과 비트 단위로 같다).
+    batch가 `SDPA_MAX_BATCH`보다 크면 나눠 부른다."""
+    if torch.compiler.is_compiling():
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    n = q.shape[0]
+    if n <= SDPA_MAX_BATCH:
+        return F.scaled_dot_product_attention(q, k, v)
+    # batch를 나눠 부른다 (batch 원소마다 따로 계산하므로 값은 같다). `split`이라 compile(dynamic)은
+    # batch 크기가 아니라 조각 수에만 guard를 건다(`range(0, n, step)`은 크기마다 다시 compile한다)
+    chunks = zip(*(t.split(SDPA_MAX_BATCH) for t in (q, k, v)), strict=True)
+    return torch.cat([F.scaled_dot_product_attention(*c) for c in chunks])
 
 
 class CellTransformerLayer(nn.Module):
@@ -154,6 +177,11 @@ class CellTransformer(nn.Module):
     # 모델 종류 (`minipfn.models.MODEL_TYPES`)
     model_type = "cell_transformer"
     config_class = CellTransformerConfig
+    # activation checkpointing (학습 설정 `TrainConfig.activation_checkpointing_rows`, #79·#81).
+    # 표의 행 수(학습 + 테스트)가 이 값보다 많은 학습 forward에서 층마다 activation을 backward까지
+    # 들지 않고 다시 계산한다(`torch.utils.checkpoint`). 같은 연산을 다시 하므로 손실·gradient는
+    # 비트 단위로 같다. None이면 끈다(기본). 학습 루프가 정하는 값이라 checkpoint 파일에 남지 않는다
+    activation_checkpointing_rows: int | None = None
 
     def __init__(self, config: CellTransformerConfig | None = None) -> None:
         super().__init__()
@@ -257,6 +285,17 @@ class CellTransformer(nn.Module):
             thinking = self.thinking_rows.to(h.dtype)[None, :, None].expand(b, -1, c, e)
             h = torch.cat([thinking, h], dim=1)
             n_context += self.config.n_thinking_rows
+        ckpt = self._checkpointing(x.shape[1])
         for layer in self.layers:
-            h = layer(h, n_context)
+            if ckpt:
+                # non-reentrant라 DDP와 같이 쓴다. compile한 층도 그대로 부른다. 난수가 없다
+                h = checkpoint(layer, h, n_context, use_reentrant=False, preserve_rng_state=False)
+            else:
+                h = layer(h, n_context)
         return self.decoder(h[:, n_context:, -1])
+
+    def _checkpointing(self, rows: int) -> bool:
+        """이 forward에서 activation checkpointing을 쓰는지: 켰고, 행 수가 기준보다 많고, gradient를
+        계산하는 학습 forward일 때."""
+        limit = self.activation_checkpointing_rows
+        return limit is not None and rows > limit and self.training and torch.is_grad_enabled()

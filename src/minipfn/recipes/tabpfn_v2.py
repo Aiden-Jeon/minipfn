@@ -102,6 +102,109 @@ def paper(task: str = "classification") -> TrainConfig:
     return TrainConfig(task=task)
 
 
+# issue #81(v2.5 medium 20k A/B/C/D)로 고른 학습 설정. 논문에 없음
+TUNED_STEPS = 300_000  # TabICLv2 stage 1처럼 짧게, 스케줄이 이 step에서 끝난다
+TUNED_SPEED = {"compile": True, "fused_adam": True, "tf32": True}
+# 분류: TabICLv2 stage 1 표 크기·prior (`recipes.tabpfn_v3.CURRICULUM`). feature 상한·셀 수 상한은
+# 논문 그대로 둔다(추론의 one-hot 폭 상한과 학습 메모리가 같도록)
+TUNED_CLASSIFICATION_PRIOR = {
+    "size_rule": "train_fraction",
+    "min_rows": 1024,
+    "max_rows": 1024,
+    "min_train_fraction": 0.3,
+    "max_train_fraction": 0.9,
+    "binary_prob": 0.5,
+    "filter_unpredictable": True,
+}
+
+
+def tuned(task: str = "classification") -> TrainConfig:
+    """issue #81에서 고른 TabPFN-2.5 학습 설정 (논문에 없음). paper에서 바꾸는 것:
+
+    - 둘 다: 학습 가속 옵션 compile·fused Adam·TF32 (medium 20k에서 s/step −11~12%, Elo는 CI 안).
+      LAWA는 원래 가중치보다 낫지 않아 켜지 않는다
+    - 분류: TabICLv2 stage 1 표 크기·prior (`TUNED_CLASSIFICATION_PRIOR`). TabArena-Lite 분류 Elo
+      1191 → 1205, multiclass 1224 → 1349 (CI 안), s/step +40%
+    - 회귀: Muon (반복 블록 안 행렬, lr·스케줄은 Adam과 같음). 회귀 Elo 858 → 1135, 20k val
+      −1.11 → −1.23 (CI가 조금 겹침), s/step +33%. 분류는 Muon이 나빴다(1191 → 1067)
+    - 스케줄 길이 `TUNED_STEPS`(300k, warmup 10k + cosine으로 0까지)
+
+    QK-clip·rewind 같은 안정화 설정은 paper 그대로다. 구조는 `with_architecture`가 정한다(--arch).
+    """
+    config = replace(paper(task), steps=TUNED_STEPS, **TUNED_SPEED)
+    if task == "classification":
+        return replace(config, **TUNED_CLASSIFICATION_PRIOR)
+    return replace(config, optimizer="muon")
+
+
+# tuned(= stage 1) 뒤의 긴 표 단계. TabPFN-3.5에 쓴 TabICLv2 curriculum stage 2·3
+# (`recipes.tabpfn_v3.CURRICULUM`)을 옮긴 것. lr은 stage 1 대비 같은 비율(1/8, 1/40)로 낮춘다
+TUNED_LONG_COMMON = {
+    "size_rule": "train_fraction",
+    "min_rows": 400,
+    "min_train_fraction": 0.79,
+    "max_train_fraction": 0.81,
+    "log_uniform_rows": True,
+    # 추론의 one-hot 폭 상한(`max_features`)은 옛 long_tables처럼 500으로 넓힌다. 학습 표의 feature
+    # 수는 TabICLv2처럼 U(1, 100)(`feature_scale`)에서 뽑고, 셀 상한이 긴 표에서 더 줄인다. 500까지
+    # 뽑으면 짧은 표가 넓어져 16 GPU stage 2가 분류 4.1·회귀 3.4 s/step이었다
+    "max_features": 500,
+    "feature_scale": 100,
+    "micro_batch": 1,
+    "val_batch": 4,
+    "val_every": 1_000,
+    "checkpoint_every": 1_000,
+    # activation checkpointing은 4,096행보다 긴 표에서. H100 한 장 실측: 끄면 분류는 stage 2의 가장
+    # 큰 표(10,240×100)에서 OOM, 회귀는 67 GB. 켜면 stage 3의 50,000×30까지 분류 17·회귀 15 GB.
+    # 4,096행 이하는 셀이 41만 개 이하라(feature ≤ 100) 옛 long_tables(셀 40만, 분류 36 GB)처럼
+    # 그대로 든다. 모든 batch에서 켜면 16 GPU stage 2가 분류 2.3~2.9 s/step이었다
+    "activation_checkpointing_rows": 4_096,
+}
+TUNED_LONG = {
+    2: {
+        "steps": 20_000,
+        "lr_factor": 1 / 8,
+        "max_rows": 10_240,
+        # 10,240행이면 feature 100개 (TabICLv2 stage 2의 상한)
+        "max_cells": 10_240 * 100,
+        "keep_every": 5_000,
+    },
+    3: {
+        "steps": 5_000,
+        "lr_factor": 1 / 40,
+        # TabPFN-2.5가 지원하는 학습 행 수(`SUPPORTED_SIZE`)까지. TabICLv2는 60,000
+        "max_rows": 50_000,
+        # 50,000행이면 feature 30개 (TabICLv2의 행 수별 feature 상한과 같다)
+        "max_cells": 50_000 * 30,
+        "keep_every": 1_000,
+    },
+}
+TUNED_LONG_WARMUP = 0.01  # 단계 step의 1% (`recipes.tabpfn_v3.CURRICULUM_WARMUP`)
+# 분류 tuned 300k run은 QK-clip 없이 sample attention logit 상한이 56,000까지 커졌다. 더 커지지만
+# 않게 그 근처에 둔다(작게 두면 시작하자마자 logit을 깎는다)
+TUNED_LONG_CLASSIFICATION_QK_CLIP = 60_000.0
+
+
+def tuned_long(stage: int, task: str = "classification") -> TrainConfig:
+    """tuned로 학습한 가중치를 긴 표로 이어 학습하는 `stage`(2·3)번째 단계 (논문에 없음).
+
+    TabPFN-3.5에서 쓴 TabICLv2 curriculum stage 2·3(`recipes.tabpfn_v3.curriculum`)을 TabPFN-2.5에
+    옮겼다: 표 행 수 400~10,240(stage 2, 20k step)·400~50,000(stage 3, 5k step) log 균등, 학습 행
+    비율 U(0.79, 0.81), lr은 stage 1(tuned)의 1/8·1/40, warmup 1% + cosine, 4,096행보다 긴
+    표에서 activation checkpointing. task별 optimizer·prior와 가속 옵션은 tuned 그대로다(분류는
+    Adam·TabICLv2 prior, 회귀는 Muon). 가중치는 앞 단계 run에서 가져온다(학습 스크립트가 막는다).
+    """
+    if stage not in TUNED_LONG:
+        raise ValueError(f"tuned_long stage는 {tuple(TUNED_LONG)} 가운데 하나다: {stage}")
+    base = tuned(task)
+    changes = {**TUNED_LONG_COMMON, **TUNED_LONG[stage]}
+    changes["lr"] = base.lr * changes.pop("lr_factor")
+    changes["warmup_steps"] = int(TUNED_LONG_WARMUP * changes["steps"])
+    if task == "classification":
+        changes.update(qk_clip=TUNED_LONG_CLASSIFICATION_QK_CLIP, rewind_lr_factor=0.5)
+    return replace(base, **changes)
+
+
 def long_tables(task: str = "classification", arch: str = "v2") -> TrainConfig:
     """paper로 학습한 모델을 더 긴·넓은 표로 짧게 이어 학습한다 (논문에 없음, 값은 여기서 정함).
 

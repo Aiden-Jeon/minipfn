@@ -141,7 +141,9 @@ class GraphSCMPrior:
                 max_rows=self.max_rows,
                 min_train_fraction=self.min_train_fraction,
                 max_train_fraction=self.max_train_fraction,
-                max_features=self.max_features,
+                # feature 수 U(1, 상한)의 상한. feature_scale이 더 작으면 그것 (TabPFN-2.5 긴 표:
+                # 추론의 one-hot 폭 상한은 넓게 두고 학습 표는 TabICLv2처럼 좁게, issue #81)
+                max_features=min(self.max_features, self.feature_scale),
                 log_uniform_rows=self.log_uniform_rows,
                 max_cells=self.max_cells,
                 min_train_rows=self.min_train_rows,
@@ -208,6 +210,9 @@ def _check(*, size_rule: str, **sizes) -> None:
     if size_rule not in SIZE_RULES:
         raise ValueError(f"size_rule은 {SIZE_RULES} 가운데 하나여야 한다: {size_rule}")
     if size_rule == "train_fraction":
+        # feature 수 상한은 min(max_features, feature_scale)이다 (`GraphSCMPrior.sample_shape`)
+        if sizes["feature_scale"] < 1:
+            raise ValueError(f"feature_scale는 1 이상이어야 한다: {sizes['feature_scale']}")
         check_split_sizes(
             **{
                 k: sizes[k]
