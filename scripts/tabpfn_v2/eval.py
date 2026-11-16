@@ -738,9 +738,10 @@ def start_bag_pool(args: argparse.Namespace, out_dir: Path):
     )
 
 
-def merge_worker_logs(args: argparse.Namespace, out_dir: Path, workers_dir: Path) -> None:
-    """worker들의 test-time·증류 기록(jsonl)을 이 실행의 파일 뒤에 붙인다."""
-    for worker_dir in sorted(workers_dir.glob("worker*")):
+def merge_worker_logs(args: argparse.Namespace, out_dir: Path, worker_dirs: list[Path]) -> None:
+    """이 실행의 worker들(`worker_dirs`)의 test-time·증류 기록(jsonl)을 이 실행의 파일 뒤에
+    붙인다. 폴더를 glob하지 않는다: 지난 실행에서 worker가 더 많았으면 남은 폴더의 기록이 섞인다."""
+    for worker_dir in worker_dirs:
         for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
             part = worker_dir / name
             if part.exists():
@@ -794,9 +795,10 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
         )
     finally:
         if pool is not None:
+            worker_dirs = [out_dir / "bag_gpus" / f"worker{i}" for i in range(len(pool))]
             pool.close()
             make.bag_pool = None
-            merge_worker_logs(args, out_dir, out_dir / "bag_gpus")
+            merge_worker_logs(args, out_dir, worker_dirs)
     print_arena_summary(summary)
     if use_mlflow:
         log_arena_mlflow(args, summary, out_dir / args.suite, kinds, one_hot)
@@ -1065,12 +1067,7 @@ def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "")
     for job in sorted(jobs, key=lambda j: j["dataset"]):
         with open(job["results"], "rb") as f:
             results.extend(pickle.load(f))
-    for worker_dir in worker_dirs:
-        for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
-            part = worker_dir / name
-            if part.exists():
-                with open(out_dir / name, "a") as f:
-                    f.write(part.read_text())
+    merge_worker_logs(args, out_dir, worker_dirs)
     print(f"shards: {len(results)} split results from {n_workers} workers", flush=True)
     return results
 
@@ -1170,6 +1167,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--shards는 1 이상이어야 한다.")
     if args.shards > 1 and args.suite not in ARENA_SUITES:
         raise SystemExit("--shards는 TabArena·BeyondArena suite에서만 쓴다.")
+    if args.bag_gpus < 0:
+        raise SystemExit("--bag-gpus는 0 이상이어야 한다.")
     if args.bag_gpus:
         if args.suite not in ARENA_SUITES or args.bagging < 2:
             raise SystemExit("--bag-gpus는 TabArena·BeyondArena의 --bagging 2 이상에서만 쓴다.")

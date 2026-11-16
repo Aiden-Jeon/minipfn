@@ -294,7 +294,7 @@ def test_bag_gpus_worker_command_and_checks():
     argv = ["--suite", "tabarena-lite", "--bagging", "8", "--bag-gpus", "8", "--mlflow"]
     cmd = script.bag_worker_command([*argv, "--out-dir", "x"], Path("w0"))
     assert cmd == [*argv[:4], "--out-dir", "w0", "--device", "cuda"]
-    for bad in (["--bagging", "0"], ["--shards", "2"], ["--latency"]):
+    for bad in (["--bagging", "0"], ["--shards", "2"], ["--latency"], ["--bag-gpus", "-1"]):
         with pytest.raises(SystemExit):
             script.main(["--suite", "tabarena-lite", "--bagging", "8", "--bag-gpus", "2", *bad])
 

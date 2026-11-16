@@ -162,7 +162,7 @@ class EstimatorSystem(ExternalSystemModel):
         Xp, _ = prepare_frame(X)
         Xp = Xp.reset_index(drop=True)
         if getattr(self, "pool_", None) is not None:
-            preds = self.pool_.predict(self.handles_, Xp, proba=False)
+            preds = self._pool_predict(Xp, proba=False)
         else:
             preds = [e.predict(Xp) for e in self.estimators_]
         pred = np.mean(preds, axis=0)
@@ -176,7 +176,7 @@ class EstimatorSystem(ExternalSystemModel):
         # TabArena가 이진 분류는 둘째 열을, 다중 분류는 열을 위치로 읽기 때문이다
         if getattr(self, "pool_", None) is not None:
             bag_classes = [np.asarray(c) for c in self.pool_classes_]
-            probas = self.pool_.predict(self.handles_, Xp, proba=True)
+            probas = self._pool_predict(Xp, proba=True)
         else:
             bag_classes = [np.asarray(e.classes_) for e in self.estimators_]
             probas = (e.predict_proba(Xp) for e in self.estimators_)
@@ -188,6 +188,15 @@ class EstimatorSystem(ExternalSystemModel):
         total = total / len(bag_classes)
         total.index = X.index
         return total
+
+    def _pool_predict(self, X: pd.DataFrame, proba: bool) -> list[np.ndarray]:
+        # 예측이 실패하면 TabArena는 cleanup을 부르지 않는다(`cleanup_on_failure`가 기본 False):
+        # worker에 남은 bag을 여기서 버린다 (같은 프로세스의 estimator는 system과 함께 사라진다)
+        try:
+            return self.pool_.predict(self.handles_, X, proba=proba)
+        except Exception:
+            self.cleanup()
+            raise
 
     def cleanup(self):
         self.estimators_ = []
