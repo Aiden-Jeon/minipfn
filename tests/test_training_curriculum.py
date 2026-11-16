@@ -372,14 +372,16 @@ def test_curriculum_recipe():
     )
     assert (s3.steps, s3.lr, s3.grad_clip, s3.max_rows) == (5_000, 1e-5, 1.0, 60_000)
     assert all(c.logit_softcap == 50.0 for c in (s1, s2, s3, s4))
-    # stage 4 (issue #91): 400~200,000행, 셀 상한 4M, stage 3의 절반 lr로 2,000 step
+    # stage 4 (issue #91): 400~200,000행, 셀 상한 4M, stage 3의 절반 lr로 1,000 step(500~1,000),
+    # GPU끼리 표 크기 나누기
     assert (s4.steps, s4.lr, s4.grad_clip, s4.warmup_steps, s4.micro_batch) == (
-        2_000,
+        1_000,
         5e-6,
         1.0,
-        20,
+        10,
         1,
     )
+    assert s4.balance_tables and not any(c.balance_tables for c in (s1, s2, s3))
     assert (s4.min_rows, s4.max_rows, s4.max_cells, s4.feature_cap_rule) == (
         400,
         200_000,
@@ -460,11 +462,12 @@ def test_train_script_stages(monkeypatch):
     for stage in ("stage2", "stage4"):  # 앞 단계 가중치 없이 stage 2~4는 시작하지 않는다
         with pytest.raises(SystemExit):
             script.parse_args(["--config-name", stage, "--arch", "v3.5", "--task", "multitask"])
-    # stage 4도 recipe 그대로이고, 인자로 준 step 수(yaml 기본 300을 덮어쓴 값)만 바뀐다
-    args = ["--config-name", "stage4", "--arch", "v3.5", "--task", "multitask", "--steps", "2000"]
+    # stage 4도 recipe 그대로이고, 인자로 준 step 수(yaml 기본 300을 덮어쓴 값)와 그에 맞춘
+    # warmup만 바뀐다
+    args = ["--config-name", "stage4", "--arch", "v3.5", "--task", "multitask", "--steps", "500"]
     args += ["--init-run-id", "stage3"]
     config, arch = script.build_config(script.parse_args(args))
-    assert arch == "v3.5" and config == tabpfn_v3.curriculum(4)
+    assert arch == "v3.5" and config == tabpfn_v3.curriculum(4, steps=500)
     with pytest.raises(SystemExit, match="v3.5 multitask"):
         script.build_config(script.parse_args(["--config-name", "stage1", "--arch", "v3.5"]))
     # 이어 학습하면 Muon 범위·momentum을 원래 run에서 잇는다

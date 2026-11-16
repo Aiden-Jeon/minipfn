@@ -515,21 +515,35 @@ def _flex_softcap(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cap: float)
     """soft-cap attention을 flex attention kernel로 (GPU). logit·softmax는 kernel 안에서 float32로
     계산하고, 메모리는 fused SDPA처럼 query·key 길이에 선형이다(backward도 logit을 다시 계산).
     q·k·v는 v의 dtype으로 맞춘다(autocast의 SDPA처럼. QK-norm 출력이 float32일 수 있다).
-    batch는 kernel grid의 한 축이라 CUDA 상한(`FLEX_MAX_BATCH`)을 넘지 않게 나눠 부른다."""
+    batch는 kernel grid의 한 축이라 CUDA 상한(`FLEX_MAX_BATCH`)을 넘지 않게 나눠 부른다
+    (`_flex_batches`)."""
     score_mod = _softcap_score_mod(float(cap))
     q, k = q.to(v.dtype), k.to(v.dtype)
+    if q.shape[0] > FLEX_MAX_BATCH:
+        return _flex_batches(q, k, v, score_mod)
+    if torch.compiler.is_compiling():  # 가속 옵션 compile: 블록 compile 안에서 그대로 쓴다
+        return _flex_attend(q, k, v, score_mod)
+    return _eager_flex_attend(q, k, v, score_mod)
+
+
+def _eager_flex_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, score_mod):
+    """compile 밖에서 flex attention 한 번 (`_compiled_flex_attend`, recompile 한도를 지킨다)."""
+    with _FlexRecompileLimit():
+        return _compiled_flex_attend()(q, k, v, score_mod)
+
+
+@torch.compiler.disable
+def _flex_batches(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, score_mod) -> torch.Tensor:
+    """batch가 `FLEX_MAX_BATCH`보다 큰 flex attention: batch를 그 크기로 나눠 부른다(batch마다
+    따로라 결과는 같다). 늘 compile 밖에서 돈다(블록 compile 안이면 graph가 여기서 끊긴다). 블록
+    compile 안에서 나누면 dynamo가 나눌 횟수를 정하려고 batch 크기(행 단계에서는 행 수)를 graph에
+    고정해, 행 수가 다른 큰 표마다 다시 compile했다(stage 4 32 GPU 측정에서 처음 20 step 동안 블록
+    forward가 recompile 한도 64에 걸렸다, issue #91)."""
     max_batch = FLEX_MAX_BATCH
-
-    def attend(qi, ki, vi):
-        if torch.compiler.is_compiling():  # 가속 옵션 compile: 블록 compile 안에서 그대로 쓴다
-            return _flex_attend(qi, ki, vi, score_mod)
-        with _FlexRecompileLimit():
-            return _compiled_flex_attend()(qi, ki, vi, score_mod)
-
-    if q.shape[0] <= max_batch:
-        return attend(q, k, v)
     parts = [
-        attend(q[i : i + max_batch], k[i : i + max_batch], v[i : i + max_batch])
+        _eager_flex_attend(
+            q[i : i + max_batch], k[i : i + max_batch], v[i : i + max_batch], score_mod
+        )
         for i in range(0, q.shape[0], max_batch)
     ]
     return torch.cat(parts)

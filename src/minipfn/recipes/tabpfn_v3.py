@@ -228,9 +228,14 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
 # - feature 상한은 TabICLv2의 행별 표(65,000행 넘으면 10) 대신 셀 상한 4M으로:
 #   min(100, 4,000,000 // 행 수) (`feature_cap_rule="cells"`). 40,000행까지 100, 100,000행 40,
 #   200,000행 20
-# - lr은 stage 3의 절반(5e-6), grad clip 1, 2,000 step(task당 데이터셋 256K개). 나머지는 stage 3과
-#   같다(activation checkpointing 10,240행 초과 포함)
-# - step이 길어(~100 s 추정) 기록·되돌릴 상태·checkpoint 간격을 줄인다
+# - lr은 stage 3의 절반(5e-6), grad clip 1. 나머지는 stage 3과 같다(activation checkpointing
+#   10,240행 초과 포함)
+# - step 수는 STAGE4_STEPS(500~1,000, 기본 STAGE4_DEFAULT_STEPS). 처음 설계한 2,000 step은 32
+#   GPU에서 처음 20 step이 333 s/step이라 줄였다. warmup·cosine은 그 step 수에 맞춘다
+#   (`curriculum`의 `steps`)
+# - 표 크기를 GPU끼리 나눠 받는다(`balance_tables`, `training.table_balance`). 표 계산 시간이 행
+#   수의 제곱에 가까워 GPU마다 따로 뽑으면 가장 느린 GPU가 평균의 2~3배였다
+# - step이 길어(~2분) 기록·되돌릴 상태·checkpoint 간격을 줄인다
 CURRICULUM_COMMON = {
     "batch_size": 256,
     "optimizer": "muon",
@@ -286,7 +291,7 @@ CURRICULUM = {
         "activation_checkpointing_rows": 10_240,
     },
     4: {
-        "steps": 2_000,
+        "steps": 1_000,
         "lr": 5e-6,
         "grad_clip": 1.0,
         "min_rows": 400,
@@ -297,28 +302,43 @@ CURRICULUM = {
         "micro_batch": 1,
         "max_cells": 4_000_000,
         "feature_cap_rule": "cells",
-        "log_every": 20,
-        "snapshot_every": 200,
+        "balance_tables": True,
+        "log_every": 5,
+        "snapshot_every": 50,
         "val_every": 250,
-        "checkpoint_every": 250,
-        "keep_every": 500,
+        "checkpoint_every": 50,
+        "keep_every": 250,
         "activation_checkpointing_rows": 10_240,
     },
 }
+# stage 4의 step 수 범위와 기본값 (issue #91)
+STAGE4_STEPS = (500, 1_000)
+STAGE4_DEFAULT_STEPS = CURRICULUM[4]["steps"]
 # warmup은 단계 길이의 1% (스크립트 `--warmup_proportion 0.01`)
 CURRICULUM_WARMUP = 0.01
 
 
-def curriculum(stage: int, task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
+def curriculum(
+    stage: int, task: str = "multitask", arch: str = "v3.5", steps: int | None = None
+) -> TrainConfig:
     """TabICLv2 3단계 학습의 `stage`(1·2·3)번째 단계 설정과 그 뒤에 더한 긴 표 stage 4
     (`CURRICULUM`). stage 2~4는 앞 단계 checkpoint에서 가중치만 가져와(`init_from`) 시작한다(학습
-    스크립트가 막는다). 셀 상한은 stage에 적은 값, 없으면 최대 행 수 × feature 상한이다. v3.5
-    multitask만."""
+    스크립트가 막는다). 셀 상한은 stage에 적은 값, 없으면 최대 행 수 × feature 상한이다. `steps`를
+    주면 그 step 수로 학습하고 warmup(1%)·cosine도 그것에 맞춘다(stage 4는 `STAGE4_STEPS` 범위).
+    v3.5 multitask만."""
     if (task, arch) != ("multitask", "v3.5"):
         raise ValueError(f"curriculum은 v3.5 multitask만 있다 (task {task}, arch {arch})")
     if stage not in CURRICULUM:
         raise ValueError(f"curriculum stage는 {tuple(CURRICULUM)} 가운데 하나다: {stage}")
     changes = {**CURRICULUM_COMMON, **CURRICULUM[stage]}
+    if steps is not None:
+        low, high = STAGE4_STEPS
+        if steps < 1 or (stage == 4 and not low <= steps <= high):
+            raise ValueError(
+                f"stage {stage}의 step 수가 범위 밖이다: {steps}"
+                + (f" (stage 4는 {low}~{high})" if stage == 4 else "")
+            )
+        changes["steps"] = steps
     changes.setdefault("max_cells", changes["max_rows"] * changes["max_features"])
     changes["warmup_steps"] = int(CURRICULUM_WARMUP * changes["steps"])
     return replace(paper(task, arch), **changes)

@@ -41,6 +41,7 @@ SPEED_OPTIONS = (
     "muon_scope",
     "muon_momentum",
     "phases",
+    "balance_tables",
 )
 OPTIMIZERS = ("adam", "muon")
 # step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
@@ -219,6 +220,13 @@ class TrainConfig:
     # 곱이 bf16) 조금 더 정확하다. None이면 끈다(기본, 예전 학습과 비트 단위로 같다).
     # curriculum stage 3의 긴 표(30,000행 이상)가 GPU 한 장에 들어가도록 켠다
     activation_checkpointing_rows: int | None = None
+    # 표 크기를 GPU끼리 나눠 받는다 (issue #91, 학습 가속 옵션. 논문에 없음, 여기서 정함,
+    # `training.table_balance`). 끄면(기본, 예전 학습과 비트 단위로 같다) GPU마다 표 크기를 따로
+    # 뽑아, 큰 표를 여럿 받은 GPU를 나머지가 all-reduce에서 기다린다. 켜면 한 step의 표 크기를 모든
+    # GPU가 같은 seed로 함께 뽑고, 비싼 표부터 가장 덜 찬 GPU에 준다(LPT). 표 크기 분포·GPU마다의 표
+    # 수·task 순서는 그대로이고 어느 GPU가 어느 표를 계산하는지만 바뀐다. curriculum stage 4에서
+    # 켠다
+    balance_tables: bool = False
 
     def __post_init__(self) -> None:
         self.phases = normalize_phases(self.phases)
@@ -278,6 +286,9 @@ class TrainConfig:
                 )
             if not hasattr(model_class(self.model_type), "activation_checkpointing_rows"):
                 raise ValueError(f"activation checkpointing은 {self.model_type} 모델에 없다")
+        if self.balance_tables and self.prior_type != "graph_scm":
+            # 크기를 다른 난수로 뽑는 `sample_shape(rng)`는 graph SCM prior에만 있다
+            raise ValueError(f"balance_tables는 graph_scm prior에서만 쓴다: {self.prior_type}")
         if self.weight_average < 0 or self.weight_average_every < 1:
             raise ValueError("weight_average는 0 이상, weight_average_every는 1 이상이어야 한다")
         if self.grad_cosine and self.task != "multitask":

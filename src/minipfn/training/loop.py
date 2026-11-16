@@ -67,7 +67,10 @@ from minipfn.training.stability import (
     qk_logit_bounds,
     sample_attention_rows,
 )
+from minipfn.training.table_balance import TableBalance
 from minipfn.utils import DistContext, lr_factor, setup_distributed
+
+BALANCE_SEED_TAG = 2**31 - 1  # 표 크기 난수의 seed 끝에 붙이는 수 (`balance_tables`)
 
 
 def _borders(config: TrainConfig, d: DistContext, device: torch.device) -> torch.Tensor | None:
@@ -540,10 +543,25 @@ def _train(
         # 이어서 학습할 때 같은 데이터를 다시 보지 않도록 시드에 시작 step을 섞는다.
         # 붕괴로 되돌아가면 되돌린 횟수도 섞어 다른 데이터로 다시 간다. multitask는 task 번호도
         seed = (config.seed, from_step, d.rank) + ((rewinds,) if rewinds else ())
+
+        def balance(i: int) -> TableBalance | None:
+            # 표 크기를 GPU끼리 나누면(`balance_tables`) 크기 난수에는 rank를 넣지 않는다. 마지막
+            # 수는 데이터 seed와 섞이지 않게 붙인 표시
+            if not config.balance_tables:
+                return None
+            return TableBalance(
+                seed=(config.seed, from_step, rewinds, i, BALANCE_SEED_TAG),
+                rank=d.rank,
+                world_size=d.world_size,
+                per_rank=accumulation,
+            )
+
         return {
             task: iter(
                 DataLoader(
-                    PriorBatches(task_config, seed=seed + ((i,) if multitask else ())),
+                    PriorBatches(
+                        task_config, seed=seed + ((i,) if multitask else ()), balance=balance(i)
+                    ),
                     batch_size=None,
                     **loader_kwargs,
                 )

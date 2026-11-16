@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import numpy as np
 import torch
 
 from minipfn.priors.base import PriorBatch
@@ -135,12 +136,14 @@ class GraphSCMPrior:
     def max_missing_rate(self) -> float:
         return self._missing.max_rate
 
-    def sample_shape(self) -> tuple[int, int, int]:
+    def sample_shape(self, rng: np.random.Generator | None = None) -> tuple[int, int, int]:
         """(학습 행 수, feature 수, 검증 행 수) — `sample_batch`의 `size`와 같은 순서. "eval_rows"
-        규칙이면 검증 행 수는 늘 `n_eval_rows`다."""
+        규칙이면 검증 행 수는 늘 `n_eval_rows`다. `rng`를 주면 prior의 난수 대신 그것으로 뽑는다
+        (학습 옵션 `balance_tables`: 모든 GPU가 같은 난수로 한 step의 표 크기를 함께 뽑는다)."""
+        rng = self.rng.numpy if rng is None else rng
         if self.size_rule == "train_fraction":
             n_train, n_eval, n_features = sample_split_size(
-                self.rng.numpy,
+                rng,
                 min_rows=self.min_rows,
                 max_rows=self.max_rows,
                 min_train_fraction=self.min_train_fraction,
@@ -154,15 +157,15 @@ class GraphSCMPrior:
                 feature_cap_rule=self.feature_cap_rule,
             )
             return n_train, n_features, n_eval
-        n_train, n_features = self.sample_size()
+        n_train, n_features = self.sample_size(rng)
         return n_train, n_features, self.n_eval_rows
 
-    def sample_size(self) -> tuple[int, int]:
-        """ "eval_rows" 규칙의 (학습 행 수, feature 수)."""
+    def sample_size(self, rng: np.random.Generator | None = None) -> tuple[int, int]:
+        """ "eval_rows" 규칙의 (학습 행 수, feature 수). `rng`는 `sample_shape`와 같다."""
         if self.size_rule != "eval_rows":
             raise ValueError("sample_size는 eval_rows 규칙의 것이다 (sample_shape를 쓴다)")
         n_train, n_features = sample_table_size(
-            self.rng.numpy,
+            self.rng.numpy if rng is None else rng,
             self.max_train_rows,
             self.n_eval_rows,
             self.max_features,

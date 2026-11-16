@@ -12,12 +12,16 @@ worker·GPU·이어 학습한 시점마다 서로 다른 데이터셋이 나오�
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
+
+if TYPE_CHECKING:
+    from minipfn.training.table_balance import TableBalance
 
 
 def derive_seed(*keys: int) -> int:
@@ -28,11 +32,21 @@ def derive_seed(*keys: int) -> int:
 class PriorBatches(IterableDataset):
     """DataLoader worker마다 다른 시드로 prior batch를 끝없이 만든다.
 
-    `config`는 `make_prior(seed)`와 `micro_batch`가 있는 학습 설정(`TrainConfig`)이다."""
+    `config`는 `make_prior(seed)`와 `micro_batch`가 있는 학습 설정(`TrainConfig`)이다.
 
-    def __init__(self, config: Any, seed: tuple[int, ...]) -> None:
+    `balance`를 주면 표 크기를 prior의 난수로 뽑지 않고 GPU끼리 나눠 받는다(학습 옵션
+    `balance_tables`, `training.table_balance`). 이 GPU의 n번째 batch는 DataLoader worker
+    n % W(worker 수)가 만들고(DataLoader가 worker를 돌아가며 받는 순서), 그 크기는
+    `balance.rank_shapes`의 step 묶음 n // per_rank, n % per_rank번째다. 그래서 worker 수와
+    상관없이 같은 순서다. 표 내용은 `seed`(GPU마다 다르다)로 정한다. prior에는
+    `sample_shape(rng)`와 `sample_batch(n, size=...)`가 있어야 한다."""
+
+    def __init__(
+        self, config: Any, seed: tuple[int, ...], balance: TableBalance | None = None
+    ) -> None:
         self.config = config
         self.seed = seed
+        self.balance = balance
 
     def __iter__(self):
         info = get_worker_info()
@@ -40,8 +54,18 @@ class PriorBatches(IterableDataset):
         torch.set_num_threads(1)
         seed = hash((*self.seed, worker)) % (2**31)
         prior = self.config.make_prior(seed)
-        while True:
-            batch = prior.sample_batch(self.config.micro_batch)
+        if self.balance is None:
+            while True:
+                batch = prior.sample_batch(self.config.micro_batch)
+                yield batch.x, batch.y, batch.n_train
+        n_workers = 1 if info is None else info.num_workers
+        group, shapes = None, []
+        for n in itertools.count(worker, n_workers):
+            if n // self.balance.per_rank != group:
+                group = n // self.balance.per_rank
+                shapes = self.balance.rank_shapes(prior, group)
+            size = shapes[n % self.balance.per_rank]
+            batch = prior.sample_batch(self.config.micro_batch, size=size)
             yield batch.x, batch.y, batch.n_train
 
 
