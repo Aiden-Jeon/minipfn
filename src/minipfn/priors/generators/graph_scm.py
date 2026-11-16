@@ -114,12 +114,7 @@ class GraphSCM:
     def __call__(
         self, n_rows: int, n_features: int, n_datasets: int, hp: dict, rng: Rng
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        xs, ys = [], []
-        for _ in range(n_datasets):
-            x, y = self._dataset(n_rows, n_features, hp)
-            xs.append(x)
-            ys.append(y)
-        return torch.stack(xs, 1), torch.stack(ys, 1)
+        return stack_datasets(self._dataset, n_rows, n_features, n_datasets, hp)
 
     def _dataset(self, n_rows: int, n_features: int, hp: dict) -> tuple[torch.Tensor, torch.Tensor]:
         make = self._graph_scm(
@@ -139,6 +134,19 @@ class GraphSCM:
                     return plain()
 
         return filtered(make, self, regression=self.regression)
+
+
+def stack_datasets(
+    dataset, n_rows: int, n_features: int, n_datasets: int, hp: dict
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`dataset(n_rows, n_features, hp)`로 하나씩 만든 데이터셋 n_datasets개를 그룹으로 쌓는다:
+    x (행, 데이터셋, feature), y (행, 데이터셋). graph·tree SCM 생성기가 같이 쓴다."""
+    xs, ys = [], []
+    for _ in range(n_datasets):
+        x, y = dataset(n_rows, n_features, hp)
+        xs.append(x)
+        ys.append(y)
+    return torch.stack(xs, 1), torch.stack(ys, 1)
 
 
 def check_probability(name: str, value: float) -> None:

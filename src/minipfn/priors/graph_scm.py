@@ -134,7 +134,7 @@ class GraphSCMPrior:
         if tree_scm_prob:
             from minipfn.priors.generators.tree_scm import TreeSCM
 
-            tree = TreeSCM(task, filter_unpredictable=filter_unpredictable)
+            tree = TreeSCM(task, seed, filter_unpredictable=filter_unpredictable)
             generator = Mixture({"graph_scm": generator, "tree_scm": tree}, choose=chosen_generator)
             hyperparameters = GeneratorChoice(hyperparameters, tree_scm_prob)
         # 결측값을 넣기 전까지 (회귀 구간 경계와 `_one_dataset`은 여기까지만 거친다)
@@ -366,11 +366,7 @@ def regression_borders(
     seed: int = 0,
     *,
     n_jobs: int = 1,
-    filter_unpredictable: bool = False,
-    tree_scm_prob: float = 0.0,
-    graph_scm_corrected: bool = False,
-    mixture_root_prob: float = 0.0,
-    **sizes,
+    **sizes_and_options,
 ) -> torch.Tensor:
     """회귀 출력 구간의 경계 (Methods "Regression details").
 
@@ -380,21 +376,18 @@ def regression_borders(
     구간이 생기지 않도록, 데이터셋마다 고유한 값만 모은다(여기서 정함).
     데이터셋 크기 인자는 `SIZE_FIELDS` 이름의 키워드로 주고, 빠지면 `SIZE_DEFAULTS`를 쓴다.
     `GraphSCMPrior`와 같은 뜻이며, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
-    `filter_unpredictable`과 prior 변형 옵션(`BORDER_PRIOR_FIELDS`)도 학습 prior와 같게 둔다(걸러진
-    데이터셋의 target은 학습에 안 나오고, tree SCM·군집 root는 target 분포를 바꾼다).
+    `filter_unpredictable`과 prior 변형 옵션(`BORDER_PRIOR_FIELDS` 이름의 키워드, 빠지면
+    `GraphSCMPrior`의 기본값)도 학습 prior와 같게 둔다(걸러진 데이터셋의 target은 학습에 안 나오고,
+    tree SCM·군집 root는 target 분포를 바꾼다).
     """
+    options = {k: v for k, v in sizes_and_options.items() if k in BORDER_PRIOR_FIELDS}
+    sizes = {k: v for k, v in sizes_and_options.items() if k not in BORDER_PRIOR_FIELDS}
     unknown = set(sizes) - set(SIZE_DEFAULTS)
     if unknown:
-        raise TypeError(f"regression_borders에 없는 크기 인자: {sorted(unknown)}")
+        raise TypeError(f"regression_borders에 없는 크기·prior 인자: {sorted(unknown)}")
     # n_jobs개 프로세스로 나눠 만든다 (프로세스마다 시드가 다르다)
     counts = [n_datasets // n_jobs + (i < n_datasets % n_jobs) for i in range(n_jobs)]
     table = {**SIZE_DEFAULTS, **sizes}
-    options = {
-        "filter_unpredictable": filter_unpredictable,
-        "tree_scm_prob": tree_scm_prob,
-        "graph_scm_corrected": graph_scm_corrected,
-        "mixture_root_prob": mixture_root_prob,
-    }
     jobs = [(n, seed + i, table, options) for i, n in enumerate(counts)]
     if n_jobs == 1:
         targets = _border_targets(jobs[0])

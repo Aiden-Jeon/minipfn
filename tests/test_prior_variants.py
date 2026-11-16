@@ -122,6 +122,21 @@ def test_tree_scm_mixture_uses_the_tree_generator_with_its_probability(task):
             assert len(torch.unique(y)) >= 2
 
 
+def test_tree_scm_mixture_is_reproducible_with_its_seed():
+    # tree SCM(TabICL Reg2Cls 등)은 파이썬 random도 쓴다. 같은 seed면 다른 random 상태에서 시작해도
+    # 같은 batch(검증 batch·회귀 구간 경계가 run마다 같도록), seed가 다르면 다른 batch
+    _needs_xgboost()
+    import random
+
+    def batch(seed, state):
+        random.seed(state)
+        return _prior("classification", seed=seed, tree_scm_prob=1.0).sample_batch(2)
+
+    a, b, c = batch(0, 1), batch(0, 2), batch(1, 1)
+    assert _same(a.x, b.x) and _same(a.y, b.y)
+    assert not _same(a.x, c.x)
+
+
 def test_generator_choice_draws_tree_with_its_probability():
     choice = P.GeneratorChoice(None, 0.3)
     rng = Rng.from_seed(0)

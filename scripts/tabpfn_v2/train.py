@@ -241,7 +241,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=_env_flag("TABPFN_V2_FILTER_UNPREDICTABLE"),
     )
-    # prior 변형 (issue #92, graph_scm prior. TrainConfig 주석). 주지 않으면 preset 그대로다
+    # prior 변형 (issue #92, graph_scm prior. TrainConfig 주석). 주지 않으면 preset 그대로다.
+    # filter_unpredictable·binary_prob처럼 이어 학습할 때 원래 run에서 잇지 않으니 같은 값을
+    # 다시 준다
     for name in ("tree-scm-prob", "mixture-root-prob"):
         env = "TABPFN_V2_" + name.upper().replace("-", "_")
         parser.add_argument(f"--{name}", type=float, default=_env(env, float))
