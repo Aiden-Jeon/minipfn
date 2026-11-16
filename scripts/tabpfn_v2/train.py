@@ -515,8 +515,10 @@ def main(argv: list[str] | None = None) -> None:
         source = run_architecture(params)
         speed_options = source_speed_options(params)
         if args.init_run_id:
-            # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다
+            # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다.
+            # 표 크기 나누기도 앞 단계 run(끈 값)이 아니라 이번 preset·인자를 따른다 (stage 4)
             speed_options.pop("phases", None)
+            speed_options.pop("balance_tables", None)
         inherit_batch_size(args, params)
     config, arch = build_config(args, source, speed_options)
     if args.resume_run_id:
