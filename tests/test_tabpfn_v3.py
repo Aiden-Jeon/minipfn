@@ -685,13 +685,57 @@ def test_forward_rejects_labels_outside_the_target_embeddings():
     assert _model("regression").max_classes == 0 and model.max_classes == 160
 
 
-def test_diag_scale_rejects_column_row_transformer():
-    # attention이 qkv.weight를 직접 써서 DiagScale hook이 불리지 않는다 (예전에는 autograd 에러)
+def test_diag_scale_scales_queries_inside_the_attention_forward():
+    # qkv의 weight를 직접 써서 forward hook이 불리지 않는다: attention이 forward에서 δ를 곱한다
+    import copy
+
+    from minipfn.inference.diag_scale import add_diag_scale
+
+    model = _multitask()
+    adapted = copy.deepcopy(model)
+    deltas = add_diag_scale(adapted)
+    n_attention = sum(1 for m in model.modules() if type(m).__name__ == "Attention")
+    assert len(deltas) == n_attention > 0
+    assert all(not m.qkv._forward_hooks for m in adapted.modules() if hasattr(m, "diag_scale"))
+    x, yc = _data("classification")
+    _, yr = _data("regression")
+    with torch.no_grad():
+        for task, y in (("classification", yc), ("regression", yr)):
+            assert torch.equal(model(x, y, task=task), adapted(x, y, task=task))  # δ = 0
+        for d in deltas:
+            d.normal_(0, 0.5)
+        task = "classification"
+        assert not torch.allclose(model(x, yc, task=task), adapted(x, yc, task=task))
+    adapted(x, yr, task="regression").square().mean().backward()
+    assert all(d.grad is not None for d in deltas)
+    assert set(adapted.state_dict()) - set(model.state_dict()) == {
+        n for n, _ in adapted.named_parameters() if n.endswith("diag_scale")
+    }
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_diag_scale_trains_a_multitask_model(task):
     from minipfn.inference.diag_scale import DiagScale
 
-    X, y = np.random.default_rng(0).normal(size=(60, 4)), np.arange(60) % 3
-    with pytest.raises(ValueError, match="column_row_transformer"):
-        DiagScale(EnsembleClassifier(_model(), n_estimators=1), epochs=1).fit(X, y)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(120, 4))
+    model = _multitask()
+    if task == "classification":
+        y = np.arange(120) % 13  # 정답 embedding(10개)보다 많은 클래스: 묶은 번호로 forward
+        estimator = EnsembleClassifier(model, n_estimators=2)
+    else:
+        y = X[:, 0] + 0.1 * rng.normal(size=120)
+        borders = torch.linspace(-3, 3, model.config.n_buckets + 1)
+        estimator = EnsembleRegressor(model, borders, n_estimators=2)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    fitted = DiagScale(estimator, epochs=2, patience=2).fit(X[:90], y[:90])
+    info = fitted.adaptation_
+    assert info["train_loss"] and len(info["val_curve"]) == 3 and info["n_params"] > 0
+    if task == "classification":
+        assert fitted.predict_proba(X[90:]).shape == (30, 13)
+    else:
+        assert np.isfinite(fitted.predict(X[90:])).all()
+    assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())  # 원래 모델
 
 
 def test_v3_5_classes_share_the_multitask_repo(tmp_path, monkeypatch):

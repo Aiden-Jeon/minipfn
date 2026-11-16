@@ -29,6 +29,12 @@ Appendix B). 나머지 가중치는 그대로 둔다.
   head마다 연속인 `nn.Linear`)와 `nhead`가 있는 모듈을 attention으로 본다
   (`minipfn.models.cell_transformer.Attention`). 곱셈은 float32로 하고 결과를 계산 dtype으로 돌린다.
   학습은 모델 사본에 하므로 원래 모델은 바뀌지 않는다
+- qkv의 weight를 직접 쓰는 attention(`diag_scale_in_forward`, column_row_transformer:
+  TabPFN-3·3.5)은 hook 대신 attention이 forward에서 δ를 q에 곱한다. q·k의 RMSNorm·RoPE·QASSMax
+  뒤라서 logit이 그대로 qᵀ(I + diag(δ))k다. 열·행·ICL 단계의 attention 모두에 붙고, 분류
+  retrieval decoder는 attention 모듈이 아니라 붙지 않는다
+- episode의 forward는 추론과 같은 인자로 부른다(`forward_kwargs`: multitask 모델의 task, 큰 표 계산.
+  클래스가 정답 embedding 수보다 많으면 묶은 번호와 원래 번호)
 - 회귀 손실은 모델이 학습한 bar distribution NLL이다 (TabICL 회귀는 quantile head라 pinball)
 - episode 하나의 셀 수(행 × 전처리 뒤 열 수)를 `max_cells`로 줄인다(GPU 메모리. 기본값은
   `recipes.tabpfn_v2.long_tables`가 학습한 표의 셀 상한)
@@ -52,7 +58,12 @@ import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from torch import nn
 
-from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor, _Base
+from minipfn.inference.ensemble import (
+    EnsembleClassifier,
+    EnsembleRegressor,
+    _Base,
+    forward_kwargs,
+)
 from minipfn.models.bar_distribution import FullSupportBarDistribution
 
 EPOCHS = 30
@@ -87,7 +98,8 @@ def add_diag_scale(model: nn.Module) -> list[nn.Parameter]:
             raise ValueError("DiagScale을 이미 붙인 모델이다")
         delta = nn.Parameter(torch.zeros(qkv.out_features // 3, device=qkv.weight.device))
         module.register_parameter("diag_scale", delta)
-        qkv.register_forward_hook(functools.partial(_scale_query, module))
+        if not getattr(module, "diag_scale_in_forward", False):  # 그런 attention은 스스로 곱한다
+            qkv.register_forward_hook(functools.partial(_scale_query, module))
         deltas.append(delta)
     if not deltas:
         raise ValueError("qkv와 nhead가 있는 attention 모듈이 없다")
@@ -139,9 +151,11 @@ def _episode_backward(views: _Base, model: nn.Module, X_query, y_query, bar) -> 
     target = torch.as_tensor(target, device=views.device)
     total = 0.0
     n = len(views.preprocessors_)
+    kwargs = forward_kwargs(model, views.task)  # 추론과 같은 인자
     for i, x, y_train in views._iter_inputs(X_query, views.y_trains_):
+        y_train, extra = views._model_targets(y_train)
         with torch.autocast(views.device.type, dtype=torch.bfloat16, enabled=autocast):
-            logits = model(x, y_train)[0].float()
+            logits = model(x, y_train, **kwargs, **extra)[0].float()
         if regression:
             loss = bar(logits, target.float()).mean()
         else:
@@ -172,10 +186,6 @@ def fit_diag_scale(
     start = time.perf_counter()
     seed = estimator.random_state
     regression = isinstance(estimator, EnsembleRegressor)
-    if getattr(estimator.model, "supports_inference_options", False):
-        # column_row_transformer(TabPFN-3·3.5)의 attention은 qkv.weight를 직접 써서 qkv의 forward
-        # hook(`add_diag_scale`)이 불리지 않는다. 클래스 묶음·task 인자도 아직 넘기지 않는다
-        raise ValueError("DiagScale은 아직 column_row_transformer를 받지 않는다")
     model = copy.deepcopy(estimator.model).to(estimator.device).eval()
     model.requires_grad_(False)
     deltas = add_diag_scale(model)

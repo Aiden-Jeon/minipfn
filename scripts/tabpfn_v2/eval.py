@@ -275,6 +275,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         " (비싼 것부터. GPU 수 이하, 1이면 한 프로세스)",
     )
     parser.add_argument(
+        "--bag-gpus",
+        type=int,
+        default=0,
+        help="TabArena·BeyondArena --bagging: GPU마다 worker 하나를 띄워 split 하나의 bag들을"
+        " 동시에 맞추고 예측한다 (데이터셋은 차례로. 0이면 이 프로세스에서 bag을 차례로,"
+        " --shards와 따로)",
+    )
+    parser.add_argument(
         "--heartbeat-minutes",
         type=float,
         default=5.0,
@@ -660,23 +668,18 @@ def arena_fingerprint(
     )
 
 
-def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
-    """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다. estimator는
-    AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔 넘긴다)."""
+def arena_estimator_factory(args: argparse.Namespace, paths: dict):
+    """TabArena·BeyondArena system이 받는 `make(problem_type, categorical)`와 task별 factory.
+    estimator는 AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔
+    넘긴다)."""
     import types
 
-    from minipfn.benchmarks import arena
-
-    suite = arena_suite(args.suite)
-    paths = {"classification": args.classifier_path, "regression": args.regressor_path}
     factories = {
         task: make_estimator_factory(task, args) for task, path in paths.items() if path is not None
     }
     if not factories:
         raise SystemExit(f"{args.suite}에는 --classifier-path나 --regressor-path가 필요하다.")
     one_hot = headline_mode(args.one_hot)
-    kinds = {task: make.member_kinds for task, make in factories.items()}
-    print(f"member kinds: { {t: ','.join(k) for t, k in kinds.items()} }, one-hot: {one_hot}")
 
     def make(problem_type: str, categorical: list[int]):
         task = "regression" if problem_type == "regression" else "classification"
@@ -684,6 +687,78 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
 
     # arena system은 이 함수를 받으므로 split의 group 번호를 넘길지도 여기에 단다
     make.fit_groups = any(getattr(f, "fit_groups", False) for f in factories.values())
+    make.one_hot = one_hot
+    make.kinds = {task: f.member_kinds for task, f in factories.items()}
+    return make, factories
+
+
+def bag_worker_make(argv: list[str]):
+    """`--bag-gpus`의 worker가 부른다(`minipfn.benchmarks.bag_pool`): 부모와 같은 인자로 만든
+    `make(problem_type, categorical)`. worker는 GPU 하나만 본다(`CUDA_VISIBLE_DEVICES`)."""
+    args = parse_args(argv)
+    paths = {"classification": args.classifier_path, "regression": args.regressor_path}
+    return arena_estimator_factory(args, paths)[0]
+
+
+def bag_worker_command(argv: list[str], worker_dir: Path) -> list[str]:
+    """bag worker의 인자: 원래 인자에서 GPU를 나누는 인자와 MLflow 기록을 빼고 자기 out-dir을
+    더한다."""
+    base = _strip_flags(
+        argv, {"--bag-gpus": 1, "--shards": 1, "--out-dir": 1, "--mlflow": 0, "--device": 1}
+    )
+    return [*base, "--out-dir", str(worker_dir), "--device", "cuda"]
+
+
+def start_bag_pool(args: argparse.Namespace, out_dir: Path):
+    """`--bag-gpus`: GPU마다 bag worker 하나 (`minipfn.benchmarks.bag_pool.BagPool`). worker의
+    test-time·증류 기록은 `<out-dir>/bag_gpus/worker<i>/`에 쓰고 끝나면 이 실행의 파일 뒤에
+    붙인다."""
+    from minipfn.benchmarks.bag_pool import BagPool
+
+    n_gpus = torch.cuda.device_count()
+    if args.bag_gpus > n_gpus:
+        raise SystemExit(f"--bag-gpus {args.bag_gpus}가 GPU 수 {n_gpus}보다 많다.")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = (visible.split(",") if visible else [str(i) for i in range(n_gpus)])[: args.bag_gpus]
+    checkpoints = (out_dir / "checkpoints").resolve()
+    commands = []
+    for i in range(len(devices)):
+        worker_dir = out_dir / "bag_gpus" / f"worker{i}"
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
+            (worker_dir / name).unlink(missing_ok=True)  # 지난 실행의 기록이 섞이지 않도록
+        link = worker_dir / "checkpoints"  # 부모가 받아 둔 checkpoint(runs:/)를 다시 받지 않는다
+        if checkpoints.is_dir() and not link.exists():
+            link.symlink_to(checkpoints, target_is_directory=True)
+        commands.append(bag_worker_command(args.argv, worker_dir))
+    threads = max(1, (os.cpu_count() or 1) // len(devices))
+    print(f"bag gpus: {len(devices)} workers (GPU {','.join(devices)})", flush=True)
+    return BagPool(
+        str(Path(__file__).resolve()), "bag_worker_make", commands, devices, threads=threads
+    )
+
+
+def merge_worker_logs(args: argparse.Namespace, out_dir: Path, worker_dirs: list[Path]) -> None:
+    """이 실행의 worker들(`worker_dirs`)의 test-time·증류 기록(jsonl)을 이 실행의 파일 뒤에
+    붙인다. 폴더를 glob하지 않는다: 지난 실행에서 worker가 더 많았으면 남은 폴더의 기록이 섞인다."""
+    for worker_dir in worker_dirs:
+        for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
+            part = worker_dir / name
+            if part.exists():
+                with open(out_dir / name, "a") as f:
+                    f.write(part.read_text())
+
+
+def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict:
+    """TabArena-Lite·BeyondArena를 돌리고 점수(`summary.json`의 내용)를 돌려준다. estimator는
+    AMLB 평가와 같은 `make_estimator_factory`로 만든다(문제 종류와 범주형 열만 바꿔 넘긴다)."""
+    from minipfn.benchmarks import arena
+
+    suite = arena_suite(args.suite)
+    paths = {"classification": args.classifier_path, "regression": args.regressor_path}
+    make, factories = arena_estimator_factory(args, paths)
+    one_hot, kinds = make.one_hot, make.kinds
+    print(f"member kinds: { {t: ','.join(k) for t, k in kinds.items()} }, one-hot: {one_hot}")
 
     fingerprint = arena_fingerprint(args, paths, factories, kinds, one_hot)
     models = {task: (f.model, f.borders) for task, f in factories.items()}
@@ -712,9 +787,18 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
     if args.shards > 1:
         cache_id = arena._run_id(fingerprint, args.method_name, args.bagging)  # 진행률 표시용
         results = run_shards(args, suite, limits, datasets, out_dir, cache_id)
-    summary = arena.run(
-        suite, make, out_dir=out_dir / args.suite, datasets=datasets, results=results, **common
-    )
+    pool = start_bag_pool(args, out_dir) if args.bag_gpus else None
+    make.bag_pool = pool
+    try:
+        summary = arena.run(
+            suite, make, out_dir=out_dir / args.suite, datasets=datasets, results=results, **common
+        )
+    finally:
+        if pool is not None:
+            worker_dirs = [out_dir / "bag_gpus" / f"worker{i}" for i in range(len(pool))]
+            pool.close()
+            make.bag_pool = None
+            merge_worker_logs(args, out_dir, worker_dirs)
     print_arena_summary(summary)
     if use_mlflow:
         log_arena_mlflow(args, summary, out_dir / args.suite, kinds, one_hot)
@@ -983,12 +1067,7 @@ def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "")
     for job in sorted(jobs, key=lambda j: j["dataset"]):
         with open(job["results"], "rb") as f:
             results.extend(pickle.load(f))
-    for worker_dir in worker_dirs:
-        for name in ("test_time.jsonl", f"distill_{args.suite}.jsonl"):
-            part = worker_dir / name
-            if part.exists():
-                with open(out_dir / name, "a") as f:
-                    f.write(part.read_text())
+    merge_worker_logs(args, out_dir, worker_dirs)
     print(f"shards: {len(results)} split results from {n_workers} workers", flush=True)
     return results
 
@@ -1088,6 +1167,16 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--shards는 1 이상이어야 한다.")
     if args.shards > 1 and args.suite not in ARENA_SUITES:
         raise SystemExit("--shards는 TabArena·BeyondArena suite에서만 쓴다.")
+    if args.bag_gpus < 0:
+        raise SystemExit("--bag-gpus는 0 이상이어야 한다.")
+    if args.bag_gpus:
+        if args.suite not in ARENA_SUITES or args.bagging < 2:
+            raise SystemExit("--bag-gpus는 TabArena·BeyondArena의 --bagging 2 이상에서만 쓴다.")
+        if args.shards > 1:
+            raise SystemExit("--bag-gpus는 --shards와 같이 쓰지 않는다 (둘 다 GPU마다 worker).")
+        if args.latency:
+            # 한 행 예측 시간은 이 프로세스의 estimator에서 잰다 (bag은 worker에 있다)
+            raise SystemExit("--latency는 --bag-gpus와 같이 쓸 수 없다.")
     if args.uncertainty and args.suite in ARENA_SUITES:
         # arena는 공식 패키지의 지표만 낸다. 조용히 무시하지 않고 멈춘다
         raise SystemExit("--uncertainty는 AMLB suite(classification, regression, all)에서만 쓴다.")

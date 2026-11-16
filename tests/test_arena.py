@@ -221,6 +221,84 @@ def test_bagging_fits_k_estimators_and_aligns_their_classes():
     assert [e.n_fit_ for e in model.estimators_] == [20]
 
 
+_POOL_SCRIPT = """
+import numpy as np
+
+
+class Constant:
+    def fit(self, X, y, groups=None):
+        if len(X) == 0:
+            raise ValueError("빈 bag")
+        self.classes_, counts = np.unique(y, return_counts=True)
+        self.p_ = counts / counts.sum()
+        self.groups_ = None if groups is None else len(groups)
+        return self
+
+    def predict_proba(self, X):
+        return np.tile(self.p_, (len(X), 1))
+
+    def predict(self, X):
+        return np.full(len(X), float(self.p_[-1]))
+
+
+def build(argv):
+    def make(problem_type, categorical):
+        return Constant()
+
+    return make
+"""
+
+
+def test_bag_pool_matches_in_process_bagging(tmp_path):
+    from minipfn.benchmarks.bag_pool import BagPool
+
+    system = _system()
+    script = tmp_path / "pool_script.py"
+    script.write_text(_POOL_SCRIPT)
+    X = pd.DataFrame({"x": np.arange(40.0)}, index=np.arange(200, 240))
+    y = pd.Series(["a"] * 30 + ["b"] * 7 + ["c"] * 3, index=X.index)
+    models = {}
+    pool = BagPool(str(script), "build", [[], []], ["", ""])  # bag 4개 → worker 2개에 2번씩
+    try:
+        for name, with_pool in (("local", False), ("pool", True)):
+            spec = importlib.util.spec_from_file_location(f"pool_script_{name}", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            make = module.build([])
+            make.bag_pool = pool if with_pool else None
+            model = object.__new__(system.EstimatorSystem)
+            model.factory, model.bagging = system.register_factory(make), 4
+            model._fit_system(X, y, problem_type="multiclass", random_state=0)
+            models[name] = model
+        assert models["pool"].estimators_ == [] and len(models["pool"].handles_) == 4
+        pd.testing.assert_frame_equal(
+            models["pool"]._predict_proba(X.iloc[:5]), models["local"]._predict_proba(X.iloc[:5])
+        )
+        pd.testing.assert_series_equal(
+            models["pool"]._predict(X.iloc[:5]), models["local"]._predict(X.iloc[:5])
+        )
+        models["pool"].cleanup()
+        assert models["pool"].pool_ is None
+        # worker 안의 예외는 그 split만 실패시킨다 (pool은 계속 쓴다)
+        with pytest.raises(RuntimeError, match="빈 bag"):
+            pool.fit("binary", [], [(X.iloc[:0], y.iloc[:0].to_numpy(), None)] * 2)
+        handles, classes = pool.fit("binary", [], [(X, y.to_numpy(), np.zeros(40))])
+        assert [list(c) for c in classes] == [["a", "b", "c"]]
+        assert pool.predict(handles, X.iloc[:3], proba=True)[0].shape == (3, 3)
+    finally:
+        pool.close()
+
+
+def test_bag_gpus_worker_command_and_checks():
+    script = _eval_script()
+    argv = ["--suite", "tabarena-lite", "--bagging", "8", "--bag-gpus", "8", "--mlflow"]
+    cmd = script.bag_worker_command([*argv, "--out-dir", "x"], Path("w0"))
+    assert cmd == [*argv[:4], "--out-dir", "w0", "--device", "cuda"]
+    for bad in (["--bagging", "0"], ["--shards", "2"], ["--latency"], ["--bag-gpus", "-1"]):
+        with pytest.raises(SystemExit):
+            script.main(["--suite", "tabarena-lite", "--bagging", "8", "--bag-gpus", "2", *bad])
+
+
 def _eval_script():
     path = Path(__file__).parents[1] / "scripts" / "tabpfn_v2" / "eval.py"
     spec = importlib.util.spec_from_file_location("eval_tabpfn_v2_arena", path)

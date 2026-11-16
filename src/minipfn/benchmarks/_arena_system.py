@@ -6,7 +6,9 @@ yaml로 저장될 수 있어서 estimator를 만드는 함수는 이 모듈의 r
 
 estimator를 만드는 함수에 `fit_groups = True`를 달면 fit에 `groups`(행마다의 group 번호)도
 넘긴다. task의 split 정보(`validation_metadata`의 group·시간 열)로 만든다
-(`minipfn.benchmarks.arena.split_groups`).
+(`minipfn.benchmarks.arena.split_groups`). `bag_pool`(`minipfn.benchmarks.bag_pool.BagPool`)을
+달면 bagging의 bag을 이 프로세스가 아니라 pool의 GPU worker들이 동시에 맞추고 예측한다. bag을
+나누는 방법과 예측을 평균하는 방법은 같다.
 """
 
 from __future__ import annotations
@@ -108,6 +110,20 @@ class EstimatorSystem(ExternalSystemModel):
             parts = self._bags(X, y, problem_type, random_state)
         else:
             parts = [np.arange(len(X))]
+        self.pool_, self.handles_, self.pool_classes_ = None, [], []
+        pool = getattr(make, "bag_pool", None)
+        if pool is not None and len(parts) > 1:  # bag을 GPU worker들이 동시에 맞춘다
+            self.estimators_ = []
+            self.handles_, self.pool_classes_ = pool.fit(
+                problem_type,
+                categorical,
+                [
+                    (X.iloc[ix], y.iloc[ix].to_numpy(), None if groups is None else groups[ix])
+                    for ix in parts
+                ],
+            )
+            self.pool_ = pool
+            return self
         self.estimators_ = [
             make(problem_type, categorical).fit(
                 X.iloc[ix],
@@ -145,7 +161,11 @@ class EstimatorSystem(ExternalSystemModel):
     def _predict(self, X: pd.DataFrame) -> pd.Series:
         Xp, _ = prepare_frame(X)
         Xp = Xp.reset_index(drop=True)
-        pred = np.mean([e.predict(Xp) for e in self.estimators_], axis=0)
+        if getattr(self, "pool_", None) is not None:
+            preds = self._pool_predict(Xp, proba=False)
+        else:
+            preds = [e.predict(Xp) for e in self.estimators_]
+        pred = np.mean(preds, axis=0)
         return pd.Series(pred, index=X.index)
 
     def _predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -154,16 +174,32 @@ class EstimatorSystem(ExternalSystemModel):
         # bag마다 본 클래스가 다를 수 있다: 모든 bag의 클래스로 열을 맞추고 없는 클래스는 0.
         # 열 순서는 라벨의 자연 순서(np.unique, estimator의 LabelEncoder와 같다)여야 한다.
         # TabArena가 이진 분류는 둘째 열을, 다중 분류는 열을 위치로 읽기 때문이다
-        classes = list(
-            np.unique(np.concatenate([np.asarray(e.classes_) for e in self.estimators_]))
-        )
+        if getattr(self, "pool_", None) is not None:
+            bag_classes = [np.asarray(c) for c in self.pool_classes_]
+            probas = self._pool_predict(Xp, proba=True)
+        else:
+            bag_classes = [np.asarray(e.classes_) for e in self.estimators_]
+            probas = (e.predict_proba(Xp) for e in self.estimators_)
+        classes = list(np.unique(np.concatenate(bag_classes)))
         total = pd.DataFrame(0.0, index=range(len(Xp)), columns=classes)
-        for e in self.estimators_:
-            proba = pd.DataFrame(np.asarray(e.predict_proba(Xp)), columns=list(e.classes_))
+        for bag, p in zip(bag_classes, probas, strict=True):
+            proba = pd.DataFrame(np.asarray(p), columns=list(bag))
             total = total.add(proba.reindex(columns=classes, fill_value=0.0))
-        total = total / len(self.estimators_)
+        total = total / len(bag_classes)
         total.index = X.index
         return total
 
+    def _pool_predict(self, X: pd.DataFrame, proba: bool) -> list[np.ndarray]:
+        # 예측이 실패하면 TabArena는 cleanup을 부르지 않는다(`cleanup_on_failure`가 기본 False):
+        # worker에 남은 bag을 여기서 버린다 (같은 프로세스의 estimator는 system과 함께 사라진다)
+        try:
+            return self.pool_.predict(self.handles_, X, proba=proba)
+        except Exception:
+            self.cleanup()
+            raise
+
     def cleanup(self):
         self.estimators_ = []
+        if getattr(self, "pool_", None) is not None:
+            self.pool_.drop(self.handles_)
+            self.pool_, self.handles_, self.pool_classes_ = None, [], []
