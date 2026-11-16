@@ -21,6 +21,12 @@ import sync_hub_card  # noqa: E402
 # Hub main에 올라가 있는 model.safetensors의 SHA-256
 V1_WEIGHTS = "0a13d4b61510cbeaac035a731fdb751d1a8b1860fdbeda9411d7abf30e465309"
 V2_WEIGHTS = "8642571d25045d0aa5cc70e191cbfa61f14a08e04bf8e4262fd757747e4d019b"
+# TabPFN-3.5 카드가 설명하는 가중치 (`push_to_hub.py --paper tabpfn_v3 --dry-run`이 낸 SHA-256)
+V3_5_WEIGHTS = {
+    "main": "01238841bddc8cf84a5a6ace55bda84d612861065d113c4f00d22b3e61ab714d",
+    "stage2-20k": "4e7bc2d7a6edfb39695f97f6e390e174204528d101d5707b8c63717bb797d6cd",
+    "stage1-250k": "2ddf63bce39538c1c4abe7b7bdc018a2367db995242f8bcda77ce4d7556283b5",
+}
 CARDS = sorted(push.HUB_DIR.glob("*/README.md"))
 
 
@@ -63,6 +69,22 @@ def test_cards_name_the_weights_they_describe():
     assert sync_hub_card.names_main_weights(v1, V1_WEIGHTS)
     assert sync_hub_card.names_main_weights(v2, V2_WEIGHTS)
     assert not sync_hub_card.names_main_weights(v1, V2_WEIGHTS)
+
+
+def test_v3_5_card_names_main_and_each_curriculum_branch():
+    # main은 stage 3, branch는 stage 1·2. 다른 단계의 가중치가 main·branch로 통과하면 안 된다
+    card = push.resolve_model_card("aiden-jeon/minipfn-tabpfn-v3-5", None)
+    text = card.read_text()
+    assert sync_hub_card.names_main_weights(text, V3_5_WEIGHTS["main"])
+    for branch in ("stage1-250k", "stage2-20k"):
+        assert not sync_hub_card.names_main_weights(text, V3_5_WEIGHTS[branch])
+        assert sync_hub_card.names_branch_weights(text, branch, V3_5_WEIGHTS[branch])
+        push.check_card_revision(card, branch, V3_5_WEIGHTS[branch])
+        other = "stage2-20k" if branch == "stage1-250k" else "stage1-250k"
+        assert not sync_hub_card.names_branch_weights(text, branch, V3_5_WEIGHTS[other])
+        assert not sync_hub_card.names_branch_weights(text, branch, V3_5_WEIGHTS["main"])
+    # 카드가 링크한 그림이 모두 있다
+    assert len(sync_hub_card.card_images(card)) == 5
 
 
 def test_branch_rows_do_not_pass_for_main_and_body_lines_do_not_pass_for_branches():
@@ -523,3 +545,104 @@ def test_v3_inference_comes_from_its_recipe(tmp_path):
     config = json.loads((out / "upload" / "config.json").read_text())
     assert config["model_type"] == "column_row_transformer"
     assert config["inference"] == {"n_estimators": 8, "member_kinds": ["standard"]}
+
+
+def _multitask_checkpoint(tmp_path, task="multitask"):
+    """TabPFN-3.5 구조의 작은 모델(soft-cap 50)과 회귀 구간 경계, 그 학습 checkpoint 경로."""
+    from dataclasses import replace
+
+    from minipfn.models import randomize_zero_weights, save_checkpoint
+    from minipfn.recipes import tabpfn_v3
+    from minipfn.training.config import TrainConfig
+
+    config = tabpfn_v3.with_architecture(TrainConfig.smoke(task), "v3.5", keep_size=True)
+    torch.manual_seed(0)
+    model = randomize_zero_weights(replace(config, logit_softcap=50.0).build_model()).eval()
+    borders = None
+    if task != "classification":
+        borders = torch.linspace(-3, 3, model.config.output_size("regression") + 1)
+    checkpoint = tmp_path / "step_0005000.pt"
+    save_checkpoint(checkpoint, model, borders)
+    return model, borders, str(checkpoint)
+
+
+def test_v3_dry_run_keeps_both_tasks_and_predicts_the_same(tmp_path):
+    # multitask 가중치 하나를 분류·회귀가 같이 쓴다: 경계·soft-cap·추론 설정이 함께 가고, 다시 읽은
+    # 모델의 예측이 원본과 같아야 한다
+    import numpy as np
+    from sklearn.datasets import load_breast_cancer, load_diabetes
+
+    from minipfn import TabPFNv3_5Classifier, TabPFNv3_5Regressor
+
+    model, borders, checkpoint = _multitask_checkpoint(tmp_path)
+    card = _card(tmp_path, _v2_weights(tmp_path, model, borders))
+    out = tmp_path / "out"
+    push.main(
+        ["--paper", "tabpfn_v3", "--checkpoint", checkpoint, "--repo-id", "a/b"]
+        + ["--model-card", str(card), "--out-dir", str(out), "--dry-run"]
+    )
+    upload = out / "upload"
+    assert {p.name for p in upload.iterdir()} == {"model.safetensors", "config.json", "README.md"}
+    config = json.loads((upload / "config.json").read_text())
+    assert config["task"] == "multitask" and config["model_type"] == "column_row_transformer"
+    assert config["model"]["logit_softcap"] == 50.0
+    assert config["inference"] == {"n_estimators": 8, "member_kinds": ["standard"]}
+
+    X, y = load_breast_cancer(return_X_y=True)
+    a = TabPFNv3_5Classifier(model).fit(X[:60], y[:60]).predict_proba(X[60:80])
+    b = TabPFNv3_5Classifier(str(upload)).fit(X[:60], y[:60]).predict_proba(X[60:80])
+    assert np.array_equal(a, b)
+    Xr, yr = load_diabetes(return_X_y=True)
+    a = TabPFNv3_5Regressor(model, borders).fit(Xr[:60], yr[:60]).predict(Xr[60:80])
+    reg = TabPFNv3_5Regressor(str(upload))
+    assert torch.equal(reg.borders, borders)
+    assert np.array_equal(a, reg.fit(Xr[:60], yr[:60]).predict(Xr[60:80]))
+
+
+def test_v3_needs_a_multitask_checkpoint_and_v2_refuses_one(tmp_path):
+    with pytest.raises(SystemExit):
+        push.parse_args(
+            ["--paper", "tabpfn_v3", "--checkpoint", "x.pt", "--repo-id", "a/b"]
+            + ["--task", "classification"]
+        )
+    (tmp_path / "m").mkdir()
+    (tmp_path / "s").mkdir()
+    _, _, multitask = _multitask_checkpoint(tmp_path / "m")
+    _, _, single = _multitask_checkpoint(tmp_path / "s", task="classification")
+    card = _card(tmp_path)
+    common = ["--repo-id", "a/b", "--model-card", str(card), "--dry-run"]
+    with pytest.raises(SystemExit, match="multitask 모델이 아닙니다"):
+        push.main(
+            ["--paper", "tabpfn_v3", "--checkpoint", single, "--out-dir", str(tmp_path / "o1")]
+            + common
+        )
+    with pytest.raises(SystemExit, match="--paper tabpfn_v3"):
+        push.main(
+            ["--paper", "tabpfn_v2", "--task", "classification", "--checkpoint", multitask]
+            + ["--out-dir", str(tmp_path / "o2"), *common]
+        )
+    (tmp_path / "r").mkdir()
+    _, _, regression = _multitask_checkpoint(tmp_path / "r", task="regression")
+    with pytest.raises(SystemExit, match="multitask 체크포인트만"):
+        push.main(
+            ["--paper", "tabpfn_v3", "--checkpoint", regression, "--out-dir", str(tmp_path / "o3")]
+            + common
+        )
+
+
+def test_v3_revision_dry_run_for_a_curriculum_stage(tmp_path):
+    model, borders, checkpoint = _multitask_checkpoint(tmp_path)
+    wid = sync_hub_card.weights_id(_v2_weights(tmp_path, model, borders))
+    card = _card(tmp_path)
+    card.write_text(
+        "---\nlicense: apache-2.0\n---\n\n# Card\n\n"
+        + f"| `stage1-250k` | `{wid}` |\n| `main` (stage 3) | `sha256:{'0' * 12}` |\n"
+    )
+    out = tmp_path / "out"
+    push.main(
+        ["--paper", "tabpfn_v3", "--checkpoint", checkpoint, "--repo-id", "a/b"]
+        + ["--revision", "stage1-250k", "--model-card", str(card), "--out-dir", str(out)]
+        + ["--dry-run"]
+    )
+    readme = (out / "upload" / "README.md").read_text()
+    assert f"`{wid}`" in readme and 'revision="stage1-250k"' in readme

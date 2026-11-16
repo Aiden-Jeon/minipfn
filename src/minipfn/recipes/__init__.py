@@ -8,8 +8,9 @@
   v1 학습 루프, 회전 앙상블 설정(`TabPFNv1Classifier`)
 - `tabpfn_v2`: TabPFN v2·2.5의 학습 설정(`graph_scm` prior + `CellTransformer` + 공용 학습 루프)과
   구조, 전처리 멤버 앙상블 설정(`TabPFNv2Classifier`·`TabPFNv2Regressor`)
-- `tabpfn_v3`: TabPFN-3·3.5의 구조(`graph_scm` prior + `ColumnRowTransformer` + 공용 학습 루프)와
-  추론 설정(`default_inference`)
+- `tabpfn_v3`: TabPFN-3·3.5의 구조(`graph_scm` prior + `ColumnRowTransformer` + 공용 학습 루프),
+  추론 설정(`default_inference`), 3.5 공개 가중치를 받는 추론 클래스(`TabPFNv3_5Classifier`·
+  `TabPFNv3_5Regressor`)
 """
 
 from __future__ import annotations
@@ -63,8 +64,13 @@ def architecture_name(config: Any) -> str | None:
 
 
 def default_inference(model: Any, task: str) -> dict:
-    """모델의 추론 설정 `{"n_estimators", "member_kinds"}`. 모델 종류의 recipe가 정한다."""
-    return recipe_for_model_type(model.model_type).default_inference(model, task)
+    """모델의 추론 설정 `{"n_estimators", "member_kinds"}`. 모델 종류의 recipe가 정한다. 어느
+    recipe에도 없는 모델 종류(registry에 더한 모델)와 종류가 없는 모델은 v2의 것(`tabpfn_v2`)."""
+    try:
+        recipe = recipe_for_model_type(getattr(model, "model_type", None) or "")
+    except ValueError:
+        recipe = importlib.import_module("minipfn.recipes.tabpfn_v2")
+    return recipe.default_inference(model, task)
 
 
 def supported_size(model: Any, task: str) -> dict:

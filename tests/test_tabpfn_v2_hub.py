@@ -226,7 +226,7 @@ def test_inference_classes_load_weights_without_from_pretrained(tmp_path, monkey
         TabPFNv2Classifier(str(reg_dir))
     with pytest.raises(ValueError, match="classification 모델"):
         TabPFNv2Regressor(str(cls_dir))
-    with pytest.raises(ValueError, match="v2·2.5 모델이 아니다"):
+    with pytest.raises(ValueError, match="v2 이후 모델이 아니다"):
         TabPFNv2Classifier(str(v1_dir))
     with pytest.raises(ValueError, match="v1 모델이 아니다"):
         TabPFNv1Classifier(str(cls_dir))

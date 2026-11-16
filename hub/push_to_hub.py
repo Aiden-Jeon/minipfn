@@ -1,4 +1,4 @@
-"""학습한 TabPFN(v1·v2) 가중치를 Hugging Face Hub에 올린다.
+"""학습한 TabPFN(v1·v2·3.5) 가중치를 Hugging Face Hub에 올린다.
 
 예) 저장소 루트에서 (.env.local을 불러온 셸)
   MLFLOW_TRACKING_URI=databricks uv run python hub/push_to_hub.py --paper tabpfn \
@@ -7,17 +7,24 @@
   MLFLOW_TRACKING_URI=databricks uv run python hub/push_to_hub.py --paper tabpfn_v2 \
     --checkpoint runs:/<학습 run_id>/checkpoints/step_0500000.pt --task classification \
     --repo-id aiden-jeon/minipfn-tabpfn-v2-classifier --dry-run
+  MLFLOW_TRACKING_URI=databricks uv run python hub/push_to_hub.py --paper tabpfn_v3 \
+    --checkpoint runs:/<stage 3 run_id>/checkpoints/step_0005000.pt \
+    --repo-id aiden-jeon/minipfn-tabpfn-v3-5 --dry-run
 
 `--paper`는 `scripts/<paper>/` 폴더 이름이다.
 
 - `tabpfn`: `save_tabpfn`으로 저장한 `tabpfn_final.pt`(파일 또는
   `runs:/<run_id>/model/tabpfn_final.pt`). 저장소 루트의 `NOTICE`(공식 TabPFN v1 코드의 저작권
   표기)를 함께 올린다.
-- `tabpfn_v2`: `minipfn.hub.load_model`이 읽는 체크포인트면 무엇이든(v2·2.5, TabPFN-3·3.5 모델
-  포함). `--task`가 필요하다. 이 weight의 추론 설정(멤버 수, 멤버 전처리 종류)은 `config.json`의
-  `inference`에 적는다. 추론 설정은 모델 종류의 recipe가 구조로 정하고
-  (`minipfn.recipes.default_inference`: 2.5 구조면 v2.5, TabPFN-3.5면 standard 8개 등), 카드의
-  수치를 다른 멤버 종류로 냈으면 `--member-kinds`로 준다.
+- `tabpfn_v2`: `minipfn.hub.load_model`이 읽는 한 task 체크포인트면 무엇이든(v2·2.5, task마다
+  학습한 TabPFN-3 모델 포함). `--task`가 필요하다. 이 weight의 추론 설정(멤버 수, 멤버 전처리
+  종류)은 `config.json`의 `inference`에 적는다. 추론 설정은 모델 종류의 recipe가 구조로 정하고
+  (`minipfn.recipes.default_inference`: 2.5 구조면 v2.5 등), 카드의 수치를 다른 멤버 종류로
+  냈으면 `--member-kinds`로 준다. 분류·회귀를 한 모델로 학습한 체크포인트(multitask)는 받지 않는다.
+- `tabpfn_v3`: TabPFN-3.5 multitask 체크포인트(분류·회귀가 같은 가중치, `column_row_transformer`).
+  `--task` 없이 두 task를 함께 올린다: 회귀 구간 경계를 같은 `model.safetensors`에 두고, 두 task의
+  추론 설정이 같아야 `inference` 하나로 적는다(3.5는 standard 8개). soft-cap 등 모델 설정은
+  `config.json`의 `model`에 있다. `--member-kinds`는 `tabpfn_v2`와 같다.
 
 체크포인트를 `model.safetensors` + `config.json`으로 바꾸고 모델 카드를 붙여 올린다. 모델 카드는
 `--model-card`로 주거나, 주지 않으면 repo 이름으로 `hub/<name>/README.md`를 찾는다. 카드가
@@ -37,7 +44,7 @@ repo의 공개 여부는 바꾸지 않으므로, `--private`인데 repo가 공�
 설명하는 최종 가중치)을 먼저 올려 repo가 있어야 한다. branch는 repo의 첫 commit에서 만들어
 `main`의 카드와 그림을 물려받지 않고, 가중치·설정과 함께 그 step을 설명하는 짧은 README를 둔다.
 이때는 `main` 카드의 한 줄(중간 checkpoint 표의 행)에 branch와 그 가중치 id가 함께 적혀
-있어야 한다 — branch 이름과 다른 step의 가중치가 올라가지 않도록. v2만 지원한다.
+있어야 한다 — branch 이름과 다른 step의 가중치가 올라가지 않도록. v2·3.5만 지원한다.
 """
 
 from __future__ import annotations
@@ -65,8 +72,10 @@ from sync_hub_card import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HUB_DIR = Path(__file__).resolve().parent
 NOTICE = REPO_ROOT / "NOTICE"
-PAPERS = ("tabpfn", "tabpfn_v2")
-TITLE = {"tabpfn": "TabPFN", "tabpfn_v2": "TabPFN v2"}
+PAPERS = ("tabpfn", "tabpfn_v2", "tabpfn_v3")
+TITLE = {"tabpfn": "TabPFN", "tabpfn_v2": "TabPFN v2", "tabpfn_v3": "TabPFN-3.5"}
+# multitask 체크포인트(`--paper tabpfn_v3`)가 내야 하는 task
+MULTITASK = ("classification", "regression")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -79,8 +88,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--member-kinds",
-        help="tabpfn_v2만: config.json에 적을 멤버 전처리 종류 (v2, v2.5, v3, v3.5 또는 쉼표로"
-        " 구분한 목록)."
+        help="tabpfn_v2·tabpfn_v3: config.json에 적을 멤버 전처리 종류 (v2, v2.5, v3, v3.5 또는"
+        " 쉼표로 구분한 목록)."
         " 기본: 모델 구조로 정한다",
     )
     parser.add_argument(
@@ -99,8 +108,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--paper tabpfn_v2에는 --task가 필요합니다")
     if args.paper == "tabpfn" and args.task is not None:
         parser.error("--task는 --paper tabpfn_v2에서만 씁니다 (v1은 분류만)")
+    if args.paper == "tabpfn_v3" and args.task is not None:
+        parser.error("--paper tabpfn_v3는 분류·회귀를 함께 올려서 --task를 받지 않습니다")
     if args.paper == "tabpfn" and args.member_kinds is not None:
-        parser.error("--member-kinds는 --paper tabpfn_v2에서만 씁니다")
+        parser.error("--member-kinds는 --paper tabpfn_v2·tabpfn_v3에서만 씁니다")
     if args.member_kinds is not None:
         from minipfn.recipes import resolve_member_kinds
 
@@ -111,7 +122,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.revision == "main":
         args.revision = None
     if args.paper == "tabpfn" and args.revision is not None:
-        parser.error("--revision은 --paper tabpfn_v2에서만 씁니다")
+        parser.error("--revision은 --paper tabpfn_v2·tabpfn_v3에서만 씁니다")
     return args
 
 
@@ -171,16 +182,27 @@ def prepare_tabpfn(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
     return model, reloaded
 
 
-def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
-    """v2: 체크포인트를 변환하고 원본과 다시 읽은 모델을 돌려준다. 회귀 구간 경계도 확인한다."""
-    from minipfn.hub import from_pretrained, load_model, save_pretrained
+def _save_and_reload(model, borders, tasks: tuple[str, ...], args, upload_dir: Path):
+    """`tasks`의 추론 설정을 적어 변환하고 다시 읽는다. 회귀 구간 경계와 추론 설정이 그대로인지
+    확인한다. 여러 task(multitask)면 task마다 추론 설정이 같아야 한다(config.json에 하나만 둔다)."""
+    from minipfn.hub import from_pretrained, save_pretrained
     from minipfn.recipes import default_inference
 
-    model, borders = load_model(args.checkpoint, args.task, out_dir / "checkpoint")
-    inference = default_inference(model, args.task)
-    if args.member_kinds is not None:
-        inference["member_kinds"] = args.member_kinds
-    inference["member_kinds"] = list(inference["member_kinds"])
+    def by_task(m, member_kinds=None):
+        # task마다 추론 설정. `member_kinds`를 주면 멤버 종류는 그것
+        out = {}
+        for task in tasks:
+            inference = default_inference(m, task)
+            if member_kinds is not None:
+                inference["member_kinds"] = member_kinds
+            out[task] = {**inference, "member_kinds": tuple(inference["member_kinds"])}
+        return out
+
+    expected = by_task(model, args.member_kinds)
+    inference = expected[tasks[0]]
+    if any(v != inference for v in expected.values()):
+        raise SystemExit(f"task마다 추론 설정이 달라 config.json에 하나로 적을 수 없다: {expected}")
+    inference = {**inference, "member_kinds": list(inference["member_kinds"])}
     print("inference:", inference)
     save_pretrained(model, borders, upload_dir, inference=inference)
     reloaded, reloaded_borders = from_pretrained(upload_dir)
@@ -188,14 +210,52 @@ def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path)
         borders is not None and not torch.equal(borders.cpu(), reloaded_borders)
     ):
         raise RuntimeError("변환한 회귀 구간 경계가 원본과 다릅니다")
-    if default_inference(reloaded, args.task) != default_inference(model, args.task) | {
-        "member_kinds": tuple(inference["member_kinds"])
-    }:
+    # 다시 읽은 모델은 config.json의 `inference`만으로 같은 설정을 내야 한다
+    if by_task(reloaded) != expected:
         raise RuntimeError("다시 읽은 추론 설정이 적은 것과 다릅니다")
-    return model, reloaded
+    return reloaded
 
 
-PREPARE = {"tabpfn": prepare_tabpfn, "tabpfn_v2": prepare_tabpfn_v2}
+def prepare_tabpfn_v2(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
+    """v2: 체크포인트를 변환하고 원본과 다시 읽은 모델을 돌려준다. 회귀 구간 경계도 확인한다."""
+    from minipfn.hub import load_model, served_tasks
+
+    model, borders = load_model(args.checkpoint, args.task, out_dir / "checkpoint")
+    if len(getattr(model, "tasks", ())) > 1:
+        # 한 task의 추론 설정만 적으면 다른 task로 받는 사람이 다른 설정으로 돌린다
+        raise SystemExit(
+            f"{args.checkpoint}는 {'·'.join(served_tasks(model, borders))}를 함께 내는 multitask"
+            " 모델입니다. --paper tabpfn_v3로 (--task 없이) 올려 주세요."
+        )
+    return model, _save_and_reload(model, borders, (args.task,), args, upload_dir)
+
+
+def prepare_tabpfn_v3(args: argparse.Namespace, out_dir: Path, upload_dir: Path):
+    """TabPFN-3.5 multitask: 분류·회귀를 함께 내는 체크포인트를 변환하고 원본과 다시 읽은 모델을
+    돌려준다. 회귀 구간 경계(같은 파일)와 두 task의 추론 설정을 확인한다."""
+    from minipfn.hub import load_model, served_tasks
+
+    try:
+        model, borders = load_model(args.checkpoint, MULTITASK[0], out_dir / "checkpoint")
+    except SystemExit as e:  # 회귀만 내는 모델 등: 왜 안 되는지와 다른 길을 함께 알려 준다
+        raise SystemExit(
+            f"{e} --paper tabpfn_v3는 분류·회귀를 함께 내는 TabPFN-3.5 multitask 체크포인트만"
+            " 받습니다. 한 task 모델은 --paper tabpfn_v2로 올려 주세요."
+        ) from e
+    if (
+        getattr(model, "model_type", None) != "column_row_transformer"
+        or served_tasks(model, borders) != MULTITASK
+    ):
+        raise SystemExit(
+            f"{args.checkpoint}는 분류·회귀를 함께 내는 TabPFN-3.5 multitask 모델이 아닙니다"
+            f" (모델 {getattr(model, 'model_type', type(model).__name__)},"
+            f" task {'·'.join(served_tasks(model, borders))}). 한 task 모델은 --paper tabpfn_v2로"
+            " 올려 주세요."
+        )
+    return model, _save_and_reload(model, borders, MULTITASK, args, upload_dir)
+
+
+PREPARE = {"tabpfn": prepare_tabpfn, "tabpfn_v2": prepare_tabpfn_v2, "tabpfn_v3": prepare_tabpfn_v3}
 FRONT_MATTER = re.compile(r"\A---\r?\n.*?^---[ \t]*(?:\r?\n|\Z)", re.S | re.M)
 
 

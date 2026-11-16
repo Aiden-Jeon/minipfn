@@ -29,6 +29,7 @@ from torch import nn
 
 from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
+from minipfn.recipes import default_inference as recipe_inference
 from minipfn.recipes import resolve_member_kinds
 
 if TYPE_CHECKING:
@@ -188,8 +189,10 @@ def default_inference(model: nn.Module, task: str) -> dict:
 
 
 def _inference_kwargs(model: nn.Module, task: str, n_estimators, member_kinds) -> dict:
-    # 인자로 준 값이 먼저, 없으면 모델의 추론 설정 (`default_inference`)
-    defaults = default_inference(model, task)
+    # 인자로 준 값이 먼저, 없으면 모델의 추론 설정. 모델 종류의 recipe가 정한다
+    # (`minipfn.recipes.default_inference`: TabPFN-3.5 모델이면 `tabpfn_v3`의 것, 어느 recipe에도
+    # 없는 모델 종류는 v2의 것)
+    defaults = recipe_inference(model, task)
     return {
         "n_estimators": defaults["n_estimators"] if n_estimators is None else n_estimators,
         "member_kinds": defaults["member_kinds"]
@@ -218,7 +221,8 @@ def _load(model, task: str, repos: dict[str, str]) -> tuple[nn.Module, torch.Ten
 
     loaded, borders = model_or_pretrained(model, repos[task], task)
     if not hasattr(loaded, "model_type"):
-        raise ValueError(f"{model or repos[task]}는 TabPFN v2·2.5 모델이 아니다")
+        # TabPFN v1 모델(RowTransformer)은 model_type이 없다 (`TabPFNv1Classifier`로 쓴다)
+        raise ValueError(f"{model or repos[task]}는 TabPFN v2 이후 모델이 아니다")
     return loaded, borders
 
 
