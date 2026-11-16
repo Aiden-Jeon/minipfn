@@ -3,6 +3,7 @@
 # 표에서 학습 step(Muon 포함) 메모리·시간, 검증 batch의 메모리(학습 경로·추론 경로).
 #   databricks air run -f scripts/tabpfn_v3/activation_checkpointing.yaml --watch --override mlflow_experiment_directory=$MLFLOW_EXPERIMENT_DIR
 # 일부만: --override env_variables.CHECKPOINTING_ARGS="--skip-check --tables 2,3_60k"
+# stage 4 긴 표(issue #91, 켬만): --override env_variables.CHECKPOINTING_ARGS="--skip-check --modes on --tables 4_40k,4_100k,4_200k_10,4_200k"
 experiment_name: tabpfn-v3-reproduction
 mlflow_run_name: tabpfn-v3-5-activation-checkpointing
 environment:

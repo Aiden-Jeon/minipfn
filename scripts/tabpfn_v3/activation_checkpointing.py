@@ -7,8 +7,9 @@ GPU 한 장에서 세 가지를 본다.
    행렬을 만드는 것(`fused` 끔, 그러면 비트 단위로 같아야 한다)과 만들지 않는 것(기본)
 2. 학습 step (`bench`): 학습 루프와 같은 한 step — bf16 autocast forward, 학습 손실(회귀는 bar
    distribution), backward, gradient clip, Muon(모든 파라미터, curriculum 설정) 갱신. 블록 compile·
-   TF32는 실제 run처럼 켠다. stage 2의 가장 큰 표와 stage 3의 feature 상한마다 가장 큰 표에서 step
-   시간과 최대 메모리(optimizer 상태 포함). checkpointing 끔·켬
+   TF32는 실제 run처럼 켠다. stage 2의 가장 큰 표와 stage 3의 feature 상한마다 가장 큰 표, stage 4
+   (셀 상한 4M, issue #91)의 긴 표에서 step 시간과 최대 메모리(optimizer 상태 포함). checkpointing
+   끔·켬
 3. 검증 (`val`): 학습 루프의 검증처럼 gradient 없이 데이터셋 8개 batch. 학습 forward 경로와 추론
    경로(`inference=True`, checkpointing을 켜면 큰 표의 검증이 이것을 쓴다)
 
@@ -31,7 +32,9 @@ from minipfn.training.losses import prior_loss
 from minipfn.training.muon import MuonAdam
 
 # (micro batch, 행 수, feature 수, 학습 행 비율). stage 2의 가장 큰 표와 stage 3의 feature 상한
-# (`priors.table_size.LONG_TABLE_FEATURE_CAPS`)마다 가장 큰 표. 학습 행은 81%까지
+# (`priors.table_size.LONG_TABLE_FEATURE_CAPS`)마다 가장 큰 표. 학습 행은 81%까지. stage 4는 셀
+# 상한 4M(feature 상한 min(100, 4M // 행 수))의 가장 긴 표와 그 사이 점: 40,000행 × 100(셀 상한에
+# 걸리는 가장 짧은 표), 100,000행 × 40, 200,000행 × 20, 셀이 반인 200,000행 × 10
 TABLES = {
     "2": (1, 10_240, 100, 0.81),
     "3_20k": (1, 20_000, 80, 0.81),
@@ -39,13 +42,19 @@ TABLES = {
     "3_40k": (1, 40_000, 40, 0.81),
     "3_50k": (1, 50_000, 30, 0.81),
     "3_60k": (1, 60_000, 20, 0.81),
+    "4_40k": (1, 40_000, 100, 0.81),
+    "4_100k": (1, 100_000, 40, 0.81),
+    "4_200k_10": (1, 200_000, 10, 0.81),
+    "4_200k": (1, 200_000, 20, 0.81),
 }
+# 기본으로 재는 표 (stage 2·3, issue #79). stage 4 표는 `--tables`로 고른다 (yaml 주석)
+DEFAULT_TABLES = ("2", "3_20k", "3_30k", "3_40k", "3_50k", "3_60k")
 TASKS = ("classification", "regression")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--tables", default=",".join(TABLES))
+    parser.add_argument("--tables", default=",".join(DEFAULT_TABLES))
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--modes", default="on,off", help="checkpointing on·off 가운데 잴 것")

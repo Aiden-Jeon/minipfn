@@ -13,7 +13,8 @@
 
 TabICLv2 학습 스크립트에 맞추는 옵션 (기본은 모두 꺼져 예전과 같은 데이터셋):
 - `size_rule="train_fraction"`: 표 크기를 행 수(학습 + 검증)와 학습 행 비율로 뽑는다
-  (`table_size.sample_split_size`). 검증 행 수가 batch마다 달라진다
+  (`table_size.sample_split_size`). 검증 행 수가 batch마다 달라진다. `feature_cap_rule="cells"`면
+  긴 표의 feature 상한을 TabICLv2 표 대신 셀 상한으로 정한다(TabICLv2에 없음, curriculum stage 4)
 - `binary_prob`: 분류 클래스 수를 이 확률로 2로 (`ClassCount`)
 - `filter_unpredictable`: 예측할 수 없는 그래프·데이터셋을 다시 뽑는다 (`generators.graph_scm`)
 
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import numpy as np
 import torch
 
 from minipfn.priors.base import PriorBatch
@@ -72,6 +74,7 @@ class GraphSCMPrior:
         max_rows: int = 1024,
         min_train_fraction: float = 0.3,
         max_train_fraction: float = 0.9,
+        feature_cap_rule: str = "rows",
         binary_prob: float = 0.0,
         filter_unpredictable: bool = False,
     ) -> None:
@@ -90,6 +93,7 @@ class GraphSCMPrior:
             max_rows=max_rows,
             min_train_fraction=min_train_fraction,
             max_train_fraction=max_train_fraction,
+            feature_cap_rule=feature_cap_rule,
         )
         # 크기 설정은 batch마다 읽는다. task와 결측값 설정은 부품에 들어가므로 읽기 전용 속성이다
         self.min_train_rows = min_train_rows
@@ -104,6 +108,7 @@ class GraphSCMPrior:
         self.max_rows = max_rows
         self.min_train_fraction = min_train_fraction
         self.max_train_fraction = max_train_fraction
+        self.feature_cap_rule = feature_cap_rule
         self.rng = Rng.from_seed(seed)
         # TabICL의 전역 난수 시드도 여기서 고정한다
         generator = GraphSCM(task, seed=seed, filter_unpredictable=filter_unpredictable)
@@ -131,12 +136,14 @@ class GraphSCMPrior:
     def max_missing_rate(self) -> float:
         return self._missing.max_rate
 
-    def sample_shape(self) -> tuple[int, int, int]:
+    def sample_shape(self, rng: np.random.Generator | None = None) -> tuple[int, int, int]:
         """(학습 행 수, feature 수, 검증 행 수) — `sample_batch`의 `size`와 같은 순서. "eval_rows"
-        규칙이면 검증 행 수는 늘 `n_eval_rows`다."""
+        규칙이면 검증 행 수는 늘 `n_eval_rows`다. `rng`를 주면 prior의 난수 대신 그것으로 뽑는다
+        (학습 옵션 `balance_tables`: 모든 GPU가 같은 난수로 한 step의 표 크기를 함께 뽑는다)."""
+        rng = self.rng.numpy if rng is None else rng
         if self.size_rule == "train_fraction":
             n_train, n_eval, n_features = sample_split_size(
-                self.rng.numpy,
+                rng,
                 min_rows=self.min_rows,
                 max_rows=self.max_rows,
                 min_train_fraction=self.min_train_fraction,
@@ -147,17 +154,18 @@ class GraphSCMPrior:
                 log_uniform_rows=self.log_uniform_rows,
                 max_cells=self.max_cells,
                 min_train_rows=self.min_train_rows,
+                feature_cap_rule=self.feature_cap_rule,
             )
             return n_train, n_features, n_eval
-        n_train, n_features = self.sample_size()
+        n_train, n_features = self.sample_size(rng)
         return n_train, n_features, self.n_eval_rows
 
-    def sample_size(self) -> tuple[int, int]:
-        """ "eval_rows" 규칙의 (학습 행 수, feature 수)."""
+    def sample_size(self, rng: np.random.Generator | None = None) -> tuple[int, int]:
+        """ "eval_rows" 규칙의 (학습 행 수, feature 수). `rng`는 `sample_shape`와 같다."""
         if self.size_rule != "eval_rows":
             raise ValueError("sample_size는 eval_rows 규칙의 것이다 (sample_shape를 쓴다)")
         n_train, n_features = sample_table_size(
-            self.rng.numpy,
+            self.rng.numpy if rng is None else rng,
             self.max_train_rows,
             self.n_eval_rows,
             self.max_features,
@@ -199,6 +207,7 @@ SIZE_DEFAULTS = {
     "max_rows": 1024,
     "min_train_fraction": 0.3,
     "max_train_fraction": 0.9,
+    "feature_cap_rule": "rows",
 }
 SIZE_FIELDS = tuple(SIZE_DEFAULTS)
 # 학습 데이터 분포를 바꾸는 prior 옵션 (회귀 구간 경계는 크기 규칙만 따른다)
@@ -224,10 +233,13 @@ def _check(*, size_rule: str, **sizes) -> None:
                     "max_features",
                     "max_cells",
                     "min_train_rows",
+                    "feature_cap_rule",
                 )
             }
         )
         return
+    if sizes.get("feature_cap_rule", "rows") != "rows":
+        raise ValueError('feature_cap_rule은 size_rule "train_fraction"에서만 쓴다')
     check_sizes(
         **{
             k: sizes[k]

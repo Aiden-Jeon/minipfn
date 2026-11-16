@@ -17,11 +17,11 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
 `TABPFN_V2_BATCH_SIZE`, `TABPFN_V2_MICRO_BATCH`, `TABPFN_V2_NUM_WORKERS`, `TABPFN_V2_LR`,
-`TABPFN_V2_CHECKPOINT_EVERY`, `TABPFN_V2_VAL_EVERY`)로 정한다. 학습 가속 옵션(issue #46,
-`TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·`--weight-average K`
-(또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다. optimizer는
-`--optimizer muon`(또는 `TABPFN_V2_OPTIMIZER=muon`, issue #28)으로 바꾸고, Muon 묶음의 weight
-decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed node|all`(또는
+`TABPFN_V2_CHECKPOINT_EVERY`, `TABPFN_V2_VAL_EVERY`, `TABPFN_V2_LOG_EVERY`)로 정한다. 학습 가속
+옵션(issue #46, `TrainConfig` 주석)은 `--compile`·`--fused-adam`·`--tf32`·`--schedule-free`·
+`--weight-average K`(또는 `TABPFN_V2_COMPILE=1` 등, `TABPFN_V2_WEIGHT_AVERAGE=K`)로 켠다.
+optimizer는 `--optimizer muon`(또는 `TABPFN_V2_OPTIMIZER=muon`, issue #28)으로 바꾸고, Muon 묶음의
+weight decay는 `TABPFN_V2_MUON_WEIGHT_DECAY`(기본 0)로 준다. `--muon-distributed node|all`(또는
 `TABPFN_V2_MUON_DISTRIBUTED`, issue #56)은 Muon의 Newton–Schulz를 노드 안 GPU끼리 또는 모든
 GPU끼리 나눠 계산한다(결과·checkpoint 형식 같음, 이어 학습하면 원래 run의 값을 따르고 `off`로
 끈다). 회귀에서 반복되는 target 값을 이웃 구간 몇 개에 흩을지는
@@ -60,7 +60,11 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 학습한다(`recipes.tabpfn_v3.cooldown`).
 `--config-name stage1|stage2|stage3`(`--arch v3.5 --task multitask`)은 TabICLv2 3단계 학습을 옮긴
 것이다(`recipes.tabpfn_v3.curriculum`: 모든 파라미터 Muon, 표 크기 curriculum, prior filter).
-stage2·3은 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
+`stage4`는 그 뒤에 더한 긴 표(200,000행, 셀 상한 4M) 단계다(issue #91). curriculum의 warmup은
+`--steps`(`TABPFN_V2_STEPS`)로 준 step 수의 1%다(stage 4는 500~1,000 step으로 줄여 쓴다).
+stage 4는 표 크기를 GPU끼리 나눠 받는다(`--balance-tables on|off`, `TABPFN_V2_BALANCE_TABLES`, 주지
+않으면 preset 값이고 이어 학습하면 원래 run의 값이다).
+stage2~4는 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -105,8 +109,8 @@ PRESETS = {
     # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,
     # --init-run-id와 같이)
     "cooldown": tabpfn_v3.cooldown,
-    # TabICLv2 3단계 학습을 옮긴 것 (`recipes.tabpfn_v3.curriculum`, --arch v3.5 --task multitask).
-    # stage2·3은 앞 단계 run에서 가중치를 가져온다(--init-run-id)
+    # TabICLv2 3단계 학습을 옮긴 것과 긴 표 stage 4 (`recipes.tabpfn_v3.curriculum`, --arch v3.5
+    # --task multitask). stage2~4는 앞 단계 run에서 가중치를 가져온다(--init-run-id)
     **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
 }
 CONFIG_NAMES = tuple(PRESETS)
@@ -172,6 +176,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-every", type=int, default=_env("TABPFN_V2_KEEP_EVERY", int))
     parser.add_argument("--val-every", type=int, default=_env("TABPFN_V2_VAL_EVERY", int))
+    parser.add_argument("--log-every", type=int, default=_env("TABPFN_V2_LOG_EVERY", int))
     # 학습 가속 (TrainConfig 주석). 켜기만 한다. 이어 학습하면 원래 run에서 켠 것은 그대로 켜진다
     # (`source_speed_options`)
     for flag in ("compile", "fused-adam", "tf32", "schedule-free"):
@@ -204,6 +209,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--muon-distributed",
         choices=["off", "node", "all"],
         default=os.environ.get("TABPFN_V2_MUON_DISTRIBUTED") or None,
+    )
+    # 표 크기를 GPU끼리 나눠 받기 (issue #91, TrainConfig 주석). 주지 않으면 preset 값(stage 4만
+    # 켬), 이어 학습하면 원래 run의 값이다. off로 끈다
+    parser.add_argument(
+        "--balance-tables",
+        choices=["on", "off"],
+        default=os.environ.get("TABPFN_V2_BALANCE_TABLES") or None,
     )
     parser.add_argument(
         "--collapse-threshold", default=os.environ.get("TABPFN_V2_COLLAPSE_THRESHOLD") or None
@@ -358,8 +370,10 @@ def build_config(
         if args.config_name == "long_tables":
             return recipe.long_tables(args.task, arch=arch)
         if args.config_name in ("paper_run", "cooldown", *CURRICULUM_NAMES):
+            # curriculum은 step 수로 warmup을 정하므로 --steps를 recipe에 준다
+            steps = {"steps": args.steps} if args.config_name in CURRICULUM_NAMES else {}
             try:
-                return PRESETS[args.config_name](args.task, arch)
+                return PRESETS[args.config_name](args.task, arch, **steps)
             except ValueError as e:
                 raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
@@ -420,6 +434,8 @@ def _override_values(args: argparse.Namespace) -> dict:
         "checkpoint_every": args.checkpoint_every,
         "keep_every": args.keep_every,
         "val_every": args.val_every,
+        "log_every": args.log_every,
+        "balance_tables": None if args.balance_tables is None else args.balance_tables == "on",
         "weight_average": args.weight_average,
         "weight_average_every": args.weight_average_every,
         "optimizer": args.optimizer,
@@ -499,8 +515,10 @@ def main(argv: list[str] | None = None) -> None:
         source = run_architecture(params)
         speed_options = source_speed_options(params)
         if args.init_run_id:
-            # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다
+            # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다.
+            # 표 크기 나누기도 앞 단계 run(끈 값)이 아니라 이번 preset·인자를 따른다 (stage 4)
             speed_options.pop("phases", None)
+            speed_options.pop("balance_tables", None)
         inherit_batch_size(args, params)
     config, arch = build_config(args, source, speed_options)
     if args.resume_run_id:

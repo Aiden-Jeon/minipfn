@@ -18,6 +18,11 @@
 #                --override env_variables.TABPFN_V2_RANK_TIMING=1 (GPU마다 forward·backward 시간과 표 크기,
 #                MLflow diagnostics/rank_timing_from_*.jsonl, issue #68). 학습 계산은 그대로, chunk마다 켠다.
 #                묶음별 가중치·gradient norm(issue #65)은 늘 남는다
+#   curriculum:  --override env_variables.TABPFN_V2_CONFIG_NAME=stage1 (2·3·4는 앞 단계 run에서
+#                --override env_variables.TABPFN_V2_INIT_RUN_ID=<run_id> --override env_variables.TABPFN_V2_INIT_STEP=<step>).
+#                기본 TABPFN_V2_STEPS=300이 recipe의 step 수를 덮어쓰므로 TABPFN_V2_STEPS도 그 stage의 step 수로 준다
+#                (stage 4는 500~1000, 기본 500. recipes/tabpfn_v3.py의 CURRICULUM·STAGE4_STEPS)
+#                stage 4는 표 크기를 GPU끼리 나눠 받는다(LPT, issue #91). --override env_variables.TABPFN_V2_BALANCE_TABLES=off로 끈다
 #   TabPFN-3(task마다 모델): --override env_variables.TABPFN_V2_ARCH=v3 --override env_variables.TABPFN_V2_TASK=classification
 #                (또는 regression. 53M·58M)
 # 학습 step·lr·batch는 두 보고서에 없어서 v2 paper 설정 그대로다(recipes/tabpfn_v3.py의 paper; multitask는
