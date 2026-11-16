@@ -45,7 +45,9 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
 - 공식 TabPFN-3.5 추론에 맞추는 옵션(기본은 모두 끔, 예전과 비트 동일): 멤버 전처리
   (`shuffle_categories`·`fingerprint`·`outlier_clip`, `minipfn.inference.preprocessing`), 모든
   멤버가 같이 쓰는 열 단계(`infer_categorical`: 값이 몇 개뿐인 수치 열을 범주형으로,
-  `drop_constant`: 상수 열 빼기), 회귀 `target_transform`·`regression_mean`(`EnsembleRegressor`)
+  `drop_constant`: 상수 열 빼기), 회귀 `target_transform`·`regression_mean`(`EnsembleRegressor`).
+  `unseen_category="minus1"`은 학습 행에 없던 범주를 결측(NaN, 기본. 공식 3.5도 멤버의
+  `ordinal_shuffled` 단계에서 NaN이 된다) 대신 번호 -1로 둔다(TabICLv2 방식, 진단용)
 - 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
@@ -94,6 +96,7 @@ from minipfn.inference.preprocessing import (
     one_hot_kinds,
     select_features,
     to_numeric,
+    unseen_value,
 )
 from minipfn.models.bar_distribution import FullSupportBarDistribution
 from minipfn.priors.table_size import MAX_FEATURES
@@ -170,6 +173,7 @@ class _Base:
         infer_categorical: bool = False,
         drop_constant: bool = False,
         feature_subsampling: str = "random",
+        unseen_category: str = "nan",
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
@@ -184,10 +188,13 @@ class _Base:
             shuffle_categories=shuffle_categories,
             fingerprint=fingerprint,
             outlier_clip=outlier_clip,
+            unseen_category=unseen_category,
         )
         self.infer_categorical = infer_categorical
         self.drop_constant = drop_constant
         self.feature_subsampling = feature_subsampling
+        unseen_value(unseen_category)  # 값 확인
+        self.unseen_category = unseen_category
         self.one_hot = one_hot
         self.member_kinds = resolve_member_kinds(member_kinds)
         self.softmax_temperature = softmax_temperature
@@ -210,7 +217,9 @@ class _Base:
     def _fit_columns(self, X: Any) -> np.ndarray:
         """학습 행을 수치 배열로 (모든 멤버가 같이 쓰는 열 단계). `cat_ix_`는 그 배열의 범주형 열,
         `encoded_ix_`는 문자열·범주를 번호로 바꾼 원래 열이다. 옵션을 끄면 둘은 같다."""
-        X_num, self.encoded_ix_, self.encoder_ = to_numeric(X, self.categorical_features_indices)
+        X_num, self.encoded_ix_, self.encoder_ = to_numeric(
+            X, self.categorical_features_indices, self.unseen_category
+        )
         cat_ix = list(self.encoded_ix_)
         # 수치 열 가운데 값이 몇 개뿐인 것을 범주형으로 (공식 3.5의 type 추론)
         self.low_cardinality_ = (
@@ -220,7 +229,7 @@ class _Base:
         # 학습 행에서 값이 하나뿐인 열을 뺀다 (범주형으로 준 열은 남긴다)
         self.kept_columns_ = None
         if self.drop_constant:
-            X_low = encode_low_cardinality(X_num, self.low_cardinality_)
+            X_low = encode_low_cardinality(X_num, self.low_cardinality_)  # 학습 행: 미지 값 없음
             dropped = set(constant_columns(X_low, self.categorical_features_indices))
             if dropped:
                 self.kept_columns_ = np.array(
@@ -235,7 +244,8 @@ class _Base:
     def _columns(self, X_num: np.ndarray) -> np.ndarray:
         # `_fit_columns`에서 정한 열 단계를 다른 행에도
         if self.low_cardinality_:
-            X_num = encode_low_cardinality(X_num, self.low_cardinality_)
+            unseen = unseen_value(self.unseen_category)
+            X_num = encode_low_cardinality(X_num, self.low_cardinality_, unseen)
         if self.kept_columns_ is not None:
             X_num = X_num[:, self.kept_columns_]
         return X_num

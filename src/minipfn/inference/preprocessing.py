@@ -59,6 +59,9 @@ SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
 FINGERPRINTS = ("random", "hash")
 OUTLIER_CLIPS = ("hard", "soft")
 FEATURE_SUBSAMPLINGS = ("random", "balanced")
+# 학습 행에 없던 범주: "nan"(기본, 결측과 같게) 또는 "minus1"(번호 -1이라는 보통 값. TabICLv2 방식)
+UNSEEN_CATEGORIES = ("nan", "minus1")
+UNSEEN_CODE = -1.0
 # 공식 type 추론: 학습 행이 100개보다 많으면 서로 다른 값이 4개보다 적은 수치 열은 범주형
 MIN_UNIQUE_NUMERICAL = 4
 MIN_ROWS_INFER_CATEGORICAL = 100
@@ -74,6 +77,7 @@ class PreprocessOptions:
     shuffle_categories: bool = False
     fingerprint: str = "random"
     outlier_clip: str = "hard"
+    unseen_category: str = "nan"  # "minus1"이면 one-hot 블록에서 -1(학습에 없던 범주)은 모두 0
 
     def __post_init__(self) -> None:
         if self.fingerprint not in FINGERPRINTS:
@@ -82,15 +86,30 @@ class PreprocessOptions:
             raise ValueError(f"outlier_clip은 {OUTLIER_CLIPS} 가운데 하나다: {self.outlier_clip}")
 
 
-def to_numeric(X: Any, categorical: list[int] | None) -> tuple[np.ndarray, list[int], Any]:
-    """범주형·문자열 열을 순서 번호로 바꾼다. 결측은 NaN으로 남긴다."""
+def unseen_value(unseen_category: str) -> float:
+    """학습 행에 없던 범주의 번호 (`UNSEEN_CATEGORIES`)."""
+    if unseen_category not in UNSEEN_CATEGORIES:
+        raise ValueError(f"unseen_category는 {UNSEEN_CATEGORIES} 가운데 하나다: {unseen_category}")
+    return np.nan if unseen_category == "nan" else UNSEEN_CODE
+
+
+def to_numeric(
+    X: Any, categorical: list[int] | None, unseen_category: str = "nan"
+) -> tuple[np.ndarray, list[int], Any]:
+    """범주형·문자열 열을 순서 번호로 바꾼다. 결측은 NaN으로 남긴다. 학습 행에 없던 범주(다른
+    행에 쓸 때)는 기본으로 NaN, `unseen_category="minus1"`이면 -1이다."""
     df = pd.DataFrame(X).reset_index(drop=True)
     cat = set(categorical or [])
     cat |= {i for i, dtype in enumerate(df.dtypes) if not pd.api.types.is_numeric_dtype(dtype)}
     cat_ix = sorted(cat)
     encoder = None
     if cat_ix:
-        encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)
+        encoder = OrdinalEncoder(
+            handle_unknown="use_encoded_value",
+            # sklearn은 정수나 np.nan만 받는다
+            unknown_value=np.nan if unseen_category == "nan" else int(UNSEEN_CODE),
+        )
+        unseen_value(unseen_category)  # 값 확인
         encoder.fit(df.iloc[:, cat_ix].astype(str).where(df.iloc[:, cat_ix].notna()))
     return apply_encoder(df, cat_ix, encoder), cat_ix, encoder
 
@@ -166,13 +185,17 @@ def low_cardinality_values(X: np.ndarray, cat_ix: list[int]) -> dict[int, np.nda
     return out
 
 
-def encode_low_cardinality(X: np.ndarray, values: dict[int, np.ndarray]) -> np.ndarray:
-    """`low_cardinality_values`의 열을 값의 순서 번호(0부터)로 바꾼다. 학습 행에 없던 값은 결측."""
+def encode_low_cardinality(
+    X: np.ndarray, values: dict[int, np.ndarray], unseen: float = np.nan
+) -> np.ndarray:
+    """`low_cardinality_values`의 열을 값의 순서 번호(0부터)로 바꾼다. 결측은 결측, 학습 행에 없던
+    값은 `unseen`(기본 결측, `unseen_value`)."""
     X = X.copy()
     for i, v in values.items():  # v에는 값이 하나 이상 있다
         col = X[:, i]
         ix = np.clip(np.searchsorted(v, col), 0, len(v) - 1)
-        X[:, i] = np.where(v[ix] == col, ix, np.nan)  # 결측은 v[ix] == NaN이 거짓이라 결측
+        other = np.where(np.isnan(col), np.nan, unseen)
+        X[:, i] = np.where(v[ix] == col, ix, other)  # 결측은 v[ix] == NaN이 거짓
     return X
 
 
@@ -402,7 +425,8 @@ class MemberPreprocessor:
     def _base(self, X: np.ndarray) -> np.ndarray:
         X = X.copy()
         for i, perm in self.cat_maps.items():
-            ok = np.isfinite(X[:, i]) & (X[:, i] < len(perm))
+            # 학습 행에 없던 범주(-1, unseen_category="minus1")는 섞지 않고 -1로 둔다
+            ok = np.isfinite(X[:, i]) & (X[:, i] >= 0) & (X[:, i] < len(perm))
             X[ok, i] = perm[X[ok, i].astype(int)]
         transformed = X.copy()
         empty = [i for i in self.num_ix if i not in self.fit_ix]
@@ -418,15 +442,19 @@ class MemberPreprocessor:
             return out
         # 번호 열을 빼고 one-hot 열을 뒤에 붙인다 (앞 d개 열이 원래 열 순서라 위치가 같다)
         keep = [j for j in range(out.shape[1]) if j not in self.one_hot_sizes]
-        blocks = [self._one_hot(X[:, i], n) for i, n in self.one_hot_sizes.items()]
+        unseen_zero = self.options.unseen_category == "minus1"
+        blocks = [self._one_hot(X[:, i], n, unseen_zero) for i, n in self.one_hot_sizes.items()]
         return np.concatenate([out[:, keep], *blocks], axis=1)
 
     @staticmethod
-    def _one_hot(codes: np.ndarray, n: int) -> np.ndarray:
-        # 결측과 범위 밖 번호는 NaN: 번호 열과 똑같이 결측으로 본다
+    def _one_hot(codes: np.ndarray, n: int, unseen_zero: bool = False) -> np.ndarray:
+        # 결측과 범위 밖 번호는 NaN: 번호 열과 똑같이 결측으로 본다. `unseen_zero`
+        # (unseen_category="minus1")면 학습 행에 없던 범주(-1)는 어느 범주도 아니므로 모두 0
         known = np.isfinite(codes) & (codes >= 0) & (codes < n)
         block = np.full((len(codes), n), np.nan)
         block[known] = 0.0
+        if unseen_zero:
+            block[codes == UNSEEN_CODE] = 0.0
         block[np.flatnonzero(known), codes[known].astype(int)] = 1.0
         return block[:, 1:] if n == 2 else block
 

@@ -69,7 +69,9 @@ feature 수 상한을 없애서, 권장 크기보다 넓은 split(BeyondArena의
 target 변환, 공통 경계로 옮긴 분포의 평균), `--max-features-per-member 768 --feature-subsampling
 balanced`, `--fingerprint-feature hash`·`--outlier-clip soft`·`--infer-categorical`·
 `--drop-constant`(`minipfn.inference.preprocessing`). `--official-v35`는 이것을 모두 켠다(따로 준
-옵션이 먼저). `--test-time none`에서만 쓴다.
+옵션이 먼저). `--test-time none`에서만 쓴다. 진단용으로 `--unseen-category minus1`(학습에 없던
+범주를 결측 대신 번호 -1로, TabICLv2 방식. 공식 3.5는 NaN)과 `--drop-group-columns`
+(TabArena·BeyondArena grouped split의 group 열을 fit·예측에서 뺀다)가 있다.
 
   uv run --no-dev --extra arena --group arena-dev python $EVAL --suite tabarena-lite \
     --classifier-path hf://aiden-jeon/minipfn-tabpfn-v3-5 \
@@ -162,6 +164,7 @@ from minipfn.inference.preprocessing import (
     FINGERPRINTS,
     ONE_HOT_MODES,
     OUTLIER_CLIPS,
+    UNSEEN_CATEGORIES,
     one_hot_kinds,
     one_hot_sizes,
     to_numeric,
@@ -383,6 +386,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="회귀 멤버 절반의 target 변환: power(기본, z에 Yeo-Johnson), safepower(공식), none",
     )
     parser.add_argument(
+        "--unseen-category",
+        choices=UNSEEN_CATEGORIES,
+        default=None,
+        help="학습 행에 없던 범주: nan(기본, 결측과 같게. 공식 3.5도 NaN) 또는 minus1(번호 -1,"
+        " TabICLv2 방식. one-hot 블록은 모두 0)",
+    )
+    parser.add_argument(
+        "--drop-group-columns",
+        action="store_true",
+        help="TabArena·BeyondArena 진단: grouped split의 group 열(validation_metadata.group_on)을"
+        " fit·예측 양쪽에서 뺀다",
+    )
+    parser.add_argument(
         "--regression-mean",
         choices=REGRESSION_MEANS,
         default=None,
@@ -440,6 +456,7 @@ INFERENCE_DEFAULTS = {
     "feature_subsampling": "random",
     "target_transform": "power",
     "regression_mean": "member",
+    "unseen_category": "nan",
 }
 REGRESSION_ONLY = ("target_transform", "regression_mean")
 
@@ -450,7 +467,8 @@ def resolve_inference_options(args: argparse.Namespace) -> None:
     official = getattr(args, "official_v35", False)
     for name, default in INFERENCE_DEFAULTS.items():
         if getattr(args, name, None) is None:
-            setattr(args, name, OFFICIAL_V35[name] if official else default)
+            # 공식 3.5는 학습에 없던 범주를 NaN으로 둔다 (unseen_category 기본값과 같다)
+            setattr(args, name, OFFICIAL_V35.get(name, default) if official else default)
     if getattr(args, "one_hot", None) is None:
         args.one_hot = ["off"] if official else [DEFAULT_ONE_HOT]
     if official and args.max_features_per_member is None:
@@ -817,6 +835,7 @@ def arena_fingerprint(
             ),
             # 공식 3.5 추론 옵션: 기본값과 다른 것만 (모두 기본이면 예전 fingerprint 그대로)
             **inference_option_params(args),
+            **({"drop_group_columns": True} if getattr(args, "drop_group_columns", False) else {}),
         },
         sort_keys=True,
     )
@@ -841,6 +860,8 @@ def arena_estimator_factory(args: argparse.Namespace, paths: dict):
 
     # arena system은 이 함수를 받으므로 split의 group 번호를 넘길지도 여기에 단다
     make.fit_groups = any(getattr(f, "fit_groups", False) for f in factories.values())
+    # 진단: grouped split의 group 열을 빼고 fit·예측 (`--drop-group-columns`)
+    make.drop_group_columns = getattr(args, "drop_group_columns", False)
     make.one_hot = one_hot
     make.kinds = {task: f.member_kinds for task, f in factories.items()}
     return make, factories
@@ -1262,6 +1283,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
             **inference_option_params(args),
+            "drop_group_columns": getattr(args, "drop_group_columns", False),
         }
     )
     paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}

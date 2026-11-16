@@ -347,10 +347,56 @@ def test_eval_official_v35_flags(monkeypatch, tmp_path):
     make = script.make_estimator_factory("classification", official)
     estimator = make(types.SimpleNamespace(categorical_indices=[]), "off")
     assert estimator.softmax_temperature == 1.0 and estimator.drop_constant
-    assert estimator.preprocess_options == PreprocessOptions(True, "hash", "soft")
+    assert estimator.preprocess_options == PreprocessOptions(True, "hash", "soft", "nan")
     paths, kinds = {"classification": "unused"}, {"classification": ("standard",)}
     factories = {"classification": types.SimpleNamespace(model=model)}
     printed = json.loads(script.arena_fingerprint(official, paths, factories, kinds, "off"))
     assert printed["target_transform"] == "safepower" and printed["max_features_per_member"] == 768
     plain = json.loads(script.arena_fingerprint(default, paths, factories, kinds, "all"))
     assert set(plain) == {"paths", "member_kinds", "one_hot"}  # 기본은 예전 fingerprint 그대로
+
+
+def test_unseen_category_minus1_is_a_value_not_missing():
+    from minipfn.inference.preprocessing import UNSEEN_CODE, apply_encoder, to_numeric
+
+    train = pd.DataFrame({"g": ["a", "b", "c", None], "x": [1.0, 2.0, 3.0, 4.0]})
+    test = pd.DataFrame({"g": ["b", "zz", None], "x": [1.0, 2.0, 3.0]})
+    _, cat_ix, enc = to_numeric(train, None)
+    assert np.isnan(apply_encoder(test, cat_ix, enc)[1, 0])  # 기본: 미지 범주는 결측
+    _, cat_ix, enc = to_numeric(train, None, "minus1")
+    coded = apply_encoder(test, cat_ix, enc)[:, 0]
+    assert coded[0] == 1.0 and coded[1] == UNSEEN_CODE and np.isnan(coded[2])  # 진짜 결측은 결측
+    # 번호를 섞어도 -1은 그대로, one-hot 블록은 모두 0 (결측은 NaN)
+    x = np.array([[0.0], [1.0], [2.0], [-1.0], [np.nan]])
+    member = Member("standard", None, False, 0)
+    prep = MemberPreprocessor(member, [0], 100, PreprocessOptions(shuffle_categories=True))
+    prep.fit(x[:3])
+    assert prep._base(x)[3, 0] == UNSEEN_CODE and np.isnan(prep._base(x)[4, 0])
+    block = MemberPreprocessor._one_hot(np.array([0.0, -1.0, np.nan]), 3, unseen_zero=True)
+    assert np.array_equal(block[1], [0, 0, 0]) and np.isnan(block[2]).all()
+    with pytest.raises(ValueError, match="unseen_category"):
+        to_numeric(train, None, "zero")
+    # 앙상블: 학습에 없던 범주만 있는 테스트 행도 돈다 (기본과 결과가 다르다)
+    g = np.random.default_rng(0)
+    df = pd.DataFrame({"g": [f"u{i % 30}" for i in range(200)], "x": g.normal(size=200)})
+    y = (np.arange(200) % 30 < 15).astype(int)
+    test_df = df.assign(g=[f"new{i}" for i in range(200)])[:40]
+    kw = dict(n_estimators=2, member_kinds="standard", one_hot="off")
+    a = EnsembleClassifier(_tiny_model(), **kw).fit(df, y).predict_proba(test_df)
+    b = EnsembleClassifier(_tiny_model(), unseen_category="minus1", **kw).fit(df, y)
+    assert not np.allclose(a, b.predict_proba(test_df))
+
+
+def test_group_columns_of_a_grouped_split():
+    from minipfn.benchmarks.arena import group_columns
+
+    X = pd.DataFrame({"patient": [1, 2], "x": [0.0, 1.0]})
+    assert group_columns(X, types.SimpleNamespace(group_on="patient", time_on=None)) == ["patient"]
+    assert group_columns(X, types.SimpleNamespace(group_on=["patient", "site"])) == ["patient"]
+    assert group_columns(X, types.SimpleNamespace(group_on=None)) == []
+    assert group_columns(X, None) == []
+    script = _eval_script()
+    args = script.parse_args(["--suite", "beyondarena-lite", "--drop-group-columns"])
+    assert args.drop_group_columns and not script.parse_args([]).drop_group_columns
+    assert script.parse_args(["--unseen-category", "minus1"]).unseen_category == "minus1"
+    assert script.inference_option_params(script.parse_args([])) == {}
