@@ -32,6 +32,8 @@ from minipfn.training.muon import MuonAdam
 # stage 3: 셀 1,500,000개(50,000행 × 30)까지
 TABLES = {
     "2_10k": (2, 10_240, 100),
+    # activation checkpointing을 켜지 않는 가장 큰 표 (`TUNED_LONG_COMMON`의 4,096행)
+    "2_4k": (2, 4_096, 100),
     "2_5k": (2, 5_000, 204),
     "2_wide": (2, 2_048, 500),
     "3_20k": (3, 20_000, 75),

@@ -154,10 +154,11 @@ TUNED_LONG_COMMON = {
     "val_batch": 4,
     "val_every": 1_000,
     "checkpoint_every": 1_000,
-    # activation checkpointing은 모든 batch에서 (행 수로 가르지 않는다: 셀이 많으면 짧고 넓은 표도
-    # 메모리를 넘는다). H100 한 장 실측: 끄면 분류는 stage 2의 가장 큰 표(10,240×100, 5,000×204,
-    # 2,048×500)부터 OOM, 회귀는 65~67 GB. 켜면 stage 3의 50,000×30까지 분류 17 GB·회귀 15 GB
-    "activation_checkpointing_rows": 0,
+    # activation checkpointing은 4,096행보다 긴 표에서. H100 한 장 실측: 끄면 분류는 stage 2의 가장
+    # 큰 표(10,240×100)에서 OOM, 회귀는 67 GB. 켜면 stage 3의 50,000×30까지 분류 17·회귀 15 GB.
+    # 4,096행 이하는 셀이 41만 개 이하라(feature ≤ 100) 옛 long_tables(셀 40만, 분류 36 GB)처럼
+    # 그대로 든다. 모든 batch에서 켜면 16 GPU stage 2가 분류 2.3~2.9 s/step이었다
+    "activation_checkpointing_rows": 4_096,
 }
 TUNED_LONG = {
     2: {
@@ -189,8 +190,8 @@ def tuned_long(stage: int, task: str = "classification") -> TrainConfig:
 
     TabPFN-3.5에서 쓴 TabICLv2 curriculum stage 2·3(`recipes.tabpfn_v3.curriculum`)을 TabPFN-2.5에
     옮겼다: 표 행 수 400~10,240(stage 2, 20k step)·400~50,000(stage 3, 5k step) log 균등, 학습 행
-    비율 U(0.79, 0.81), lr은 stage 1(tuned)의 1/8·1/40, warmup 1% + cosine, 모든 batch에서
-    activation checkpointing. task별 optimizer·prior와 가속 옵션은 tuned 그대로다(분류는
+    비율 U(0.79, 0.81), lr은 stage 1(tuned)의 1/8·1/40, warmup 1% + cosine, 4,096행보다 긴
+    표에서 activation checkpointing. task별 optimizer·prior와 가속 옵션은 tuned 그대로다(분류는
     Adam·TabICLv2 prior, 회귀는 Muon). 가중치는 앞 단계 run에서 가져온다(학습 스크립트가 막는다).
     """
     if stage not in TUNED_LONG:

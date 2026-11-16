@@ -701,7 +701,7 @@ def test_tuned_long_stages_follow_the_tabicl_curriculum(monkeypatch):
             assert config.optimizer == tuned.optimizer and config.compile
             assert config.filter_unpredictable == tuned.filter_unpredictable
             assert config.binary_prob == tuned.binary_prob
-            assert config.activation_checkpointing_rows == 0
+            assert config.activation_checkpointing_rows == 4_096
             expected_clip = 60_000.0 if task == "classification" else tuned.qk_clip
             assert config.qk_clip == expected_clip and config.rewind_lr_factor == 0.5
 
