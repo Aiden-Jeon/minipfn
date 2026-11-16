@@ -98,6 +98,11 @@ LONG_TABLE_FEATURE_CAPS = (
 )
 # 위 표의 마지막 행 수보다 긴 표의 feature 상한 (TabICLv2 `adjust_max_features`의 else)
 LONG_TABLE_BEYOND_CAP = 10
+# feature 상한 규칙 ("train_fraction" 규칙의 `feature_cap_rule`). "rows"는 위 TabICLv2 표
+# (`long_table_feature_cap`), "cells"는 셀 상한으로 정한 min(max_features, max_cells // 행 수)다.
+# "cells"는 TabICLv2에 없다(여기서 정함): 65,000행보다 긴 표도 feature 10개로 묶지 않고 셀 수로만
+# 묶는다(curriculum stage 4, `recipes.tabpfn_v3.CURRICULUM`)
+FEATURE_CAP_RULES = ("rows", "cells")
 
 
 def long_table_feature_cap(n_rows: int, max_features: int) -> int:
@@ -118,9 +123,14 @@ def check_split_sizes(
     max_features: int,
     max_cells: int,
     min_train_rows: int = 1,
+    feature_cap_rule: str = "rows",
 ) -> None:
     """ "train_fraction" 규칙의 설정이 말이 되는지 (`check_sizes`와 같은 일). 가장 짧은 표에도
     학습 행 `min_train_rows`개(분류는 2)와 검증 행 하나가 남아야 한다."""
+    if feature_cap_rule not in FEATURE_CAP_RULES:
+        raise ValueError(
+            f"feature_cap_rule은 {FEATURE_CAP_RULES} 가운데 하나여야 한다: {feature_cap_rule}"
+        )
     if min_rows < max(min_train_rows, 1) + 1 or max_rows < min_rows:
         raise ValueError(
             f"행 수는 min_train_rows + 1 ≤ min_rows ≤ max_rows여야 한다: {min_train_rows},"
@@ -150,6 +160,7 @@ def sample_split_size(
     log_uniform_rows: bool = False,
     max_cells: int,
     min_train_rows: int = 1,
+    feature_cap_rule: str = "rows",
 ) -> tuple[int, int, int]:
     """(학습 행 수, 검증 행 수, feature 수) — TabICLv2 규칙("train_fraction").
 
@@ -158,7 +169,9 @@ def sample_split_size(
     2. 학습 행 수 = int(행 수 × U(min_train_fraction, max_train_fraction))
        (`sample_train_size`의 비율 경우). 학습·검증 행이 하나 이상 남게 자른다
     3. feature 수 = round(U(1, 상한)), 상한은 행이 많으면 줄인다(`long_table_feature_cap`).
-       TabICLv2에는 셀 수 상한이 없다. `max_cells`를 넘으면 여기서 feature 수를 줄인다
+       TabICLv2에는 셀 수 상한이 없다. `max_cells`를 넘으면 여기서 feature 수를 줄인다.
+       `feature_cap_rule="cells"`면 상한이 min(max_features, max_cells // 행 수)이다
+       (`FEATURE_CAP_RULES`)
     """
     if min_rows == max_rows:
         n_rows = max_rows
@@ -168,7 +181,10 @@ def sample_split_size(
         n_rows = int(rng.integers(min_rows, max_rows))  # TabICL의 randint처럼 위 끝은 빠진다
     n_train = int(n_rows * rng.uniform(min_train_fraction, max_train_fraction))
     n_train = min(max(n_train, min_train_rows, 1), n_rows - 1)
-    cap = long_table_feature_cap(n_rows, max_features)
+    if feature_cap_rule == "cells":
+        cap = max(1, min(max_features, max_cells // n_rows))
+    else:
+        cap = long_table_feature_cap(n_rows, max_features)
     n_features = int(round(rng.uniform(1, cap)))
     n_features = max(1, min(n_features, max_cells // n_rows))
     return n_train, n_rows - n_train, n_features

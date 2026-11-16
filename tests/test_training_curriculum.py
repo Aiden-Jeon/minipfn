@@ -80,6 +80,38 @@ def test_long_table_sizes():
     assert long_table_feature_cap(100_000, 100) == 10
 
 
+def test_cells_feature_cap_sizes():
+    # stage 4: 400~200,000행 log 균등, feature 상한 = min(100, 4M // 행 수) (TabICLv2 표 대신)
+    rng = np.random.default_rng(3)
+    kw = dict(
+        min_rows=400,
+        max_rows=200_000,
+        min_train_fraction=0.79,
+        max_train_fraction=0.81,
+        log_uniform_rows=True,
+        max_cells=4_000_000,
+        feature_cap_rule="cells",
+    )
+    sizes = [_split(rng, **kw) for _ in range(4000)]
+    rows = np.array([n_train + n_eval for n_train, n_eval, _ in sizes])
+    features = np.array([f for _, _, f in sizes])
+    assert (features <= np.minimum(100, 4_000_000 // rows)).all() and features.min() == 1
+    assert (rows * features <= 4_000_000).all()
+    assert 400 <= rows.min() < 450 and 180_000 < rows.max() < 200_000
+    # TabICLv2 표라면 65,000행 넘는 표는 feature 10개까지다. 셀 상한이면 그보다 넓다
+    assert features[rows > 65_000].max() > 30
+    assert features[(rows > 150_000)].max() <= 26
+    # 40,000행까지는 셀 상한에 걸리지 않는다 (feature 100까지)
+    assert features[rows <= 40_000].max() == 100
+    # "rows"(기본)는 인자를 주지 않은 것과 같은 난수열·크기
+    a, b = np.random.default_rng(4), np.random.default_rng(4)
+    stage3 = dict(kw, max_rows=60_000, max_cells=6_000_000)
+    stage3.pop("feature_cap_rule")
+    assert [_split(a, **stage3) for _ in range(300)] == [
+        _split(b, **stage3, feature_cap_rule="rows") for _ in range(300)
+    ]
+
+
 def test_split_size_respects_cells_and_minimum():
     rng = np.random.default_rng(2)
     for _ in range(200):
@@ -143,6 +175,15 @@ def test_size_rule_checks():
         _prior(max_cells=10)
     with pytest.raises(ValueError, match="size_rule"):
         TrainConfig(size_rule="rows")
+    with pytest.raises(ValueError, match="feature_cap_rule"):
+        _prior(feature_cap_rule="features")
+    with pytest.raises(ValueError, match="feature_cap_rule"):  # eval_rows 규칙에는 없다
+        TrainConfig(feature_cap_rule="cells")
+    with pytest.raises(ValueError, match="feature_cap_rule"):
+        P.GraphSCMPrior("regression", feature_cap_rule="cells")
+    # prior도 셀 상한 규칙으로 크기를 뽑는다
+    wide = _prior(min_rows=60, max_rows=60, max_features=6, max_cells=180, feature_cap_rule="cells")
+    assert {wide.sample_shape()[1] for _ in range(50)} <= {1, 2, 3}
     # 기본 규칙(eval_rows)에서는 새 필드를 보지 않는다
     TrainConfig(min_rows=10_000_000)
 
@@ -304,15 +345,17 @@ def test_config_checks():
 
 
 def test_curriculum_recipe():
-    s1, s2, s3 = (tabpfn_v3.curriculum(n) for n in (1, 2, 3))
-    for c in (s1, s2, s3):
+    s1, s2, s3, s4 = (tabpfn_v3.curriculum(n) for n in (1, 2, 3, 4))
+    for c in (s1, s2, s3, s4):
         assert c.task == "multitask" and c.optimizer == "muon" and c.muon_scope == "all"
         assert c.muon_momentum == 0.9 and c.muon_weight_decay == 0.01 and c.batch_size == 256
         assert c.size_rule == "train_fraction" and c.max_features == 100
         assert c.binary_prob == 0.5 and c.filter_unpredictable and c.phases == ()
         assert c.warmup_steps == c.steps // 100
-        assert c.max_cells == c.max_rows * 100
         assert tabpfn_v3.architecture_name(c) == "v3.5"
+    # stage 1~3은 셀 상한이 최대 행 수 × 100, feature 상한은 TabICLv2 표
+    for c in (s1, s2, s3):
+        assert c.max_cells == c.max_rows * 100 and c.feature_cap_rule == "rows"
     assert (s1.steps, s1.lr, s1.grad_clip, s1.micro_batch) == (250_000, 4e-4, 10.0, 8)
     assert (s1.min_rows, s1.max_rows, s1.min_train_fraction, s1.max_train_fraction) == (
         1024,
@@ -328,7 +371,24 @@ def test_curriculum_recipe():
         True,
     )
     assert (s3.steps, s3.lr, s3.grad_clip, s3.max_rows) == (5_000, 1e-5, 1.0, 60_000)
-    assert all(c.logit_softcap == 50.0 for c in (s1, s2, s3))
+    assert all(c.logit_softcap == 50.0 for c in (s1, s2, s3, s4))
+    # stage 4 (issue #91): 400~200,000행, 셀 상한 4M, stage 3의 절반 lr로 2,000 step
+    assert (s4.steps, s4.lr, s4.grad_clip, s4.warmup_steps, s4.micro_batch) == (
+        2_000,
+        5e-6,
+        1.0,
+        20,
+        1,
+    )
+    assert (s4.min_rows, s4.max_rows, s4.max_cells, s4.feature_cap_rule) == (
+        400,
+        200_000,
+        4_000_000,
+        "cells",
+    )
+    assert (s4.min_train_fraction, s4.max_train_fraction, s4.log_uniform_rows) == (0.79, 0.81, True)
+    assert s4.activation_checkpointing_rows == s3.activation_checkpointing_rows == 10_240
+    assert s4.steps % s4.checkpoint_every == 0 and s4.steps % s4.keep_every == 0
     # task당 데이터셋 수가 TabICLv2(500K step × batch 64)와 같다
     assert s1.steps * s1.batch_size // 2 == 500_000 * 64
     assert s2.steps * s2.batch_size // 2 == 40_000 * 64
@@ -336,7 +396,7 @@ def test_curriculum_recipe():
     with pytest.raises(ValueError, match="v3.5 multitask"):
         tabpfn_v3.curriculum(1, "classification")
     with pytest.raises(ValueError, match="stage"):
-        tabpfn_v3.curriculum(4)
+        tabpfn_v3.curriculum(5)
 
 
 def _smoke_curriculum(**changes):
@@ -397,8 +457,14 @@ def test_train_script_stages(monkeypatch):
     args = ["--config-name", "stage1", "--arch", "v3.5", "--task", "multitask"]
     config, arch = script.build_config(script.parse_args(args))
     assert arch == "v3.5" and config == tabpfn_v3.curriculum(1)
-    with pytest.raises(SystemExit):  # 앞 단계 가중치 없이 stage 2는 시작하지 않는다
-        script.parse_args(["--config-name", "stage2", "--arch", "v3.5", "--task", "multitask"])
+    for stage in ("stage2", "stage4"):  # 앞 단계 가중치 없이 stage 2~4는 시작하지 않는다
+        with pytest.raises(SystemExit):
+            script.parse_args(["--config-name", stage, "--arch", "v3.5", "--task", "multitask"])
+    # stage 4도 recipe 그대로이고, 인자로 준 step 수(yaml 기본 300을 덮어쓴 값)만 바뀐다
+    args = ["--config-name", "stage4", "--arch", "v3.5", "--task", "multitask", "--steps", "2000"]
+    args += ["--init-run-id", "stage3"]
+    config, arch = script.build_config(script.parse_args(args))
+    assert arch == "v3.5" and config == tabpfn_v3.curriculum(4)
     with pytest.raises(SystemExit, match="v3.5 multitask"):
         script.build_config(script.parse_args(["--config-name", "stage1", "--arch", "v3.5"]))
     # 이어 학습하면 Muon 범위·momentum을 원래 run에서 잇는다

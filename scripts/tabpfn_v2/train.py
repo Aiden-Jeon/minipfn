@@ -60,7 +60,8 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 학습한다(`recipes.tabpfn_v3.cooldown`).
 `--config-name stage1|stage2|stage3`(`--arch v3.5 --task multitask`)은 TabICLv2 3단계 학습을 옮긴
 것이다(`recipes.tabpfn_v3.curriculum`: 모든 파라미터 Muon, 표 크기 curriculum, prior filter).
-stage2·3은 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
+`stage4`는 그 뒤에 더한 긴 표(200,000행, 셀 상한 4M) 단계다(issue #91).
+stage2~4는 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -105,8 +106,8 @@ PRESETS = {
     # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,
     # --init-run-id와 같이)
     "cooldown": tabpfn_v3.cooldown,
-    # TabICLv2 3단계 학습을 옮긴 것 (`recipes.tabpfn_v3.curriculum`, --arch v3.5 --task multitask).
-    # stage2·3은 앞 단계 run에서 가중치를 가져온다(--init-run-id)
+    # TabICLv2 3단계 학습을 옮긴 것과 긴 표 stage 4 (`recipes.tabpfn_v3.curriculum`, --arch v3.5
+    # --task multitask). stage2~4는 앞 단계 run에서 가중치를 가져온다(--init-run-id)
     **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
 }
 CONFIG_NAMES = tuple(PRESETS)

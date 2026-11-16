@@ -222,6 +222,15 @@ def cooldown(task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
 #   issue #79). 1×H100에서 끄면 30,000×60 분류부터 OOM이고, 켜면 60,000×20까지 step 최대 메모리가
 #   16~19 GB다(optimizer 상태 포함, `scripts/tabpfn_v3/activation_checkpointing.py`). 켠 표는 step이
 #   23~27% 느리다. stage 2 크기(끄고 36~38 GB)까지는 끈다
+# stage 4는 TabICLv2에 없다(여기서 정함, issue #91). stage 3까지 학습한 표는 60,000행·행이 많으면
+# feature 10~40개까지라, 공식 TabPFN-3.5와의 차이가 큰 표에서 더 컸다(issue #90). stage 3 가중치에서
+# 400~200,000행 log 균등으로 짧게 이어 학습한다:
+# - feature 상한은 TabICLv2의 행별 표(65,000행 넘으면 10) 대신 셀 상한 4M으로:
+#   min(100, 4,000,000 // 행 수) (`feature_cap_rule="cells"`). 40,000행까지 100, 100,000행 40,
+#   200,000행 20
+# - lr은 stage 3의 절반(5e-6), grad clip 1, 2,000 step(task당 데이터셋 256K개). 나머지는 stage 3과
+#   같다(activation checkpointing 10,240행 초과 포함)
+# - step이 길어(~100 s 추정) 기록·되돌릴 상태·checkpoint 간격을 줄인다
 CURRICULUM_COMMON = {
     "batch_size": 256,
     "optimizer": "muon",
@@ -276,21 +285,41 @@ CURRICULUM = {
         # stage 2의 가장 큰 표(10,240행)까지는 끈다 (위 주석)
         "activation_checkpointing_rows": 10_240,
     },
+    4: {
+        "steps": 2_000,
+        "lr": 5e-6,
+        "grad_clip": 1.0,
+        "min_rows": 400,
+        "max_rows": 200_000,
+        "min_train_fraction": 0.79,
+        "max_train_fraction": 0.81,
+        "log_uniform_rows": True,
+        "micro_batch": 1,
+        "max_cells": 4_000_000,
+        "feature_cap_rule": "cells",
+        "log_every": 20,
+        "snapshot_every": 200,
+        "val_every": 250,
+        "checkpoint_every": 250,
+        "keep_every": 500,
+        "activation_checkpointing_rows": 10_240,
+    },
 }
 # warmup은 단계 길이의 1% (스크립트 `--warmup_proportion 0.01`)
 CURRICULUM_WARMUP = 0.01
 
 
 def curriculum(stage: int, task: str = "multitask", arch: str = "v3.5") -> TrainConfig:
-    """TabICLv2 3단계 학습의 `stage`(1·2·3)번째 단계 설정 (`CURRICULUM`). stage 2·3은 앞 단계
-    checkpoint에서 가중치만 가져와(`init_from`) 시작한다(학습 스크립트가 막는다). v3.5
+    """TabICLv2 3단계 학습의 `stage`(1·2·3)번째 단계 설정과 그 뒤에 더한 긴 표 stage 4
+    (`CURRICULUM`). stage 2~4는 앞 단계 checkpoint에서 가중치만 가져와(`init_from`) 시작한다(학습
+    스크립트가 막는다). 셀 상한은 stage에 적은 값, 없으면 최대 행 수 × feature 상한이다. v3.5
     multitask만."""
     if (task, arch) != ("multitask", "v3.5"):
         raise ValueError(f"curriculum은 v3.5 multitask만 있다 (task {task}, arch {arch})")
     if stage not in CURRICULUM:
         raise ValueError(f"curriculum stage는 {tuple(CURRICULUM)} 가운데 하나다: {stage}")
     changes = {**CURRICULUM_COMMON, **CURRICULUM[stage]}
-    changes["max_cells"] = changes["max_rows"] * changes["max_features"]
+    changes.setdefault("max_cells", changes["max_rows"] * changes["max_features"])
     changes["warmup_steps"] = int(CURRICULUM_WARMUP * changes["steps"])
     return replace(paper(task, arch), **changes)
 
