@@ -158,7 +158,7 @@ def test_prior_rejects_sizes_it_cannot_draw():
 
 
 def test_train_fraction_features_follow_feature_scale_when_smaller():
-    # issue #81 tuned_long: one-hot 폭 상한(max_features)은 넓게, 학습 표 feature 수는 feature_scale까지
+    # issue #81 tuned_long: one-hot 상한(max_features)은 넓게, 학습 표 feature는 feature_scale까지
     from minipfn.priors.graph_scm import GraphSCMPrior
 
     sizes = dict(
