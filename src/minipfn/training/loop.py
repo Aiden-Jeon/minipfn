@@ -124,7 +124,12 @@ def _validate(
     for batch in val_batches:
         x, y = batch.x.to(device), batch.y.to(device)
         kwargs = forward
-        if inference_rows is not None and x.shape[1] > inference_rows:
+        # 추론 경로가 따로 있는 모델만 (cell_transformer는 학습·추론 forward가 같다)
+        if (
+            inference_rows is not None
+            and x.shape[1] > inference_rows
+            and getattr(model, "supports_inference_options", False)
+        ):
             kwargs = {**forward, "inference": True}
         with autocast():
             logits = model(x, y[:, : batch.n_train], **kwargs)

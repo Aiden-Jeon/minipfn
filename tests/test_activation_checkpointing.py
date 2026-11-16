@@ -100,8 +100,8 @@ def test_checkpointing_only_large_training_tables(monkeypatch):
 def test_checkpointing_config():
     config = TrainConfig.smoke("classification")
     assert config.activation_checkpointing_rows is None  # 기본은 끔
-    with pytest.raises(ValueError, match="cell_transformer"):  # 그 모델에는 없다
-        replace(config, activation_checkpointing_rows=10)
+    # cell_transformer(v2·2.5)도 받는다 (issue #81, tuned_stage3)
+    assert replace(config, activation_checkpointing_rows=10).activation_checkpointing_rows == 10
     v35 = tabpfn_v3.with_architecture(config, "v3.5", keep_size=True)
     assert replace(v35, activation_checkpointing_rows=0).activation_checkpointing_rows == 0
     with pytest.raises(ValueError, match="0 이상"):

@@ -613,3 +613,107 @@ def test_tuned_preset_is_paper_with_the_options_chosen_in_issue_81(monkeypatch):
         else:
             assert config.optimizer == "muon" and config.size_rule == "eval_rows"
             assert changed == {"steps", "compile", "fused_adam", "tf32", "optimizer"}
+
+
+def test_cell_transformer_activation_checkpointing_gives_the_same_gradients():
+    # issue #81 tuned_stage3: 긴 표에서 층마다 activation을 다시 계산해도 손실·gradient가 같다
+    config = recipe.with_architecture(TrainConfig.smoke("regression"), "v2.5", keep_size=True)
+    torch.manual_seed(0)
+    model = config.build_model()
+    assert isinstance(model, CellTransformer)
+    # 잔차 출력층이 0으로 시작하면 gradient가 대부분 0이라 같은지 보기 어렵다
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    x, y = torch.randn(2, 40, 7), torch.randn(2, 40)
+
+    def grads(rows):
+        model.activation_checkpointing_rows = rows
+        model.zero_grad()
+        loss = model(x, y[:, :30]).square().mean()
+        loss.backward()
+        return loss.detach(), [p.grad.clone() for p in model.parameters()]
+
+    loss, ref = grads(None)
+    assert model._checkpointing(40) is False
+    loss_ckpt, got = grads(0)
+    assert model._checkpointing(40)
+    assert torch.equal(loss, loss_ckpt)
+    assert all(torch.equal(a, b) for a, b in zip(ref, got, strict=True))
+    # 기준보다 짧은 표·평가 forward에서는 쓰지 않는다
+    model.activation_checkpointing_rows = 40
+    assert not model._checkpointing(40)
+    model.activation_checkpointing_rows = 0
+    model.eval()
+    assert not model._checkpointing(40)
+
+
+def test_validation_with_checkpointing_rows_keeps_the_cell_transformer_forward():
+    # cell_transformer에는 추론 경로(`inference=True`)가 없다: 검증은 학습 forward 그대로
+    from minipfn.training.loop import _validate
+
+    config = replace(
+        recipe.with_architecture(TrainConfig.smoke("classification"), "v2.5", keep_size=True),
+        val_batch=2,
+    )
+    import contextlib
+
+    model = config.build_model()
+    batches = _make_val_batches(config, n_batches=1)
+    out = _validate(
+        model,
+        batches,
+        torch.device("cpu"),
+        contextlib.nullcontext,
+        "classification",
+        None,
+        inference_rows=0,
+    )
+    assert "val_loss" in out and "val_acc" in out
+
+
+def test_tuned_long_stages_follow_the_tabicl_curriculum(monkeypatch):
+    for name in ("TABPFN_V2_ARCH", "TABPFN_V2_CONFIG_NAME", "TABPFN_V2_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    script = _train_script()
+    # 앞 단계 run 없이는 시작하지 않는다
+    with pytest.raises(SystemExit):
+        script.parse_args(["--config-name", "tuned_stage2", "--arch", "v2.5"])
+    for task in ("classification", "regression"):
+        tuned = recipe.with_architecture(recipe.tuned(task), "v2.5")
+        for stage, (steps, rows, factor) in {
+            2: (20_000, 10_240, 8),
+            3: (5_000, 50_000, 40),
+        }.items():
+            args = script.parse_args(
+                [f"--config-name=tuned_stage{stage}", "--arch=v2.5", f"--task={task}"]
+                + ["--init-run-id=r"]
+            )
+            config, arch = script.build_config(args)
+            assert arch == recipe.architecture_name(config) == "v2.5"
+            assert (config.steps, config.max_rows, config.min_rows) == (steps, rows, 400)
+            assert config.lr == pytest.approx(tuned.lr / factor)
+            assert config.warmup_steps == steps // 100
+            assert config.size_rule == "train_fraction" and config.log_uniform_rows
+            assert (config.min_train_fraction, config.max_train_fraction) == (0.79, 0.81)
+            assert config.max_features == 500 and config.micro_batch == 1
+            # task별 optimizer·prior·가속 옵션은 tuned 그대로
+            assert config.optimizer == tuned.optimizer and config.compile
+            assert config.filter_unpredictable == tuned.filter_unpredictable
+            assert config.binary_prob == tuned.binary_prob
+            assert config.activation_checkpointing_rows == 0
+            expected_clip = 60_000.0 if task == "classification" else tuned.qk_clip
+            assert config.qk_clip == expected_clip and config.rewind_lr_factor == 0.5
+
+
+def test_cell_transformer_splits_large_attention_batches(monkeypatch):
+    # issue #81: SDPA batch가 CUDA 상한을 넘으면 나눠 부른다. 값은 같다
+    from minipfn.models import cell_transformer as ct
+
+    config = recipe.with_architecture(TrainConfig.smoke("classification"), "v2.5", keep_size=True)
+    torch.manual_seed(0)
+    model = config.build_model().eval()
+    x, y = torch.randn(3, 30, 7), torch.randint(0, 3, (3, 22)).float()
+    with torch.no_grad():
+        ref = model(x, y)
+        monkeypatch.setattr(ct, "SDPA_MAX_BATCH", 7)
+        assert torch.equal(model(x, y), ref)

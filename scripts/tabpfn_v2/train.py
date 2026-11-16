@@ -50,6 +50,9 @@ ISO 8601 예: 2026-10-28T08:45+09:00)을 준다. 학습률 스케줄은 `steps` 
 checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--config-name long_tables`로 긴 표 학습).
 `--config-name tuned`(`--arch v2.5`)은 issue #81의 medium 20k 실험으로 고른 학습 설정이다
 (`recipes.tabpfn_v2.tuned`: 300k step, compile·fused Adam·TF32, 분류는 TabICLv2 prior, 회귀는 Muon).
+`--config-name tuned_stage2|tuned_stage3`(`--arch v2.5`)은 tuned 가중치를 긴 표로 이어
+학습한다(`recipes.tabpfn_v2.tuned_long`: TabICLv2 curriculum stage 2·3을 옮긴 것,
+`--init-run-id`로 앞 단계).
 `--config-name paper_run`(`--arch v3.5 --task multitask`)은 실제로 학습한 TabPFN-3.5 경로다
 (`recipes.tabpfn_v3.paper_run`: batch 256, Muon, step 구간별 lr·weight decay 변경 `phases`).
 구간 설정이 있는 run을 이어 학습하면 그 구간 설정을 따르고, lr은 `--lr`이 아니라 구간이 정한다.
@@ -94,6 +97,9 @@ PRESETS = {
     # issue #81로 고른 TabPFN-2.5 학습 설정 (`recipes.tabpfn_v2.tuned`, --arch v2.5): 300k step,
     # 가속 옵션, 분류는 TabICLv2 prior, 회귀는 Muon
     "tuned": recipe.tuned,
+    # tuned 뒤의 긴 표 단계 (`recipes.tabpfn_v2.tuned_long`, TabICLv2 curriculum stage 2·3).
+    # 앞 단계 run에서 가중치를 가져온다(--init-run-id)
+    **{f"tuned_stage{n}": partial(recipe.tuned_long, n) for n in recipe.TUNED_LONG},
     # 실제로 학습한 TabPFN-3.5 경로 (`recipes.tabpfn_v3.paper_run`, --arch v3.5 --task multitask)
     "paper_run": tabpfn_v3.paper_run,
     # paper_run 가중치의 마무리 학습: lr 1e-4 → 0, 20k step (`recipes.tabpfn_v3.cooldown`,
@@ -105,6 +111,7 @@ PRESETS = {
 }
 CONFIG_NAMES = tuple(PRESETS)
 CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
+TUNED_LONG_NAMES = {f"tuned_stage{n}" for n in recipe.TUNED_LONG}
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
@@ -247,6 +254,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         and not (args.init_run_id or args.resume_run_id)
     ):
         # 단계마다 앞 단계의 가중치에서 새 optimizer로 시작한다 (TabICLv2 `--only_load_model True`)
+        parser.error(
+            f"{args.config_name}는 --init-run-id(앞 단계 run)나 --resume-run-id와 같이 줘야 한다"
+        )
+    if args.config_name in TUNED_LONG_NAMES and not (args.init_run_id or args.resume_run_id):
+        # tuned 가중치(stage 1)나 앞 단계에서 새 optimizer로 시작한다. 회귀 구간 경계도 이어 쓴다
         parser.error(
             f"{args.config_name}는 --init-run-id(앞 단계 run)나 --resume-run-id와 같이 줘야 한다"
         )
