@@ -712,7 +712,8 @@ def test_tuned_long_stages_follow_the_tabicl_curriculum(monkeypatch):
 
 def test_tuned_long_rewind_lowers_the_lr(tmp_path, monkeypatch):
     # issue #95: 하한이 기본값(2.5e-5)이면 stage 3(lr 5e-6)에서 되돌려도 lr이 그대로였다.
-    # tuned_stage3의 lr·하한·rewind 배율만 smoke 설정에 옮겨 붕괴 한 번에 lr이 절반이 되는지 본다
+    # tuned_stage3 회귀의 optimizer(Muon)·lr·하한·rewind 배율만 smoke 설정에 옮겨 붕괴 한 번에 모든
+    # param group의 lr이 절반이 되는지 본다
     calls = {"n": 0}
     original = CollapseGuard.update
 
@@ -729,6 +730,7 @@ def test_tuned_long_rewind_lowers_the_lr(tmp_path, monkeypatch):
         steps=30,
         log_every=5,
         snapshot_every=10,
+        optimizer=long.optimizer,
         lr=long.lr,
         rewind_min_lr=long.rewind_min_lr,
         rewind_lr_factor=long.rewind_lr_factor,
@@ -736,7 +738,11 @@ def test_tuned_long_rewind_lowers_the_lr(tmp_path, monkeypatch):
     train(config, tmp_path, mlflow_log=False)
     state = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert state["rewinds"] == 1
-    assert state["scheduler"]["base_lrs"][0] == pytest.approx(long.lr * long.rewind_lr_factor)
+    lowered = long.lr * long.rewind_lr_factor
+    assert long.optimizer == "muon" and len(state["scheduler"]["base_lrs"]) > 1
+    assert state["scheduler"]["base_lrs"] == pytest.approx(
+        [lowered] * len(state["scheduler"]["base_lrs"])
+    )
 
 
 def test_cell_transformer_splits_large_attention_batches(monkeypatch):
