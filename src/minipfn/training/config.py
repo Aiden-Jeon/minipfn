@@ -156,7 +156,9 @@ class TrainConfig:
     # 미리 정한 규칙으로 낮춘다. warmup·cosine 모양은 그대로이고 다음 chunk에도 이어진다
     rewind_lr_factor: float = 1.0
     # 규칙으로는 기준 lr을 이보다 낮추지 않는다(그 뒤로는 되돌리기만 한다). 2e-4에서 세 번 절반,
-    # 5e-5가 안정했던 것의 절반까지. 이어서 학습할 때 TABPFN_V2_LR로 준 lr은 이 값과 상관없다
+    # 5e-5가 안정했던 것의 절반까지. 이어서 학습할 때 TABPFN_V2_LR로 준 lr은 이 값과 상관없다.
+    # lr × rewind_lr_factor보다 높으면 되돌려도 lr이 그대로라, lr을 낮춘 recipe는 이것도 함께
+    # 낮춰야 한다 (`recipes.tabpfn_v2.tuned_long`, issue #95)
     rewind_min_lr: float = 2.5e-5
     # QK-clip (논문에 없음, 여기서 정함. Kimi K2의 MuonClip과 같은 생각): optimizer step마다
     # head별 attention logit의 상한(`qk_logit_bounds`)이 이 값을 넘으면 그 head의 Wq·Wk를 줄여
