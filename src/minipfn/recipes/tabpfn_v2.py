@@ -191,14 +191,19 @@ def tuned_long(stage: int, task: str = "classification") -> TrainConfig:
     TabPFN-3.5에서 쓴 TabICLv2 curriculum stage 2·3(`recipes.tabpfn_v3.curriculum`)을 TabPFN-2.5에
     옮겼다: 표 행 수 400~10,240(stage 2, 20k step)·400~50,000(stage 3, 5k step) log 균등, 학습 행
     비율 U(0.79, 0.81), lr은 stage 1(tuned)의 1/8·1/40, warmup 1% + cosine, 4,096행보다 긴
-    표에서 activation checkpointing. task별 optimizer·prior와 가속 옵션은 tuned 그대로다(분류는
-    Adam·TabICLv2 prior, 회귀는 Muon). 가중치는 앞 단계 run에서 가져온다(학습 스크립트가 막는다).
+    표에서 activation checkpointing. 붕괴 규칙의 lr 하한(`rewind_min_lr`)도 lr과 같은 비율로
+    낮춘다. task별 optimizer·prior와 가속 옵션은 tuned 그대로다(분류는 Adam·TabICLv2 prior, 회귀는
+    Muon). 가중치는 앞 단계 run에서 가져온다(학습 스크립트가 막는다).
     """
     if stage not in TUNED_LONG:
         raise ValueError(f"tuned_long stage는 {tuple(TUNED_LONG)} 가운데 하나다: {stage}")
     base = tuned(task)
     changes = {**TUNED_LONG_COMMON, **TUNED_LONG[stage]}
-    changes["lr"] = base.lr * changes.pop("lr_factor")
+    lr_factor = changes.pop("lr_factor")
+    changes["lr"] = base.lr * lr_factor
+    # 붕괴 규칙의 lr 하한도 같은 비율로 낮춘다. 기본 하한(2.5e-5)은 stage 2 lr과 같고 stage 3 lr보다
+    # 높아서, 그대로 두면 되돌려도 lr이 낮아지지 않는다 (issue #95)
+    changes["rewind_min_lr"] = base.rewind_min_lr * lr_factor
     changes["warmup_steps"] = int(TUNED_LONG_WARMUP * changes["steps"])
     if task == "classification":
         changes.update(qk_clip=TUNED_LONG_CLASSIFICATION_QK_CLIP, rewind_lr_factor=0.5)

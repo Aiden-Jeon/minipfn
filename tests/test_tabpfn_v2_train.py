@@ -704,6 +704,39 @@ def test_tuned_long_stages_follow_the_tabicl_curriculum(monkeypatch):
             assert config.activation_checkpointing_rows == 4_096
             expected_clip = 60_000.0 if task == "classification" else tuned.qk_clip
             assert config.qk_clip == expected_clip and config.rewind_lr_factor == 0.5
+            # 붕괴 규칙의 lr 하한도 lr과 같은 비율로 낮춰, 되돌리면 lr이 rewind 배율만큼 낮아진다
+            # (issue #95)
+            assert config.rewind_min_lr == pytest.approx(tuned.rewind_min_lr / factor)
+            assert config.rewind_min_lr <= config.lr * config.rewind_lr_factor
+
+
+def test_tuned_long_rewind_lowers_the_lr(tmp_path, monkeypatch):
+    # issue #95: 하한이 기본값(2.5e-5)이면 stage 3(lr 5e-6)에서 되돌려도 lr이 그대로였다.
+    # tuned_stage3의 lr·하한·rewind 배율만 smoke 설정에 옮겨 붕괴 한 번에 lr이 절반이 되는지 본다
+    calls = {"n": 0}
+    original = CollapseGuard.update
+
+    def fake_update(self, window_mean):
+        calls["n"] += 1
+        if calls["n"] == 5:  # 25 step에서 붕괴, 가장 오래된 snapshot(10 step)으로 되돌린다
+            return True
+        return original(self, window_mean)
+
+    monkeypatch.setattr(CollapseGuard, "update", fake_update)
+    long = recipe.tuned_long(3, "regression")
+    config = replace(
+        TrainConfig.smoke("regression"),
+        steps=30,
+        log_every=5,
+        snapshot_every=10,
+        lr=long.lr,
+        rewind_min_lr=long.rewind_min_lr,
+        rewind_lr_factor=long.rewind_lr_factor,
+    )
+    train(config, tmp_path, mlflow_log=False)
+    state = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert state["rewinds"] == 1
+    assert state["scheduler"]["base_lrs"][0] == pytest.approx(long.lr * long.rewind_lr_factor)
 
 
 def test_cell_transformer_splits_large_attention_batches(monkeypatch):
