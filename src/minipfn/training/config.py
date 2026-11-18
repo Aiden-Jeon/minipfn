@@ -118,6 +118,15 @@ class TrainConfig:
     tree_scm_prob: float = 0.0
     graph_scm_corrected: bool = False
     mixture_root_prob: float = 0.0
+    # 현실의 지저분함과 클래스 불균형 (issue #103, `minipfn.priors.graph_scm`. 기본값이면 위 prior
+    # 그대로다): missing_patterns면 결측값을 MCAR 대신 MAR·MNAR 등 패턴 섞기로, 나머지는 그 확률로
+    # 고른 데이터셋에 거친(격자로 반올림한) feature, 범주 값이 많은 열, 꼬리가 긴 회귀 target, 이진
+    # 소수 클래스 1~15%
+    missing_patterns: bool = False
+    coarse_feature_prob: float = 0.0
+    high_cardinality_prob: float = 0.0
+    long_tail_target_prob: float = 0.0
+    imbalance_prob: float = 0.0
     missing_dataset_prob: float = 0.3
     border_datasets: int = 20_000  # 회귀 구간 경계를 정할 때 뽑는 데이터셋 수 (여기서 정함)
     # 최적화 (논문: 약 200만 step × batch 64. warmup 길이와 lr은 여기서 정함)
@@ -278,7 +287,15 @@ class TrainConfig:
             self.muon_scope != "blocks" or self.muon_momentum != MUON_MOMENTUM
         ):
             raise ValueError("muon_scope·muon_momentum은 optimizer=muon일 때만 바꾼다")
-        for name in ("binary_prob", "tree_scm_prob", "mixture_root_prob"):
+        for name in (
+            "binary_prob",
+            "tree_scm_prob",
+            "mixture_root_prob",
+            "coarse_feature_prob",
+            "high_cardinality_prob",
+            "long_tail_target_prob",
+            "imbalance_prob",
+        ):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name}는 0 이상 1 이하여야 한다: {getattr(self, name)}")
         if self.logit_softcap is not None:

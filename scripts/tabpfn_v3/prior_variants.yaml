@@ -6,6 +6,9 @@
 #     --override mlflow_run_name=tabpfn-v3-5-prior92-B-20k --override env_variables.TABPFN_V2_TREE_SCM_PROB=0.3
 #   A′(노이즈): TABPFN_V2_SEED=1 / B: TABPFN_V2_TREE_SCM_PROB=0.3 / C: TABPFN_V2_GRAPH_SCM_CORRECTED=1 /
 #   D: TABPFN_V2_MIXTURE_ROOT_PROB=0.3
+# issue #103 (현실의 지저분함·클래스 불균형, 대조는 #92의 A·A′): B 결측 패턴 TABPFN_V2_MISSING_PATTERNS=1 /
+#   C 거친 feature TABPFN_V2_COARSE_FEATURE_PROB=0.3 / D 범주 값 많은 열 TABPFN_V2_HIGH_CARDINALITY_PROB=0.3 /
+#   E 꼬리 긴 회귀 target TABPFN_V2_LONG_TAIL_TARGET_PROB=0.3 / F 이진 불균형 TABPFN_V2_IMBALANCE_PROB=0.3
 # 평가는 scripts/tabpfn_v2/eval_arena.yaml(TabArena-Lite, BeyondArena의 작은 표 --datasets)로 한다.
 experiment_name: tabpfn-v3-reproduction
 mlflow_run_name: tabpfn-v3-5-prior92-A-20k

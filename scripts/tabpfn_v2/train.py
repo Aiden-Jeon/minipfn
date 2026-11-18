@@ -30,6 +30,9 @@ TabICLv2의 표 크기·prior 설정(`TrainConfig` 주석, issue #74·#81)은
 `TABPFN_V2_SIZE_RULE=train_fraction`(`TABPFN_V2_MIN_ROWS`·`TABPFN_V2_MAX_ROWS`·`TABPFN_V2_MIN_TRAIN_FRACTION`·
 `TABPFN_V2_MAX_TRAIN_FRACTION`), `TABPFN_V2_BINARY_PROB`, `TABPFN_V2_FILTER_UNPREDICTABLE=1`로
 켠다(주지 않으면 preset 그대로, v2·2.5는 논문 규칙).
+graph SCM prior의 현실의 지저분함·클래스 불균형 옵션(issue #103)은 `TABPFN_V2_MISSING_PATTERNS=1`,
+`TABPFN_V2_COARSE_FEATURE_PROB`·`TABPFN_V2_HIGH_CARDINALITY_PROB`·`TABPFN_V2_LONG_TAIL_TARGET_PROB`·
+`TABPFN_V2_IMBALANCE_PROB`(확률)로 켠다.
 학습 진단 지표(`minipfn.training.diagnostics`)는 묶음별 가중치·gradient norm을 늘 남기고,
 `--grad-cosine`(`TABPFN_V2_GRAD_COSINE=1`, multitask만, issue #64)은 두 task gradient의 묶음별
 cosine을, `--rank-timing`(`TABPFN_V2_RANK_TIMING=1`, issue #68)은 GPU마다 forward·backward 시간과
@@ -247,6 +250,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for name in ("tree-scm-prob", "mixture-root-prob"):
         env = "TABPFN_V2_" + name.upper().replace("-", "_")
         parser.add_argument(f"--{name}", type=float, default=_env(env, float))
+    # 현실의 지저분함과 클래스 불균형 (issue #103, TrainConfig 주석). 위 prior 변형과 같은 규칙이다
+    for name in (
+        "coarse-feature-prob",
+        "high-cardinality-prob",
+        "long-tail-target-prob",
+        "imbalance-prob",
+    ):
+        env = "TABPFN_V2_" + name.upper().replace("-", "_")
+        parser.add_argument(f"--{name}", type=float, default=_env(env, float))
+    parser.add_argument(
+        "--missing-patterns",
+        action="store_true",
+        default=_env_flag("TABPFN_V2_MISSING_PATTERNS"),
+    )
     parser.add_argument(
         "--graph-scm-corrected",
         action="store_true",
@@ -465,6 +482,10 @@ def _override_values(args: argparse.Namespace) -> dict:
         "binary_prob": args.binary_prob,
         "tree_scm_prob": args.tree_scm_prob,
         "mixture_root_prob": args.mixture_root_prob,
+        "coarse_feature_prob": args.coarse_feature_prob,
+        "high_cardinality_prob": args.high_cardinality_prob,
+        "long_tail_target_prob": args.long_tail_target_prob,
+        "imbalance_prob": args.imbalance_prob,
         "seed": args.seed,
         "warmup_steps": args.warmup_steps,
         **{
@@ -478,6 +499,7 @@ def _override_values(args: argparse.Namespace) -> dict:
                 "rank_timing",
                 "filter_unpredictable",
                 "graph_scm_corrected",
+                "missing_patterns",
             )
             if getattr(args, name)
         },

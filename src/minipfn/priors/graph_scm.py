@@ -25,6 +25,18 @@ prior 변형 옵션 (issue #92, 기본은 모두 꺼져 예전과 같은 데이�
 - `mixture_root_prob`: graph SCM 데이터셋을 이 확률로 골라 root 노드를 Gaussian mixture(군집)에서
   뽑는다 (`generators.graph_scm`)
 
+현실의 지저분함과 클래스 불균형 옵션 (issue #103, Kumo-Tabular 블로그의 prior 목록을 다시 구현.
+기본은 모두 꺼져 예전과 같은 데이터셋):
+- `missing_patterns`: 결측값을 MCAR 대신 패턴 섞기로 (`transforms.missing.PatternMissing`. 결측을
+  넣는 데이터셋 비율은 `missing_dataset_prob` 그대로)
+- `coarse_feature_prob`: 이 확률로 고른 데이터셋의 수치 열 일부를 격자로 반올림 (`CoarseFeatures`)
+- `high_cardinality_prob`: 이 확률로 고른 데이터셋의 수치 열 1~3개를 범주 50~500개 열로
+  (`HighCardinality`)
+- `long_tail_target_prob`: 이 확률로 고른 회귀 데이터셋의 target에 꼬리를 붙인다 (`LongTailTarget`)
+- `imbalance_prob`: 이 확률로 고른 이진 데이터셋의 소수 클래스 비율을 1~15%로
+  (`generators.imbalance.ImbalancedBinary`)
+분류 prior는 회귀 옵션을, 회귀 prior는 분류 옵션을 쓰지 않는다(multitask가 한 설정을 같이 쓴다).
+
     prior = GraphSCMPrior(task="classification", seed=0)
     batch = prior.sample_batch(8)  # x (8, 행, feature), y (8, 행), n_train
 
@@ -54,7 +66,15 @@ from minipfn.priors.table_size import (
     sample_split_size,
     sample_table_size,
 )
-from minipfn.priors.transforms import CoverClasses, DropInvalid, Missing
+from minipfn.priors.transforms import (
+    CoarseFeatures,
+    CoverClasses,
+    DropInvalid,
+    HighCardinality,
+    LongTailTarget,
+    Missing,
+    PatternMissing,
+)
 
 # 분류 데이터셋의 클래스 수 상한 (v2 논문). 분류 모델의 출력 수가 된다(`TrainConfig.n_out`)
 MAX_CLASSES = 10
@@ -87,8 +107,20 @@ class GraphSCMPrior:
         tree_scm_prob: float = 0.0,
         graph_scm_corrected: bool = False,
         mixture_root_prob: float = 0.0,
+        missing_patterns: bool = False,
+        coarse_feature_prob: float = 0.0,
+        high_cardinality_prob: float = 0.0,
+        long_tail_target_prob: float = 0.0,
+        imbalance_prob: float = 0.0,
     ) -> None:
-        check_probability("tree_scm_prob", tree_scm_prob)
+        for name, value in (
+            ("tree_scm_prob", tree_scm_prob),
+            ("coarse_feature_prob", coarse_feature_prob),
+            ("high_cardinality_prob", high_cardinality_prob),
+            ("long_tail_target_prob", long_tail_target_prob),
+            ("imbalance_prob", imbalance_prob),
+        ):
+            check_probability(name, value)
         self._task = task
         if task == "classification":
             min_train_rows = max(min_train_rows, 2)  # 클래스가 2개 이상 학습 행에 나오려면
@@ -137,14 +169,32 @@ class GraphSCMPrior:
             tree = TreeSCM(task, seed, filter_unpredictable=filter_unpredictable)
             generator = Mixture({"graph_scm": generator, "tree_scm": tree}, choose=chosen_generator)
             hyperparameters = GeneratorChoice(hyperparameters, tree_scm_prob)
-        # 결측값을 넣기 전까지 (회귀 구간 경계와 `_one_dataset`은 여기까지만 거친다)
+        if classification and imbalance_prob:
+            from minipfn.priors.generators.imbalance import ImbalancedBinary
+
+            generator = ImbalancedBinary(generator, imbalance_prob)
+        # 결측값을 넣기 전까지 (회귀 구간 경계와 `_one_dataset`은 여기까지만 거친다). 꼬리를 붙인
+        # target은 구간 경계도 따른다
         self._accept = [DropInvalid(), CoverClasses()] if classification else [DropInvalid()]
-        self._missing = Missing(missing_dataset_prob, max_missing_rate)
+        if not classification and long_tail_target_prob:
+            self._accept.append(LongTailTarget(long_tail_target_prob))
+        # x만 바꾸는 후처리 (범주 값 많은 열을 먼저 만들어 반올림이 건드리지 않게 한다)
+        features = []
+        if high_cardinality_prob:
+            features.append(HighCardinality(high_cardinality_prob))
+        if coarse_feature_prob:
+            features.append(CoarseFeatures(coarse_feature_prob))
+        if missing_patterns:
+            self._missing = PatternMissing(
+                missing_dataset_prob, classification=classification, max_column_rate=0.5
+            )
+        else:
+            self._missing = Missing(missing_dataset_prob, max_missing_rate)
         self.pipeline = Pipeline(
             generator,
             rng=self.rng,
             hyperparameters=hyperparameters,
-            transforms=[*self._accept, self._missing],
+            transforms=[*self._accept, *features, self._missing],
             max_attempts=MAX_ATTEMPTS,
         )
 
@@ -158,6 +208,9 @@ class GraphSCMPrior:
 
     @property
     def max_missing_rate(self) -> float:
+        # 패턴 결측(`missing_patterns`)이면 열마다의 결측률 상한
+        if isinstance(self._missing, PatternMissing):
+            return self._missing.max_column_rate
         return self._missing.max_rate
 
     def sample_shape(self, rng: np.random.Generator | None = None) -> tuple[int, int, int]:
@@ -241,10 +294,26 @@ PRIOR_FIELDS = (
     "tree_scm_prob",
     "graph_scm_corrected",
     "mixture_root_prob",
+    "missing_patterns",
+    "coarse_feature_prob",
+    "high_cardinality_prob",
+    "long_tail_target_prob",
+    "imbalance_prob",
 )
-# 그 가운데 회귀 target 분포도 바꾸는 것 (회귀 구간 경계가 학습 prior와 같게 따른다. binary_prob는
-# 분류만 바꾼다)
-BORDER_PRIOR_FIELDS = tuple(name for name in PRIOR_FIELDS if name != "binary_prob")
+# 그 가운데 회귀 target 분포도 바꾸는 것 (회귀 구간 경계가 학습 prior와 같게 따른다). 분류만 바꾸는
+# 것(binary_prob·imbalance_prob)과 x만 바꾸는 것(결측·반올림·범주 열)은 뺀다
+BORDER_PRIOR_FIELDS = tuple(
+    name
+    for name in PRIOR_FIELDS
+    if name
+    not in (
+        "binary_prob",
+        "imbalance_prob",
+        "missing_patterns",
+        "coarse_feature_prob",
+        "high_cardinality_prob",
+    )
+)
 
 
 class GeneratorChoice:
@@ -378,7 +447,7 @@ def regression_borders(
     `GraphSCMPrior`와 같은 뜻이며, 학습에서는 `make_borders`가 학습 prior와 같은 값을 넘긴다.
     `filter_unpredictable`과 prior 변형 옵션(`BORDER_PRIOR_FIELDS` 이름의 키워드, 빠지면
     `GraphSCMPrior`의 기본값)도 학습 prior와 같게 둔다(걸러진 데이터셋의 target은 학습에 안 나오고,
-    tree SCM·군집 root는 target 분포를 바꾼다).
+    tree SCM·군집 root·꼬리 긴 target은 target 분포를 바꾼다).
     """
     options = {k: v for k, v in sizes_and_options.items() if k in BORDER_PRIOR_FIELDS}
     sizes = {k: v for k, v in sizes_and_options.items() if k not in BORDER_PRIOR_FIELDS}
