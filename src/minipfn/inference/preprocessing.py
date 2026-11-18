@@ -36,6 +36,15 @@ feature가 멤버 상한보다 많으면 멤버마다 일부 열만 쓴다(`feat
   포함)이 `MIN_UNIQUE_NUMERICAL`개보다 적은 수치 열을 범주형으로 본다 (공식 type 추론)
 - `constant_columns`: 학습 행에서 값이 하나뿐인(결측만인 것 포함) 열을 뺀다 (공식
   `RemoveConstantFeaturesStep`. 범주형으로 준 열은 빼지 않는다)
+
+Kumo-Tabular(NVIDIA structured-data-models) 추론의 범주 처리에서 가져온 옵션 (issue #100,
+동작만 다시 구현했다. 기본은 끔):
+
+- `category_count_tables`: 학습 행의 서로 다른 값이 기준보다 많은 범주 열마다 log1p(학습 행에서 그
+  값의 빈도) 수치 열을 붙인다 (Kumo `AddCategoryCounts(min_cardinality=50)`. 결측과 학습에 없던 값은
+  한 칸을 같이 쓴다)
+- `rare_category_maps`: 학습 행에 몇 번 안 나온 범주 값을 결측으로 (AutoGluon 전처리 흉내. Kumo를
+  TabArena에서 돌릴 때 같이 쓴 것). 남는 값은 순서를 지켜 번호를 다시 매긴다
 """
 
 from __future__ import annotations
@@ -197,6 +206,80 @@ def encode_low_cardinality(
     return X
 
 
+@dataclass(frozen=True)
+class CategoryCounts:
+    """범주 열 하나의 학습 행 빈도 (`category_count_tables`). 결측과 학습 행에 없던 값은 한 칸을
+    같이 쓴다 (`missing`: 학습 행의 결측 수)."""
+
+    values: np.ndarray  # 학습 행의 범주 번호 (정렬, 결측 제외)
+    counts: np.ndarray  # 번호마다 학습 행 수
+    missing: int
+
+    def log_counts(self, col: np.ndarray) -> np.ndarray:
+        """행마다 log1p(그 값의 학습 행 빈도). 결측·학습에 없던 값은 log1p(학습 행 결측 수)."""
+        out = np.full(len(col), np.log1p(self.missing), dtype=np.float64)
+        if len(self.values):
+            ix = np.clip(np.searchsorted(self.values, col), 0, len(self.values) - 1)
+            hit = self.values[ix] == col  # 결측은 거짓
+            out[hit] = np.log1p(self.counts[ix[hit]])
+        return out
+
+
+def category_count_tables(
+    X: np.ndarray, cat_ix: list[int], min_cardinality: int
+) -> dict[int, CategoryCounts]:
+    """학습 행에서 서로 다른 값(결측 제외)이 `min_cardinality`개보다 많은 범주 열의 빈도 (Kumo의
+    범주 빈도 열, `EnsembleClassifier(category_counts=...)`)."""
+    out = {}
+    for i in cat_ix:
+        col = X[:, i]
+        nan = np.isnan(col)
+        values, counts = np.unique(col[~nan], return_counts=True)
+        if len(values) > min_cardinality:
+            out[i] = CategoryCounts(values, counts, int(nan.sum()))
+    return out
+
+
+def rare_category_maps(
+    X: np.ndarray, cat_ix: list[int], min_count: int
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """학습 행에 `min_count`번보다 적게 나온 범주 값을 결측으로 바꾸는 열마다의 표 (값, 새 번호).
+    남는 값은 순서를 지켜 0부터 다시 매기고, 드문 값의 새 번호는 NaN이다. 드문 값이 없는 열은
+    없다."""
+    out = {}
+    for i in cat_ix:
+        col = X[:, i]
+        values, counts = np.unique(col[~np.isnan(col)], return_counts=True)
+        rare = counts < min_count
+        if not rare.any():
+            continue
+        new = np.full(len(values), np.nan)
+        new[~rare] = np.arange(int((~rare).sum()), dtype=np.float64)
+        out[i] = (values, new)
+    return out
+
+
+def apply_category_steps(
+    X: np.ndarray,
+    counts: dict[int, CategoryCounts],
+    rare: dict[int, tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """범주 빈도 열을 뒤에 붙이고(원래 번호로 센다) 드문 범주 값을 결측으로 바꾼다. 학습 행에 없던
+    값(결측 또는 -1)은 드문 값 표에 없어 그대로 둔다."""
+    if not counts and not rare:
+        return X
+    extra = [counts[i].log_counts(X[:, i]) for i in counts]
+    X = X.copy()
+    for i, (values, new) in rare.items():
+        col = X[:, i]
+        ix = np.clip(np.searchsorted(values, col), 0, len(values) - 1)
+        hit = values[ix] == col
+        X[hit, i] = new[ix[hit]]
+    if extra:
+        X = np.concatenate([X, np.stack(extra, axis=1)], axis=1)
+    return X
+
+
 def constant_columns(X: np.ndarray, keep: list[int] | None = None) -> list[int]:
     """학습 행에서 서로 다른 값(결측도 하나로 센다)이 하나뿐인 열. `keep`(범주형으로 준 열)은
     뺀다."""
@@ -328,6 +411,7 @@ class Member:
     seed: int
     one_hot: bool = False
     outlier_sigma: float = OUTLIER_SIGMA  # 평균에서 표준편차 몇 배 밖을 자르는지
+    target_flip: bool = False  # (회귀) 모델에 target 부호를 뒤집어 준다 (`target_flip`)
 
 
 class MemberPreprocessor:

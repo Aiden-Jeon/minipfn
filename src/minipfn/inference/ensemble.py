@@ -48,6 +48,13 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   `drop_constant`: 상수 열 빼기), 회귀 `target_transform`·`regression_mean`(`EnsembleRegressor`).
   `unseen_category="minus1"`은 학습 행에 없던 범주를 결측(NaN, 기본. 공식 3.5도 멤버의
   `ordinal_shuffled` 단계에서 NaN이 된다) 대신 번호 -1로 둔다(TabICLv2 방식, 진단용)
+- Kumo-Tabular 추론에서 가져온 옵션(issue #100, 기본은 모두 끔, 예전과 비트 동일):
+  `category_counts`(값이 그보다 많은 범주 열에 log1p(학습 행 빈도) 열을 붙인다),
+  `rare_category_min_count`(학습 행에 그보다 적게 나온 범주 값은 결측. 둘 다 모든 멤버가 같이 쓰는
+  열 단계, `minipfn.inference.preprocessing`), 분류 `class_average="logit"`(멤버 logit을 평균한 뒤
+  softmax), 회귀 `regression_trim`(행마다 멤버 평균을 정렬해 양쪽 int(비율 × 멤버 수)개를 빼고
+  평균. Kumo는 0.2)과 `target_flip`(한 멤버 걸러 target 부호를 뒤집어 넣는다. 출력 구간을 뒤집어
+  경계 -b[::-1] 위의 분포로 본다. `regression_mean="member"`에서만)
 - 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
@@ -87,13 +94,16 @@ from minipfn.inference.preprocessing import (
     Member,
     MemberPreprocessor,
     PreprocessOptions,
+    apply_category_steps,
     apply_encoder,
     balanced_feature_subsets,
+    category_count_tables,
     constant_columns,
     encode_low_cardinality,
     feature_subset,
     low_cardinality_values,
     one_hot_kinds,
+    rare_category_maps,
     select_features,
     to_numeric,
     unseen_value,
@@ -106,6 +116,7 @@ SOFTMAX_TEMPERATURE = 0.9
 DEFAULT_MEMBER_KINDS = ("quantile", "power")  # v2 논문의 두 가지
 TARGET_TRANSFORMS = ("power", "safepower", "none")
 REGRESSION_MEANS = ("member", "mixture")
+CLASS_AVERAGES = ("proba", "logit")
 # 공식 3.5의 회귀 경계 되돌리기: z가 이 범위 밖이거나 유한하지 않은 경계는 망가진 것으로 본다
 BROKEN_BORDER_LIMIT = 1e3
 
@@ -174,6 +185,8 @@ class _Base:
         drop_constant: bool = False,
         feature_subsampling: str = "random",
         unseen_category: str = "nan",
+        category_counts: int | None = None,
+        rare_category_min_count: int | None = None,
         device: str = "cpu",
         random_state: int = 0,
     ) -> None:
@@ -193,6 +206,9 @@ class _Base:
         self.infer_categorical = infer_categorical
         self.drop_constant = drop_constant
         self.feature_subsampling = feature_subsampling
+        # Kumo 범주 처리 (모듈 docstring. None이면 끔)
+        self.category_counts = category_counts
+        self.rare_category_min_count = rare_category_min_count
         unseen_value(unseen_category)  # 값 확인
         self.unseen_category = unseen_category
         self.one_hot = one_hot
@@ -229,6 +245,18 @@ class _Base:
         # 학습 행: 미지 값이 없으므로 unseen 값과 상관없다
         if self.low_cardinality_:
             X_num = encode_low_cardinality(X_num, self.low_cardinality_)
+        # 범주 빈도 열(원래 번호로 센다)과 드문 범주 값 → 결측. 빈도 열은 수치 열로 뒤에 붙는다
+        self.count_tables_ = (
+            category_count_tables(X_num, cat_ix, self.category_counts)
+            if self.category_counts is not None
+            else {}
+        )
+        self.rare_maps_ = (
+            rare_category_maps(X_num, cat_ix, self.rare_category_min_count)
+            if self.rare_category_min_count is not None
+            else {}
+        )
+        X_num = apply_category_steps(X_num, self.count_tables_, self.rare_maps_)
         # 학습 행에서 값이 하나뿐인 열을 뺀다 (범주형으로 준 열은 남긴다)
         self.kept_columns_ = None
         if self.drop_constant:
@@ -248,6 +276,7 @@ class _Base:
         if self.low_cardinality_:
             unseen = unseen_value(self.unseen_category)
             X_num = encode_low_cardinality(X_num, self.low_cardinality_, unseen)
+        X_num = apply_category_steps(X_num, self.count_tables_, self.rare_maps_)
         if self.kept_columns_ is not None:
             X_num = X_num[:, self.kept_columns_]
         return X_num
@@ -324,6 +353,12 @@ class EnsembleClassifier(_Base):
 
     task = "classification"
 
+    def __init__(self, model: nn.Module, class_average: str = "proba", **kwargs: Any) -> None:
+        super().__init__(model, **kwargs)
+        if class_average not in CLASS_AVERAGES:
+            raise ValueError(f"class_average는 {CLASS_AVERAGES} 가운데 하나다: {class_average}")
+        self.class_average = class_average
+
     def fit(self, X: Any, y: Any) -> EnsembleClassifier:
         rng = np.random.default_rng(self.random_state)
         y = self._fit_labels(y)
@@ -376,6 +411,10 @@ class EnsembleClassifier(_Base):
             yield i, logits[:, :n_classes][:, perm]  # 섞은 번호의 logit을 원래 클래스 순서로
 
     def predict_proba(self, X: Any) -> np.ndarray:
+        if self.class_average == "logit":
+            # 멤버 logit(온도로 나눈 것)을 평균한 뒤 softmax (Kumo)
+            logits = [logits / self.softmax_temperature for _, logits in self.member_logits(X)]
+            return torch.softmax(torch.stack(logits).mean(0), dim=-1).cpu().numpy()
         probs = [
             torch.softmax(logits / self.softmax_temperature, dim=-1)
             for _, logits in self.member_logits(X)
@@ -569,9 +608,17 @@ class EnsembleRegressor(_Base):
         borders: torch.Tensor,
         target_transform: str = "power",
         regression_mean: str = "member",
+        regression_trim: float = 0.0,
+        target_flip: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(model, **kwargs)
+        if not 0.0 <= regression_trim < 0.5:
+            raise ValueError(f"regression_trim은 [0, 0.5) 안이다: {regression_trim}")
+        if target_flip and regression_mean != "member":
+            raise ValueError("target_flip은 regression_mean='member'에서만 쓴다")
+        self.regression_trim = regression_trim
+        self.target_flip = target_flip
         if target_transform not in TARGET_TRANSFORMS:
             raise ValueError(
                 f"target_transform은 {TARGET_TRANSFORMS} 가운데 하나다: {target_transform}"
@@ -598,6 +645,8 @@ class EnsembleRegressor(_Base):
                 and (i // max(2, len(self.member_kinds))) % 2 == 1,
                 seed=int(rng.integers(0, 2**31 - 1)),
                 one_hot=self._expands(self._kind(i)),
+                # 한 멤버 걸러 (target power와 엇갈려 네 조합이 고르게)
+                target_flip=self.target_flip and i % 2 == 1,
             )
             for i in range(self.n_estimators)
         ]
@@ -612,7 +661,12 @@ class EnsembleRegressor(_Base):
         self.y_trains_, self.bucket_values_, self.border_maps_ = [], [], []
         self.official_maps_ = []  # regression_mean="mixture"에서 쓴다
         for m in members:
-            u, values, border_map, official = z, _bucket_values(self.borders, z), None, None
+            # target_flip 멤버: 모델에는 -u를 주고, 출력 구간을 뒤집어(`_iter_logits`) u 공간의
+            # 경계 -b[::-1] 위의 확률로 본다
+            mb = -self.borders.flip(0) if m.target_flip else self.borders
+            u, values, border_map, official = z, _bucket_values(mb, z), None, None
+            if m.target_flip:
+                border_map = mb.clone()
             if m.target_power:
                 transform = self._make_target_transform()
                 u = np.asarray(transform.fit_transform(z.reshape(-1, 1))).ravel()
@@ -620,10 +674,11 @@ class EnsembleRegressor(_Base):
                     official = _official_border_map(transform, b)
                 inverse = _clipped_inverse(transform, u)
                 # 멤버 공간의 구간 값과 경계를 z 공간으로 (경계는 predict_distribution에서 쓴다)
-                values = np.clip(inverse(_bucket_values(self.borders, u)), b[0], b[-1])
-                back = np.clip(np.maximum.accumulate(inverse(b)), b[0], b[-1])
+                mbn = mb.double().numpy()
+                values = np.clip(inverse(_bucket_values(mb, u)), b[0], b[-1])
+                back = np.clip(np.maximum.accumulate(inverse(mbn)), b[0], b[-1])
                 border_map = torch.as_tensor(back, dtype=torch.float32)
-            self.y_trains_.append(u)
+            self.y_trains_.append(-u if m.target_flip else u)
             self.bucket_values_.append(torch.as_tensor(values, dtype=torch.float32))
             self.border_maps_.append(border_map)
             self.official_maps_.append(official)
@@ -667,6 +722,13 @@ class EnsembleRegressor(_Base):
             probs.append(self._on_common_borders(i, p))
         return (self._mean(means), *self._mixture(probs))
 
+    def _iter_logits(self, X: Any, y_trains: list[np.ndarray]):
+        # target_flip 멤버의 출력 구간을 뒤집어 u 공간 경계(-b[::-1]) 순서로 (`fit_members`)
+        for i, logits in super()._iter_logits(X, y_trains):
+            if self.preprocessors_[i].member.target_flip:
+                logits = logits.flip(-1)
+            yield i, logits
+
     def _member_probs(self, X: Any):
         """멤버마다 (번호, 자기 공간의 구간 확률)."""
         for i, logits in self._iter_logits(X, self.y_trains_):
@@ -698,6 +760,8 @@ class EnsembleRegressor(_Base):
         if centers is None:
             centers = FullSupportBarDistribution(self.borders).bucket_centers
             self.mixture_centers_ = centers
+        if self.regression_trim > 0:  # 멤버마다 평균을 내 trimmed mean (`_mean`)
+            return self._mean([p @ centers.to(p.device, p.dtype) for p in probs])
         p = torch.stack(probs).mean(0)
         return (p @ centers.to(p.device, p.dtype)).cpu().numpy() * self.y_std_ + self.y_mean_
 
@@ -705,7 +769,12 @@ class EnsembleRegressor(_Base):
         return p @ self.bucket_values_[i].to(p.device)
 
     def _mean(self, means: list[torch.Tensor]) -> np.ndarray:
-        return torch.stack(means).mean(0).cpu().numpy() * self.y_std_ + self.y_mean_
+        stacked = torch.stack(means)
+        # regression_trim: 행마다 멤버 평균을 정렬해 양쪽에서 int(비율 × 멤버 수)개씩 뺀다 (Kumo)
+        cut = int(self.regression_trim * len(means))
+        if cut > 0:
+            stacked = stacked.sort(dim=0).values[cut : len(means) - cut]
+        return stacked.mean(0).cpu().numpy() * self.y_std_ + self.y_mean_
 
     def _on_common_borders(self, i: int, p: torch.Tensor) -> torch.Tensor:
         if self.border_maps_[i] is None:

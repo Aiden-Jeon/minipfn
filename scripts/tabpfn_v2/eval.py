@@ -90,6 +90,12 @@ balanced`, `--fingerprint-feature hash`·`--outlier-clip soft`·`--infer-categor
     --regressor-path hf://aiden-jeon/minipfn-tabpfn-v3-5 \
     --official-v35 --method-name minipfn-tabpfn-v3-5-official-inference
 
+Kumo-Tabular(NVIDIA structured-data-models) 추론에서 가져온 옵션도 항목마다 따로 켠다(issue #100,
+기본은 모두 끔): `--category-counts 50`(값이 50개 넘는 범주 열에 log1p(학습 행 빈도) 열),
+`--rare-category-min-count 2`(학습 행에 한 번만 나온 범주 값을 결측으로), `--class-average logit`
+(분류 멤버 logit 평균 뒤 softmax), `--regression-trim 0.2`(회귀 멤버 평균의 trimmed mean),
+`--target-flip`(회귀 멤버 절반의 target 부호 뒤집기). 이것도 `--test-time none`에서만 쓴다.
+
 `--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
 학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
 `--selection`·`--pool-size`), `diagscale`은 데이터셋마다 attention의 대각 scale만 학습한다
@@ -154,6 +160,7 @@ from minipfn.inference.distillation import (
     DistilledRegressor,
 )
 from minipfn.inference.ensemble import (
+    CLASS_AVERAGES,
     DEFAULT_ONE_HOT,
     REGRESSION_MEANS,
     SOFTMAX_TEMPERATURE,
@@ -429,6 +436,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="회귀 평균: member(기본, 멤버마다 자기 구간 값) 또는 mixture(공식, 공통 경계로 옮긴"
         " 분포의 평균, half-normal 꼬리)",
     )
+    # Kumo-Tabular 추론에서 가져온 옵션 (issue #100, 기본은 모두 끔)
+    parser.add_argument(
+        "--category-counts",
+        type=int,
+        default=None,
+        help="학습 행의 값이 이보다 많은 범주 열에 log1p(학습 행 빈도) 열을 붙인다"
+        " (Kumo 50, 기본 끔)",
+    )
+    parser.add_argument(
+        "--rare-category-min-count",
+        type=int,
+        default=None,
+        help="학습 행에 이보다 적게 나온 범주 값을 결측으로 (2: 한 번만 나온 값, 기본 끔)",
+    )
+    parser.add_argument(
+        "--class-average",
+        choices=CLASS_AVERAGES,
+        default=None,
+        help="분류 멤버 합치기: proba(기본, 확률 평균) 또는 logit(logit 평균 뒤 softmax, Kumo)",
+    )
+    parser.add_argument(
+        "--regression-trim",
+        type=float,
+        default=None,
+        help="회귀: 행마다 멤버 평균의 양쪽 이 비율을 빼고 평균 (기본 0, Kumo 0.2)",
+    )
+    parser.add_argument(
+        "--target-flip",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="회귀: 한 멤버 걸러 target 부호를 뒤집는다 (Kumo, --regression-mean member에서만)",
+    )
     parser.add_argument(
         "--method-name", default="minipfn-tabpfn-v2", help="TabArena·BeyondArena 결과의 방법 이름"
     )
@@ -451,7 +490,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     resolve_inference_options(args)
     if inference_option_params(args) and args.test_time != "none":
         # greedy pool·DiagScale의 view는 이 옵션을 넘기지 않는다
-        parser.error("공식 3.5 추론 옵션은 --test-time none에서만 쓴다.")
+        parser.error("추론 옵션(공식 3.5·Kumo)은 --test-time none에서만 쓴다.")
+    if args.target_flip and args.regression_mean != "member":
+        parser.error("--target-flip은 --regression-mean member에서만 쓴다.")
     if args.subsample_train_rows is not None and args.subsample_train_rows < 1:
         parser.error("--subsample-train-rows는 1 이상이어야 한다.")
     if args.drop_group_columns and args.suite not in ARENA_SUITES:
@@ -486,8 +527,15 @@ INFERENCE_DEFAULTS = {
     "target_transform": "power",
     "regression_mean": "member",
     "unseen_category": "nan",
+    # Kumo-Tabular 추론 옵션 (issue #100)
+    "category_counts": None,
+    "rare_category_min_count": None,
+    "class_average": "proba",
+    "regression_trim": 0.0,
+    "target_flip": False,
 }
-REGRESSION_ONLY = ("target_transform", "regression_mean")
+REGRESSION_ONLY = ("target_transform", "regression_mean", "regression_trim", "target_flip")
+CLASSIFICATION_ONLY = ("class_average",)
 
 
 def resolve_inference_options(args: argparse.Namespace) -> None:
@@ -519,6 +567,8 @@ def estimator_options(args: argparse.Namespace, suite: str) -> dict:
     out = {}
     for name, value in inference_option_params(args).items():
         if name in REGRESSION_ONLY and suite != "regression":
+            continue
+        if name in CLASSIFICATION_ONLY and suite == "regression":
             continue
         out["fingerprint" if name == "fingerprint_feature" else name] = value
     return out
