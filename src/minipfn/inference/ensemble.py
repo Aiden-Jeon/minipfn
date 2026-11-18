@@ -54,7 +54,11 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   열 단계, `minipfn.inference.preprocessing`), 분류 `class_average="logit"`(멤버 logit을 평균한 뒤
   softmax), 회귀 `regression_trim`(행마다 멤버 평균을 정렬해 양쪽 int(비율 × 멤버 수)개를 빼고
   평균. Kumo는 0.2)과 `target_flip`(한 멤버 걸러 target 부호를 뒤집어 넣는다. 출력 구간을 뒤집어
-  경계 -b[::-1] 위의 분포로 본다. `regression_mean="member"`에서만)
+  경계 -b[::-1] 위의 분포로 본다. `regression_mean="member"`에서만). issue #101: 멤버 종류
+  `"rankgauss"`(RankGaussian)와 `feature_flip`(멤버마다 수치 열 부호를 확률 0.5로 뒤집기,
+  `minipfn.inference.preprocessing`). Kumo의 수치 열 돌려쓰기는
+  `member_kinds=("standard", "power", "robust", "rankgauss")`다(우리 robust는 ±3 saturate 대신
+  smooth clipping)
 - 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
@@ -185,6 +189,7 @@ class _Base:
         drop_constant: bool = False,
         feature_subsampling: str = "random",
         unseen_category: str = "nan",
+        feature_flip: bool = False,
         category_counts: int | None = None,
         rare_category_min_count: int | None = None,
         device: str = "cpu",
@@ -202,6 +207,7 @@ class _Base:
             fingerprint=fingerprint,
             outlier_clip=outlier_clip,
             unseen_category=unseen_category,
+            feature_flip=feature_flip,
         )
         self.infer_categorical = infer_categorical
         self.drop_constant = drop_constant

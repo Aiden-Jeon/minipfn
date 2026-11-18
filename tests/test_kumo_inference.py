@@ -246,3 +246,68 @@ def test_eval_kumo_flags(monkeypatch):
         script.parse_args(["--target-flip", "--regression-mean", "mixture"])
     with pytest.raises(SystemExit):
         script.parse_args(["--class-average", "logit", "--test-time", "greedy"])
+
+
+# issue #101: RankGaussian 멤버 종류, 수치 열 부호 뒤집기
+
+
+def _numeric(n: int = 400, seed: int = 0) -> np.ndarray:
+    g = np.random.default_rng(seed)
+    x = np.stack([g.lognormal(size=n), g.normal(size=n) * 3 + 1, g.exponential(size=n)], 1)
+    x[::17, 1] = np.nan
+    return x
+
+
+def test_rankgauss_member_maps_ranks_to_standard_normal():
+    from minipfn.inference.preprocessing import Member, MemberPreprocessor
+
+    x = _numeric()
+    prep = MemberPreprocessor(Member("rankgauss", None, False, 0), [], 100).fit(x)
+    base = prep._base(prep._clip(x))
+    assert base.shape == x.shape  # 원래 열을 남기지 않는다
+    assert np.array_equal(np.isnan(base), np.isnan(x))  # 결측은 그대로
+    for j in range(3):
+        ok = ~np.isnan(x[:, j])
+        order = np.argsort(x[ok, j])
+        assert (np.diff(base[ok, j][order]) >= 0).all()  # 순서를 지킨다
+        assert abs(np.mean(base[ok, j])) < 0.05 and abs(np.std(base[ok, j]) - 1) < 0.1
+    clf = EnsembleClassifier(_tiny_model(), n_estimators=5, member_kinds=("standard", "rankgauss"))
+    y = (x[:, 0] > 1).astype(int)
+    proba = clf.fit(x[:300], y[:300]).predict_proba(x[300:])
+    assert [p.member.kind for p in clf.preprocessors_][:2] == ["standard", "rankgauss"]
+    assert np.allclose(proba.sum(1), 1)
+
+
+@pytest.mark.parametrize("kind", ["standard", "robust", "rankgauss", "power"])
+def test_feature_flip_negates_numeric_columns_only(kind):
+    from minipfn.inference.preprocessing import Member, MemberPreprocessor, PreprocessOptions
+
+    x = _numeric()
+    x = np.concatenate([x, (np.arange(len(x)) % 4)[:, None].astype(float)], 1)  # 범주형 열 3
+    member = Member(kind, None, False, seed=11)
+    plain = MemberPreprocessor(member, [3], 100).fit(x)
+    flip = MemberPreprocessor(member, [3], 100, PreprocessOptions(feature_flip=True)).fit(x)
+    assert flip.signs is not None and len(flip.signs) == 3
+    assert np.array_equal(flip.order, plain.order)  # 다른 난수는 그대로
+    a = plain.transform(x, np.random.default_rng(1))
+    b = flip.transform(x, np.random.default_rng(1))
+    signs = np.ones(a.shape[1])
+    inv = np.argsort(plain.order)  # 섞기 전 열 → 섞은 뒤 위치
+    for k, j in enumerate(plain.num_ix):
+        signs[inv[j]] = flip.signs[k]
+    atol = 2e-3 if kind == "power" else 1e-9  # Yeo-Johnson λ는 2 − λ로 다시 맞춘다 (수치 오차)
+    assert np.allclose(b, a * signs, atol=atol, equal_nan=True)
+    assert (flip.signs < 0).any()  # seed 11에서 하나 이상 뒤집힌다
+
+
+def test_default_feature_flip_is_off_and_eval_flag():
+    from minipfn.inference.preprocessing import PreprocessOptions
+
+    assert PreprocessOptions().feature_flip is False
+    script = _eval_script()
+    assert script.inference_option_params(script.parse_args([])) == {}
+    kinds = "standard,power,robust,rankgauss"
+    args = script.parse_args(["--feature-flip", "--member-kinds", kinds])
+    assert script.inference_option_params(args) == {"feature_flip": True}
+    assert args.member_kinds == ("standard", "power", "robust", "rankgauss")
+    assert script.estimator_options(args, "regression")["feature_flip"] is True

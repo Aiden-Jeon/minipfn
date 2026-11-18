@@ -1,7 +1,7 @@
 """앙상블 멤버의 전처리 (TabPFN v2 논문 Methods "Inference details"의 전처리 목록).
 
 멤버 하나는 학습 행에 전처리를 맞추고(`MemberPreprocessor.fit`), 학습 행과 테스트 행에 같은 변환을
-쓴다. 멤버 종류(`MEMBER_KINDS`)는 네 가지다.
+쓴다. 멤버 종류(`MEMBER_KINDS`)는 다섯 가지다.
 
 - `"quantile"`: 분위수 변환한 열을 원래 열 옆에 붙이고 SVD 성분을 덧붙인다. 범주형 열은 번호를
   섞는다
@@ -10,6 +10,9 @@
   (`RobustSoftClip`)
 - `"standard"`: 열 값을 바꾸지 않는다(이상치 자르기만). 표준화는 모델이 학습 행으로 한다. TabPFN-3.5
   추론이 이것 하나만 쓴다
+- `"rankgauss"`: RankGaussian. 학습 행의 분위수(최대 `RANK_GAUSS_KNOTS`개)로 순위를 구해 표준정규
+  분위수로 바꾼다 (Kumo-Tabular의 `RankGaussian(max_knots=8192)`, issue #101). 분위수 멤버와 달리
+  원래 열을 남기지 않고 SVD 성분도 붙이지 않는다
 
 모든 멤버에서 수치형 열의 평균으로부터 표준편차 `outlier_sigma`배(기본 `OUTLIER_SIGMA`) 밖의 값은
 그 경계로 자르고, 열
@@ -36,6 +39,10 @@ feature가 멤버 상한보다 많으면 멤버마다 일부 열만 쓴다(`feat
   포함)이 `MIN_UNIQUE_NUMERICAL`개보다 적은 수치 열을 범주형으로 본다 (공식 type 추론)
 - `constant_columns`: 학습 행에서 값이 하나뿐인(결측만인 것 포함) 열을 뺀다 (공식
   `RemoveConstantFeaturesStep`. 범주형으로 준 열은 빼지 않는다)
+- `feature_flip`(Kumo `FlipSign`, issue #101): 멤버마다 수치 열을 확률 0.5로 골라 부호를 뒤집는다.
+  이상치 자르기 뒤, 분포 변환 앞이다. 다섯 변환은 모두 부호를 뒤집은 입력에 맞추면 출력도 부호만
+  뒤집히므로(Yeo-Johnson은 λ가 2 − λ로) 변환 뒤에 뒤집는 Kumo와 같은 효과다. 부호는 멤버 seed에서
+  따로 뽑아 다른 난수(열 순서 등)는 그대로다
 
 Kumo-Tabular(NVIDIA structured-data-models) 추론의 범주 처리에서 가져온 옵션 (issue #100,
 동작만 다시 구현했다. 기본은 끔):
@@ -63,7 +70,10 @@ from sklearn.preprocessing import OrdinalEncoder, PowerTransformer, QuantileTran
 OUTLIER_SIGMA = 12.0
 MAX_ONE_HOT_CATEGORIES = 20  # benchmark의 socmob(17개)은 펼치고 colleges(수천 개)는 번호로 둔다
 ONE_HOT_MODES = ("off", "power", "all")
-MEMBER_KINDS = ("quantile", "power", "robust", "standard")
+MEMBER_KINDS = ("quantile", "power", "robust", "standard", "rankgauss")
+RANK_GAUSS_KNOTS = 8192  # RankGaussian 분위수 수 상한 (Kumo max_knots)
+RANK_GAUSS_SUBSAMPLE = 100_000  # 분위수를 구할 학습 행 수 상한
+_FLIP_STREAM = 7  # feature_flip 부호의 난수 (멤버 seed와 함께)
 SOFT_CLIP = 3.0  # RealMLP smooth clipping의 폭
 FINGERPRINTS = ("random", "hash")
 OUTLIER_CLIPS = ("hard", "soft")
@@ -87,6 +97,7 @@ class PreprocessOptions:
     fingerprint: str = "random"
     outlier_clip: str = "hard"
     unseen_category: str = "nan"  # "minus1"이면 one-hot 블록에서 -1(학습에 없던 범주)은 모두 0
+    feature_flip: bool = False  # 멤버마다 수치 열 부호 뒤집기 (모듈 docstring, Kumo)
 
     def __post_init__(self) -> None:
         if self.fingerprint not in FINGERPRINTS:
@@ -405,7 +416,7 @@ def one_hot_kinds(one_hot: str, member_kinds: tuple[str, ...]) -> frozenset[str]
 
 @dataclass
 class Member:
-    kind: str  # "quantile" | "power" | "robust" | "standard"
+    kind: str  # "quantile" | "power" | "robust" | "standard" | "rankgauss"
     class_permutation: np.ndarray | None
     target_power: bool
     seed: int
@@ -456,6 +467,12 @@ class MemberPreprocessor:
         X = self._clip(X)
         num_ix = [i for i in range(X.shape[1]) if i not in self.cat_ix]
         self.num_ix = num_ix
+        # 수치 열 부호 (feature_flip. 멤버 seed에서 따로 뽑아 아래 난수는 그대로다)
+        self.signs = None
+        if self.options.feature_flip and num_ix:
+            flip_rng = np.random.default_rng([self.member.seed, _FLIP_STREAM])
+            self.signs = np.where(flip_rng.random(len(num_ix)) < 0.5, -1.0, 1.0)
+        X = self._flip(X)
         # 범주형 열의 번호는 0부터 (학습 행의 범주 수 - 1)까지다
         n_categories = {
             i: int(np.nanmax(X[:, i])) + 1 if np.isfinite(X[:, i]).any() else 1 for i in self.cat_ix
@@ -481,6 +498,13 @@ class MemberPreprocessor:
             self.transformer = PowerTransformer(method="yeo-johnson", standardize=True)
         elif self.member.kind == "robust":
             self.transformer = RobustSoftClip()
+        elif self.member.kind == "rankgauss":
+            self.transformer = QuantileTransformer(
+                n_quantiles=max(min(X.shape[0], RANK_GAUSS_KNOTS), 2),
+                output_distribution="normal",
+                subsample=RANK_GAUSS_SUBSAMPLE,
+                random_state=self.member.seed,
+            )
         else:  # standard: 값은 그대로
             self.transformer = None
         # 학습 행에 값이 하나도 없는 수치 열은 변환기에 넣지 않고 결측으로 둔다(Yeo-Johnson은 빈
@@ -503,6 +527,13 @@ class MemberPreprocessor:
         # fingerprint="hash"의 salt: 학습 행의 셀 수 (식별자 열 앞까지)
         self.n_cells = X.shape[0] * (base.shape[1] + n_components)
         return self
+
+    def _flip(self, X: np.ndarray) -> np.ndarray:
+        if self.signs is None:
+            return X
+        X = X.copy()
+        X[:, self.num_ix] *= self.signs
+        return X
 
     def _standardize(self, base: np.ndarray) -> np.ndarray:
         return np.nan_to_num((base - self.svd_mean) / self.svd_std, nan=0.0)
@@ -558,7 +589,7 @@ class MemberPreprocessor:
         self, X: np.ndarray, rng: np.random.Generator, is_test: bool = False
     ) -> np.ndarray:
         """`is_test`는 fingerprint="hash"에서만 쓴다 (학습 행만 같은 행을 다른 값으로 만든다)."""
-        base = self._base(self._clip(X))
+        base = self._base(self._flip(self._clip(X)))
         parts = [base]
         if self.svd is not None:
             parts.append(self.svd.transform(self._standardize(base)))

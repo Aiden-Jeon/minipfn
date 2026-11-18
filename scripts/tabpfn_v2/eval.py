@@ -94,7 +94,9 @@ Kumo-Tabular(NVIDIA structured-data-models) 추론에서 가져온 옵션도 항
 기본은 모두 끔): `--category-counts 50`(값이 50개 넘는 범주 열에 log1p(학습 행 빈도) 열),
 `--rare-category-min-count 2`(학습 행에 한 번만 나온 범주 값을 결측으로), `--class-average logit`
 (분류 멤버 logit 평균 뒤 softmax), `--regression-trim 0.2`(회귀 멤버 평균의 trimmed mean),
-`--target-flip`(회귀 멤버 절반의 target 부호 뒤집기). 이것도 `--test-time none`에서만 쓴다.
+`--target-flip`(회귀 멤버 절반의 target 부호 뒤집기). issue #101: 멤버 종류 `rankgauss`
+(RankGaussian, `--member-kinds standard,power,robust,rankgauss`가 Kumo의 돌려쓰기)와
+`--feature-flip`(멤버마다 수치 열 부호 뒤집기). 이것도 `--test-time none`에서만 쓴다.
 
 `--test-time`은 추론에 연산을 더 쓰는 방법이다(issue #43, arXiv 2610.12005). `greedy`는 멤버 pool을
 학습 행 안의 out-of-fold 손실로 greedy 선택하고(`minipfn.inference.ensemble_selection`,
@@ -469,6 +471,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="회귀: 한 멤버 걸러 target 부호를 뒤집는다 (Kumo, --regression-mean member에서만)",
     )
     parser.add_argument(
+        "--feature-flip",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="멤버마다 수치 열을 확률 0.5로 골라 부호를 뒤집는다 (Kumo FlipSign, 기본 끔)",
+    )
+    parser.add_argument(
         "--method-name", default="minipfn-tabpfn-v2", help="TabArena·BeyondArena 결과의 방법 이름"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -533,6 +541,7 @@ INFERENCE_DEFAULTS = {
     "class_average": "proba",
     "regression_trim": 0.0,
     "target_flip": False,
+    "feature_flip": False,  # issue #101
 }
 REGRESSION_ONLY = ("target_transform", "regression_mean", "regression_trim", "target_flip")
 CLASSIFICATION_ONLY = ("class_average",)
