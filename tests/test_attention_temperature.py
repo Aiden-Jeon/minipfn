@@ -260,6 +260,15 @@ def test_train_script_options(monkeypatch):
         monkeypatch.setenv(f"TABPFN_V2_{env}", "kumo" if env == "ATTENTION_TEMPERATURE" else "on")
     with pytest.raises(SystemExit, match="logit-softcap"):
         script.build_config(script.parse_args([*base, "--logit-softcap", "fifty"]))
+    # 인자로 주면 틀린 환경변수 값이 있어도 인자 값을 쓴다
+    monkeypatch.setenv("TABPFN_V2_QK_NORM_AFFINE", "1")
+    assert script.parse_args([*base, "--qk-norm-affine", "on"]).qk_norm_affine == "on"
+    monkeypatch.setenv("TABPFN_V2_QK_NORM_AFFINE", "on")
+    # soft-cap을 끈 run은 이어 학습할 때만 끈 채로 잇는다 (가중치만 가져오면 preset 값)
+    assert script.source_speed_options({"logit_softcap": "None"}, resume=True) == {
+        "logit_softcap": None
+    }
+    assert script.source_speed_options({"logit_softcap": "None"}) == {}
     # 가중치를 가져오면 원래 run의 온도를 쓰고, --arch v3.5여도 구조가 다르다고 멈추지 않는다
     monkeypatch.delenv("TABPFN_V2_ATTENTION_TEMPERATURE")
     monkeypatch.delenv("TABPFN_V2_ROW_TEMPERATURE")

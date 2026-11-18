@@ -265,13 +265,18 @@ def main(argv=None) -> None:
             path = mlflow.artifacts.download_artifacts(artifact_uri=spec, dst_path=d)
             state = torch.load(path, map_location="cpu", weights_only=True)
         model, borders = model_from_state(state)
-        step = int(state.get("step") or re.search(r"step_(\d+)", spec).group(1))
+        step = state.get("step")
+        if step is None:  # 파일 이름에서 (latest.pt처럼 없으면 -1)
+            found = re.search(r"step_(\d+)", spec)
+            step = int(found.group(1)) if found else -1
         del state
         res = probe(model, borders, sets, device)
         run = spec.removeprefix("runs:/").split("/", 1)[0]
         label = f"{names.get(run, run[:8])}@{step}"
         results[label] = {"spec": spec, "step": step, **res}
         print(summary(label, res), f"  ({time.time() - start:.0f}s)", flush=True)
+        with open(args.out, "w") as f:  # 뒤 checkpoint에서 멈춰도 앞 결과가 남도록
+            json.dump(results, f, indent=1)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
