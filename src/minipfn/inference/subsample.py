@@ -49,6 +49,9 @@ def subsample_indices(y: Any, n: int, *, stratify: bool, seed: int) -> np.ndarra
     return np.sort(np.concatenate(parts))
 
 
+ROW_ALIGNED_FIT_KWARGS = ("groups",)  # 행과 나란한 fit 인자: 같은 행으로 줄인다
+
+
 def _take(value: Any, ix: np.ndarray) -> Any:
     return value.iloc[ix] if hasattr(value, "iloc") else np.asarray(value)[ix]
 
@@ -56,9 +59,9 @@ def _take(value: Any, ix: np.ndarray) -> Any:
 class SubsampledEstimator:
     """estimator를 감싸 fit의 학습 행을 `max_rows`개로 줄인다 (`subsample_indices`).
 
-    행과 나란한 fit 인자(`groups` 등 길이가 학습 행 수인 배열)도 같은 행으로 줄인다. 원래 행 수와
-    고른 행 수는 `train_rows_`(원래, 고른 수)에 남는다. 나머지 속성(`predict`, `predict_proba`,
-    `classes_`, `after_predict` 등)은 감싼 estimator의 것이다.
+    행과 나란한 fit 인자(`ROW_ALIGNED_FIT_KWARGS`, 지금은 `groups`)도 같은 행으로 줄인다.
+    원래 행 수와 고른 행 수는 `train_rows_`(원래, 고른 수)에 남는다. 나머지 속성(`predict`,
+    `predict_proba`, `classes_`, `after_predict` 등)은 감싼 estimator의 것이다.
     """
 
     def __init__(self, estimator, max_rows: int, *, stratify: bool, seed: int = 0) -> None:
@@ -82,7 +85,7 @@ class SubsampledEstimator:
         if len(ix) < total:
             X, y = _take(X, ix), _take(y, ix)
             fit_kwargs = {
-                k: _take(v, ix) if v is not None and np.ndim(v) >= 1 and len(v) == total else v
+                k: _take(v, ix) if k in ROW_ALIGNED_FIT_KWARGS and v is not None else v
                 for k, v in fit_kwargs.items()
             }
         self.estimator.fit(X, y, **fit_kwargs)

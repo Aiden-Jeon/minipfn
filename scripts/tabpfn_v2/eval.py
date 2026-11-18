@@ -228,7 +228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="앙상블 멤버의 난수 seed (feature·클래스 순서, 식별자 열 등. 같은 모델의 평가 노이즈를"
-        " 잴 때 바꾼다)",
+        " 잴 때 바꾼다). --subsample-train-rows면 고르는 학습 행도 이 seed로 정한다",
     )
     parser.add_argument(
         "--uncertainty",
@@ -1242,7 +1242,8 @@ def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "")
         if unknown:
             raise SystemExit(f"{suite.name}에 없는 데이터셋: {unknown}")
         grid = grid[grid["dataset"].isin(datasets)]
-    jobs = shard_jobs(arena.dataset_queue(grid), out_dir, args.suite, cache_id)
+    queue = arena.dataset_queue(grid, getattr(args, "subsample_train_rows", None))
+    jobs = shard_jobs(queue, out_dir, args.suite, cache_id)
     if not jobs:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
         return []
     n_workers = min(args.shards, len(jobs))

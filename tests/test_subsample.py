@@ -93,6 +93,11 @@ def test_wrapper_subsamples_rows_and_row_aligned_fit_args():
     rows = inner.X["a"].to_numpy().astype(int)
     assert len(rows) == 40 and np.array_equal(inner.y, y[rows])
     assert np.array_equal(inner.kwargs["groups"], groups[rows]) and inner.kwargs["other"] == 3
+    # 이름이 행 인자가 아니면 길이가 학습 행 수와 같아도 자르지 않는다
+    weights = np.arange(300.0)
+    inner = _Recorder()
+    SubsampledEstimator(inner, 40, stratify=True, seed=0).fit(X, y, per_feature=weights)
+    assert inner.kwargs["per_feature"] is weights
     assert (inner.y == 0).sum() == 20  # 층화
     # 나머지 속성은 감싼 estimator의 것
     assert np.array_equal(est.classes_, [0, 1]) and len(est.predict(X)) == 300
