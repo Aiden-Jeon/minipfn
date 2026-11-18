@@ -63,6 +63,18 @@ seed마다 따로다.
 feature 수 상한을 없애서, 권장 크기보다 넓은 split(BeyondArena의 6,772~22,215개)도
 돌린다(issue #66).
 
+`--subsample-train-rows N`은 fit마다 학습 행이 N개보다 많으면 N개만 무작위로 골라 문맥으로 쓴다
+(`minipfn.inference.subsample`, issue #91: 큰 표에서 긴 문맥을 쓰는지 보는 실험). 분류는 클래스
+층화로 고르고 클래스마다 최소 1행을 남긴다. 고르는 난수는 `--seed`로 정해지고, 앙상블 멤버는 모두
+같은 행을 쓴다. `--max-train-rows`는 이와 따로, 원래 학습 행 수로 split을 거른다(넘으면 돌리지
+않고 imputed). 그래서 둘을 함께 주면 원래 행이 `--max-train-rows` 이하인 split만 돌리고, 그 가운데
+N개보다 많은 split만 줄인다. `--bagging`이면 bag마다 따로 줄인다.
+
+  uv run --no-dev --extra arena --group arena-dev python $EVAL --suite beyondarena \
+    --classifier-path hf://aiden-jeon/minipfn-tabpfn-v3-5 \
+    --regressor-path hf://aiden-jeon/minipfn-tabpfn-v3-5 \
+    --subsample-train-rows 30000 --method-name minipfn-tabpfn-v3-5-ctx30k
+
 공식 TabPFN-3.5(PriorLabs/TabPFN v9 이후) checkpoint에 든 추론 설정에 맞추는 옵션은 항목마다 따로
 켠다(기본은 모두 main과 같다): `--softmax-temperature 1.0`, `--one-hot off --shuffle-categories`
 (범주를 번호로 두고 멤버마다 섞기), `--target-transform safepower`·`--regression-mean mixture`(회귀
@@ -169,6 +181,7 @@ from minipfn.inference.preprocessing import (
     one_hot_sizes,
     to_numeric,
 )
+from minipfn.inference.subsample import SubsampledEstimator, subsample_indices
 from minipfn.priors.table_size import MAX_FEATURES
 from minipfn.recipes import default_inference, resolve_member_kinds, supported_size
 from minipfn.utils import mlflow_eval_run
@@ -314,7 +327,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 내부용: stdin으로 받은 데이터셋을 하나씩 돌리는 worker (`--shards`가 띄운다)
     parser.add_argument("--shard-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--max-train-rows", type=int, help="TabArena·BeyondArena: 학습 행 상한 (기본: 모델 구조)"
+        "--max-train-rows",
+        type=int,
+        help="TabArena·BeyondArena: 원래 학습 행이 이보다 많은 split은 돌리지 않는다(imputed)"
+        " (기본: 모델 구조. --subsample-train-rows로 줄이기 전의 행 수로 본다)",
+    )
+    parser.add_argument(
+        "--subsample-train-rows",
+        type=int,
+        default=None,
+        help="fit마다 학습 행이 이보다 많으면 이만큼만 무작위로 골라 문맥으로 쓴다(분류는 클래스"
+        " 층화, 클래스마다 최소 1행, 난수는 --seed, 멤버는 모두 같은 행, --bagging이면 bag마다)."
+        " --max-train-rows로 거르고 남은 split에 쓴다 (기본: 줄이지 않는다)",
     )
     parser.add_argument(
         "--max-features", type=int, help="TabArena·BeyondArena: feature 수 상한 (기본: 모델 구조)"
@@ -428,6 +452,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if inference_option_params(args) and args.test_time != "none":
         # greedy pool·DiagScale의 view는 이 옵션을 넘기지 않는다
         parser.error("공식 3.5 추론 옵션은 --test-time none에서만 쓴다.")
+    if args.subsample_train_rows is not None and args.subsample_train_rows < 1:
+        parser.error("--subsample-train-rows는 1 이상이어야 한다.")
     if args.drop_group_columns and args.suite not in ARENA_SUITES:
         # AMLB split에는 group 열이 없어 아무 일도 하지 않는다
         parser.error("--drop-group-columns는 TabArena·BeyondArena suite에서만 쓴다.")
@@ -529,18 +555,29 @@ def fold_expands_one_hot(X: pd.DataFrame, categorical_indices: list[int], max_wi
     return bool(one_hot_sizes(n_categories, X_num.shape[1], max_width))
 
 
-def expands_one_hot(task: bm.OpenMLTask, max_width: int = MAX_FEATURES, n_folds: int = 10) -> bool:
+def expands_one_hot(
+    task: bm.OpenMLTask,
+    max_width: int = MAX_FEATURES,
+    n_folds: int = 10,
+    subsample_rows: int | None = None,
+    seed: int = 0,
+) -> bool:
     """one-hot 모드에 따라 결과가 달라질 수 있는지: 어느 fold의 학습 행에서든 펼칠 열이 있으면 True.
 
     전체 행으로 보면 안 된다. 범주가 전체로는 `MAX_ONE_HOT_CATEGORIES`개를 넘어도
     fold의 학습 행에서는 그 이하일 수 있고, 멤버 전처리는 fold마다 학습 행으로 맞춘다.
     `n_folds`는 평가에 쓰는 fold 수와 같아야 한다. 상한 `max_width`는 모델이 학습 때 본
-    feature 수다 (`max_features_of`).
+    feature 수다 (`max_features_of`). `subsample_rows`(`--subsample-train-rows`)면 fit이 보는
+    것처럼 fold의 학습 행을 `SubsampledEstimator`와 같은 규칙(`subsample_indices`)으로 줄여 본다.
     """
-    return any(
-        fold_expands_one_hot(task.X.iloc[train_ix], task.categorical_indices, max_width)
-        for _, train_ix, _ in task.folds(n_folds)
-    )
+    for _, train_ix, _ in task.folds(n_folds):
+        if subsample_rows is not None:
+            y = task.y.iloc[train_ix].to_numpy()
+            stratify = task.task_type == "classification"
+            train_ix = train_ix[subsample_indices(y, subsample_rows, stratify=stratify, seed=seed)]
+        if fold_expands_one_hot(task.X.iloc[train_ix], task.categorical_indices, max_width):
+            return True
+    return False
 
 
 def same_result_modes(
@@ -655,6 +692,14 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         if args.distill != "none" or args.latency:
             record = {"suite": args.suite, "task": suite, "dataset": getattr(task, "name", None)}
             estimator = RecordedEstimator(estimator, record, fits_log, latency=args.latency)
+        if args.subsample_train_rows is not None:
+            # 맨 바깥: test-time 방법·증류·기록 모두 고른 행만 본다
+            estimator = SubsampledEstimator(
+                estimator,
+                args.subsample_train_rows,
+                stratify=suite == "classification",
+                seed=args.seed,
+            )
         return estimator
 
     # arena system이 fit에 split의 group 번호(groups)를 넘긴다
@@ -839,6 +884,12 @@ def arena_fingerprint(
             # 공식 3.5 추론 옵션: 기본값과 다른 것만 (모두 기본이면 예전 fingerprint 그대로)
             **inference_option_params(args),
             **({"drop_group_columns": True} if getattr(args, "drop_group_columns", False) else {}),
+            # 주지 않으면(기본) 예전 fingerprint 그대로
+            **(
+                {"subsample_train_rows": args.subsample_train_rows}
+                if getattr(args, "subsample_train_rows", None) is not None
+                else {}
+            ),
         },
         sort_keys=True,
     )
@@ -1287,6 +1338,7 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
             **inference_option_params(args),
             "drop_group_columns": getattr(args, "drop_group_columns", False),
+            "subsample_train_rows": args.subsample_train_rows,
         }
     )
     paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
@@ -1399,6 +1451,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "one_hot_modes": ",".join(args.one_hot),
                 "seed": args.seed,
                 "max_features_per_member": args.max_features_per_member,
+                "subsample_train_rows": args.subsample_train_rows,
                 **test_time_params(args),
                 **distill_params(args),
                 **inference_option_params(args),
@@ -1429,7 +1482,13 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         expands = (
             args.infer_categorical
             or args.drop_constant
-            or expands_one_hot(task, factories[suite].max_one_hot_width, args.folds)
+            or expands_one_hot(
+                task,
+                factories[suite].max_one_hot_width,
+                args.folds,
+                subsample_rows=args.subsample_train_rows,
+                seed=args.seed,
+            )
         )
         for group in same_result_modes(args.one_hot, factories[suite].member_kinds, expands):
             # 한 묶음의 모드는 결과가 같으므로 첫 모드만 평가하고 나머지에는 그 결과를 쓴다

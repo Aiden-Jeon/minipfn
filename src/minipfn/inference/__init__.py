@@ -11,6 +11,8 @@
   (앙상블 estimator를 감싼다)
 - `distillation`: 추론 estimator(teacher)를 데이터셋마다 GBDT 학생으로 증류하는
   `DistilledClassifier`·`DistilledRegressor` (예측은 CPU의 학생만 쓴다)
+- `subsample`: fit의 학습 행을 N개로 줄이는 `SubsampledEstimator` (분류는 클래스 층화, 문맥 길이
+  실험용)
 
 논문의 기본 설정(멤버 수, 온도, 멤버 종류 묶음)을 붙인 클래스는 `minipfn.recipes`에 있다.
 """
