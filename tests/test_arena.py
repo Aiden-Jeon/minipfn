@@ -384,6 +384,9 @@ def test_dataset_queue_puts_expensive_datasets_first_and_skips_unrun_splits():
     assert queue == arena.dataset_queue(grid.sample(frac=1, random_state=0))
     # mid_a·mid_b는 셀 3백만으로 같다: 이름 순
     assert queue == [("big", 1), ("mid_a", 3), ("mid_b", 3), ("small", 30), ("tiny", 10)]
+    # --subsample-train-rows: 학습 행을 그만큼으로 잘라 센다 (big은 10k × 50 = 50만 셀)
+    queue = arena.dataset_queue(grid, subsample_rows=10_000)
+    assert queue == [("mid_a", 3), ("mid_b", 3), ("big", 1), ("small", 30), ("tiny", 10)]
 
 
 def test_shard_worker_command_replaces_dataset_and_output_flags(tmp_path):

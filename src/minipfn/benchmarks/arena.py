@@ -374,13 +374,17 @@ def run(
     return summary
 
 
-def dataset_queue(grid: pd.DataFrame) -> list[tuple[str, int]]:
+def dataset_queue(grid: pd.DataFrame, subsample_rows: int | None = None) -> list[tuple[str, int]]:
     """돌릴 split(`skip_reason`이 없는 것)이 있는 데이터셋을 비용이 큰 것부터 (데이터셋, split
     수)로. 데이터셋 하나의 비용은 그 split들의 셀 수(학습 행 × feature) 합이다. 비싼 것을 먼저
     내보내야 마지막에 남는 일이 작아서 먼저 끝난 GPU가 오래 놀지 않는다. 같으면 이름 순이고, 같은
-    grid면 늘 같은 답이다."""
+    grid면 늘 같은 답이다. `subsample_rows`(`--subsample-train-rows`)면 학습 행을 그만큼으로 잘라
+    센다(fit이 실제로 보는 행)."""
     todo = grid[grid["skip_reason"].isna()]
-    cells = todo["max_train_rows"].astype(float) * todo["n_features"].clip(lower=1).astype(float)
+    rows = todo["max_train_rows"].astype(float)
+    if subsample_rows is not None:
+        rows = rows.clip(upper=float(subsample_rows))
+    cells = rows * todo["n_features"].clip(lower=1).astype(float)
     cost = cells.groupby(todo["dataset"]).sum()
     splits = todo.groupby("dataset").size()
     order = sorted(cost.index, key=lambda d: (-cost[d], d))
