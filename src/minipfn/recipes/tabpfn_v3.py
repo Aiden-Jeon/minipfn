@@ -8,8 +8,8 @@
   paper 설정(`recipes.tabpfn_v2.paper`)에서 시작한다. 3은 task마다 모델이 따로이고, 3.5는
   분류·회귀를 한 모델로 같이 학습한다(`task="multitask"`: 학습 루프가 step마다 task를 번갈아 쓴다)
 - 추론: `minipfn.inference.ensemble`의 `EnsembleClassifier`·`EnsembleRegressor`에
-  `default_inference` (3은 2.5와 같은 전처리, 3.5는 standard 멤버 8개). 공개 가중치는
-  `TabPFNv3_5Classifier`·`TabPFNv3_5Regressor`가 받는다
+  `default_inference` (3은 2.5와 같은 전처리, 3.5는 standard 멤버 8개 + 멤버당 768열 balanced).
+  공개 가중치는 `TabPFNv3_5Classifier`·`TabPFNv3_5Regressor`가 받는다
 
     config = with_architecture(paper("classification"), "v3")
     clf = EnsembleClassifier(model, **default_inference(model, "classification"))
@@ -349,27 +349,41 @@ def curriculum(
 # 추론
 # ---------------------------------------------------------------------------
 # 3: "추론 전처리(robust scaling + soft clipping, quantile, standard, SVD)는 2.5와 같다" → 2.5의
-# 멤버 종류와 v2 논문 멤버 수. 3.5: "quantile·robust·SVD를 빼고 standard만, estimator 8개"
+# 멤버 종류와 v2 논문 멤버 수. 3.5: "quantile·robust·SVD를 빼고 standard만, estimator 8개".
+# 3.5는 멤버마다 원래 열을 768개까지 고르게 나눠 넣는다(공식 3.5의 768·balanced, issue #99:
+# 우리 모델은 열 100개 이하 표로 학습해서, 열이 수천 개인 표에 모든 열을 넣으면 크게 나빠진다)
 INFERENCE = {
     "v3": {
         "n_estimators": {"classification": 4, "regression": 8},
         "member_kinds": ("quantile", "robust"),
     },
-    "v3.5": {"n_estimators": {"classification": 8, "regression": 8}, "member_kinds": ("standard",)},
+    "v3.5": {
+        "n_estimators": {"classification": 8, "regression": 8},
+        "member_kinds": ("standard",),
+        "max_features_per_member": 768,
+        "feature_subsampling": "balanced",
+    },
 }
 # 이름으로 고르는 멤버 종류 묶음 (`minipfn.recipes.resolve_member_kinds`가 v2·v2.5와 합쳐 읽는다)
 MEMBER_KIND_PRESETS = {name: v["member_kinds"] for name, v in INFERENCE.items()}
 
 
 def default_inference(model: nn.Module, task: str) -> dict:
-    """그 모델의 추론 설정 `{"n_estimators": int, "member_kinds": tuple}`. weight와 함께 온 설정
-    (`model.inference_config`, Hub config.json의 `inference`)이 먼저이고, 없으면 모델 구조(3.5면
-    v3.5, 그 밖은 v3)의 것."""
+    """그 모델의 추론 설정 `{"n_estimators": int, "member_kinds": tuple,
+    "max_features_per_member": int | None, "feature_subsampling": str}`. weight와 함께 온 설정
+    (`model.inference_config`, Hub config.json의 `inference`)이 먼저이고, 그 키가 없으면 모델
+    구조(3.5면 v3.5, 그 밖은 v3)의 것. 멤버당 열 상한은 3.5만 있다(3은 None: 모든 열)."""
     saved = getattr(model, "inference_config", None) or {}
     preset = INFERENCE[model_architecture(model, task) or "v3"]
     return {
         "n_estimators": int(saved.get("n_estimators", preset["n_estimators"][task])),
         "member_kinds": resolve_member_kinds(saved.get("member_kinds") or preset["member_kinds"]),
+        "max_features_per_member": saved.get(
+            "max_features_per_member", preset.get("max_features_per_member")
+        ),
+        "feature_subsampling": saved.get(
+            "feature_subsampling", preset.get("feature_subsampling", "random")
+        ),
     }
 
 
@@ -382,8 +396,8 @@ HUB_REPOS = {"classification": HUB_REPO, "regression": HUB_REPO}
 
 class TabPFNv3_5Classifier(TabPFNv2Classifier):
     """TabPFN-3.5 분류. `TabPFNv2Classifier`(전처리 멤버 앙상블)와 같고 공개 가중치만 3.5의 것
-    (`HUB_REPO`)이다. multitask 모델의 분류 출력을 쓴다. 멤버 수·전처리(standard 8개)는 가중치의
-    config.json이 정한다.
+    (`HUB_REPO`)이다. multitask 모델의 분류 출력을 쓴다. 멤버 수·전처리(standard 8개, 멤버당
+    768열)는 가중치의 config.json이 정하고, 없는 값은 recipe의 값이다.
 
         clf = TabPFNv3_5Classifier().fit(x_train, y_train)
         clf = TabPFNv3_5Classifier("aiden-jeon/minipfn-tabpfn-v3-5@stage2-20k")  # 앞 단계

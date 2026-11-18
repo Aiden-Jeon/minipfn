@@ -32,7 +32,8 @@ coverage gap이다. 데이터셋별 표는 `eval_uncertainty_per_dataset.csv`, s
 
 앙상블 멤버 수와 전처리는 기본으로 모델이 정한다(`minipfn.recipes.default_inference`: 모델 종류의
 recipe가 정한다. Hub config.json의 `inference`가 먼저이고, 없으면 v2·2.5 모델은 구조가 2.5면 v2.5,
-아니면 v2. TabPFN-3·3.5 모델은 3이면 quantile,robust, 3.5면 standard 멤버 8개).
+아니면 v2. TabPFN-3·3.5 모델은 3이면 quantile,robust, 3.5면 standard 멤버 8개와 멤버당 768열
+balanced).
 `--member-kinds`로 주면 멤버 종류만 그 값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust
 scaling + soft clipping을 쓰는 quantile,robust). 멤버 수는 `--n-estimators`로 따로 준다.
 TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
@@ -58,6 +59,9 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
 seed만 바꿔 다시 평가하면 benchmark 점수의 노이즈를 잴 수 있다(issue #67). arena 결과 cache는
 seed마다 따로다.
 
+TabPFN-3.5 모델은 `--max-features-per-member`를 주지 않으면 모델의 추론 설정(recipe
+`default_inference`)대로 멤버마다 768열을 balanced로 고른다(issue #99, `apply_model_feature_cap`.
+test-time 방법에서는 예전처럼 모든 열).
 `--max-features-per-member 6000`은 feature가 6,000개보다 많은 표에서 앙상블 멤버마다 6,000개를
 무작위로 골라 넣는다(공식 TabPFN의 `max_features_per_estimator`). 주면 TabArena·BeyondArena의
 feature 수 상한을 없애서, 권장 크기보다 넓은 split(BeyondArena의 6,772~22,215개)도
@@ -448,6 +452,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.min_improvement = MIN_IMPROVEMENT
     if args.oof_split is None:
         args.oof_split = "task"
+    # 모델의 기본 멤버당 열 상한(`apply_model_feature_cap`)이 따로 준 나누기 방법을 덮지 않도록
+    args.feature_subsampling_given = args.feature_subsampling is not None or args.official_v35
     resolve_inference_options(args)
     if inference_option_params(args) and args.test_time != "none":
         # greedy pool·DiagScale의 view는 이 옵션을 넘기지 않는다
@@ -707,8 +713,37 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
     make.n_estimators = n_estimators
+    # 모델이 정한 멤버당 열 상한 (TabPFN-3.5: 768·balanced. `apply_model_feature_cap`)
+    make.feature_cap = (
+        inference.get("max_features_per_member"),
+        inference.get("feature_subsampling", "random"),
+    )
     make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
+
+
+def apply_model_feature_cap(args: argparse.Namespace, factories: dict) -> None:
+    """`--max-features-per-member`를 주지 않았으면 모델이 정한 멤버당 열 상한(recipe의
+    `default_inference`, TabPFN-3.5는 768·balanced)을 `args`에 채운다. 그래서 estimator, arena의
+    feature 수 상한(`arena_limits`), 결과 cache의 fingerprint, MLflow param이 모두 같은 값을 쓴다.
+    `--feature-subsampling`을 따로 줬으면 나누기 방법은 그것이다. test-time 방법(greedy·DiagScale)은
+    멤버 view가 이 옵션을 넘기지 않으므로 채우지 않는다(예전처럼 모든 열)."""
+    if args.max_features_per_member is not None or args.test_time != "none":
+        return
+    caps = {f.feature_cap for f in factories.values()}
+    if len(caps) > 1:
+        raise SystemExit(
+            f"분류·회귀 모델의 멤버당 열 상한이 다르다 ({caps}). --max-features-per-member로 준다."
+        )
+    if not caps:
+        return
+    cap, subsampling = caps.pop()
+    if cap is None:
+        return
+    args.max_features_per_member = cap
+    if not args.feature_subsampling_given:
+        args.feature_subsampling = subsampling
+    print(f"멤버당 열 상한: {cap} ({args.feature_subsampling}, 모델의 추론 설정)", flush=True)
 
 
 def record_fits(estimator, path: Path, **fields) -> None:
@@ -906,6 +941,7 @@ def arena_estimator_factory(args: argparse.Namespace, paths: dict):
     }
     if not factories:
         raise SystemExit(f"{args.suite}에는 --classifier-path나 --regressor-path가 필요하다.")
+    apply_model_feature_cap(args, factories)
     one_hot = headline_mode(args.one_hot)
 
     def make(problem_type: str, categorical: list[int]):
@@ -1442,6 +1478,9 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         f"one-hot: {','.join(args.one_hot)} (결과: {headline})",
         flush=True,
     )
+    # 모델을 먼저 읽는다: 멤버당 열 상한의 기본값을 모델이 정한다 (`apply_model_feature_cap`)
+    factories = {suite: make_estimator_factory(suite, args) for suite in {s for s, _ in tasks}}
+    apply_model_feature_cap(args, factories)
 
     if use_mlflow:
         mlflow.log_params(
@@ -1461,7 +1500,6 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
 
-    factories = {suite: make_estimator_factory(suite, args) for suite in {s for s, _ in tasks}}
     kinds = {suite: ",".join(make.member_kinds) for suite, make in sorted(factories.items())}
     print("member kinds:", kinds, flush=True)
     if use_mlflow:

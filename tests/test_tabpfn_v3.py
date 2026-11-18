@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import math
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -233,7 +234,12 @@ def test_ensembles_and_default_inference():
     X[::7, 3] = np.nan
     model = _model()
     defaults = recipe.default_inference(model, "classification")
-    assert defaults == {"n_estimators": 4, "member_kinds": ("quantile", "robust")}
+    assert defaults == {
+        "n_estimators": 4,
+        "member_kinds": ("quantile", "robust"),
+        "max_features_per_member": None,  # 3은 모든 열
+        "feature_subsampling": "random",
+    }
     clf = EnsembleClassifier(model, **defaults).fit(X[:100], y[:100])
     proba = clf.predict_proba(X[100:130])
     assert proba.shape == (30, 2) and np.allclose(proba.sum(1), 1, atol=1e-5)
@@ -241,8 +247,10 @@ def test_ensembles_and_default_inference():
     Xr, yr = load_diabetes(return_X_y=True)
     reg_model = _model("regression", "v3.5")
     defaults = recipe.default_inference(reg_model, "regression")
-    assert defaults == {"n_estimators": 8, "member_kinds": ("standard",)}
+    v35 = {"max_features_per_member": 768, "feature_subsampling": "balanced"}
+    assert defaults == {"n_estimators": 8, "member_kinds": ("standard",), **v35}
     reg = EnsembleRegressor(reg_model, torch.linspace(-3, 3, 5001), **defaults)
+    assert reg.max_features_per_member == 768 and reg.feature_subsampling == "balanced"
     pred = reg.fit(Xr[:100], yr[:100]).predict(Xr[100:120])
     assert pred.shape == (20,) and np.isfinite(pred).all()
     assert {p.member.kind for p in reg.preprocessors_} == {"standard"}
@@ -251,7 +259,10 @@ def test_ensembles_and_default_inference():
     assert recipe.default_inference(reg_model, "regression") == {
         "n_estimators": 2,
         "member_kinds": ("quantile", "power"),
+        **v35,  # config에 없는 키는 구조의 값
     }
+    reg_model.inference_config = {"max_features_per_member": None}
+    assert recipe.default_inference(reg_model, "regression")["max_features_per_member"] is None
 
 
 def test_standard_members_keep_values():
@@ -325,6 +336,8 @@ def test_eval_script_takes_v3_inference_defaults():
     assert script.default_inference(_model(arch="v3.5"), "classification") == {
         "n_estimators": 8,
         "member_kinds": ("standard",),
+        "max_features_per_member": 768,
+        "feature_subsampling": "balanced",
     }
     assert script.resolve_member_kinds("v3.5") == ("standard",)
     assert script.resolve_member_kinds("v2") == tabpfn_v2.MEMBER_KINDS_V2
@@ -782,3 +795,39 @@ def test_v2_classes_take_inference_defaults_from_the_model_recipe():
     reg = TabPFNv2Regressor(model, borders)
     assert (clf.n_estimators, clf.member_kinds) == (8, ("standard",))
     assert (reg.n_estimators, reg.member_kinds) == (8, ("standard",))
+
+
+def test_v35_default_feature_cap_in_classes_and_eval(monkeypatch, tmp_path):
+    # TabPFN-3.5의 기본 추론은 멤버마다 768열을 balanced로 (issue #99). 인자로 주면 그것이 먼저다
+    from minipfn import TabPFNv3_5Classifier
+
+    model = _model(arch="v3.5")
+    clf = TabPFNv3_5Classifier(model)
+    assert clf.max_features_per_member == 768 and clf.feature_subsampling == "balanced"
+    clf = TabPFNv3_5Classifier(model, max_features_per_member=None, feature_subsampling="random")
+    assert clf.max_features_per_member is None and clf.feature_subsampling == "random"
+    assert EnsembleClassifier(model, n_estimators=2).max_features_per_member is None  # 축은 그대로
+
+    script = _script("eval")
+    models = {"v3": _model(), "v3.5": model}
+
+    def caps(argv, arch="v3.5"):
+        monkeypatch.setattr(script, "load_model", lambda *a, **k: (models[arch], None))
+        args = script.parse_args(["--classifier-path", "unused", "--out-dir", str(tmp_path), *argv])
+        factory = script.make_estimator_factory("classification", args)
+        script.apply_model_feature_cap(args, {"classification": factory})
+        return args
+
+    args = caps([])
+    assert (args.max_features_per_member, args.feature_subsampling) == (768, "balanced")
+    assert script.inference_option_params(args) == {"feature_subsampling": "balanced"}
+    paths, kinds = {"classification": "unused"}, {"classification": ("standard",)}
+    factories = {"classification": types.SimpleNamespace(model=model)}
+    printed = json.loads(script.arena_fingerprint(args, paths, factories, kinds, "all"))
+    assert printed["max_features_per_member"] == 768  # 예전(모든 열) 결과를 다시 쓰지 않는다
+    args = caps(["--feature-subsampling", "random"])
+    assert (args.max_features_per_member, args.feature_subsampling) == (768, "random")
+    args = caps(["--max-features-per-member", "6000"])
+    assert (args.max_features_per_member, args.feature_subsampling) == (6000, "random")
+    assert caps([], arch="v3").max_features_per_member is None  # 3은 모든 열
+    assert caps(["--test-time", "greedy"]).max_features_per_member is None
