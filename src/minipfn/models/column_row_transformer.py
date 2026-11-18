@@ -60,6 +60,25 @@ TabPFN-3.5가 바꾼 것은 설정으로 켠다 (recipe `ARCHITECTURES["v3.5"]`)
 - `task="multitask"`: 분류·회귀를 한 모델로. 정답 encoder(셀·ICL)와 출력층(앞 MLP 포함)만 task마다
   있고 나머지는 같이 쓴다. forward의 `task` 인자가 어느 쪽을 쓸지 고른다. 분류 출력 수는
   `n_out`, 회귀 구간 수는 `n_buckets`
+
+attention 온도 (issue #102, 기본값이면 위 구조 그대로다). Kumo-Tabular(NVIDIA structured-data-models
+`sdm/nn/scaling.py`·`sdm/models/kumo/tabular/block.py`, Apache 2.0. 동작만 보고 다시 구현했다)는
+q·k RMSNorm에 gain을 두지 않고, q에 곱하는 온도를 head마다 스칼라 하나로 둔다. 그러면 logit이
+√(head dim) · a_h · log n (· 2)로 묶인다. 이 모델은 QK-norm gain과 QASSMax 배율이 함께 커지며 ICL
+logit이 수십만이 되어 무너졌다(PR #74).
+
+- `qk_norm_affine`: False면 q·k RMSNorm에 gain이 없다(`qk_norm`일 때만)
+- 단계마다 온도 종류 (`TEMPERATURES`): 열 단계 요약 쪽(`column_summary_temperature`, 기본
+  qassmax), 펼치는 쪽(`column_spread_temperature`, 기본 none), 행 단계(`row_temperature`, 기본
+  none), 행 ICL(`icl_temperature`, 기본 qassmax), 분류 retrieval decoder(`decoder_temperature`,
+  기본 qassmax)
+  - `logscale`: q ← q · a_h · log n. a_h는 head마다 학습되는 스칼라이고 U(0, 1)에서 시작한다(Kumo와
+    같다)
+  - `gated_logscale`: logscale에 (1 + tanh(gate(q)))를 곱한다. gate는 head dim → `qassmax_hidden`
+    → head dim MLP이고 마지막 층이 0으로 시작한다
+  - n은 QASSMax와 같은 key 수다(학습 행 수, 행 단계는 CLS + feature 토큰 수)
+- Kumo는 RoPE를 q·k RMSNorm 앞에 건다. gain이 없으면 회전이 크기를 바꾸지 않아 순서와 상관없이
+  같은 값이라 여기 순서(norm → RoPE) 그대로 둔다. Kumo에는 retrieval decoder가 없다
 """
 
 from __future__ import annotations
@@ -78,6 +97,16 @@ from minipfn.models.cell_transformer import NAN_INDICATOR, standardize_cells
 
 TASKS = ("classification", "regression", "multitask")
 ENCODERS = ("linear", "fourier")
+# attention 온도 종류 (모듈 docstring "attention 온도"): q에 곱하는 배율
+TEMPERATURES = ("qassmax", "logscale", "gated_logscale", "none")
+# 단계마다 온도를 고르는 설정 필드와 그 기본값 (지금 구조)
+TEMPERATURE_FIELDS = {
+    "column_summary_temperature": "qassmax",
+    "column_spread_temperature": "none",
+    "row_temperature": "none",
+    "icl_temperature": "qassmax",
+    "decoder_temperature": "qassmax",
+}
 N_FOURIER = 32  # TabPFN-3.5 cell encoder의 주파수 수
 N_HARMONICS = 4  # TabPFN-3.5 ECDF의 sin·cos 차수
 # 추론에서 받는 클래스 수 상한 (공식 TabPFN-3.5와 같다). retrieval decoder에는 클래스마다
@@ -154,16 +183,35 @@ class ColumnRowTransformerConfig:
     # ICL 앞쪽 층이 하나씩 one-hot attention이 되며 학습이 무너졌다(PR #74 stage 1, 75k~150k).
     # 가중치 모양과 상관없어 checkpoint의 값과 달라도 가중치를 가져올 수 있다
     logit_softcap: float | None = None
+    # attention 온도 (issue #102, 모듈 docstring "attention 온도"). 기본값이면 지금 구조 그대로다
+    qk_norm_affine: bool = True  # False면 q·k RMSNorm에 gain이 없다 (qk_norm일 때만)
+    column_summary_temperature: str = TEMPERATURE_FIELDS["column_summary_temperature"]
+    column_spread_temperature: str = TEMPERATURE_FIELDS["column_spread_temperature"]
+    row_temperature: str = TEMPERATURE_FIELDS["row_temperature"]
+    icl_temperature: str = TEMPERATURE_FIELDS["icl_temperature"]
+    decoder_temperature: str = TEMPERATURE_FIELDS["decoder_temperature"]
 
     INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features", "logit_softcap")
     # 첫 공개 뒤에 더한 필드: 기본값이면 checkpoint·config.json에 적지 않는다
-    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("logit_softcap",)
+    ADDED_FIELDS: ClassVar[tuple[str, ...]] = (
+        "logit_softcap",
+        "qk_norm_affine",
+        *TEMPERATURE_FIELDS,
+    )
 
     def __post_init__(self) -> None:
         if self.task not in TASKS:
             raise ValueError(f"task는 {TASKS} 가운데 하나여야 한다: {self.task}")
         if self.encoder not in ENCODERS:
             raise ValueError(f"encoder는 {ENCODERS} 가운데 하나여야 한다: {self.encoder}")
+        for name in TEMPERATURE_FIELDS:
+            if getattr(self, name) not in TEMPERATURES:
+                raise ValueError(
+                    f"{name}는 {TEMPERATURES} 가운데 하나여야 한다: {getattr(self, name)}"
+                )
+        if not self.qk_norm_affine and not self.qk_norm:
+            # QK-norm이 없으면 gain도 없다 (조용히 아무 일도 하지 않는 설정을 막는다)
+            raise ValueError("qk_norm_affine=False는 qk_norm=True일 때만 쓴다")
         if self.logit_softcap is not None and not (
             math.isfinite(self.logit_softcap) and self.logit_softcap > 0
         ):
@@ -302,13 +350,67 @@ class QASSMax(nn.Module):
         return q * base * (1 + torch.tanh(self.query_mlp(q)))
 
 
+class LogScale(nn.Module):
+    """q ← q · a_h · log n (모듈 docstring "attention 온도"). a_h(`head_scale`)는 head마다 학습되는
+    스칼라이고 U(0, 1)에서 시작한다. `gated`면 (1 + tanh(gate(q)))를 더 곱한다(gate는 처음에 0이라
+    처음 배율은 1)."""
+
+    def __init__(self, nhead: int, head_dim: int, hidden: int, gated: bool = False) -> None:
+        super().__init__()
+        self.head_scale = nn.Parameter(torch.rand(nhead))
+        self.gate = None
+        if gated:
+            self.gate = nn.Sequential(
+                nn.Linear(head_dim, hidden), nn.GELU(), nn.Linear(hidden, head_dim)
+            )
+            nn.init.zeros_(self.gate[2].weight)
+            nn.init.zeros_(self.gate[2].bias)
+
+    def forward(self, q: torch.Tensor, n_keys: int) -> torch.Tensor:
+        # q: (N, H, L, d). log n은 QASSMax처럼 compile할 때 텐서로 (n마다 다시 compile하지 않도록)
+        if torch.compiler.is_compiling():
+            log_n = (torch.ones((), device=q.device) * n_keys).clamp(min=1).log()
+        else:
+            log_n = q.new_full((), math.log(max(n_keys, 1)), dtype=torch.float32)
+        scale = (self.head_scale.float() * log_n).to(q.dtype).view(1, -1, 1, 1)
+        out = q * scale
+        if self.gate is not None:
+            out = out * (1 + torch.tanh(self.gate(q)))
+        return out
+
+
+def _temperature(
+    kind: str, nhead: int, head_dim: int, hidden: int
+) -> tuple[QASSMax | None, LogScale | None]:
+    """온도 종류(`TEMPERATURES`)의 모듈 (QASSMax, LogScale). 쓰는 쪽만 있고 나머지는 None이다.
+    QASSMax는 예전 checkpoint와 같은 이름(`qassmax`)으로 둔다."""
+    if kind not in TEMPERATURES:
+        raise ValueError(f"온도 종류는 {TEMPERATURES} 가운데 하나다: {kind}")
+    if kind == "qassmax":
+        return QASSMax(nhead, head_dim, hidden), None
+    if kind == "none":
+        return None, None
+    return None, LogScale(nhead, head_dim, hidden, gated=kind == "gated_logscale")
+
+
+def _scale_query(module: nn.Module, q: torch.Tensor, n_keys: int) -> torch.Tensor:
+    """`_temperature`로 만든 온도(`module.qassmax`·`module.log_scale`)를 q에 곱한다."""
+    if module.qassmax is not None:
+        return module.qassmax(q, n_keys)
+    if module.log_scale is not None:
+        return module.log_scale(q, n_keys)
+    return q
+
+
 class Attention(nn.Module):
     """multi-head attention. q·k·v를 한 weight(`qkv`, (3D, D))로 둔다.
 
     - `context`를 주면 key·value는 거기서(cross-attention), 아니면 query와 같은 입력에서
     - `n_context`를 주면(self-attention) 앞의 n_context개만 key·value가 되고, 그 뒤 query(테스트
       행)는 첫 head의 key·value만 본다(multi-query)
-    - `qassmax`: QASSMax (모듈 docstring), `qk_norm`: q·k에 RMSNorm, `rope_base`: q·k에 RoPE
+    - `temperature`: q에 곱하는 온도 (`TEMPERATURES`, 모듈 docstring). QASSMax는 `qassmax` 모듈,
+      logscale·gated_logscale은 `log_scale` 모듈이다. `qassmax=True`는 temperature="qassmax"와 같다
+    - `qk_norm`: q·k에 RMSNorm (`qk_norm_affine`이면 head dim마다 gain), `rope_base`: q·k에 RoPE
     - `zero_out`: 출력층을 0으로 시작한다 (처음에는 잔차에 아무것도 더하지 않는다)
     - DiagScale(`minipfn.inference.diag_scale`)이 parameter `diag_scale`(δ, head × head 차원)을
       붙이면 q·k 유사도를 qᵀ(I + diag(δ))k로 바꾼다. q·k에 RMSNorm·RoPE·QASSMax를 거친 뒤 q에
@@ -327,9 +429,11 @@ class Attention(nn.Module):
         qassmax: bool = False,
         qassmax_hidden: int = 64,
         qk_norm: bool = False,
+        qk_norm_affine: bool = True,
         rope_base: float | None = None,
         zero_out: bool = True,
         logit_softcap: float | None = None,
+        temperature: str = "none",
     ) -> None:
         super().__init__()
         self.nhead, self.qk_norm, self.rope_base = nhead, qk_norm, rope_base
@@ -337,11 +441,17 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         if qk_norm:
-            self.q_norm = nn.RMSNorm(dim // nhead)
-            self.k_norm = nn.RMSNorm(dim // nhead)
+            self.q_norm = nn.RMSNorm(dim // nhead, elementwise_affine=qk_norm_affine)
+            self.k_norm = nn.RMSNorm(dim // nhead, elementwise_affine=qk_norm_affine)
         if zero_out:
             nn.init.zeros_(self.out.weight)
-        self.qassmax = QASSMax(nhead, dim // nhead, qassmax_hidden) if qassmax else None
+        if qassmax:
+            if temperature not in ("none", "qassmax"):
+                raise ValueError(f"qassmax=True와 temperature={temperature}를 같이 줬다")
+            temperature = "qassmax"
+        self.qassmax, self.log_scale = _temperature(
+            temperature, nhead, dim // nhead, qassmax_hidden
+        )
 
     @property
     def logit_softcap(self) -> float | None:
@@ -377,8 +487,7 @@ class Attention(nn.Module):
         if self.rope_base is not None:
             # query가 앞쪽 일부(CLS)여도 위치는 key와 같은 0부터다
             q, k = _rope(q, self.rope_base), _rope(k, self.rope_base)
-        if self.qassmax is not None:
-            q = self.qassmax(q, k.shape[2])
+        q = _scale_query(self, q, k.shape[2])
         delta = getattr(self, "diag_scale", None)  # DiagScale이 붙인 δ (클래스 docstring)
         if delta is not None:
             h, d = q.shape[1], q.shape[3]
@@ -593,8 +702,8 @@ class Block(nn.Module):
 
 
 class InducedBlock(nn.Module):
-    """열 단계 블록 하나 (ISAB): inducing point가 학습 행을 요약하고(QASSMax), 모든 행이 그 요약을
-    본다."""
+    """열 단계 블록 하나 (ISAB): inducing point가 학습 행을 요약하고(기본 QASSMax), 모든 행이 그
+    요약을 본다(기본 온도 없음). 온도는 `summary_temperature`·`spread_temperature`."""
 
     def __init__(
         self,
@@ -603,15 +712,20 @@ class InducedBlock(nn.Module):
         n_inducing: int,
         ff_factor: int,
         qassmax_hidden: int,
+        summary_temperature: str = "qassmax",
+        spread_temperature: str = "none",
         **attention,
     ) -> None:
         super().__init__()
         self.inducing = nn.Parameter(nn.init.trunc_normal_(torch.empty(n_inducing, dim), std=0.02))
+        hidden = {"qassmax_hidden": qassmax_hidden}
         self.summarize = Attention(
-            dim, nhead, qassmax=True, qassmax_hidden=qassmax_hidden, **attention
+            dim, nhead, temperature=summary_temperature, **hidden, **attention
         )
         self.summarize_mlp = _mlp(dim, ff_factor)
-        self.broadcast = Attention(dim, nhead, **attention)
+        self.broadcast = Attention(
+            dim, nhead, temperature=spread_temperature, **hidden, **attention
+        )
         self.broadcast_mlp = _mlp(dim, ff_factor)
         # 학습 파라미터가 있으므로 query·context·MLP 앞을 따로 둔다
         self.norms = nn.ModuleDict(
@@ -740,14 +854,23 @@ class _CellStats:
 
 class RetrievalDecoder(nn.Module):
     """many-class retrieval decoder: 테스트 행(query)이 학습 행(key)에 attention한 가중치로 학습
-    행의 one-hot 정답을 평균한다(head 평균). logit은 log(max(p, 1e-5) + 3e-5)."""
+    행의 one-hot 정답을 평균한다(head 평균). logit은 log(max(p, 1e-5) + 3e-5). q의 온도는
+    `temperature`(`TEMPERATURES`, 기본 QASSMax)."""
 
-    def __init__(self, dim: int, heads: int, head_dim: int, n_classes: int, hidden: int) -> None:
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        head_dim: int,
+        n_classes: int,
+        hidden: int,
+        temperature: str = "qassmax",
+    ) -> None:
         super().__init__()
         self.heads, self.head_dim, self.n_classes = heads, head_dim, n_classes
         self.q_projection = nn.Linear(dim, heads * head_dim)
         self.k_projection = nn.Linear(dim, heads * head_dim)
-        self.qassmax = QASSMax(heads, head_dim, hidden)
+        self.qassmax, self.log_scale = _temperature(temperature, heads, head_dim, hidden)
 
     def forward(
         self,
@@ -769,7 +892,7 @@ class RetrievalDecoder(nn.Module):
         n_classes = n_classes or self.n_classes
         q = self.q_projection(h[:, n_train:]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_projection(h[:, :n_train]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
-        q = self.qassmax(q, n_train)
+        q = _scale_query(self, q, n_train)
         onehot = F.one_hot(y_train.long().clamp(0, n_classes - 1), n_classes).float()
         if fused:
             p = _retrieve(q, k, onehot).mean(1)
@@ -838,6 +961,12 @@ class ColumnRowTransformer(nn.Module):
         if config.target_norm:  # 두 task가 같이 쓴다
             self.cell_target_norm = nn.LayerNorm(e)
             self.icl_target_norm = nn.LayerNorm(d)
+        # 모든 attention이 같이 쓰는 설정 (q·k RMSNorm, soft-cap, 온도 MLP 폭)
+        shared = {
+            "qk_norm": config.qk_norm,
+            "qk_norm_affine": config.qk_norm_affine,
+            "logit_softcap": config.logit_softcap,
+        }
         self.column_blocks = nn.ModuleList(
             InducedBlock(
                 e,
@@ -845,8 +974,9 @@ class ColumnRowTransformer(nn.Module):
                 config.n_inducing,
                 config.ff_factor,
                 config.qassmax_hidden,
-                qk_norm=config.qk_norm,
-                logit_softcap=config.logit_softcap,
+                summary_temperature=config.column_summary_temperature,
+                spread_temperature=config.column_spread_temperature,
+                **shared,
             )
             for _ in range(config.column_blocks)
         )
@@ -858,22 +988,18 @@ class ColumnRowTransformer(nn.Module):
                 e,
                 config.row_heads,
                 config.ff_factor,
-                qk_norm=config.qk_norm,
                 rope_base=config.rope_base,
-                logit_softcap=config.logit_softcap,
                 zero_out=False,  # 모듈 docstring "여기서 정한 것"
+                temperature=config.row_temperature,
+                qassmax_hidden=config.qassmax_hidden,
+                **shared,
             )
             for _ in range(config.row_blocks)
         )
         self.row_norm = nn.RMSNorm(e)
-        qassmax = {
-            "qassmax": True,
-            "qassmax_hidden": config.qassmax_hidden,
-            "logit_softcap": config.logit_softcap,
-        }
+        icl = {"temperature": config.icl_temperature, "qassmax_hidden": config.qassmax_hidden}
         self.icl_layers = nn.ModuleList(
-            Block(d, config.nhead, config.ff_factor, qk_norm=config.qk_norm, **qassmax)
-            for _ in range(config.nlayers)
+            Block(d, config.nhead, config.ff_factor, **icl, **shared) for _ in range(config.nlayers)
         )
         self.icl_norm = nn.RMSNorm(d)
         if config.head_mlp:
@@ -885,7 +1011,12 @@ class ColumnRowTransformer(nn.Module):
             n = config.output_size(t)
             if t == "classification":
                 self.heads[t] = RetrievalDecoder(
-                    d, config.decoder_heads, config.decoder_head_dim, n, config.qassmax_hidden
+                    d,
+                    config.decoder_heads,
+                    config.decoder_head_dim,
+                    n,
+                    config.qassmax_hidden,
+                    temperature=config.decoder_temperature,
                 )
             elif config.head_mlp:
                 self.heads[t] = nn.Linear(d, n)

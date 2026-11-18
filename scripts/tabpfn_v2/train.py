@@ -86,9 +86,15 @@ import mlflow  # noqa: E402
 
 from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
+from minipfn.models.column_row_transformer import TEMPERATURE_FIELDS, TEMPERATURES  # noqa: E402
+from minipfn.recipes import kumo_tabular, tabpfn_v3  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
-from minipfn.recipes import tabpfn_v3  # noqa: E402
-from minipfn.training.config import SPEED_OPTIONS, TrainConfig, normalize_phases  # noqa: E402
+from minipfn.training.config import (  # noqa: E402
+    ATTENTION_TEMPERATURE_DEFAULTS,
+    SPEED_OPTIONS,
+    TrainConfig,
+    normalize_phases,
+)
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
@@ -116,6 +122,8 @@ PRESETS = {
 CONFIG_NAMES = tuple(PRESETS)
 CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
 TUNED_LONG_NAMES = {f"tuned_stage{n}" for n in recipe.TUNED_LONG}
+# attention 온도 묶음 (`--attention-temperature`, issue #102). 구조 이름(`--arch`)과 따로 켠다
+TEMPERATURE_PRESETS = {"kumo": kumo_tabular.ATTENTION_TEMPERATURE}
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
@@ -134,6 +142,15 @@ def _env_flag(name: str) -> bool:
     raise SystemExit(
         f"{name}={os.environ[name]!r}는 켜고 끄는 값이 아니다 ({TRUE_VALUES} 또는 {FALSE_VALUES})"
     )
+
+
+def _env_choice(name: str, choices) -> str | None:
+    """고르는 값의 환경변수 (비우면 None). argparse는 기본값을 `choices`로 검사하지 않아서, 틀린
+    값이 조용히 기본 구조로 돌아가지 않도록 여기서 멈춘다."""
+    value = os.environ.get(name) or None
+    if value is not None and value not in choices:
+        raise SystemExit(f"{name}={value!r}는 {tuple(choices)} 가운데 하나여야 한다")
+    return value
 
 
 def _env(name: str, cast=str):
@@ -201,10 +218,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--logit-softcap",
-        type=float,
-        default=_env("TABPFN_V2_LOGIT_SOFTCAP", float),
-        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)",
+        default=os.environ.get("TABPFN_V2_LOGIT_SOFTCAP") or None,
+        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)."
+        " none·off면 끈다",
     )
+    # attention 온도 (issue #102, column_row_transformer만. 모델 docstring "attention 온도"). 묶음
+    # 이름(`TEMPERATURE_PRESETS`)을 먼저 적용하고 단계별 인자로 덮어쓴다. 모델 구조라
+    # 이어 학습하거나 가중치를 가져올 때 주지 않으면 원래 run의 값이다(주면 checkpoint와 구조가
+    # 달라 멈춘다)
+    presets = sorted(TEMPERATURE_PRESETS)
+    parser.add_argument(
+        "--attention-temperature",
+        choices=presets,
+        default=_env_choice("TABPFN_V2_ATTENTION_TEMPERATURE", presets),
+    )
+    parser.add_argument(
+        "--qk-norm-affine",
+        choices=["on", "off"],
+        default=_env_choice("TABPFN_V2_QK_NORM_AFFINE", ("on", "off")),
+    )
+    for name in TEMPERATURE_FIELDS:
+        parser.add_argument(
+            "--" + name.replace("_", "-"),
+            choices=TEMPERATURES,
+            default=_env_choice("TABPFN_V2_" + name.upper(), TEMPERATURES),
+        )
     parser.add_argument(
         "--muon-distributed",
         choices=["off", "node", "all"],
@@ -408,7 +446,13 @@ def build_config(
         )
     base = preset(arch or "v2")
     if args.arch is not None:
-        differ = {k: (getattr(base, k), v) for k, v in source.items() if getattr(base, k) != v}
+        # attention 온도는 구조 이름과 따로 켜는 설정이라 비교하지 않는다 (주지 않으면 원래 run의
+        # 값을 쓴다)
+        differ = {
+            k: (getattr(base, k), v)
+            for k, v in source.items()
+            if getattr(base, k) != v and k not in ATTENTION_TEMPERATURE_DEFAULTS
+        }
         if differ:
             raise SystemExit(
                 f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
@@ -456,7 +500,6 @@ def _override_values(args: argparse.Namespace) -> dict:
         "optimizer": args.optimizer,
         "muon_weight_decay": args.muon_weight_decay,
         "muon_distributed": args.muon_distributed,
-        "logit_softcap": args.logit_softcap,
         "size_rule": args.size_rule,
         "min_rows": args.min_rows,
         "max_rows": args.max_rows,
@@ -490,7 +533,24 @@ def _override_values(args: argparse.Namespace) -> dict:
         overrides["collapse_threshold"] = _optional_float(args.collapse_threshold)
     if args.qk_clip is not None:
         overrides["qk_clip"] = _optional_float(args.qk_clip)
-    return overrides
+    if args.logit_softcap is not None:
+        try:
+            overrides["logit_softcap"] = _optional_float(args.logit_softcap)
+        except ValueError:
+            raise SystemExit(f"--logit-softcap은 수나 none·off다: {args.logit_softcap!r}") from None
+    return {**overrides, **_temperature_values(args)}
+
+
+def _temperature_values(args: argparse.Namespace) -> dict:
+    """attention 온도 인자 (`--attention-temperature` 묶음 뒤에 단계별 인자). 주지 않은 것은
+    빠진다."""
+    values = dict(TEMPERATURE_PRESETS.get(args.attention_temperature, {}))
+    if args.qk_norm_affine is not None:
+        values["qk_norm_affine"] = args.qk_norm_affine == "on"
+    for name in TEMPERATURE_FIELDS:
+        if getattr(args, name) is not None:
+            values[name] = getattr(args, name)
+    return values
 
 
 def _check_source(path: str, config: TrainConfig, *, resume: bool) -> float:

@@ -11,6 +11,8 @@
 - `tabpfn_v3`: TabPFN-3·3.5의 구조(`graph_scm` prior + `ColumnRowTransformer` + 공용 학습 루프),
   추론 설정(`default_inference`), 3.5 공개 가중치를 받는 추론 클래스(`TabPFNv3_5Classifier`·
   `TabPFNv3_5Regressor`)
+- `kumo_tabular`: Kumo-Tabular에서 가져온 부품의 설정(attention 온도). 모델 종류가 없어
+  `TABLE_RECIPES`에 넣지 않고, 다른 recipe의 모델에 덧붙여 켠다
 """
 
 from __future__ import annotations
