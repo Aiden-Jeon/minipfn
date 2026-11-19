@@ -142,4 +142,4 @@ class CoverClasses:
                 return None
             xs.append(group.x[order, d])
             ys.append(group.y[order, d])
-        return Group(torch.stack(xs, 1), torch.stack(ys, 1), group.n_train, group.hp)
+        return group.with_tensors(torch.stack(xs, 1), torch.stack(ys, 1))

@@ -56,8 +56,7 @@ class PriorBatches(IterableDataset):
         prior = self.config.make_prior(seed)
         if self.balance is None:
             while True:
-                batch = prior.sample_batch(self.config.micro_batch)
-                yield batch.x, batch.y, batch.n_train
+                yield _items(prior.sample_batch(self.config.micro_batch))
         n_workers = 1 if info is None else info.num_workers
         group, shapes = None, []
         for n in itertools.count(worker, n_workers):
@@ -65,8 +64,15 @@ class PriorBatches(IterableDataset):
                 group = n // self.balance.per_rank
                 shapes = self.balance.rank_shapes(prior, group)
             size = shapes[n % self.balance.per_rank]
-            batch = prior.sample_batch(self.config.micro_batch, size=size)
-            yield batch.x, batch.y, batch.n_train
+            yield _items(prior.sample_batch(self.config.micro_batch, size=size))
+
+
+def _items(batch) -> tuple:
+    """DataLoader가 넘기는 batch: (x, y, n_train). 범주 열 표시(`PriorBatch.categorical`, issue
+    #110)가 있으면 그것을 넷째로 더한다."""
+    if getattr(batch, "categorical", None) is None:
+        return batch.x, batch.y, batch.n_train
+    return batch.x, batch.y, batch.n_train, batch.categorical
 
 
 class PriorGroups(IterableDataset):

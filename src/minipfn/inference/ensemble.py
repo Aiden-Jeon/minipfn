@@ -48,12 +48,17 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
   `drop_constant`: 상수 열 빼기), 회귀 `target_transform`·`regression_mean`(`EnsembleRegressor`).
   `unseen_category="minus1"`은 학습 행에 없던 범주를 결측(NaN, 기본. 공식 3.5도 멤버의
   `ordinal_shuffled` 단계에서 NaN이 된다) 대신 번호 -1로 둔다(TabICLv2 방식, 진단용)
+- 범주를 아는 셀 encoder 모델(`categorical_encoder`, issue #110)에는 멤버마다 입력 열의 범주 표시
+  (`MemberPreprocessor.categorical_columns`: 번호로 둔 범주형 열만 True, one-hot으로 펼친 열은
+  수치 열)를 forward의 `categorical`로 넘긴다
 - 분류: logit을 온도(`softmax_temperature`, 기본 0.9)로 나눠 softmax한 뒤 멤버 평균
 - 회귀: y를 z-정규화하고, 멤버 절반은 y에도 power transform을 한다. 멤버 `max(2, 종류 수)`개마다
   켜고 끄므로, 종류가 1~2개면 예전처럼 2개씩(끔, 끔, 켬, 켬, …)이고 3개면 종류를 한 바퀴 돌 때마다
   바뀐다. 멤버 수가 `2 × max(2, 종류 수)`의 배수일 때 전체와 종류마다 정확히 절반이다(기본 8개는
   종류 1~2개에서 그렇다). 예측 분포는 구간 경계만
-  역변환해 공통 경계로 옮긴 뒤 평균한다
+  역변환해 공통 경계로 옮긴 뒤 평균한다. 회귀 분위수 출력 모델(`regression_head="quantile"`,
+  issue #110)은 멤버마다 분위수를 구간 경계 위의 구간 확률로 바꿔(`minipfn.models.
+  quantile_distribution.quantiles_to_bucket_probs`) 같은 계산을 한다. 온도는 쓰지 않는다
 
 회귀 예측값(평균)에는 논문에 없는 것을 정했다 (여기서 정함).
 
@@ -99,6 +104,7 @@ from minipfn.inference.preprocessing import (
     unseen_value,
 )
 from minipfn.models.bar_distribution import FullSupportBarDistribution
+from minipfn.models.quantile_distribution import quantiles_to_bucket_probs
 from minipfn.priors.table_size import MAX_FEATURES
 
 DEFAULT_ONE_HOT = "all"
@@ -139,6 +145,17 @@ def max_classes_of(model: nn.Module) -> int:
     decoder는 정답 embedding을 묶어 출력 수보다 많이 받는다), 없으면 출력 수(`config.n_out`).
     `EnsembleClassifier`와 평가 스크립트의 TabArena·BeyondArena 상한이 같이 쓴다."""
     return int(getattr(model, "max_classes", model.config.n_out))
+
+
+def uses_categorical(model: nn.Module) -> bool:
+    """forward에 범주 열 표시(`categorical`)를 받는 모델인지 (범주를 아는 셀 encoder,
+    issue #110)."""
+    return bool(getattr(getattr(model, "config", None), "categorical_encoder", False))
+
+
+def quantile_regressor(model: nn.Module) -> bool:
+    """회귀 출력이 분위수인 모델인지 (`regression_head="quantile"`, issue #110)."""
+    return getattr(getattr(model, "config", None), "regression_head", "bar") == "quantile"
 
 
 def forward_kwargs(model: nn.Module, task: str) -> dict:
@@ -300,8 +317,12 @@ class _Base:
         model = self.model.to(self.device).eval()
         autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
         kwargs = forward_kwargs(model, self.task)
+        categorical = uses_categorical(model)
         for i, x, y in self._iter_inputs(X, y_trains):
             y, extra = self._model_targets(y)
+            if categorical:  # 멤버 입력 열의 범주 표시 (모듈 docstring)
+                mask = self.preprocessors_[i].categorical_columns()
+                extra = {**extra, "categorical": torch.as_tensor(mask, device=self.device)[None]}
             with (
                 torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
                 torch.inference_mode(),
@@ -667,16 +688,26 @@ class EnsembleRegressor(_Base):
             probs.append(self._on_common_borders(i, p))
         return (self._mean(means), *self._mixture(probs))
 
+    def _bucket_logits(self, X: Any):
+        """멤버마다 (번호, 자기 공간의 구간 logit을 온도로 나눈 것). 분위수 출력 모델은 분위수를
+        구간 확률로 바꾼 log 확률이고 온도로 나누지 않는다 (모듈 docstring)."""
+        quantile = quantile_regressor(self.model)
+        for i, logits in self._iter_logits(X, self.y_trains_):
+            if quantile:
+                p = quantiles_to_bucket_probs(logits, self.borders)
+                yield i, p.clamp_min(1e-30).log()
+            else:
+                yield i, logits / self.softmax_temperature
+
     def _member_probs(self, X: Any):
         """멤버마다 (번호, 자기 공간의 구간 확률)."""
-        for i, logits in self._iter_logits(X, self.y_trains_):
-            yield i, torch.softmax(logits / self.softmax_temperature, dim=-1)
+        for i, logits in self._bucket_logits(X):
+            yield i, torch.softmax(logits, dim=-1)
 
     def _official_probs(self, X: Any) -> list[torch.Tensor]:
         """`regression_mean="mixture"`: 멤버마다 공통 경계 위의 구간 확률 (클래스 docstring)."""
         probs = []
-        for i, logits in self._iter_logits(X, self.y_trains_):
-            logits = logits / self.softmax_temperature
+        for i, logits in self._bucket_logits(X):
             official = self.official_maps_[i]
             if official is None:  # target 변환이 없는 멤버는 경계가 공통 경계 그대로다
                 probs.append(torch.softmax(logits, dim=-1))

@@ -79,6 +79,28 @@ logit이 수십만이 되어 무너졌다(PR #74).
   - n은 QASSMax와 같은 key 수다(학습 행 수, 행 단계는 CLS + feature 토큰 수)
 - Kumo는 RoPE를 q·k RMSNorm 앞에 건다. gain이 없으면 회전이 크기를 바꾸지 않아 순서와 상관없이
   같은 값이라 여기 순서(norm → RoPE) 그대로 둔다. Kumo에는 retrieval decoder가 없다
+
+Kumo-Tabular의 나머지 부품 (issue #110, 기본값이면 위 구조 그대로다. 같은 공개 소스의
+`sdm/models/kumo/tabular/{cell_embedding,row_embedding,model}.py`·`sdm/models/tabfm/
+cell_embedding.py`와 블로그에서 동작만 보고 다시 구현했다):
+
+- `decoder_qk_norm`: 분류 retrieval decoder의 q·k에 head마다 gain 없는 RMSNorm(온도 앞). 그러면
+  decoder logit도 √(head dim) · a_h · log n으로 묶인다(logscale 온도일 때). Kumo에는 decoder가 없어
+  여기서 정함
+- `stage_layout="interleaved"`: 열 단계와 행 단계 블록을 번갈아 쌓는다. 셀 토큰이 [열 블록 i → 행
+  블록 i]를 차례로 지나고(i = 0..블록 수 − 1, `column_blocks`와 `row_blocks`가 같아야 한다), CLS
+  토큰은 행 블록 사이에 이어진다(열 블록에는 들어가지 않는다). 마지막 행 블록은 CLS만 query다.
+  기본 `"sequential"`은 열 블록을 모두 지난 뒤 행 블록을 모두 지난다(지금 구조). Kumo-L은 셀 폭
+  256, 6쌍, head 4, inducing 256, CLS 4개(행 벡터 1024)다(`recipes.kumo_tabular.STAGES`)
+- `regression_head="quantile"`: 회귀 출력을 bar distribution 구간 logit 대신 분위수 999개로
+  (`minipfn.models.quantile_distribution`: 수준 k/1000, 학습 손실은 pinball, 처음 bias는 표준정규
+  분위수, 처음 weight는 0. 출력층 앞은 bar와 같다). 추론은 분위수를 구간 확률로 바꿔 bar
+  distribution 추론 코드를 그대로 쓴다
+- `categorical_encoder`: 범주를 아는 셀 encoder(`encoder="fourier"`일 때만). forward의
+  `categorical`(B, C, 범주 열이면 True)을 받아, 묶음 위치마다 그 열이 범주 열이면 범주 쪽 주파수와
+  Linear를 쓴다(Kumo처럼 수치·범주가 따로). 위치마다 범주 표시를 Linear해 더한다(Kumo의 결측
+  표시 Linear와 같은 식, 여기서 정함). z값·결측 표시·ECDF 갈래는 같이 쓴다. 범주 쪽 주파수의 처음
+  값은 수치 쪽과 같다
 """
 
 from __future__ import annotations
@@ -94,9 +116,13 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from minipfn.models.cell_transformer import NAN_INDICATOR, standardize_cells
+from minipfn.models.quantile_distribution import N_QUANTILES, initial_bias
 
 TASKS = ("classification", "regression", "multitask")
 ENCODERS = ("linear", "fourier")
+# 열·행 단계 블록 쌓는 순서, 회귀 출력 (모듈 docstring "Kumo-Tabular의 나머지 부품")
+STAGE_LAYOUTS = ("sequential", "interleaved")
+REGRESSION_HEADS = ("bar", "quantile")
 # attention 온도 종류 (모듈 docstring "attention 온도"): q에 곱하는 배율
 TEMPERATURES = ("qassmax", "logscale", "gated_logscale", "none")
 # 단계마다 온도를 고르는 설정 필드와 그 기본값 (지금 구조)
@@ -190,6 +216,11 @@ class ColumnRowTransformerConfig:
     row_temperature: str = TEMPERATURE_FIELDS["row_temperature"]
     icl_temperature: str = TEMPERATURE_FIELDS["icl_temperature"]
     decoder_temperature: str = TEMPERATURE_FIELDS["decoder_temperature"]
+    # Kumo-Tabular의 나머지 부품 (issue #110, 모듈 docstring). 기본값이면 지금 구조 그대로다
+    decoder_qk_norm: bool = False
+    stage_layout: str = "sequential"
+    regression_head: str = "bar"
+    categorical_encoder: bool = False
 
     INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features", "logit_softcap")
     # 첫 공개 뒤에 더한 필드: 기본값이면 checkpoint·config.json에 적지 않는다
@@ -197,6 +228,10 @@ class ColumnRowTransformerConfig:
         "logit_softcap",
         "qk_norm_affine",
         *TEMPERATURE_FIELDS,
+        "decoder_qk_norm",
+        "stage_layout",
+        "regression_head",
+        "categorical_encoder",
     )
 
     def __post_init__(self) -> None:
@@ -204,6 +239,27 @@ class ColumnRowTransformerConfig:
             raise ValueError(f"task는 {TASKS} 가운데 하나여야 한다: {self.task}")
         if self.encoder not in ENCODERS:
             raise ValueError(f"encoder는 {ENCODERS} 가운데 하나여야 한다: {self.encoder}")
+        if self.stage_layout not in STAGE_LAYOUTS:
+            raise ValueError(
+                f"stage_layout은 {STAGE_LAYOUTS} 가운데 하나여야 한다: {self.stage_layout}"
+            )
+        if self.stage_layout == "interleaved" and (
+            self.column_blocks != self.row_blocks or self.row_blocks < 1
+        ):
+            raise ValueError(
+                "stage_layout=interleaved는 열·행 블록 수가 같아야 한다:"
+                f" column_blocks {self.column_blocks}, row_blocks {self.row_blocks}"
+            )
+        if self.regression_head not in REGRESSION_HEADS:
+            raise ValueError(
+                f"regression_head는 {REGRESSION_HEADS} 가운데 하나여야 한다: {self.regression_head}"
+            )
+        if self.regression_head != "bar" and "regression" not in self.tasks:
+            raise ValueError(
+                "regression_head는 회귀 출력이 있는 모델(regression·multitask)에만 쓴다"
+            )
+        if self.categorical_encoder and self.encoder != "fourier":
+            raise ValueError("categorical_encoder는 encoder=fourier일 때만 쓴다")
         for name in TEMPERATURE_FIELDS:
             if getattr(self, name) not in TEMPERATURES:
                 raise ValueError(
@@ -237,7 +293,9 @@ class ColumnRowTransformerConfig:
         return ("classification", "regression") if self.task == "multitask" else (self.task,)
 
     def output_size(self, task: str) -> int:
-        """그 task의 출력 수 (분류: 클래스 상한, 회귀: 구간 수)."""
+        """그 task의 출력 수 (분류: 클래스 상한, 회귀: 구간 수, 분위수 출력이면 분위수 수)."""
+        if task == "regression" and self.regression_head == "quantile":
+            return N_QUANTILES
         if task == "classification" or self.task != "multitask":
             return self.n_out
         return self.n_buckets
@@ -755,24 +813,50 @@ class FourierCellEncoder(nn.Module):
     """TabPFN-3.5 셀 encoder: 학습 주파수 sin·cos 항 + [z값, 결측 표시, ECDF 조화 항] 항
     → LayerNorm."""
 
-    def __init__(self, g: int, dim: int) -> None:
+    def __init__(self, g: int, dim: int, categorical: bool = False) -> None:
         super().__init__()
         self.frequencies = nn.Parameter(torch.logspace(-1, 1, N_FOURIER))
         self.fourier = nn.Linear(g * 2 * N_FOURIER, dim)
         self.metadata = nn.Linear(g * (2 + 2 * N_HARMONICS), dim)
         self.norm = nn.LayerNorm(dim)
+        self.categorical = categorical
+        if categorical:
+            # 범주를 아는 encoder (모듈 docstring "Kumo-Tabular의 나머지 부품"): 범주 열 위치의
+            # 주파수·Linear와 위치마다 범주 표시 Linear
+            self.cat_frequencies = nn.Parameter(torch.logspace(-1, 1, N_FOURIER))
+            self.cat_fourier = nn.Linear(g * 2 * N_FOURIER, dim, bias=False)
+            self.cat_type = nn.Linear(g, dim, bias=False)
 
-    def forward(self, z: torch.Tensor, indicator: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        # 각각 (B, R, C, G)
+    def forward(
+        self,
+        z: torch.Tensor,
+        indicator: torch.Tensor,
+        u: torch.Tensor,
+        categorical: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # 각각 (B, R, C, G). `categorical`은 묶음 위치마다 범주 열인지 (B, 1, C, G) float
         b, r, c, g = z.shape
-        phase = z[..., None] * self.frequencies.to(z.dtype)  # (B, R, C, G, F)
-        fourier = torch.cat([phase.sin(), phase.cos()], dim=-1).reshape(b, r, c, -1)
         k = torch.arange(1, N_HARMONICS + 1, device=u.device, dtype=u.dtype)
         harmonics = math.pi * u[..., None] * k
         meta = torch.cat(
             [z[..., None], indicator[..., None], harmonics.sin(), harmonics.cos()], dim=-1
         ).reshape(b, r, c, -1)
-        return self.norm(self.fourier(fourier) + self.metadata(meta))
+        if not self.categorical:
+            phase = z[..., None] * self.frequencies.to(z.dtype)  # (B, R, C, G, F)
+            fourier = torch.cat([phase.sin(), phase.cos()], dim=-1).reshape(b, r, c, -1)
+            return self.norm(self.fourier(fourier) + self.metadata(meta))
+        if categorical is None:
+            categorical = z.new_zeros(b, 1, c, g)
+        m = categorical.to(z.dtype)[..., None]  # (B, 1, C, G, 1)
+        freq = torch.where(
+            m > 0, self.cat_frequencies.to(z.dtype), self.frequencies.to(z.dtype)
+        )  # (B, 1, C, G, F)
+        phase = z[..., None] * freq
+        fourier = torch.cat([phase.sin(), phase.cos()], dim=-1)  # (B, R, C, G, 2F)
+        numeric = (fourier * (1 - m)).reshape(b, r, c, -1)
+        cat = (fourier * m).reshape(b, r, c, -1)
+        out = self.fourier(numeric) + self.cat_fourier(cat) + self.cat_type(m[..., 0])
+        return self.norm(out + self.metadata(meta))
 
 
 class TargetEncoder(nn.Module):
@@ -804,6 +888,23 @@ class PreHeadMLP(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         return h + self.mlp(self.norm(h))
+
+
+def _quantile_head(dim: int, n: int, ff_factor: int, head_mlp: bool) -> nn.Module:
+    """분위수 출력층 (`regression_head="quantile"`): bar 출력층과 모양이 같고(`head_mlp`면 Linear
+    하나, 아니면 D → 2D → GELU → n), 마지막 Linear는 weight 0·bias 표준정규 분위수에서 시작한다
+    (처음 예측이 표준정규 분포, `minipfn.models.quantile_distribution`)."""
+    if head_mlp:
+        head = last = nn.Linear(dim, n)
+    else:
+        head = nn.Sequential(
+            nn.Linear(dim, ff_factor * dim), nn.GELU(), nn.Linear(ff_factor * dim, n)
+        )
+        last = head[-1]
+    nn.init.zeros_(last.weight)
+    with torch.no_grad():
+        last.bias.copy_(initial_bias(n))
+    return head
 
 
 class _CellStats:
@@ -865,11 +966,17 @@ class RetrievalDecoder(nn.Module):
         n_classes: int,
         hidden: int,
         temperature: str = "qassmax",
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         self.heads, self.head_dim, self.n_classes = heads, head_dim, n_classes
         self.q_projection = nn.Linear(dim, heads * head_dim)
         self.k_projection = nn.Linear(dim, heads * head_dim)
+        # gain 없는 q·k RMSNorm (`decoder_qk_norm`, 파라미터 없음)
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
+            self.k_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
         self.qassmax, self.log_scale = _temperature(temperature, heads, head_dim, hidden)
 
     def forward(
@@ -892,6 +999,8 @@ class RetrievalDecoder(nn.Module):
         n_classes = n_classes or self.n_classes
         q = self.q_projection(h[:, n_train:]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_projection(h[:, :n_train]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q = _scale_query(self, q, n_train)
         onehot = F.one_hot(y_train.long().clamp(0, n_classes - 1), n_classes).float()
         if fused:
@@ -948,7 +1057,7 @@ class ColumnRowTransformer(nn.Module):
         e, g, d = config.emsize, config.features_per_group, config.icl_dim
         self.offsets = group_offsets(g)
         if config.encoder == "fourier":
-            self.cell_encoder = FourierCellEncoder(g, e)
+            self.cell_encoder = FourierCellEncoder(g, e, categorical=config.categorical_encoder)
         else:
             self.cell_encoder = nn.Linear(2 * g, e)  # [값 g개, 결측 표시 g개] → 토큰
         # 정답 encoder: 셀 단계·행 ICL 입력 각각, task마다
@@ -1017,7 +1126,10 @@ class ColumnRowTransformer(nn.Module):
                     n,
                     config.qassmax_hidden,
                     temperature=config.decoder_temperature,
+                    qk_norm=config.decoder_qk_norm,
                 )
+            elif config.regression_head == "quantile":
+                self.heads[t] = _quantile_head(d, n, config.ff_factor, config.head_mlp)
             elif config.head_mlp:
                 self.heads[t] = nn.Linear(d, n)
             else:  # TabPFN-3 회귀: D → 2D → GELU → 구간 수
@@ -1099,7 +1211,9 @@ class ColumnRowTransformer(nn.Module):
             return head.weight if isinstance(head, nn.Linear) else head[-1].weight
         return self.heads["classification"].q_projection.weight
 
-    def _embed_cells(self, x: torch.Tensor, n_train: int) -> torch.Tensor:
+    def _embed_cells(
+        self, x: torch.Tensor, n_train: int, categorical: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: (B, R, C) → 토큰 (B, R, C, E). feature j의 토큰은 열 j + offset들의 셀
         z, indicator, used = standardize_cells(x, n_train)
         zg, ig = _group(z, self.offsets), _group(indicator, self.offsets)
@@ -1108,8 +1222,25 @@ class ColumnRowTransformer(nn.Module):
             # 학습 행에서 상수인 열: z를 0으로 둔 것처럼 u도 모든 행에서 0.5 (학습 행은 모두 0.5이고
             # 테스트 행만 0이나 1이 되어 테스트 행에만 있는 신호가 되지 않도록)
             u = torch.where(used > 0, u, 0.5)
-            return self.cell_encoder(zg, ig, _group(u, self.offsets))
+            ug = _group(u, self.offsets)
+            if self.config.categorical_encoder:
+                cat = self._grouped_categorical(categorical, x, None)
+                return self.cell_encoder(zg, ig, ug, cat)
+            return self.cell_encoder(zg, ig, ug)
         return self.cell_encoder(torch.cat([zg, ig], dim=-1))
+
+    def _grouped_categorical(
+        self, categorical: torch.Tensor | None, x: torch.Tensor, cols: torch.Tensor | None
+    ) -> torch.Tensor:
+        """범주 열 표시 (B, C) → 묶음 위치마다 (B, 1, Cj, G) float. `cols`가 None이면 열 C개를
+        circular shift로 묶고(`_group`), (Cj, G)면 그 열 번호들이다. 표시가 없으면 모두 수치 열."""
+        b, c = x.shape[0], x.shape[-1]
+        if categorical is None:
+            categorical = torch.zeros(b, c, dtype=torch.bool, device=x.device)
+        m = categorical.to(device=x.device, dtype=torch.float32)
+        if cols is None:
+            return _group(m[:, None, :], self.offsets)
+        return m[:, cols][:, None]
 
     def _target(self, stage: str, task: str, y_train: torch.Tensor, rows: int, like: torch.Tensor):
         # 학습 행 정답 embedding (B, R, dim). 테스트 행은 0
@@ -1127,12 +1258,17 @@ class ColumnRowTransformer(nn.Module):
         y_classes: torch.Tensor | None = None,
         n_classes: int | None = None,
         inference: bool = False,
+        categorical: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """테스트 행의 logit (B, R - n_train, 출력 수).
 
         x: (B, R, C), 학습 행 다음에 테스트 행. y_train: (B, n_train).
         분류면 y는 0부터 시작하는 클래스 번호, 회귀면 z-정규화한 값이다. `task`는 multitask
         모델에서만 준다("classification" 또는 "regression"). 한 task 모델은 그 task다.
+        회귀 분위수 출력(`regression_head="quantile"`)이면 출력은 분위수 999개다(정렬하지 않은 값).
+
+        `categorical`: 범주 열 표시 (B, C) bool. 범주를 아는 셀 encoder(`categorical_encoder`)만
+        받는다. 주지 않으면 모든 열을 수치 열로 본다.
 
         추론에서만 쓰는 인자:
 
@@ -1155,6 +1291,13 @@ class ColumnRowTransformer(nn.Module):
             raise ValueError("y_classes와 n_classes는 같이 준다")
         if n_classes is not None and n_classes > self.max_classes:
             raise ValueError(f"클래스 {n_classes}개는 상한({self.max_classes}개)보다 많다")
+        if categorical is not None:
+            if not cfg.categorical_encoder:
+                # 조용히 버리지 않는다 (범주 표시를 쓰지 않는 모델)
+                raise ValueError("categorical은 categorical_encoder 모델만 받는다")
+            if categorical.shape != (x.shape[0], x.shape[-1]):
+                expected = (x.shape[0], x.shape[-1])
+                raise ValueError(f"categorical은 (B, C) = {expected}다: {tuple(categorical.shape)}")
         if task == "classification" and not self.training:
             # 정답 embedding 수보다 큰 번호는 embedding·decoder에서 마지막 클래스로 합쳐진다.
             # 학습 중에는 prior가 범위를 지키므로 (GPU 동기화를 피해) 평가·추론에서만 본다
@@ -1172,9 +1315,12 @@ class ColumnRowTransformer(nn.Module):
         n_train = y_train.shape[1]
         ckpt = self._checkpointing(r)
         if inference and b * r * c > self.inference_chunk_cells:
-            rows = self._rows_chunked(x, y_train, task)
+            if cfg.stage_layout == "interleaved":
+                rows = self._rows_interleaved_chunked(x, y_train, task, categorical)
+            else:
+                rows = self._rows_chunked(x, y_train, task, categorical)
         else:
-            rows = self._rows(x, y_train, task, ckpt=ckpt)
+            rows = self._rows(x, y_train, task, ckpt=ckpt, categorical=categorical)
 
         # 3) 행 ICL: 학습 행 벡터에 정답 embedding을 한 번 더 더한다
         rows = rows + self._target("icl", task, y_train, r, rows)
@@ -1192,15 +1338,23 @@ class ColumnRowTransformer(nn.Module):
         return self.heads[task](rows[:, n_train:])
 
     def _rows(
-        self, x: torch.Tensor, y_train: torch.Tensor, task: str, *, ckpt: bool = False
+        self,
+        x: torch.Tensor,
+        y_train: torch.Tensor,
+        task: str,
+        *,
+        ckpt: bool = False,
+        categorical: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """단계 0~2 (셀 encoder, 열 단계, 행 단계): x (B, R, C) → 행 벡터 (B, R, n_cls × E).
         `ckpt`면 블록마다 activation checkpointing (`_call`)."""
         b, r, c = x.shape
         n_train = y_train.shape[1]
-        cells = self._embed_cells(x, n_train)  # (B, R, C, E)
+        cells = self._embed_cells(x, n_train, categorical)  # (B, R, C, E)
         cells = cells + self._target("cell", task, y_train, r, cells)[:, :, None]
         e = cells.shape[-1]
+        if self.config.stage_layout == "interleaved":
+            return self._interleaved(cells, n_train, ckpt=ckpt)
 
         # 1) 열 단계: (B × C, R, E)
         h = cells.permute(0, 2, 1, 3).reshape(b * c, r, e)
@@ -1208,6 +1362,29 @@ class ColumnRowTransformer(nn.Module):
             h = _call(block, ckpt, h, n_train)
         # 2) 행 단계
         return self._row_stage(h.view(b, c, r, e).transpose(1, 2), ckpt=ckpt)
+
+    def _interleaved(
+        self, cells: torch.Tensor, n_train: int, *, ckpt: bool = False
+    ) -> torch.Tensor:
+        """`stage_layout="interleaved"`의 열·행 단계: 셀 토큰 (B, R, C, E)이 [열 블록 i → 행 블록
+        i]를 차례로 지난다. CLS 토큰은 행 블록 사이에 이어지고, 마지막 행 블록은 CLS만 query다.
+        → 행 벡터 (B, R, n_cls × E)."""
+        cfg = self.config
+        b, r, c, e = cells.shape
+        h = cells
+        cls = self.cls_tokens.to(h.dtype).expand(b * r, -1, -1)
+        last = len(self.row_blocks) - 1
+        for i, (column, row) in enumerate(zip(self.column_blocks, self.row_blocks, strict=True)):
+            hc = h.permute(0, 2, 1, 3).reshape(b * c, r, e)
+            hc = _call(column, ckpt, hc, n_train)
+            hr = hc.view(b, c, r, e).transpose(1, 2).reshape(b * r, c, e)
+            tokens = torch.cat([cls.to(hr.dtype), hr], dim=1)
+            if i == last:
+                cls = _call(row, ckpt, tokens, n_queries=cfg.n_cls)
+            else:
+                tokens = _call(row, ckpt, tokens)
+                cls, h = tokens[:, : cfg.n_cls], tokens[:, cfg.n_cls :].view(b, r, c, e)
+        return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
 
     def _row_stage(self, h: torch.Tensor, *, ckpt: bool = False) -> torch.Tensor:
         """행 단계: 셀 토큰 (B, R, C, E) → (B × R, n_cls + C, E) → CLS 출력을 이어 붙인 행 벡터
@@ -1221,7 +1398,13 @@ class ColumnRowTransformer(nn.Module):
         h = _call(self.row_blocks[-1], ckpt, h, n_queries=cfg.n_cls)
         return self.row_norm(h).reshape(b, r, cfg.icl_dim)
 
-    def _rows_chunked(self, x: torch.Tensor, y_train: torch.Tensor, task: str) -> torch.Tensor:
+    def _rows_chunked(
+        self,
+        x: torch.Tensor,
+        y_train: torch.Tensor,
+        task: str,
+        categorical: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """`_rows`와 같은 값을 행 묶음으로 나눠 계산한다 (추론용, 공식 TabPFN-3.5 추론 코드의
         chunkwise inference와 같은 순서).
 
@@ -1232,25 +1415,14 @@ class ColumnRowTransformer(nn.Module):
         구한다(`_CellStats`). 그래서 (B, R, C, E) 크기의 텐서를 한 번에 두지 않는다."""
         b, r, c = x.shape
         n_train = y_train.shape[1]
-        stats = _CellStats(x, n_train, ecdf=self.config.encoder == "fourier")
-        offsets = torch.tensor(self.offsets, device=x.device)
-        groups = (torch.arange(c, device=x.device)[:, None] + offsets) % c  # 열 j에 묶는 열
-        target = None  # 학습 행의 셀 정답 embedding (B, n_train, E), 셀 dtype을 알 때 만든다
-
-        def embed(x_part: torch.Tensor, cols: torch.Tensor | None, shape) -> torch.Tensor:
-            nonlocal target
-            cells = self._encode_cells(*stats.features(x_part, cols), shape)
-            if target is None:
-                target = self._target("cell", task, y_train, n_train, cells)
-            return cells
+        embed, groups = self._chunk_embedder(x, y_train, task, categorical)
 
         # (1) 블록마다 요약 (B × C, n_inducing, E)
         summaries: list[torch.Tensor | None] = [None] * len(self.column_blocks)
         for c0 in range(0, c, self.inference_column_chunk):
             src = groups[c0 : c0 + self.inference_column_chunk]  # (Cj, G): 묶는 열
             cj = src.shape[0]
-            cells = embed(x[:, :n_train, src.reshape(-1)], src.reshape(-1), (cj, src.shape[1]))
-            cells = cells + target[:, :, None]
+            cells = embed(x[:, :n_train, src.reshape(-1)], src, train=True)
             e = cells.shape[-1]
             h = cells.permute(0, 2, 1, 3).reshape(b * cj, n_train, e)
             for i, block in enumerate(self.column_blocks):
@@ -1266,10 +1438,7 @@ class ColumnRowTransformer(nn.Module):
         out = None
         for r0 in range(0, r, step):
             r1 = min(r0 + step, r)
-            cells = embed(x[:, r0:r1], None, None)  # (B, Rj, C, E)
-            if r0 < n_train:  # 학습 행에만 정답 embedding
-                k = min(r1, n_train) - r0
-                cells = torch.cat([cells[:, :k] + target[:, r0 : r0 + k, None], cells[:, k:]], 1)
+            cells = embed(x[:, r0:r1], None, rows=(r0, r1))  # (B, Rj, C, E)
             e = cells.shape[-1]
             h = cells.permute(0, 2, 1, 3).reshape(b * c, r1 - r0, e)
             for block, ind in zip(self.column_blocks, summaries, strict=True):
@@ -1280,9 +1449,108 @@ class ColumnRowTransformer(nn.Module):
             out[:, r0:r1] = rows
         return out
 
-    def _encode_cells(self, z, indicator, u, shape) -> torch.Tensor:
+    def _chunk_embedder(
+        self,
+        x: torch.Tensor,
+        y_train: torch.Tensor,
+        task: str,
+        categorical: torch.Tensor | None,
+    ):
+        """행·열 일부의 셀 토큰을 만드는 함수 `embed`와 열마다 묶는 열 번호 `groups` (C, G)
+        (`_rows_chunked`·`_rows_interleaved_chunked`). 학습 행 통계(`_CellStats`)는 한 번만
+        구한다. `embed(x_part, src, train=True)`는 학습 행 전체·묶은 열 `src` (Cj, G)의 토큰,
+        `embed(x_part, None, rows=(r0, r1))`는 행 r0..r1·모든 열의 토큰이다. 둘 다 학습 행에는 셀
+        정답 embedding을 더한다."""
+        n_train = y_train.shape[1]
+        c = x.shape[-1]
+        stats = _CellStats(x, n_train, ecdf=self.config.encoder == "fourier")
+        offsets = torch.tensor(self.offsets, device=x.device)
+        groups = (torch.arange(c, device=x.device)[:, None] + offsets) % c  # 열 j에 묶는 열
+        target = None  # 학습 행의 셀 정답 embedding (B, n_train, E), 셀 dtype을 알 때 만든다
+
+        def embed(x_part, src, *, train: bool = False, rows: tuple[int, int] | None = None):
+            nonlocal target
+            cols = None if src is None else src.reshape(-1)
+            shape = None if src is None else tuple(src.shape)
+            cat = None
+            if self.config.categorical_encoder:
+                cat = self._grouped_categorical(categorical, x, src)
+            cells = self._encode_cells(*stats.features(x_part, cols), shape, cat)
+            if target is None:
+                target = self._target("cell", task, y_train, n_train, cells)
+            if train:
+                return cells + target[:, :, None]
+            r0, r1 = rows
+            if r0 < n_train:  # 학습 행에만 정답 embedding
+                k = min(r1, n_train) - r0
+                cells = torch.cat([cells[:, :k] + target[:, r0 : r0 + k, None], cells[:, k:]], 1)
+            return cells
+
+        return embed, groups
+
+    def _rows_interleaved_chunked(
+        self,
+        x: torch.Tensor,
+        y_train: torch.Tensor,
+        task: str,
+        categorical: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`stage_layout="interleaved"`에서 `_rows`와 같은 값을 나눠 계산한다 (추론용).
+
+        행 블록이 열 사이를 섞으므로, 다음 열 블록의 요약은 앞 행 블록을 지난 학습 행 전체가
+        정한다. 그래서 셀 상태 (B, R, C, E) 하나와 CLS 상태 (B, R, n_cls, E)를 들고, 블록 쌍마다
+        (1) 열을 `inference_column_chunk`개씩 나눠 학습 행의 지금 상태로 요약을 구하고 (2) 행을
+        `inference_chunk_cells / (B × C)`개씩 나눠 펼치기와 행 블록을 계산해 상태를 바꾼다. 요약은
+        (2) 전에 다 구하므로 학습 행 상태가 바뀌기 전의 값이다. 셀 encoder도 행 묶음으로
+        계산한다."""
+        cfg = self.config
+        b, r, c = x.shape
+        n_train = y_train.shape[1]
+        embed, _ = self._chunk_embedder(x, y_train, task, categorical)
+        step = max(1, self.inference_chunk_cells // (b * c))
+        h = None
+        for r0 in range(0, r, step):
+            r1 = min(r0 + step, r)
+            cells = embed(x[:, r0:r1], None, rows=(r0, r1))
+            if h is None:
+                h = cells.new_empty(b, r, c, cells.shape[-1])
+            h[:, r0:r1] = cells
+        e = h.shape[-1]
+        cls = self.cls_tokens.to(h.dtype).expand(b, r, -1, -1).clone()  # (B, R, n_cls, E)
+        last = len(self.row_blocks) - 1
+        for i, (column, row) in enumerate(zip(self.column_blocks, self.row_blocks, strict=True)):
+            # (1) 학습 행의 지금 상태로 열마다 요약 (B, C, n_inducing, E)
+            summary = None
+            for c0 in range(0, c, self.inference_column_chunk):
+                c1 = min(c0 + self.inference_column_chunk, c)
+                ht = h[:, :n_train, c0:c1].permute(0, 2, 1, 3).reshape(b * (c1 - c0), n_train, e)
+                ind = column.summary(ht)
+                if summary is None:
+                    summary = ind.new_empty(b, c, *ind.shape[1:])
+                summary[:, c0:c1] = ind.view(b, c1 - c0, *ind.shape[1:])
+            summary = summary.reshape(b * c, *summary.shape[2:])
+            # (2) 행 묶음마다 펼치기 → 행 블록
+            for r0 in range(0, r, step):
+                r1 = min(r0 + step, r)
+                rj = r1 - r0
+                hc = h[:, r0:r1].permute(0, 2, 1, 3).reshape(b * c, rj, e)
+                hc = column.spread(hc, summary)
+                hr = hc.view(b, c, rj, e).transpose(1, 2).reshape(b * rj, c, e)
+                part = cls[:, r0:r1].reshape(b * rj, cfg.n_cls, e)
+                tokens = torch.cat([part.to(hr.dtype), hr], dim=1)
+                if i == last:
+                    out = row(tokens, n_queries=cfg.n_cls)
+                    cls[:, r0:r1] = out.view(b, rj, cfg.n_cls, e).to(cls.dtype)
+                else:
+                    tokens = row(tokens)
+                    cls[:, r0:r1] = tokens[:, : cfg.n_cls].view(b, rj, cfg.n_cls, e).to(cls.dtype)
+                    h[:, r0:r1] = tokens[:, cfg.n_cls :].view(b, rj, c, e).to(h.dtype)
+        return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
+
+    def _encode_cells(self, z, indicator, u, shape, categorical=None) -> torch.Tensor:
         """셀 값 (`_CellStats.features`) → 토큰. `shape`이 None이면 열 C개를 circular shift로
-        묶고(`_group`), (Cj, G)면 이미 묶은 열 Cj × G개다. 결과는 (B, 행, Cj, E)."""
+        묶고(`_group`), (Cj, G)면 이미 묶은 열 Cj × G개다. 결과는 (B, 행, Cj, E).
+        `categorical`은 묶은 범주 표시 (`_grouped_categorical`, 범주를 아는 encoder만)."""
 
         def group(t: torch.Tensor) -> torch.Tensor:
             if shape is None:
@@ -1291,5 +1559,7 @@ class ColumnRowTransformer(nn.Module):
 
         zg, ig = group(z), group(indicator)
         if self.config.encoder == "fourier":
+            if categorical is not None:
+                return self.cell_encoder(zg, ig, group(u), categorical)
             return self.cell_encoder(zg, ig, group(u))
         return self.cell_encoder(torch.cat([zg, ig], dim=-1))
