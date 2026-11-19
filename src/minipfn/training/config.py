@@ -19,6 +19,7 @@ from minipfn.models import (
     config_fields,
     model_class,
 )
+from minipfn.models.column_row_transformer import TEMPERATURE_FIELDS, TEMPERATURES
 from minipfn.priors import DEFAULT_PRIOR_TYPE, canonical_prior_type, prior_module
 from minipfn.priors.table_size import MAX_CELLS, MAX_FEATURES, MAX_TRAIN_ROWS, N_EVAL_ROWS
 from minipfn.training.muon import MUON_MOMENTUM, MUON_SCOPES
@@ -44,6 +45,8 @@ SPEED_OPTIONS = (
     "balance_tables",
 )
 OPTIMIZERS = ("adam", "muon")
+# attention 온도 설정 (issue #102)과 그 기본값 (`ColumnRowTransformerConfig`, 지금 구조)
+ATTENTION_TEMPERATURE_DEFAULTS = {"qk_norm_affine": True, **TEMPERATURE_FIELDS}
 # step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
 PHASE_KEYS = ("lr", "muon_weight_decay")
 # 분산 Muon의 범위 (issue #56, `muon_distributed`)
@@ -81,6 +84,14 @@ class TrainConfig:
     qk_norm: bool = False
     # attention logit soft-cap (`ColumnRowTransformerConfig.logit_softcap`, None이면 끔)
     logit_softcap: float | None = None
+    # attention 온도 (issue #102, `ColumnRowTransformerConfig`의 같은 이름 필드). 기본값이면 지금
+    # 구조 그대로다. 단계마다 qassmax / logscale / gated_logscale / none
+    qk_norm_affine: bool = True
+    column_summary_temperature: str = TEMPERATURE_FIELDS["column_summary_temperature"]
+    column_spread_temperature: str = TEMPERATURE_FIELDS["column_spread_temperature"]
+    row_temperature: str = TEMPERATURE_FIELDS["row_temperature"]
+    icl_temperature: str = TEMPERATURE_FIELDS["icl_temperature"]
+    decoder_temperature: str = TEMPERATURE_FIELDS["decoder_temperature"]
     target_norm: bool = False
     head_mlp: bool = False
     # prior / 표 크기 (논문 Methods, `minipfn.priors.table_size`). max_features는 모델 설정에도
@@ -287,6 +298,19 @@ class TrainConfig:
             if "logit_softcap" not in config_fields(self.model_type):
                 # 모델 설정으로 옮길 때(`model_config`) 조용히 빠지지 않도록
                 raise ValueError(f"logit_softcap은 {self.model_type} 모델에 없다")
+        for name, default in ATTENTION_TEMPERATURE_DEFAULTS.items():
+            # 기본값이 아니면 그 필드가 있는 모델이어야 한다 (`model_config`에서 조용히 빠지지
+            # 않도록). 값 검사는 모델 설정이 한다
+            if getattr(self, name) != default and name not in config_fields(self.model_type):
+                raise ValueError(f"{name}은 {self.model_type} 모델에 없다")
+        # 모델 설정과 같은 검사를 여기서도 한다 (학습 스크립트가 MLflow run을 열기 전에 멈추도록)
+        for name in TEMPERATURE_FIELDS:
+            if getattr(self, name) not in TEMPERATURES:
+                raise ValueError(
+                    f"{name}는 {TEMPERATURES} 가운데 하나여야 한다: {getattr(self, name)}"
+                )
+        if not self.qk_norm_affine and not self.qk_norm:
+            raise ValueError("qk_norm_affine=False는 qk_norm=True일 때만 쓴다")
         if self.activation_checkpointing_rows is not None:
             if self.activation_checkpointing_rows < 0:
                 raise ValueError(
