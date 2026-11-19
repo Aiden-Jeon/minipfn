@@ -27,6 +27,12 @@ prior 변형 옵션 (issue #92, 기본은 모두 꺼져 예전과 같은 데이�
   mixture(군집 `MIXTURE_MIN_CENTERS`~`MIXTURE_MAX_CENTERS`개)에서 뽑는다(`mixture_roots`). 행이
   군집·그룹을 이루는 표다. TabICL의 `RandomGaussianMixturePoints`는 정의만 있고 root 분포
   후보에는 없다
+
+`categorical_mask`(issue #110, 범주를 아는 셀 encoder): 데이터셋마다 범주 열 표시 (feature,) bool을
+더 낸다(생성기 반환이 (x, y, 표시)). TabICL `GraphSCM.__call__`은 범주 열(x_cat)을 앞에, 수치
+열(x_num)을 뒤에 이어 붙인 뒤 열을 섞는데 그 표시를 돌려주지 않는다. 그래서 같은 계산을 같은 난수
+순서로 다시 짜서(`_call_with_categorical`) 표시만 더 꺼낸다. 표 x·y는 끈 것과 같다(테스트로
+확인). 기본은 끔(예전과 같은 경로)
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ import importlib
 import sys
 import types
 from contextlib import contextmanager
-from functools import cache
+from functools import cache, partial
 from typing import Literal
 
 import numpy as np
@@ -52,6 +58,9 @@ CORRECTED_FLAGS = (
     "use_corrected_cat_sizes",
     "use_corrected_cat_meta_sampling",
 )
+# `_call_with_categorical`이 그대로 옮긴 TabICL `GraphSCM.__call__`의 버전 (다른 버전이면 난수
+# 순서가 어긋날 수 있어 멈춘다)
+CATEGORICAL_TABICL_VERSION = "2.2."
 # `mixture_root_prob`로 고른 데이터셋의 군집 수 범위 (log 균등, 여기서 정함)
 MIXTURE_MIN_CENTERS = 2
 MIXTURE_MAX_CENTERS = 32
@@ -97,9 +106,11 @@ class GraphSCM:
         filter_unpredictable: bool = False,
         corrected: bool = False,
         mixture_root_prob: float = 0.0,
+        categorical_mask: bool = False,
     ) -> None:
         check_probability("mixture_root_prob", mixture_root_prob)
         self.regression = task == "regression"
+        self.categorical_mask = categorical_mask
         self.filter_unpredictable = filter_unpredictable
         self.mixture_root_prob = mixture_root_prob
         np.random.seed(seed)
@@ -116,7 +127,7 @@ class GraphSCM:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return stack_datasets(self._dataset, n_rows, n_features, n_datasets, hp)
 
-    def _dataset(self, n_rows: int, n_features: int, hp: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def _dataset(self, n_rows: int, n_features: int, hp: dict) -> tuple[torch.Tensor, ...]:
         make = self._graph_scm(
             regression=self.regression,
             seq_len=n_rows,
@@ -125,6 +136,8 @@ class GraphSCM:
             num_classes=None if self.regression else hp["num_classes"],
             config=self._config,
         )
+        if self.categorical_mask:  # (x, y, 범주 열 표시) (모듈 docstring)
+            make = partial(_call_with_categorical, make)
         # 확률을 켰을 때만 난수를 쓴다(끄면 예전과 같은 데이터셋). filter로 다시 만들어도 같은 선택
         if self.mixture_root_prob and np.random.random() < self.mixture_root_prob:
             plain = make
@@ -138,15 +151,15 @@ class GraphSCM:
 
 def stack_datasets(
     dataset, n_rows: int, n_features: int, n_datasets: int, hp: dict
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """`dataset(n_rows, n_features, hp)`로 하나씩 만든 데이터셋 n_datasets개를 그룹으로 쌓는다:
-    x (행, 데이터셋, feature), y (행, 데이터셋). graph·tree SCM 생성기가 같이 쓴다."""
-    xs, ys = [], []
-    for _ in range(n_datasets):
-        x, y = dataset(n_rows, n_features, hp)
-        xs.append(x)
-        ys.append(y)
-    return torch.stack(xs, 1), torch.stack(ys, 1)
+    x (행, 데이터셋, feature), y (행, 데이터셋). graph·tree SCM 생성기가 같이 쓴다. 데이터셋이 범주
+    열 표시 (feature,)도 내면(`categorical_mask`) 셋째로 (데이터셋, feature)를 더 낸다."""
+    outs = [dataset(n_rows, n_features, hp) for _ in range(n_datasets)]
+    x, y = torch.stack([o[0] for o in outs], 1), torch.stack([o[1] for o in outs], 1)
+    if len(outs[0]) > 2:
+        return x, y, torch.stack([o[2] for o in outs])
+    return x, y
 
 
 def check_probability(name: str, value: float) -> None:
@@ -156,22 +169,87 @@ def check_probability(name: str, value: float) -> None:
 
 def filtered(
     make, generator, *, regression: bool, attempts: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """`make()`로 데이터셋 하나를 만든다. `generator.filter_unpredictable`이면 예측할 수 있을
     때까지 다시 만든다(`attempts`개, 기본 `FILTER_ATTEMPTS`개를 다 거르면 그 다음 것을 받는다).
     NaN으로 버린 데이터셋(y가 모두 -100)은 거르지 않고 내보내 DropInvalid가 다시 뽑게 한다.
     `generator`는 `filter_unpredictable`·`_should_filter`·`_config`가 있는 생성기다(graph·tree
-    SCM)."""
-    x, y = make()
+    SCM). `make()`가 (x, y, 범주 열 표시)를 내면 그대로 넘긴다."""
+    out = make()
     if not generator.filter_unpredictable:
-        return x, y
+        return out
     for _ in range(FILTER_ATTEMPTS if attempts is None else attempts):
+        x, y = out[0], out[1]
         if (y == -100).all() or not generator._should_filter(
             x, y, generator._config, is_classif=not regression
         ):
             break
-        x, y = make()
-    return x, y
+        out = make()
+    return out
+
+
+def _call_with_categorical(scm) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """TabICL `GraphSCM.__call__`(tabicl 2.2, BSD-3-Clause)과 같은 계산을 같은 순서로 하고 범주 열
+    표시 (feature,) bool을 더 낸다 (모듈 docstring). 그 함수가 쓰는 TabICL 부품을 그대로 부른다.
+    범주 열은 x_cat 쪽 열이고(TabICL이 범주 크기가 2 이상인 열을 x_cat으로 모은다), 열 섞기·0
+    패딩을 표시에도 똑같이 한다."""
+    import importlib.metadata
+
+    import torch.nn.functional as F
+    from tabicl.prior._reg2cls import outlier_removing, standard_scaling
+
+    version = importlib.metadata.version("tabicl")
+    if not version.startswith(CATEGORICAL_TABICL_VERSION):
+        raise RuntimeError(
+            f"categorical_mask는 tabicl {CATEGORICAL_TABICL_VERSION}x의 GraphSCM을 옮긴 것이다"
+            f" (설치된 것 {version}): `_call_with_categorical`을 그 버전과 맞춘다"
+        )
+    from tabicl.prior.graph_lib._base import Context, DatasetProperties
+    from tabicl.prior.graph_lib._dataset import RandomDataset
+    from tabicl.prior.graph_lib._properties import sample_categorical_sizes
+
+    context = Context(config=scm.config, device=scm.device)
+    properties = DatasetProperties(
+        n_train=scm.seq_len,
+        n_test=0,
+        cat_sizes={
+            "x": sample_categorical_sizes(scm.num_features, context, max_cat_size=200),
+            "y": [0 if scm.regression else scm.num_classes],
+        },
+    )
+    data = RandomDataset(context).sample(properties).get_concat_tensors()
+    x_cat, x_num = data.get("x_cat", None), data.get("x_num", None)
+    parts = [t for t in (x_cat, x_num) if t is not None]
+    if not parts:
+        raise ValueError("No features found in dataset")
+    X = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+    n_cat = 0 if x_cat is None else x_cat.shape[-1]
+    is_cat = torch.arange(X.shape[-1], device=X.device) < n_cat
+
+    X = outlier_removing(X.float(), threshold=4)
+    X = standard_scaling(X)
+    if scm.permute_features:
+        feat_perm = torch.randperm(scm.num_features, device=scm.device)
+        X = X[..., feat_perm]
+        is_cat = is_cat[feat_perm]
+    if scm.num_features < scm.max_features:
+        pad = scm.max_features - scm.num_features
+        X = F.pad(X, (0, pad), mode="constant", value=0.0)
+        is_cat = F.pad(is_cat, (0, pad), value=False)
+    if scm.regression:
+        y = data["y_num"]
+        y = outlier_removing(y.float(), threshold=4)
+        y = standard_scaling(y)
+        y = y.view(-1)
+    else:
+        y = data["y_cat"].view(-1)
+        if scm.permute_labels:
+            class_perm = torch.randperm(scm.num_classes, device=scm.device)
+            y = class_perm[y.long()]
+    if torch.any(torch.isnan(X)) or torch.any(torch.isnan(y)):
+        X = torch.zeros_like(X)
+        y = torch.full_like(y, -100.0)
+    return X, y, is_cat
 
 
 @contextmanager

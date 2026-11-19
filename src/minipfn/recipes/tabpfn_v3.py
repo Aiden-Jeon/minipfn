@@ -112,16 +112,29 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
     return replace(config, **_model_changes(config, arch, keep_size), qk_clip=None)
 
 
+# Kumo식 열·행 단계(`stage_layout="interleaved"`, `recipes.kumo_tabular.STAGES`, issue #110)가
+# 바꾸는 열·행 단계 폭. 그 구조는 이 값들을 빼고 견주고, 대신 행 ICL 폭(n_cls × emsize)이 같아야
+# 그 구조로 본다(추론 설정·권장 크기는 행 ICL 이후가 같은 구조의 것을 쓴다)
+INTERLEAVED_STAGE_FIELDS = ("emsize", "n_cls", "n_inducing")
+
+
 def architecture_name(config) -> str | None:
     """`config`(학습 설정, 또는 `task`·`model_type`과 구조 필드가 있는 것)의 구조가
-    `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 크기를 줄인 것도 그 구조로 본다."""
+    `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 크기를 줄인 것도 그 구조로 본다.
+    열·행 단계를 번갈아 쌓은 것(`INTERLEAVED_STAGE_FIELDS`)은 행 ICL 폭이 같으면 그 구조다."""
     if canonical_model_type(config.model_type) != MODEL_TYPE:
         return None
+    interleaved = getattr(config, "stage_layout", "sequential") == "interleaved"
     for name in ARCHITECTURES:
         if config.task not in ARCHITECTURES[name]:
             continue
         for keep_size in (False, True):
             changes = _model_changes(config, name, keep_size)
+            if interleaved:
+                icl = changes["n_cls"] * changes["emsize"]
+                if config.n_cls * config.emsize != icl:
+                    continue
+                changes = {k: v for k, v in changes.items() if k not in INTERLEAVED_STAGE_FIELDS}
             if all(getattr(config, k) == v for k, v in changes.items()):
                 return name
     return None

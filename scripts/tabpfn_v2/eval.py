@@ -167,6 +167,8 @@ from minipfn.inference.ensemble import (
     EnsembleRegressor,
     max_classes_of,
     max_features_of,
+    quantile_regressor,
+    uses_categorical,
 )
 from minipfn.inference.ensemble_selection import (
     MIN_IMPROVEMENT,
@@ -628,6 +630,12 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
         raise SystemExit(f"{suite} 평가에는 {flag}가 필요하다.")
     # CPU로 읽고, 추론할 때 모델만 장치로 옮긴다
     model, borders = load_model(path, suite, Path(args.out_dir) / "checkpoints" / suite)
+    quantile = suite == "regression" and quantile_regressor(model)
+    if (uses_categorical(model) or quantile) and args.test_time != "none":
+        # 범주 열 표시·회귀 분위수 출력(issue #110)은 기본 앙상블만 맞췄다
+        # (`check_basic_ensemble_only`). 여기서 멈춘다(arena에서는 estimator를 만들 때 실패하면
+        # 모든 split이 조용히 imputed가 된다). 증류는 teacher의 예측만 쓰므로 막지 않는다
+        raise SystemExit("범주 표시·회귀 분위수 출력 모델은 --test-time none에서만 쓴다.")
     # 주지 않으면 모델의 추론 설정 (Hub config.json의 inference, 없으면 모델 구조로)
     inference = default_inference(model, suite)
     member_kinds = args.member_kinds or inference["member_kinds"]

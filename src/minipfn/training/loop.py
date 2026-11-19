@@ -118,26 +118,30 @@ def _validate(
     bar,
     forward: dict | None = None,
     inference_rows: int | None = None,
+    regression_head: str = "bar",
 ) -> dict[str, float]:
     """검증 batch마다 손실(분류는 정확도도). `inference_rows`를 주면 행 수가 그보다 많은 batch는
-    모델의 추론 경로(`inference=True`)로 계산한다(`TrainConfig.activation_checkpointing_rows`)."""
+    모델의 추론 경로(`inference=True`)로 계산한다(`TrainConfig.activation_checkpointing_rows`).
+    batch에 범주 열 표시(`PriorBatch.categorical`)가 있으면 모델에 넘긴다."""
     forward = forward or {}  # multitask 모델에 줄 task (`_forward_kwargs`)
     model.eval()
     total, correct, count = 0.0, 0, 0
     for batch in val_batches:
         x, y = batch.x.to(device), batch.y.to(device)
         kwargs = forward
+        if getattr(batch, "categorical", None) is not None:
+            kwargs = {**forward, "categorical": batch.categorical.to(device)}
         # 추론 경로가 따로 있는 모델만 (cell_transformer는 학습·추론 forward가 같다)
         if (
             inference_rows is not None
             and x.shape[1] > inference_rows
             and getattr(model, "supports_inference_options", False)
         ):
-            kwargs = {**forward, "inference": True}
+            kwargs = {**kwargs, "inference": True}
         with autocast():
             logits = model(x, y[:, : batch.n_train], **kwargs)
         y_eval = y[:, batch.n_train :]
-        total += prior_loss(logits, y_eval, task, bar).item()
+        total += prior_loss(logits, y_eval, task, bar, regression_head).item()
         if task == "classification":
             correct += (logits.argmax(-1) == y_eval.long()).sum().item()
             count += y_eval.numel()
@@ -151,15 +155,22 @@ def _validate(
 def _validate_tasks(model, val_sets, device, autocast, config, bar) -> dict[str, float]:
     """task마다 검증. 한 task면 예전 지표 그대로, multitask면 지표 이름 뒤에 task를 붙이고
     `val_loss`는 두 task 손실의 평균이다."""
-    rows = config.activation_checkpointing_rows
+    rows, head = config.activation_checkpointing_rows, config.regression_head
     if config.task != "multitask":
         return _validate(
-            model, val_sets[config.task], device, autocast, config.task, bar, inference_rows=rows
+            model,
+            val_sets[config.task],
+            device,
+            autocast,
+            config.task,
+            bar,
+            inference_rows=rows,
+            regression_head=head,
         )
     out = {}
     for task, batches in val_sets.items():
         forward = _forward_kwargs(config, task)
-        val = _validate(model, batches, device, autocast, task, bar, forward, rows)
+        val = _validate(model, batches, device, autocast, task, bar, forward, rows, head)
         out.update({f"{k}_{task}": v for k, v in val.items()})
     out["val_loss"] = sum(out[f"val_loss_{t}"] for t in val_sets) / len(val_sets)
     return out
@@ -654,19 +665,29 @@ def _train(
         micro_info = []
         for micro in range(accumulation):
             t_wait = time.time()
-            x, y, n_train = next(batches[task])
+            item = next(batches[task])  # (x, y, n_train) 또는 범주 열 표시를 더한 4개
+            x, y, n_train = item[:3]
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            forward = _forward_kwargs(config, task)
+            if len(item) > 3:  # 범주를 아는 셀 encoder (issue #110, `PriorBatch.categorical`)
+                forward["categorical"] = item[3].to(device, non_blocking=True)
             window_wait += time.time() - t_wait
             sync = micro == accumulation - 1 or d.world_size == 1
             ctx = contextlib.nullcontext() if sync else ddp_model.no_sync()
             marks = (timing.mark(),) if timing is not None else ()
             with ctx:
                 with autocast():
-                    logits = train_forward(x, y[:, :n_train], **_forward_kwargs(config, task))
+                    logits = train_forward(x, y[:, :n_train], **forward)
                 y_eval = y[:, n_train:]
-                if task == "regression" and config.dequantize_buckets:
+                # 분위수 출력은 흩지 않는다: 반복되는 target에서 NLL 최적이 무한대가 되는 문제는
+                # bar distribution의 것이고, pinball 손실의 최적은 유한하다 (issue #110)
+                if (
+                    task == "regression"
+                    and config.dequantize_buckets
+                    and config.regression_head == "bar"
+                ):
                     y_eval = dequantize_targets(y, n_train, bar, config.dequantize_buckets)
-                loss = prior_loss(logits, y_eval, task, bar) / accumulation
+                loss = prior_loss(logits, y_eval, task, bar, config.regression_head) / accumulation
                 if timing is not None:
                     marks += (timing.mark(),)
                 loss.backward()

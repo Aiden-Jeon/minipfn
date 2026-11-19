@@ -65,6 +65,10 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 stage 4는 표 크기를 GPU끼리 나눠 받는다(`--balance-tables on|off`, `TABPFN_V2_BALANCE_TABLES`, 주지
 않으면 preset 값이고 이어 학습하면 원래 run의 값이다).
 stage2~4는 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
+`--kumo-options`(`TABPFN_V2_KUMO_OPTIONS`, 쉼표로 여럿, issue #110)는 Kumo-Tabular 부품 묶음을 켠다
+(`recipes.kumo_tabular.OPTIONS`: decoder_qk_norm, stages, quantile_head, categorical_encoder).
+attention 온도처럼 구조 이름과 따로 켜는 설정이고, 이어 학습·가중치 가져오기에서는 원래 run의
+값이다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -91,6 +95,7 @@ from minipfn.recipes import kumo_tabular, tabpfn_v3  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.training.config import (  # noqa: E402
     ATTENTION_TEMPERATURE_DEFAULTS,
+    KUMO_OPTION_DEFAULTS,
     SPEED_OPTIONS,
     TrainConfig,
     normalize_phases,
@@ -124,6 +129,8 @@ CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
 TUNED_LONG_NAMES = {f"tuned_stage{n}" for n in recipe.TUNED_LONG}
 # attention 온도 묶음 (`--attention-temperature`, issue #102). 구조 이름(`--arch`)과 따로 켠다
 TEMPERATURE_PRESETS = {"kumo": kumo_tabular.ATTENTION_TEMPERATURE}
+# Kumo-Tabular의 나머지 부품 묶음 (`--kumo-options`, issue #110). 쉼표로 여럿을 준다
+KUMO_OPTIONS = kumo_tabular.OPTIONS
 # MLflow run 이름의 머리
 RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
@@ -238,6 +245,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             default=os.environ.get("TABPFN_V2_" + name.upper()) or None,
             help=helps[name] + ". 모델 구조라 이어 학습·가중치 가져오기에서는 바꾸지 않는다",
         )
+    # Kumo-Tabular의 나머지 부품 (issue #110, recipes/kumo_tabular.py의 OPTIONS). attention 온도처럼
+    # 구조 이름과 따로 켜고, 이어 학습·가중치 가져오기에서는 원래 run의 값이다
+    parser.add_argument(
+        "--kumo-options",
+        default=os.environ.get("TABPFN_V2_KUMO_OPTIONS") or None,
+        help="Kumo-Tabular 부품 묶음, 쉼표로 여럿 (" + ", ".join(KUMO_OPTIONS) + ")."
+        " 모델 구조라 이어 학습·가중치 가져오기에서는 바꾸지 않는다",
+    )
     parser.add_argument(
         "--muon-distributed",
         choices=["off", "node", "all"],
@@ -301,6 +316,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, name)
         if value is not None and value not in choices:
             raise SystemExit(f"TABPFN_V2_{name.upper()}={value!r}는 {choices} 가운데 하나여야 한다")
+    unknown = [o for o in _kumo_option_names(args.kumo_options) if o not in KUMO_OPTIONS]
+    if unknown:
+        raise SystemExit(f"--kumo-options의 {unknown}는 {tuple(KUMO_OPTIONS)} 가운데 하나여야 한다")
     if args.resume_step is not None and not args.resume_run_id:
         parser.error("--resume-step은 --resume-run-id와 같이 줘야 한다")
     if args.init_step is not None and not args.init_run_id:
@@ -454,10 +472,14 @@ def build_config(
     if args.arch is not None:
         # attention 온도는 구조 이름과 따로 켜는 설정이라 비교하지 않는다 (주지 않으면 원래 run의
         # 값을 쓴다)
+        # Kumo 부품(issue #110)도 같다. Kumo식 열·행 단계면 그 폭·블록 수도 비교하지 않는다
+        separate = {*ATTENTION_TEMPERATURE_DEFAULTS, *KUMO_OPTION_DEFAULTS}
+        if source.get("stage_layout") == "interleaved":
+            separate |= set(kumo_tabular.STAGES)
         differ = {
             k: (getattr(base, k), v)
             for k, v in source.items()
-            if getattr(base, k) != v and k not in ATTENTION_TEMPERATURE_DEFAULTS
+            if getattr(base, k) != v and k not in separate
         }
         if differ:
             raise SystemExit(
@@ -544,7 +566,19 @@ def _override_values(args: argparse.Namespace) -> dict:
             overrides["logit_softcap"] = _optional_float(args.logit_softcap)
         except ValueError:
             raise SystemExit(f"--logit-softcap은 수나 none·off다: {args.logit_softcap!r}") from None
-    return {**overrides, **_temperature_values(args)}
+    return {**overrides, **_temperature_values(args), **_kumo_values(args)}
+
+
+def _kumo_option_names(text: str | None) -> list[str]:
+    return [o.strip() for o in (text or "").split(",") if o.strip()]
+
+
+def _kumo_values(args: argparse.Namespace) -> dict:
+    """`--kumo-options`로 고른 Kumo-Tabular 부품 묶음을 합친 것 (주지 않으면 빈 dict)."""
+    values = {}
+    for name in _kumo_option_names(args.kumo_options):
+        values.update(KUMO_OPTIONS[name])
+    return values
 
 
 def _temperature_values(args: argparse.Namespace) -> dict:

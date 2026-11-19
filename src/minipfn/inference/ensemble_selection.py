@@ -63,7 +63,11 @@ import pandas as pd
 import torch
 from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 
-from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
+from minipfn.inference.ensemble import (
+    EnsembleClassifier,
+    EnsembleRegressor,
+    check_basic_ensemble_only,
+)
 from minipfn.inference.preprocessing import MEMBER_KINDS, Member
 
 POOL_SIZE = 24
@@ -146,6 +150,7 @@ class _Selection:
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        check_basic_ensemble_only(self.model, self.task, "greedy 선택")
         self.temperatures = check_selection(
             n_estimators=self.n_estimators,
             pool_size=pool_size,

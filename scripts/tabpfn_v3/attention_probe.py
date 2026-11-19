@@ -170,6 +170,8 @@ def probe(model, borders, sets, device) -> dict:
     RECORDER[0] = recorder
     handles = recorder.install(model)
     bar = FullSupportBarDistribution(borders.to(device)) if borders is not None else None
+    # 회귀 분위수 출력이면 pinball 손실 (issue #110. 단위가 bar NLL과 달라 견주지 않는다)
+    head = getattr(model.config, "regression_head", "bar")
     losses = {}
     cuda = device.type == "cuda"
     try:
@@ -178,8 +180,11 @@ def probe(model, borders, sets, device) -> dict:
                 total = 0.0
                 for b in batches:
                     x, y = b.x.to(device), b.y.to(device)
-                    logits = model(x, y[:, : b.n_train], task=task, inference=True)
-                    total += prior_loss(logits.float(), y[:, b.n_train :], task, bar).item()
+                    extra = {}
+                    if getattr(model.config, "categorical_encoder", False):  # issue #110
+                        extra["categorical"] = b.categorical.to(device)
+                    logits = model(x, y[:, : b.n_train], task=task, inference=True, **extra)
+                    total += prior_loss(logits.float(), y[:, b.n_train :], task, bar, head).item()
                 losses[task] = total / len(batches)
     finally:
         RECORDER[0] = None
@@ -256,7 +261,9 @@ def main(argv=None) -> None:
         return
     import mlflow
 
-    sets = val_batches(tabpfn_v3.curriculum(1), args.n_batches)
+    # 범주 열 표시도 같이 뽑는다 (범주를 아는 셀 encoder만 쓴다. 표는 표시 없이 뽑은 것과 같다,
+    # `priors.generators.graph_scm`의 `categorical_mask`)
+    sets = val_batches(replace(tabpfn_v3.curriculum(1), categorical_encoder=True), args.n_batches)
     print("검증 batch", {t: [tuple(b.x.shape) for b in bs] for t, bs in sets.items()}, flush=True)
     names = dict(x.split("=", 1) for x in args.labels.split(",") if "=" in x)
     for spec in args.ckpt:
