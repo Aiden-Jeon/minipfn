@@ -77,42 +77,44 @@ Regression: the median RMSE ratio is 0.999, and 25 of 28 datasets are within 1.1
 
 Most of the regression gain came from stage 2, the first stage with long tables: the ratio fell from 1.075 to 1.005, and 20 of 28 datasets improved. Stage 3 changed little on this suite.
 
+The column cap of the default inference (768 per member) never applies on this suite: the widest dataset, Mercedes_Benz_Greener_Manufacturing, has 376 columns. Re-run with the current default inference, the stage-3 weights gave the same score on all 570 folds, so the numbers above hold for every stage.
+
 ![ROC AUC per dataset](images/benchmark_roc_auc.png)
 
 ![RMSE ratio per dataset](images/benchmark_rmse_ratio.png)
 
 ### TabArena-Lite
 
-[TabArena-Lite](https://huggingface.co/spaces/TabArena/leaderboard) (51 datasets, one split each), scored the way the public leaderboard is: Elo against the leaderboard's method pool, with RandomForest (default) at 1000. The same weights serve the classification and regression splits. No split exceeds the size limit (1,000,000 training rows, 6,000 features, 160 classes), so none is imputed. Every method on the public leaderboard is 8-fold bagged; this model is fit once per split.
+[TabArena-Lite](https://huggingface.co/spaces/TabArena/leaderboard) (51 datasets, one split each), scored the way the public leaderboard is: Elo against the leaderboard's method pool, with RandomForest (default) at 1000. The same weights serve the classification and regression splits, with the default inference (768 columns per member, balanced). No split exceeds the size limit (1,000,000 training rows, 160 classes; the column cap removes the column limit), so none is imputed. Every method on the public leaderboard is 8-fold bagged; this model is fit once per split.
 
 | Method | Elo | Imputed splits |
 | --- | --- | --- |
-| TabPFN-3.5 (default), public | 1857 | |
-| TabPFN-3 (default), public | 1620 | |
+| TabPFN-3.5 (default), public | 1858 | |
+| TabPFN-3 (default), public | 1621 | |
+| **minipfn TabPFN-3.5 (this model)** | **1563** (+75/−67) | 0.0% |
 | TabICLv2 (default), public | 1558 | |
-| **minipfn TabPFN-3.5 (this model)** | **1556** (+75/−67) | 0.0% |
 | RealTabPFN-2.5 (default), public | 1513 | |
 | minipfn TabPFN-2.5 | 1436 | 7.8% |
 
-By stage, the Elo was 1354 (+72/−77) after stage 1, 1542 (+70/−70) after stage 2 and 1556 after stage 3. This model places 16th of 99 methods. By problem type its Elo is 1568 (binary), 1635 (multiclass) and 1663 (regression), and it beats XGBoost (default) on 90% of the splits. The official TabPFN-3.5 is still about 300 Elo higher.
+By stage, the Elo was 1354 (+72/−77) after stage 1, 1542 (+70/−70) after stage 2 and 1563 after stage 3. The stage-1 and stage-2 values were measured before the column cap became the default (every column in every member) and were not re-run; with all columns, stage 3 scored 1556. Only 3 of the 51 datasets have more than 768 columns, so the cap changes little here, and the difference is inside the confidence interval. This model places 15th of 99 methods. By problem type its Elo is 1587 (binary), 1601 (multiclass) and 1663 (regression), and it beats XGBoost (default) on 90% of the splits. The official TabPFN-3.5 is still about 300 Elo higher.
 
 ![Arena Elo by stage](images/arena_elo.png)
 
 ### BeyondArena
 
-BeyondArena core2k (2,000 splits from 142 datasets), scored like its public leaderboard with XGBoost (default) at 1000. 1,999 splits run. The one above the size limit (amex_non_iid_1m, more than 1,000,000 training rows) takes RandomForest (default)'s result. On tables with more than 6,000 features, each ensemble member uses a random subset of 6,000 features (like the official `max_features_per_estimator`).
+BeyondArena core2k (2,000 splits from 142 datasets), scored like its public leaderboard with XGBoost (default) at 1000. 1,999 splits run. The one above the size limit (amex_non_iid_1m, more than 1,000,000 training rows) takes RandomForest (default)'s result. On tables with more than 768 columns, each ensemble member gets 768 of them, split so that every column is used about equally often (the default inference, like the official 3.5's `max_features_per_estimator`). Only the 10 datasets with more than 768 columns were re-run with this setting; the other splits give the same result as with all columns, so their results were kept and the Elo was recomputed with the same `tabarena` aggregation.
 
 | Method | Elo |
 | --- | --- |
 | TabPFN-3.5 (default), public | 1375 |
 | TabPFN-3 (default), public | 1232 |
 | TabICLv2 (default), public | 1171 |
+| **minipfn TabPFN-3.5 (this model)** | **1149** (+35/−36) |
 | RealTabPFN-2.5 (default), public | 1141 |
-| **minipfn TabPFN-3.5 (this model)** | **1139** (+36/−39) |
 | minipfn TabPFN-2.5 | 1096 |
 | XGBoost (default), public | 1000 |
 
-By stage, the Elo was 1049 → 1127 → 1139. This model places 20th of 41 methods. It is strongest on tiny tables (Elo 1317), low-dimensional tables (1276), random splits (1258) and small tables (1237). It is weakest on large tables (676), high-cardinality categorical features (738), temporal splits (740), text features (874) and high-dimensional tables (909).
+By stage, the Elo was 1049 → 1127 → 1149. The stage-1 and stage-2 values were measured before the 768-column cap became the default (each member took a random 6,000 of the columns on wider tables) and were not re-run; with that setting, stage 3 scored 1139. The cap helps most on wide tables: the error on the 10 datasets with more than 768 columns fell to 0.71× (geometric mean), and the high-dimensional group rose from 909 to 939. The overall gain (+10) is inside the confidence interval. This model places 18th of 41 methods. It is strongest on tiny tables (Elo 1344), low-dimensional tables (1276), random splits (1275) and small tables (1242). It is weakest on large tables (676), high-cardinality categorical features (738), temporal splits (740), text features (874) and high-dimensional tables (939).
 
 ## Limitations
 
@@ -158,7 +160,7 @@ uv run python scripts/tabpfn_v2/eval.py --suite all \
   --regressor-path hf://aiden-jeon/minipfn-tabpfn-v3-5
 ```
 
-For BeyondArena, add `--max-features-per-member 6000`.
+The column cap (768 per member, balanced) comes with the model; pass `--max-features-per-member N` and `--feature-subsampling random|balanced` to change it.
 
 ## Intermediate checkpoints
 
@@ -168,7 +170,9 @@ The weights at the end of stages 1 and 2 are kept as branches of this repo. Each
 | --- | --- | --- | --- | --- | --- |
 | `stage1-250k` | `sha256:2ddf63bce395` | 0.9358 | 1.075 | 1354 | 1049 |
 | `stage2-20k` | `sha256:4e7bc2d7a6ed` | 0.9370 | 1.005 | 1542 | 1127 |
-| `main` (stage 3, +5k) | `sha256:01238841bddc` | 0.9371 | 1.005 | 1556 | 1139 |
+| `main` (stage 3, +5k) | `sha256:01238841bddc` | 0.9371 | 1.005 | 1563 | 1149 |
+
+The arena Elo of `stage1-250k` and `stage2-20k` was measured with every column in every member (6,000 at most on BeyondArena), before the 768-column cap became the default; with that setting, `main` scored 1556 and 1139. The AMLB columns do not depend on the cap.
 
 ```python
 clf = TabPFNv3_5Classifier("aiden-jeon/minipfn-tabpfn-v3-5@stage2-20k")
