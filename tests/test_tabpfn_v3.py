@@ -809,25 +809,62 @@ def test_v35_default_feature_cap_in_classes_and_eval(monkeypatch, tmp_path):
     assert EnsembleClassifier(model, n_estimators=2).max_features_per_member is None  # 축은 그대로
 
     script = _script("eval")
-    models = {"v3": _model(), "v3.5": model}
+    models = {"v3": _model(), "v3.5": model, "v3-reg": _model("regression", "v3")}
+
+    def factory(argv, arch="v3.5", task="classification"):
+        monkeypatch.setattr(script, "load_model", lambda *a, **k: (models[arch], None))
+        paths = ["--classifier-path", "u", "--regressor-path", "u", "--out-dir", str(tmp_path)]
+        args = script.parse_args([*paths, *argv])
+        f = script.make_estimator_factory(task, args)
+        return args, f
 
     def caps(argv, arch="v3.5"):
-        monkeypatch.setattr(script, "load_model", lambda *a, **k: (models[arch], None))
-        args = script.parse_args(["--classifier-path", "unused", "--out-dir", str(tmp_path), *argv])
-        factory = script.make_estimator_factory("classification", args)
-        script.apply_model_feature_cap(args, {"classification": factory})
-        return args
+        _, f = factory(argv, arch)
+        return f.max_features_per_member, f.feature_subsampling
 
-    args = caps([])
-    assert (args.max_features_per_member, args.feature_subsampling) == (768, "balanced")
-    assert script.inference_option_params(args) == {"feature_subsampling": "balanced"}
-    paths, kinds = {"classification": "unused"}, {"classification": ("standard",)}
-    factories = {"classification": types.SimpleNamespace(model=model)}
-    printed = json.loads(script.arena_fingerprint(args, paths, factories, kinds, "all"))
-    assert printed["max_features_per_member"] == 768  # 예전(모든 열) 결과를 다시 쓰지 않는다
-    args = caps(["--feature-subsampling", "random"])
-    assert (args.max_features_per_member, args.feature_subsampling) == (768, "random")
-    args = caps(["--max-features-per-member", "6000"])
-    assert (args.max_features_per_member, args.feature_subsampling) == (6000, "random")
-    assert caps([], arch="v3").max_features_per_member is None  # 3은 모든 열
-    assert caps(["--test-time", "greedy"]).max_features_per_member is None
+    args, f = factory([])
+    assert (f.max_features_per_member, f.feature_subsampling) == (768, "balanced")
+    est = f(types.SimpleNamespace(categorical_indices=[]), "all")
+    assert est.max_features_per_member == 768 and est.feature_subsampling == "balanced"
+    paths, kinds = {"classification": "u"}, {"classification": ("standard",)}
+    printed = json.loads(script.arena_fingerprint(args, paths, {"classification": f}, kinds, "all"))
+    # 예전(모든 열) 결과를 다시 쓰지 않는다
+    assert printed["max_features_per_member"] == 768
+    assert printed["feature_subsampling"] == "balanced"
+    assert caps(["--feature-subsampling", "random"]) == (768, "random")
+    assert caps(["--max-features-per-member", "6000"]) == (6000, "random")
+    assert caps(["--max-features-per-member", "0"]) == (None, "random")  # 끔: 모든 열
+    assert caps([], arch="v3") == (None, "random")  # 3은 모든 열
+    assert caps(["--test-time", "greedy"]) == (None, "random")
+    with pytest.raises(SystemExit):
+        script.parse_args(["--max-features-per-member", "-1"])
+    # 끄면 예전 기본 fingerprint와 arena 상한 그대로
+    off, f_off = factory(["--max-features-per-member", "0"])
+    fp = script.arena_fingerprint(off, paths, {"classification": f_off}, kinds, "all")
+    printed = json.loads(fp)
+    assert "max_features_per_member" not in printed and "feature_subsampling" not in printed
+    caps_off = script.feature_caps(off, {"classification": f_off})
+    limits = script.arena_limits({"classification": (model, None)}, off, caps_off)
+    assert limits["binary"].max_features == 6_000
+    # 3.5 분류 + 3 회귀: task마다 자기 값 (멈추지 않는다)
+    args, f_reg = factory([], arch="v3-reg", task="regression")
+    factories = {"classification": f, "regression": f_reg}
+    assert script.feature_caps(args, factories) == {"classification": 768, "regression": None}
+    models_ = {"classification": (model, None), "regression": (models["v3-reg"], None)}
+    limits = script.arena_limits(models_, args, script.feature_caps(args, factories))
+    assert limits["binary"].max_features is None and limits["regression"].max_features == 2_000
+    paths2 = {"classification": "u", "regression": "u"}
+    kinds2 = {"classification": ("standard",), "regression": ("quantile", "robust")}
+    printed = json.loads(script.arena_fingerprint(args, paths2, factories, kinds2, "all"))
+    assert printed["max_features_per_member"] == {"classification": 768, "regression": None}
+
+
+def test_diag_scale_views_keep_feature_subsampling():
+    from minipfn.inference.diag_scale import _views
+
+    model = _model(arch="v3.5")
+    est = EnsembleClassifier(
+        model, n_estimators=2, max_features_per_member=3, feature_subsampling="balanced"
+    )
+    views = _views(est, model, n_views=4, random_state=0)
+    assert views.max_features_per_member == 3 and views.feature_subsampling == "balanced"
