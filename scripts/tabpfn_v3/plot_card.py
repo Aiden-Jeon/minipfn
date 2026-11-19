@@ -80,8 +80,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="stage=학습 run_id, 쉼표로 구분 (단계 안에서는 순서대로)",
     )
     parser.add_argument("--benchmark-runs", required=True, help="stage=benchmark 평가 run_id")
-    parser.add_argument("--tabarena-runs", required=True, help="stage=TabArena-Lite 평가 run_id")
-    parser.add_argument("--beyondarena-runs", required=True, help="stage=BeyondArena 평가 run_id")
+    parser.add_argument(
+        "--tabarena-runs",
+        required=True,
+        help="stage=TabArena-Lite 평가 run_id (또는 leaderboard CSV 경로)",
+    )
+    parser.add_argument(
+        "--beyondarena-runs",
+        required=True,
+        help="stage=BeyondArena 평가 run_id (또는 leaderboard CSV 경로)",
+    )
     parser.add_argument(
         "--v2-5-benchmark-runs",
         required=True,
@@ -246,6 +254,10 @@ def plot_by_stage(bench: dict, v25: dict, path: Path) -> None:
 
 
 def load_leaderboard(run_id: str, suite: str, cache: Path) -> pd.DataFrame:
+    """평가 run의 `eval/<suite>/leaderboard.csv`. run_id 대신 leaderboard CSV 경로를 주면 그
+    파일을 읽는다(평가 run 없이 split 일부만 바꿔 다시 집계한 leaderboard, 예: issue #109)."""
+    if run_id.endswith(".csv"):
+        return pd.read_csv(run_id)
     csv = mlflow.artifacts.download_artifacts(
         run_id=run_id, artifact_path=f"eval/{suite}/leaderboard.csv", dst_path=str(cache / run_id)
     )
