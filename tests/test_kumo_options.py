@@ -425,3 +425,31 @@ def test_kumo_options_smoke_train(tmp_path, monkeypatch, options):
         assert "cell_encoder.cat_frequencies" in state["model"]
     if "regression_head" in options:
         assert borders is not None  # 평가가 구간 확률로 바꿀 때 쓴다
+
+
+def test_test_time_methods_refuse_categorical_and_quantile_models():
+    from minipfn.inference.diag_scale import DiagScale
+    from minipfn.inference.ensemble_selection import GreedyEnsembleRegressor
+
+    borders = torch.linspace(-3, 3, 11)
+    quantile = ColumnRowTransformer(_config(regression_head="quantile"))
+    with pytest.raises(ValueError, match="greedy"):
+        GreedyEnsembleRegressor(quantile, borders, n_estimators=2)
+    with pytest.raises(ValueError, match="DiagScale"):
+        DiagScale(EnsembleRegressor(quantile, borders, n_estimators=2))
+    categorical = ColumnRowTransformer(_config(categorical_encoder=True))
+    with pytest.raises(ValueError, match="DiagScale"):
+        DiagScale(EnsembleClassifier(categorical, n_estimators=2))
+    # 분위수 출력 모델의 분류 쪽은 그대로 쓴다
+    DiagScale(EnsembleClassifier(quantile, n_estimators=2))
+
+
+def test_pad_features_pads_the_categorical_mask():
+    from minipfn.priors.pipeline import Group, Rng
+    from minipfn.priors.transforms.scaling import PadFeatures
+
+    mask = torch.tensor([[True, False], [False, True]])
+    group = Group(torch.randn(5, 2, 2), torch.randn(5, 2), 3, {}, mask)
+    out = PadFeatures(4, rescale=False)(group, Rng.from_seed(0))
+    assert out.x.shape == (5, 2, 4)
+    assert out.categorical.tolist() == [[True, False, False, False], [False, True, False, False]]

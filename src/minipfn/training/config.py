@@ -20,6 +20,7 @@ from minipfn.models import (
     model_class,
 )
 from minipfn.models.column_row_transformer import (
+    KUMO_OPTION_FIELDS,
     REGRESSION_HEADS,
     STAGE_LAYOUTS,
     TEMPERATURE_FIELDS,
@@ -54,12 +55,10 @@ OPTIMIZERS = ("adam", "muon")
 ATTENTION_TEMPERATURE_DEFAULTS = {"qk_norm_affine": True, **TEMPERATURE_FIELDS}
 # Kumo-Tabular의 나머지 부품 (issue #110, `ColumnRowTransformerConfig`)과 그 기본값 (지금 구조).
 # attention 온도처럼 구조 이름(`recipes.tabpfn_v3.ARCHITECTURES`)과 따로 켜는 설정이다
-KUMO_OPTION_DEFAULTS = {
-    "decoder_qk_norm": False,
-    "stage_layout": "sequential",
-    "regression_head": "bar",
-    "categorical_encoder": False,
-}
+KUMO_OPTION_DEFAULTS = dict(KUMO_OPTION_FIELDS)
+# 열·행 단계 블록 수·head 수 (`ColumnRowTransformerConfig`의 기본값과 같다, Kumo식 열·행 단계가
+# 바꾼다)
+STAGE_SIZE_DEFAULTS = {"column_blocks": 3, "row_blocks": 3, "column_heads": 8, "row_heads": 8}
 # step 구간별로 바꿀 수 있는 설정 (`TrainConfig.phases`)
 PHASE_KEYS = ("lr", "muon_weight_decay")
 # 분산 Muon의 범위 (issue #56, `muon_distributed`)
@@ -107,18 +106,18 @@ class TrainConfig:
     decoder_temperature: str = TEMPERATURE_FIELDS["decoder_temperature"]
     # 열·행 단계 블록 수와 head 수 (`ColumnRowTransformerConfig`의 같은 이름 필드, 기본값도 같다).
     # Kumo식 열·행 단계(issue #110, `recipes.kumo_tabular.STAGES`)가 바꾼다
-    column_blocks: int = 3
-    row_blocks: int = 3
-    column_heads: int = 8
-    row_heads: int = 8
+    column_blocks: int = STAGE_SIZE_DEFAULTS["column_blocks"]
+    row_blocks: int = STAGE_SIZE_DEFAULTS["row_blocks"]
+    column_heads: int = STAGE_SIZE_DEFAULTS["column_heads"]
+    row_heads: int = STAGE_SIZE_DEFAULTS["row_heads"]
     # Kumo-Tabular의 나머지 부품 (issue #110, `KUMO_OPTION_DEFAULTS`). 기본값이면 지금 구조
     # 그대로다:
     # decoder q·k RMSNorm(gain 없음), 열·행 단계를 번갈아 쌓기("interleaved"), 회귀 분위수
     # 출력("quantile", pinball 손실), 범주를 아는 셀 encoder(prior가 범주 열 표시를 넘긴다)
-    decoder_qk_norm: bool = False
-    stage_layout: str = "sequential"
-    regression_head: str = "bar"
-    categorical_encoder: bool = False
+    decoder_qk_norm: bool = KUMO_OPTION_FIELDS["decoder_qk_norm"]
+    stage_layout: str = KUMO_OPTION_FIELDS["stage_layout"]
+    regression_head: str = KUMO_OPTION_FIELDS["regression_head"]
+    categorical_encoder: bool = KUMO_OPTION_FIELDS["categorical_encoder"]
     target_norm: bool = False
     head_mlp: bool = False
     # prior / 표 크기 (논문 Methods, `minipfn.priors.table_size`). max_features는 모델 설정에도
@@ -339,11 +338,10 @@ class TrainConfig:
         if not self.qk_norm_affine and not self.qk_norm:
             raise ValueError("qk_norm_affine=False는 qk_norm=True일 때만 쓴다")
         fields_of_model = config_fields(self.model_type)
-        for name, default in KUMO_OPTION_DEFAULTS.items():
+        for name, default in {**KUMO_OPTION_DEFAULTS, **STAGE_SIZE_DEFAULTS}.items():
+            # 기본값이 아니면 그 필드가 있는 모델이어야 한다 (`model_config`에서 조용히 빠지지
+            # 않도록)
             if getattr(self, name) != default and name not in fields_of_model:
-                raise ValueError(f"{name}은 {self.model_type} 모델에 없다")
-        for name in ("column_blocks", "row_blocks", "column_heads", "row_heads"):
-            if getattr(self, name) != getattr(TrainConfig, name) and name not in fields_of_model:
                 raise ValueError(f"{name}은 {self.model_type} 모델에 없다")
         if self.stage_layout not in STAGE_LAYOUTS:
             raise ValueError(

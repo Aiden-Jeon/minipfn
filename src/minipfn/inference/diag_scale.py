@@ -62,6 +62,7 @@ from minipfn.inference.ensemble import (
     EnsembleClassifier,
     EnsembleRegressor,
     _Base,
+    check_basic_ensemble_only,
     forward_kwargs,
 )
 from minipfn.models.bar_distribution import FullSupportBarDistribution
@@ -278,6 +279,7 @@ class DiagScale:
     `adaptation_`이다."""
 
     def __init__(self, estimator: _Base, **kwargs: Any) -> None:
+        check_basic_ensemble_only(estimator.model, estimator.task, "DiagScale")
         self.estimator = estimator
         self.kwargs = kwargs
 

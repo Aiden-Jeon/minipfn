@@ -158,6 +158,14 @@ def quantile_regressor(model: nn.Module) -> bool:
     return getattr(getattr(model, "config", None), "regression_head", "bar") == "quantile"
 
 
+def check_basic_ensemble_only(model: nn.Module, task: str, method: str) -> None:
+    """범주 열 표시·회귀 분위수 출력 모델(issue #110)은 기본 앙상블(`EnsembleClassifier`·
+    `EnsembleRegressor`)만 맞췄다. `method`(greedy 선택, DiagScale 등)에 그런 모델을 주면 멈춘다
+    (DiagScale은 범주 표시 없이 모델을 부르고, greedy pool은 분위수를 구간 logit으로 읽는다)."""
+    if uses_categorical(model) or (task == "regression" and quantile_regressor(model)):
+        raise ValueError(f"{method}는 범주 표시·회귀 분위수 출력 모델을 받지 않는다 (issue #110)")
+
+
 def forward_kwargs(model: nn.Module, task: str) -> dict:
     """모델 forward에 줄 인자. task는 여러 task를 내는 모델(`model.tasks`, 예: TabPFN-3.5의
     multitask column_row_transformer)만 받고, 한 task 모델은 예전처럼 `model(x, y_train)`이다.

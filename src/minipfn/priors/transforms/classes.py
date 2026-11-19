@@ -110,7 +110,7 @@ class ToClasses:
     def __call__(self, group: Group, rng: Rng) -> Group:
         n_classes = group.hp["num_classes"]
         y = multiclass_rank(group.y, n_classes, self.ordered_p, rng.numpy, rng.torch)
-        return Group(group.x, y, group.n_train, group.hp)
+        return group.with_tensors(group.x, y)
 
 
 class MatchClasses:
@@ -118,14 +118,14 @@ class MatchClasses:
 
     def __call__(self, group: Group, rng: Rng) -> Group:
         x, y = make_compatible(group.x, group.y, group.n_train, rng.torch)
-        return Group(x, y, group.n_train, group.hp)
+        return group.with_tensors(x, y)
 
 
 class Relabel:
     """클래스 번호를 0..n-1로 다시 매기고 무작위로 회전한다 (`normalize_labels`)."""
 
     def __call__(self, group: Group, rng: Rng) -> Group:
-        return Group(group.x, normalize_labels(group.y, rng.torch), group.n_train, group.hp)
+        return group.with_tensors(group.x, normalize_labels(group.y, rng.torch))
 
 
 class CoverClasses:

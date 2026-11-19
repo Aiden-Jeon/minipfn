@@ -58,6 +58,9 @@ CORRECTED_FLAGS = (
     "use_corrected_cat_sizes",
     "use_corrected_cat_meta_sampling",
 )
+# `_call_with_categorical`이 그대로 옮긴 TabICL `GraphSCM.__call__`의 버전 (다른 버전이면 난수
+# 순서가 어긋날 수 있어 멈춘다)
+CATEGORICAL_TABICL_VERSION = "2.2."
 # `mixture_root_prob`로 고른 데이터셋의 군집 수 범위 (log 균등, 여기서 정함)
 MIXTURE_MIN_CENTERS = 2
 MIXTURE_MAX_CENTERS = 32
@@ -190,8 +193,17 @@ def _call_with_categorical(scm) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
     표시 (feature,) bool을 더 낸다 (모듈 docstring). 그 함수가 쓰는 TabICL 부품을 그대로 부른다.
     범주 열은 x_cat 쪽 열이고(TabICL이 범주 크기가 2 이상인 열을 x_cat으로 모은다), 열 섞기·0
     패딩을 표시에도 똑같이 한다."""
+    import importlib.metadata
+
     import torch.nn.functional as F
     from tabicl.prior._reg2cls import outlier_removing, standard_scaling
+
+    version = importlib.metadata.version("tabicl")
+    if not version.startswith(CATEGORICAL_TABICL_VERSION):
+        raise RuntimeError(
+            f"categorical_mask는 tabicl {CATEGORICAL_TABICL_VERSION}x의 GraphSCM을 옮긴 것이다"
+            f" (설치된 것 {version}): `_call_with_categorical`을 그 버전과 맞춘다"
+        )
     from tabicl.prior.graph_lib._base import Context, DatasetProperties
     from tabicl.prior.graph_lib._dataset import RandomDataset
     from tabicl.prior.graph_lib._properties import sample_categorical_sizes

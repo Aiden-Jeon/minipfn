@@ -123,6 +123,13 @@ ENCODERS = ("linear", "fourier")
 # 열·행 단계 블록 쌓는 순서, 회귀 출력 (모듈 docstring "Kumo-Tabular의 나머지 부품")
 STAGE_LAYOUTS = ("sequential", "interleaved")
 REGRESSION_HEADS = ("bar", "quantile")
+# 그 부품을 고르는 설정 필드와 기본값 (지금 구조). 학습 설정(`TrainConfig`)도 이 값을 쓴다
+KUMO_OPTION_FIELDS = {
+    "decoder_qk_norm": False,
+    "stage_layout": "sequential",
+    "regression_head": "bar",
+    "categorical_encoder": False,
+}
 # attention 온도 종류 (모듈 docstring "attention 온도"): q에 곱하는 배율
 TEMPERATURES = ("qassmax", "logscale", "gated_logscale", "none")
 # 단계마다 온도를 고르는 설정 필드와 그 기본값 (지금 구조)
@@ -217,10 +224,10 @@ class ColumnRowTransformerConfig:
     icl_temperature: str = TEMPERATURE_FIELDS["icl_temperature"]
     decoder_temperature: str = TEMPERATURE_FIELDS["decoder_temperature"]
     # Kumo-Tabular의 나머지 부품 (issue #110, 모듈 docstring). 기본값이면 지금 구조 그대로다
-    decoder_qk_norm: bool = False
-    stage_layout: str = "sequential"
-    regression_head: str = "bar"
-    categorical_encoder: bool = False
+    decoder_qk_norm: bool = KUMO_OPTION_FIELDS["decoder_qk_norm"]
+    stage_layout: str = KUMO_OPTION_FIELDS["stage_layout"]
+    regression_head: str = KUMO_OPTION_FIELDS["regression_head"]
+    categorical_encoder: bool = KUMO_OPTION_FIELDS["categorical_encoder"]
 
     INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features", "logit_softcap")
     # 첫 공개 뒤에 더한 필드: 기본값이면 checkpoint·config.json에 적지 않는다
@@ -228,10 +235,7 @@ class ColumnRowTransformerConfig:
         "logit_softcap",
         "qk_norm_affine",
         *TEMPERATURE_FIELDS,
-        "decoder_qk_norm",
-        "stage_layout",
-        "regression_head",
-        "categorical_encoder",
+        *KUMO_OPTION_FIELDS,
     )
 
     def __post_init__(self) -> None:
@@ -1041,6 +1045,10 @@ class ColumnRowTransformer(nn.Module):
     # 열 수
     inference_chunk_cells = 2048 * 768
     inference_column_chunk = 4
+    # `stage_layout="interleaved"`의 추론(`_rows_interleaved_chunked`)이 들고 가는 셀 상태
+    # (B, R, C, E)가 이보다 크면 CPU에 두고 묶음마다 장치로 옮긴다 (아주 큰 표에서 GPU 메모리를
+    # 묶는다)
+    interleaved_state_device_bytes = 16 << 30
     # forward가 추론용 인자(`inference`, `y_classes`·`n_classes`)를 받는다
     # (`minipfn.inference.ensemble.forward_kwargs`)
     supports_inference_options = True
@@ -1502,18 +1510,27 @@ class ColumnRowTransformer(nn.Module):
         (1) 열을 `inference_column_chunk`개씩 나눠 학습 행의 지금 상태로 요약을 구하고 (2) 행을
         `inference_chunk_cells / (B × C)`개씩 나눠 펼치기와 행 블록을 계산해 상태를 바꾼다. 요약은
         (2) 전에 다 구하므로 학습 행 상태가 바뀌기 전의 값이다. 셀 encoder도 행 묶음으로
-        계산한다."""
+        계산한다. 셀 상태가 `interleaved_state_device_bytes`보다 크면 CPU에 둔다."""
         cfg = self.config
         b, r, c = x.shape
         n_train = y_train.shape[1]
         embed, _ = self._chunk_embedder(x, y_train, task, categorical)
         step = max(1, self.inference_chunk_cells // (b * c))
+        device = x.device
         h = None
         for r0 in range(0, r, step):
             r1 = min(r0 + step, r)
             cells = embed(x[:, r0:r1], None, rows=(r0, r1))
             if h is None:
-                h = cells.new_empty(b, r, c, cells.shape[-1])
+                shape = (b, r, c, cells.shape[-1])
+                size = math.prod(shape) * cells.element_size()
+                offload = device.type == "cuda" and size > self.interleaved_state_device_bytes
+                h = torch.empty(
+                    shape,
+                    dtype=cells.dtype,
+                    device="cpu" if offload else device,
+                    pin_memory=offload,
+                )
             h[:, r0:r1] = cells
         e = h.shape[-1]
         cls = self.cls_tokens.to(h.dtype).expand(b, r, -1, -1).clone()  # (B, R, n_cls, E)
@@ -1523,7 +1540,8 @@ class ColumnRowTransformer(nn.Module):
             summary = None
             for c0 in range(0, c, self.inference_column_chunk):
                 c1 = min(c0 + self.inference_column_chunk, c)
-                ht = h[:, :n_train, c0:c1].permute(0, 2, 1, 3).reshape(b * (c1 - c0), n_train, e)
+                ht = h[:, :n_train, c0:c1].to(device).permute(0, 2, 1, 3)
+                ht = ht.reshape(b * (c1 - c0), n_train, e)
                 ind = column.summary(ht)
                 if summary is None:
                     summary = ind.new_empty(b, c, *ind.shape[1:])
@@ -1533,7 +1551,7 @@ class ColumnRowTransformer(nn.Module):
             for r0 in range(0, r, step):
                 r1 = min(r0 + step, r)
                 rj = r1 - r0
-                hc = h[:, r0:r1].permute(0, 2, 1, 3).reshape(b * c, rj, e)
+                hc = h[:, r0:r1].to(device).permute(0, 2, 1, 3).reshape(b * c, rj, e)
                 hc = column.spread(hc, summary)
                 hr = hc.view(b, c, rj, e).transpose(1, 2).reshape(b * rj, c, e)
                 part = cls[:, r0:r1].reshape(b * rj, cfg.n_cls, e)

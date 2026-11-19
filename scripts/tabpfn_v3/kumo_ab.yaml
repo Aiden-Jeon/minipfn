@@ -13,9 +13,9 @@ experiment_name: tabpfn-v3-reproduction
 mlflow_run_name: tabpfn-v3-5-kumo110-50k
 environment:
   version: databricks_ai_v6
-  # TabICL prior (uv.lock과 같은 범위)
+  # TabICL prior (uv.lock과 같은 버전. 범주 열 표시(arm C)는 이 버전의 GraphSCM을 옮긴 것이다)
   dependencies:
-    - tabicl>=2.2
+    - tabicl==2.2.0
 compute:
   accelerator_type: GPU_8xH100
   num_accelerators: 8
