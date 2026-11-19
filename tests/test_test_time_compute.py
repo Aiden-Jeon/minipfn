@@ -419,7 +419,7 @@ def test_arena_factory_passes_groups_only_for_task_out_of_fold(monkeypatch, tmp_
     script = _eval_script()
     monkeypatch.setattr(script, "load_model", lambda path, task, cache: (_tiny_model(), None))
     monkeypatch.setattr(script, "arena_suite", lambda name: None)
-    monkeypatch.setattr(script, "arena_limits", lambda models, args: {})
+    monkeypatch.setattr(script, "arena_limits", lambda models, args, caps=None: {})
     monkeypatch.setattr(script, "print_arena_summary", lambda summary: None)
     seen = {}
 

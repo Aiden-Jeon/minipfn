@@ -23,8 +23,8 @@
   냈으면 `--member-kinds`로 준다. 분류·회귀를 한 모델로 학습한 체크포인트(multitask)는 받지 않는다.
 - `tabpfn_v3`: TabPFN-3.5 multitask 체크포인트(분류·회귀가 같은 가중치, `column_row_transformer`).
   `--task` 없이 두 task를 함께 올린다: 회귀 구간 경계를 같은 `model.safetensors`에 두고, 두 task의
-  추론 설정이 같아야 `inference` 하나로 적는다(3.5는 standard 8개). soft-cap 등 모델 설정은
-  `config.json`의 `model`에 있다. `--member-kinds`는 `tabpfn_v2`와 같다.
+  추론 설정이 같아야 `inference` 하나로 적는다(3.5는 standard 8개, 멤버당 768열 balanced).
+  soft-cap 등 모델 설정은 `config.json`의 `model`에 있다. `--member-kinds`는 `tabpfn_v2`와 같다.
 
 체크포인트를 `model.safetensors` + `config.json`으로 바꾸고 모델 카드를 붙여 올린다. 모델 카드는
 `--model-card`로 주거나, 주지 않으면 repo 이름으로 `hub/<name>/README.md`를 찾는다. 카드가

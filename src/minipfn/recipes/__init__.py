@@ -64,7 +64,10 @@ def architecture_name(config: Any) -> str | None:
 
 
 def default_inference(model: Any, task: str) -> dict:
-    """모델의 추론 설정 `{"n_estimators", "member_kinds"}`. 모델 종류의 recipe가 정한다. 어느
+    """모델의 추론 설정 `{"n_estimators", "member_kinds"}`, TabPFN-3·3.5 recipe는 여기에
+    `"max_features_per_member"`·`"feature_subsampling"`(멤버당 열 상한, 3.5는 768·balanced)도
+    더한다.
+    모두 `EnsembleClassifier`·`EnsembleRegressor`의 인자다. 모델 종류의 recipe가 정한다. 어느
     recipe에도 없는 모델 종류(registry에 더한 모델)와 종류가 없는 모델은 v2의 것(`tabpfn_v2`)."""
     try:
         recipe = recipe_for_model_type(getattr(model, "model_type", None) or "")

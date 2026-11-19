@@ -544,7 +544,12 @@ def test_v3_inference_comes_from_its_recipe(tmp_path):
     )
     config = json.loads((out / "upload" / "config.json").read_text())
     assert config["model_type"] == "column_row_transformer"
-    assert config["inference"] == {"n_estimators": 8, "member_kinds": ["standard"]}
+    assert config["inference"] == {
+        "n_estimators": 8,
+        "member_kinds": ["standard"],
+        "max_features_per_member": 768,
+        "feature_subsampling": "balanced",
+    }
 
 
 def _multitask_checkpoint(tmp_path, task="multitask"):
@@ -586,7 +591,12 @@ def test_v3_dry_run_keeps_both_tasks_and_predicts_the_same(tmp_path):
     config = json.loads((upload / "config.json").read_text())
     assert config["task"] == "multitask" and config["model_type"] == "column_row_transformer"
     assert config["model"]["logit_softcap"] == 50.0
-    assert config["inference"] == {"n_estimators": 8, "member_kinds": ["standard"]}
+    assert config["inference"] == {
+        "n_estimators": 8,
+        "member_kinds": ["standard"],
+        "max_features_per_member": 768,
+        "feature_subsampling": "balanced",
+    }
 
     X, y = load_breast_cancer(return_X_y=True)
     a = TabPFNv3_5Classifier(model).fit(X[:60], y[:60]).predict_proba(X[60:80])

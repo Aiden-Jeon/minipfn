@@ -99,7 +99,7 @@ uv run python scripts/tabpfn_v2/eval.py \
 
 ### TabPFN-3.5
 
-TabPFN-3.5는 `TabPFNv3_5Classifier`·`TabPFNv3_5Regressor`로 씁니다. 두 클래스가 같은 repo의 같은 가중치를 받고, 분류는 분류 출력을, 회귀는 회귀 출력(구간 경계도 같은 파일에 있습니다)을 씁니다. 앙상블 설정(standard 멤버 8개)은 v2처럼 가중치의 `config.json`이 정합니다. 219M 모델이라 GPU(`device="cuda"`)를 권합니다.
+TabPFN-3.5는 `TabPFNv3_5Classifier`·`TabPFNv3_5Regressor`로 씁니다. 두 클래스가 같은 repo의 같은 가중치를 받고, 분류는 분류 출력을, 회귀는 회귀 출력(구간 경계도 같은 파일에 있습니다)을 씁니다. 앙상블 설정(standard 멤버 8개, 열이 768개 넘는 표는 멤버마다 768열을 고르게 나눠 넣기)은 v2처럼 가중치의 `config.json`이 정하고, 거기 없는 값은 recipe의 값을 씁니다. 다른 값을 쓰려면 `TabPFNv3_5Classifier(max_features_per_member=None)`(모든 열)처럼 인자로 줍니다. 219M 모델이라 GPU(`device="cuda"`)를 권합니다.
 
 ```python
 from minipfn import TabPFNv3_5Classifier, TabPFNv3_5Regressor, from_pretrained

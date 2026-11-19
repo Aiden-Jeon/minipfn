@@ -32,7 +32,8 @@ coverage gap이다. 데이터셋별 표는 `eval_uncertainty_per_dataset.csv`, s
 
 앙상블 멤버 수와 전처리는 기본으로 모델이 정한다(`minipfn.recipes.default_inference`: 모델 종류의
 recipe가 정한다. Hub config.json의 `inference`가 먼저이고, 없으면 v2·2.5 모델은 구조가 2.5면 v2.5,
-아니면 v2. TabPFN-3·3.5 모델은 3이면 quantile,robust, 3.5면 standard 멤버 8개).
+아니면 v2. TabPFN-3·3.5 모델은 3이면 quantile,robust, 3.5면 standard 멤버 8개와 멤버당 768열
+balanced).
 `--member-kinds`로 주면 멤버 종류만 그 값을 쓴다(v2의 quantile,power, `v2.5`는 TabPFN-2.5의 robust
 scaling + soft clipping을 쓰는 quantile,robust). 멤버 수는 `--n-estimators`로 따로 준다.
 TabPFN-2.5 checkpoint를 로컬에서 `--mlflow`로 평가하면
@@ -58,6 +59,10 @@ split 전체에 한 번 fit하고, `--bagging 8`은 TabArena처럼 8-fold로 나
 seed만 바꿔 다시 평가하면 benchmark 점수의 노이즈를 잴 수 있다(issue #67). arena 결과 cache는
 seed마다 따로다.
 
+TabPFN-3.5 모델은 `--max-features-per-member`를 주지 않으면 모델의 추론 설정(recipe
+`default_inference`)대로 멤버마다 768열을 balanced로 고른다(issue #99, `model_feature_cap`. 분류·
+회귀 모델마다 따로 정한다. test-time 방법에서는 예전처럼 모든 열). `--max-features-per-member 0`은
+상한을 끈다(모든 열, 예전 기본값. arena의 feature 수 상한도 모델 구조의 값 그대로).
 `--max-features-per-member 6000`은 feature가 6,000개보다 많은 표에서 앙상블 멤버마다 6,000개를
 무작위로 골라 넣는다(공식 TabPFN의 `max_features_per_estimator`). 주면 TabArena·BeyondArena의
 feature 수 상한을 없애서, 권장 크기보다 넓은 split(BeyondArena의 6,772~22,215개)도
@@ -347,8 +352,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-features-per-member",
         type=int,
         default=None,
-        help="feature가 이보다 많으면 앙상블 멤버마다 이만큼만 무작위로 고른다(공식 TabPFN의"
-        " max_features_per_estimator). 주면 TabArena·BeyondArena의 feature 수 상한은 없앤다"
+        help="feature가 이보다 많으면 앙상블 멤버마다 이만큼만 고른다(공식 TabPFN의"
+        " max_features_per_estimator). 기본: 모델이 정한다(TabPFN-3.5는 768, 그 밖은 끔)."
+        " 0이면 끈다(모든 열). 상한이 있으면 TabArena·BeyondArena의 feature 수 상한은 없앤다"
         "(--max-features로 다시 둘 수 있다)",
     )
     # 공식 TabPFN-3.5 추론 설정에 맞추는 옵션 (docstring). 주지 않으면 None → 기본값
@@ -448,6 +454,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.min_improvement = MIN_IMPROVEMENT
     if args.oof_split is None:
         args.oof_split = "task"
+    # 모델의 기본 멤버당 열 상한(`model_feature_cap`)이 따로 준 나누기 방법을 덮지 않도록
+    args.feature_subsampling_given = args.feature_subsampling is not None or args.official_v35
+    if args.max_features_per_member is not None and args.max_features_per_member < 0:
+        parser.error("--max-features-per-member는 0(끔) 이상이어야 한다.")
     resolve_inference_options(args)
     if inference_option_params(args) and args.test_time != "none":
         # greedy pool·DiagScale의 view는 이 옵션을 넘기지 않는다
@@ -652,8 +662,9 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
             "member_kinds": member_kinds,
             "device": args.device,
             "random_state": args.seed,
-            "max_features_per_member": args.max_features_per_member,
+            "max_features_per_member": make.max_features_per_member,
             **estimator_options(args, suite),
+            "feature_subsampling": make.feature_subsampling,
         }
         if "greedy" in args.test_time:
             # 기본 앙상블(후보 0번, pool 앞 멤버)의 멤버 수는 n_estimators
@@ -707,8 +718,44 @@ def make_estimator_factory(suite: str, args: argparse.Namespace):
     make.max_one_hot_width = max_features_of(model)  # expands_one_hot이 같은 상한을 쓰도록
     make.member_kinds = member_kinds
     make.n_estimators = n_estimators
+    # 이 task의 멤버당 열 상한과 나누기 방법 (`model_feature_cap`. TabPFN-3.5는 768·balanced)
+    make.max_features_per_member, make.feature_subsampling = model_feature_cap(args, inference)
     make.model, make.borders = model, borders  # TabArena·BeyondArena의 크기 상한(arena_limits)
     return make
+
+
+def model_feature_cap(args: argparse.Namespace, inference: dict) -> tuple[int | None, str]:
+    """한 task의 (멤버당 열 상한, 나누기 방법). `--max-features-per-member`를 주면 그것(0은 끔:
+    모든 열)이고, 주지 않으면 모델의 추론 설정(recipe의 `default_inference`, TabPFN-3.5는
+    768·balanced)이다.
+    나누기 방법은 `--feature-subsampling`을 따로 줬으면 그것이다. 분류·회귀 모델마다 따로 정하므로
+    v3.5와 다른 모델을 같이 평가해도 각자의 값을 쓴다. test-time 방법(greedy·DiagScale)은 멤버
+    view가 나누기 방법을 넘기지 않으므로 모델 값을 쓰지 않는다(예전처럼 모든 열)."""
+    cap, subsampling = args.max_features_per_member, args.feature_subsampling
+    if cap == 0:
+        return None, subsampling
+    if cap is not None or args.test_time != "none":
+        return cap, subsampling
+    model_cap = inference.get("max_features_per_member")
+    if model_cap is None:
+        return None, subsampling
+    if not getattr(args, "feature_subsampling_given", False):
+        subsampling = inference.get("feature_subsampling", "random")
+    return model_cap, subsampling
+
+
+def feature_caps(args: argparse.Namespace, factories: dict) -> dict:
+    """task마다 쓰는 멤버당 열 상한 (`model_feature_cap`. factory가 아닌 것은 `args`의 값)."""
+    return {
+        task: getattr(f, "max_features_per_member", args.max_features_per_member or None)
+        for task, f in factories.items()
+    }
+
+
+def _one_or_by_task(values: dict):
+    # task마다 같으면 값 하나, 다르면 task별 dict (fingerprint·MLflow param)
+    distinct = set(values.values())
+    return distinct.pop() if len(distinct) == 1 else dict(sorted(values.items()))
 
 
 def record_fits(estimator, path: Path, **fields) -> None:
@@ -829,11 +876,12 @@ def arena_suite(name: str):
     return beyondarena.suite("lite" if name == "beyondarena-lite" else "core2k")
 
 
-def arena_limits(models: dict, args: argparse.Namespace) -> dict:
+def arena_limits(models: dict, args: argparse.Namespace, caps: dict | None = None) -> dict:
     """문제 종류마다 돌릴 split의 상한. 체크포인트가 없는 쪽(분류·회귀)은 빠진다(imputed).
     크기는 모델 구조의 논문 권장값(`minipfn.recipes.supported_size`: recipe의 `SUPPORTED_SIZE`,
     모르는 구조는 그 recipe의 첫 구조), 클래스 수는 모델이 받는 수(`max_classes_of`: 출력 수,
-    column_row_transformer는 정답 embedding을 묶어 `MAX_CLASSES`개까지)."""
+    column_row_transformer는 정답 embedding을 묶어 `MAX_CLASSES`개까지). 멤버당 열 상한(`caps`:
+    task마다, 주지 않으면 `--max-features-per-member`)이 있는 task는 feature 수 상한이 없다."""
     from minipfn.benchmarks.arena import ModelLimits
 
     limits = {}
@@ -843,7 +891,7 @@ def arena_limits(models: dict, args: argparse.Namespace) -> dict:
             size["max_train_rows"] = args.max_train_rows
         if args.max_features is not None:
             size["max_features"] = args.max_features
-        elif getattr(args, "max_features_per_member", None) is not None:
+        elif (caps or {}).get(task, getattr(args, "max_features_per_member", None) or None):
             size["max_features"] = None  # 멤버마다 feature를 골라 넣으므로 상한이 없다
         if task == "classification":
             lim = ModelLimits(**size, max_classes=max_classes_of(model))
@@ -863,6 +911,11 @@ def arena_fingerprint(
     inference = any(
         getattr(f.model, "supports_inference_options", False) for f in factories.values()
     )
+    caps = feature_caps(args, factories)
+    subsampling = {
+        t: getattr(f, "feature_subsampling", args.feature_subsampling) for t, f in factories.items()
+    }
+    subsampling_changed = any(v != args.feature_subsampling for v in subsampling.values())
     return json.dumps(
         {
             "paths": {t: paths[t] for t in factories},
@@ -875,14 +928,18 @@ def arena_fingerprint(
             # seed 0(기본)도 예전 fingerprint 그대로
             **({"seed": args.seed} if args.seed else {}),
             **({"inference": "chunked"} if inference else {}),
-            # 주지 않으면(기본) 예전 fingerprint 그대로
+            # 상한이 없으면(모든 열) 예전 fingerprint 그대로. task마다 다르면 task별로
             **(
-                {"max_features_per_member": args.max_features_per_member}
-                if args.max_features_per_member is not None
+                {"max_features_per_member": _one_or_by_task(caps)}
+                if any(v is not None for v in caps.values())
                 else {}
             ),
             # 공식 3.5 추론 옵션: 기본값과 다른 것만 (모두 기본이면 예전 fingerprint 그대로)
             **inference_option_params(args),
+            # 모델이 정한 나누기 방법 (`model_feature_cap`): 예전과 다를 때만
+            **(
+                {"feature_subsampling": _one_or_by_task(subsampling)} if subsampling_changed else {}
+            ),
             **({"drop_group_columns": True} if getattr(args, "drop_group_columns", False) else {}),
             # 주지 않으면(기본) 예전 fingerprint 그대로
             **(
@@ -992,7 +1049,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
     fingerprint = arena_fingerprint(args, paths, factories, kinds, one_hot)
     models = {task: (f.model, f.borders) for task, f in factories.items()}
     datasets = None if args.datasets is None else args.datasets.split(",")
-    limits = arena_limits(models, args)
+    limits = arena_limits(models, args, feature_caps(args, factories))
+    args.feature_caps_logged = _one_or_by_task(feature_caps(args, factories))
     common = dict(
         limits=limits, method=args.method_name, bagging=args.bagging, fingerprint=fingerprint
     )
@@ -1333,7 +1391,9 @@ def log_arena_mlflow(args, summary: dict, out_dir: Path, kinds: dict, one_hot: s
             "run_id_cache": summary["run_id"],
             "one_hot": one_hot,
             "seed": args.seed,
-            "max_features_per_member": args.max_features_per_member,
+            "max_features_per_member": getattr(
+                args, "feature_caps_logged", args.max_features_per_member
+            ),
             **test_time_params(args),
             **distill_params(args),
             **{f"member_kinds_{t}": ",".join(k) for t, k in kinds.items()},
@@ -1442,6 +1502,8 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         f"one-hot: {','.join(args.one_hot)} (결과: {headline})",
         flush=True,
     )
+    # 모델을 먼저 읽는다: 멤버당 열 상한의 기본값을 모델이 정한다 (`model_feature_cap`)
+    factories = {suite: make_estimator_factory(suite, args) for suite in {s for s, _ in tasks}}
 
     if use_mlflow:
         mlflow.log_params(
@@ -1451,7 +1513,7 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
                 "one_hot": headline,
                 "one_hot_modes": ",".join(args.one_hot),
                 "seed": args.seed,
-                "max_features_per_member": args.max_features_per_member,
+                "max_features_per_member": _one_or_by_task(feature_caps(args, factories)),
                 "subsample_train_rows": args.subsample_train_rows,
                 **test_time_params(args),
                 **distill_params(args),
@@ -1461,7 +1523,6 @@ def run_amlb(args: argparse.Namespace, out_dir: Path, tasks: list, use_mlflow: b
         paths = {"classifier_path": args.classifier_path, "regressor_path": args.regressor_path}
         mlflow.log_params({k: v for k, v in paths.items() if v is not None})
 
-    factories = {suite: make_estimator_factory(suite, args) for suite in {s for s, _ in tasks}}
     kinds = {suite: ",".join(make.member_kinds) for suite, make in sorted(factories.items())}
     print("member kinds:", kinds, flush=True)
     if use_mlflow:

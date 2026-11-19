@@ -301,12 +301,18 @@ def _inference_kwargs(model: nn.Module, task: str, n_estimators, member_kinds) -
     # (`minipfn.recipes.default_inference`: TabPFN-3.5 모델이면 `tabpfn_v3`의 것, 어느 recipe에도
     # 없는 모델 종류는 v2의 것)
     defaults = recipe_inference(model, task)
-    return {
+    out = {
         "n_estimators": defaults["n_estimators"] if n_estimators is None else n_estimators,
         "member_kinds": defaults["member_kinds"]
         if member_kinds is None
         else resolve_member_kinds(member_kinds),
     }
+    # 멤버당 열 상한(TabPFN-3.5 recipe만 정한다): 그 키가 있을 때만 넘긴다. 인자로 주면 그것이
+    # 먼저다
+    for key in ("max_features_per_member", "feature_subsampling"):
+        if key in defaults:
+            out[key] = defaults[key]
+    return out
 
 
 # 공개 가중치 (`TabPFNv2Classifier()`·`TabPFNv2Regressor()`의 기본값)
@@ -355,7 +361,7 @@ class TabPFNv2Classifier(EnsembleClassifier):
     ) -> None:
         model, _ = _load(model, "classification", self.hub_repos)
         inference = _inference_kwargs(model, "classification", n_estimators, member_kinds)
-        super().__init__(model, **inference, **kwargs)
+        super().__init__(model, **{**inference, **kwargs})
 
 
 class TabPFNv2Regressor(EnsembleRegressor):
@@ -386,7 +392,7 @@ class TabPFNv2Regressor(EnsembleRegressor):
                 raise ValueError("borders는 모델을 직접 줄 때만 준다 (받는 가중치에 경계가 있다)")
             model, borders = _load(model, "regression", self.hub_repos)
         inference = _inference_kwargs(model, "regression", n_estimators, member_kinds)
-        super().__init__(model, borders, **inference, **kwargs)
+        super().__init__(model, borders, **{**inference, **kwargs})
 
 
 class TabPFNv2_5Classifier(TabPFNv2Classifier):
