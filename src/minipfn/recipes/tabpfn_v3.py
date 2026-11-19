@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 from torch import nn
 
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
-from minipfn.recipes import resolve_member_kinds
+from minipfn.recipes import kumo_tabular, resolve_member_kinds
 from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
 
 if TYPE_CHECKING:
@@ -330,6 +330,28 @@ STAGE4_STEPS = (500, 1_000)
 STAGE4_DEFAULT_STEPS = CURRICULUM[4]["steps"]
 # warmup은 단계 길이의 1% (스크립트 `--warmup_proportion 0.01`)
 CURRICULUM_WARMUP = 0.01
+# Kumo-Tabular 부품을 얹은 curriculum (`kumo_curriculum`, stage 1~3). 시험 학습(8×H100 batch 64,
+# stage 1 처음부터 50k)에서 고른 것만 넣는다:
+# - attention 온도를 Kumo 식으로, soft-cap 없음, stage 1 lr을 TabICLv2 스크립트 값 8e-4로 (issue
+#   #102: 지금 구조는 soft-cap 없이 lr 8e-4면 80k부터 ICL 0층이 폭주했고, Kumo 식은 100k까지 온도가
+#   줄었다. TabArena-Lite d −0.013)
+# - Kumo식 열·행 단계 (`kumo_tabular.STAGES`)와 회귀 분위수 출력 (`kumo_tabular.QUANTILE_HEAD`,
+#   issue #110: 둘 다 BeyondArena 작은 표 d −0.006으로 노이즈 밖, TabArena-Lite는 노이즈 안)
+# - decoder q·k norm(효과 없음)·범주를 아는 셀 encoder(나빠짐)는 넣지 않았다 (issue #110)
+# stage 2·3 lr은 스크립트 값 1e-4 / 2e-5 (stage 1과 같은 비율, 여기서 정함. 이 두 단계는 시험하지
+# 않았다). stage 1 micro batch는 4: 열·행 단계가 넓어 GPU당 표 8개(stage 1 1,024행 × 100열)는
+# H100 80 GB를 넘었다(issue #110). stage 2·3은 원래 1이다
+KUMO_CURRICULUM = {
+    **kumo_tabular.ATTENTION_TEMPERATURE,
+    **kumo_tabular.STAGES,
+    **kumo_tabular.QUANTILE_HEAD,
+    "logit_softcap": None,
+}
+KUMO_CURRICULUM_STAGES = {
+    1: {"lr": 8e-4, "micro_batch": 4},
+    2: {"lr": 1e-4},
+    3: {"lr": 2e-5},
+}
 
 
 def curriculum(
@@ -356,6 +378,20 @@ def curriculum(
     changes.setdefault("max_cells", changes["max_rows"] * changes["max_features"])
     changes["warmup_steps"] = int(CURRICULUM_WARMUP * changes["steps"])
     return replace(paper(task, arch), **changes)
+
+
+def kumo_curriculum(
+    stage: int, task: str = "multitask", arch: str = "v3.5", steps: int | None = None
+) -> TrainConfig:
+    """`curriculum`의 stage 1~3에 Kumo-Tabular 부품을 얹은 설정 (`KUMO_CURRICULUM`): Kumo 식
+    attention 온도, soft-cap 없음, Kumo식 열·행 단계, 회귀 분위수 출력, 단계별 lr
+    (`KUMO_CURRICULUM_STAGES`). 표 크기·optimizer·step 수는 `curriculum` 그대로다."""
+    if stage not in KUMO_CURRICULUM_STAGES:
+        raise ValueError(
+            f"kumo curriculum stage는 {tuple(KUMO_CURRICULUM_STAGES)} 가운데 하나다: {stage}"
+        )
+    base = curriculum(stage, task, arch, steps)
+    return replace(base, **KUMO_CURRICULUM, **KUMO_CURRICULUM_STAGES[stage])
 
 
 # ---------------------------------------------------------------------------

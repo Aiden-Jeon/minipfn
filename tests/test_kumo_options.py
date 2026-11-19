@@ -453,3 +453,45 @@ def test_pad_features_pads_the_categorical_mask():
     out = PadFeatures(4, rescale=False)(group, Rng.from_seed(0))
     assert out.x.shape == (5, 2, 4)
     assert out.categorical.tolist() == [[True, False, False, False], [False, True, False, False]]
+
+
+def test_kumo_curriculum_presets():
+    one = tabpfn_v3.kumo_curriculum(1)
+    expected = replace(
+        tabpfn_v3.curriculum(1),
+        logit_softcap=None,
+        lr=8e-4,
+        micro_batch=4,
+        **KUMO,
+        **kumo_tabular.STAGES,
+        **kumo_tabular.QUANTILE_HEAD,
+    )
+    assert one == expected
+    assert tabpfn_v3.architecture_name(one) == "v3.5"
+    assert not one.decoder_qk_norm and not one.categorical_encoder  # 효과 없거나 나빠진 부품은 뺀다
+    two, three = tabpfn_v3.kumo_curriculum(2), tabpfn_v3.kumo_curriculum(3)
+    assert (two.lr, three.lr) == (1e-4, 2e-5)
+    assert two.max_rows == tabpfn_v3.curriculum(2).max_rows and two.micro_batch == 1
+    assert three.activation_checkpointing_rows == 10_240 and three.logit_softcap is None
+    assert tabpfn_v3.kumo_curriculum(1, steps=1000).warmup_steps == 10
+    with pytest.raises(ValueError, match="kumo curriculum"):
+        tabpfn_v3.kumo_curriculum(4)
+
+
+def test_train_script_kumo_curriculum(monkeypatch):
+    for name in ("TABPFN_V2_CONFIG_NAME", "TABPFN_V2_LOGIT_SOFTCAP", "TABPFN_V2_KUMO_OPTIONS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("TABPFN_V2_ATTENTION_TEMPERATURE", raising=False)
+    monkeypatch.delenv("TABPFN_V2_LR", raising=False)
+    monkeypatch.delenv("TABPFN_V2_MICRO_BATCH", raising=False)
+    script = _script("train_script_kumo_curriculum")
+    common = ["--arch", "v3.5", "--task", "multitask"]
+    config, arch = script.build_config(script.parse_args(["--config-name", "stage1_kumo", *common]))
+    assert arch == "v3.5" and config == tabpfn_v3.kumo_curriculum(1)
+    # stage 2·3은 앞 단계 run의 가중치를 가져온다
+    with pytest.raises(SystemExit):
+        script.parse_args(["--config-name", "stage2_kumo", *common])
+    source = run_architecture({k: str(v) for k, v in vars(config).items()})
+    args = script.parse_args(["--config-name", "stage2_kumo", *common, "--init-run-id", "x"])
+    two, _ = script.build_config(args, source)
+    assert two == tabpfn_v3.kumo_curriculum(2)
