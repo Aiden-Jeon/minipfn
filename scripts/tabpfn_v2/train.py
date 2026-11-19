@@ -65,6 +65,9 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 stage 4는 표 크기를 GPU끼리 나눠 받는다(`--balance-tables on|off`, `TABPFN_V2_BALANCE_TABLES`, 주지
 않으면 preset 값이고 이어 학습하면 원래 run의 값이다).
 stage2~4는 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
+`--config-name stage1_kumo|stage2_kumo|stage3_kumo`는 그 stage 1~3에 Kumo-Tabular 부품을 얹은
+것이다(`recipes.tabpfn_v3.kumo_curriculum`, issue #102·#110: Kumo 식 온도, soft-cap 없음, 열·행
+단계, 회귀 분위수 출력, lr 8e-4 / 1e-4 / 2e-5, stage 1 micro batch 4).
 `--kumo-options`(`TABPFN_V2_KUMO_OPTIONS`, 쉼표로 여럿, issue #110)는 Kumo-Tabular 부품 묶음을 켠다
 (`recipes.kumo_tabular.OPTIONS`: decoder_qk_norm, stages, quantile_head, categorical_encoder).
 attention 온도처럼 구조 이름과 따로 켜는 설정이고, 이어 학습·가중치 가져오기에서는 원래 run의
@@ -123,9 +126,18 @@ PRESETS = {
     # TabICLv2 3단계 학습을 옮긴 것과 긴 표 stage 4 (`recipes.tabpfn_v3.curriculum`, --arch v3.5
     # --task multitask). stage2~4는 앞 단계 run에서 가중치를 가져온다(--init-run-id)
     **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
+    # 그 stage 1~3에 Kumo-Tabular 부품(Kumo 식 온도, soft-cap 없음, 열·행 단계, 회귀 분위수 출력)을
+    # 얹은 것 (`recipes.tabpfn_v3.kumo_curriculum`, issue #102·#110)
+    **{
+        f"stage{n}_kumo": partial(tabpfn_v3.kumo_curriculum, n)
+        for n in tabpfn_v3.KUMO_CURRICULUM_STAGES
+    },
 }
 CONFIG_NAMES = tuple(PRESETS)
-CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
+CURRICULUM_NAMES = {
+    **{f"stage{n}": n for n in tabpfn_v3.CURRICULUM},
+    **{f"stage{n}_kumo": n for n in tabpfn_v3.KUMO_CURRICULUM_STAGES},
+}
 TUNED_LONG_NAMES = {f"tuned_stage{n}" for n in recipe.TUNED_LONG}
 # attention 온도 묶음 (`--attention-temperature`, issue #102). 구조 이름(`--arch`)과 따로 켠다
 TEMPERATURE_PRESETS = {"kumo": kumo_tabular.ATTENTION_TEMPERATURE}
