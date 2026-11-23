@@ -153,6 +153,11 @@ SOFTCAP_CHUNK_LOGITS = 1 << 28
 # flex attention kernel의 grid 둘째 축이 batch라 CUDA 상한(65,535)을 넘으면 batch를 나눠 부른다
 # (추론에서 행 단계의 batch = 행 수가 이보다 클 수 있다)
 FLEX_MAX_BATCH = 65_535
+# soft-cap 없는 attention(`F.scaled_dot_product_attention`)의 CUDA kernel(flash 등)도 grid 한 축이
+# batch라 같은 상한을 넘으면 invalid argument로 실패한다(stage2_kumo 검증: 표 8개 × 10,240행 =
+# 행 단계 batch 81,920). 넘으면 batch를 나눠 부른다(batch마다 따로라 결과는 같다). 학습 batch는
+# 이보다 작아 학습 계산은 그대로다
+SDPA_MAX_BATCH = FLEX_MAX_BATCH
 # flex attention kernel을 쓰는 가장 작은 head 폭 (Triton 행렬곱의 최소 폭). 더 좁으면(작은 smoke
 # 모델) logit을 직접 만든다
 FLEX_MIN_HEAD_DIM = 16
@@ -574,7 +579,7 @@ class Attention(nn.Module):
         학습에서 층마다 (B, H, Lq, Lk) logit을 backward용으로 들고 있으면 stage 2·3의 큰 표에서
         OOM이다). 그 밖(CPU·MPS: flex attention의 backward가 없다)에서는 logit을 직접 만든다."""
         if self.logit_softcap is None:
-            return F.scaled_dot_product_attention(q, k, v)
+            return _batched_sdpa(q, k, v)
         if (
             SOFTCAP_KERNEL == "flex"
             and q.is_cuda
@@ -718,6 +723,21 @@ def _flex_batches(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, score_mod) 
         for i in range(0, q.shape[0], max_batch)
     ]
     return torch.cat(parts)
+
+
+def _batched_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """soft-cap 없는 scaled dot-product attention. batch가 `SDPA_MAX_BATCH`보다 크면 그 크기로
+    나눠 부른다(CUDA kernel grid 상한)."""
+    n = q.shape[0]
+    if n <= SDPA_MAX_BATCH:
+        return F.scaled_dot_product_attention(q, k, v)
+    step = SDPA_MAX_BATCH
+    return torch.cat(
+        [
+            F.scaled_dot_product_attention(q[i : i + step], k[i : i + step], v[i : i + step])
+            for i in range(0, n, step)
+        ]
+    )
 
 
 def _call(block: nn.Module, ckpt: bool, *args, **kwargs) -> torch.Tensor:
