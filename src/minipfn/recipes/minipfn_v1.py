@@ -60,7 +60,8 @@ STAGE_WIDTH_FIELDS = ("emsize", "n_cls", "n_inducing")
 ICL_FIELDS = {k: v for k, v in _V3_5.items() if k not in STAGE_WIDTH_FIELDS}
 ICL_WIDTH = _V3_5["n_cls"] * _V3_5["emsize"]
 # smoke(`keep_size`): 층 수·폭·head는 smoke 설정 그대로, inducing point는 8개, 열·행 블록은 2쌍.
-# 판정에서는 층 수·head·행 ICL 폭을 보지 않고 inducing point 수로 smoke를 알아본다
+# 판정에서는 inducing point 8개이고 행 ICL 층 수·head가 줄어든 것을 smoke로 알아보고, 그때는 층
+# 수·head·행 ICL 폭을 보지 않는다(이 smoke 규칙은 여기서 정함. 위 규칙과 따로다)
 SMOKE_MAX_INDUCING = tabpfn_v3.SMOKE_MAX_INDUCING
 SMOKE_STAGE_BLOCKS = 2
 SMOKE_FREE_FIELDS = ("nlayers", "nhead")
@@ -105,8 +106,13 @@ def architecture_name(config) -> str | None:
     if all(getattr(config, k) == v for k, v in ICL_FIELDS.items()):
         if config.n_cls * config.emsize == ICL_WIDTH:
             return NAME
-    if config.n_inducing == SMOKE_MAX_INDUCING and all(
-        getattr(config, k) == v for k, v in ICL_FIELDS.items() if k not in SMOKE_FREE_FIELDS
+    reduced = any(getattr(config, k) != ICL_FIELDS[k] for k in SMOKE_FREE_FIELDS)
+    if (
+        reduced
+        and config.n_inducing == SMOKE_MAX_INDUCING
+        and all(
+            getattr(config, k) == v for k, v in ICL_FIELDS.items() if k not in SMOKE_FREE_FIELDS
+        )
     ):
         return NAME
     return None

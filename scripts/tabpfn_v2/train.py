@@ -486,6 +486,12 @@ def build_config(
                 raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
             return tabpfn_v3.paper(args.task, arch)  # multitask의 학습 설정도 이 recipe가 정한다
+        if args.config_name == "paper" and arch == minipfn_v1.NAME:
+            # 학습 설정은 v3.5 paper(multitask 붕괴 규칙 포함), 구조만 minipfn-v1
+            try:
+                return minipfn_v1.with_architecture(tabpfn_v3.paper(args.task, "v3.5"), arch)
+            except ValueError as e:
+                raise SystemExit(str(e)) from None
         return recipes.recipe_for_architecture(arch).with_architecture(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
@@ -497,6 +503,18 @@ def build_config(
         config = _overrides(preset(arch), args)
         return config, _run_arch(config, arch)
     arch = given or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
+    if (
+        given is None
+        and arch == minipfn_v1.NAME
+        and args.config_name in CURRICULUM_NAMES
+        and args.config_name not in PRESET_ARCHITECTURES
+    ):
+        # v3.5 curriculum을 minipfn-v1 run에서 이어 가려는 것. 예전(이름을 붙이기 전)처럼 하려면
+        # --arch v3.5를 준다
+        raise SystemExit(
+            f"원래 run은 {minipfn_v1.NAME} 구조다. minipfn_v1_stage* preset을 쓰거나,"
+            f" v3.5 curriculum({args.config_name})에 그 구조를 얹으려면 --arch v3.5를 준다"
+        )
     # 원래 run이 긴 표 학습을 하지 않는 구조(TabPFN-3·3.5 등)여도 run을 열기 전에 멈춘다
     if args.config_name == "long_tables" and arch not in recipe.LONG_TABLES_MICRO_BATCH:
         raise SystemExit(
@@ -518,6 +536,19 @@ def build_config(
         if differ:
             raise SystemExit(
                 f"--arch {given}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
+            )
+    if args.config_name in PRESET_ARCHITECTURES:
+        # 구조가 정해진 preset은 원래 run도 그 구조여야 한다. 위 비교는 온도·Kumo 부품을 빼고 보므로
+        # (예: 열·행 단계만 켠 #110 A/B run) 여기서 그 값까지 본다. 원래 run의 값으로 덮어쓰면
+        # 분위수 출력이나 온도가 없는 모델이 minipfn-v1 이름으로 학습된다
+        differ = {
+            k: (getattr(base, k), source[k])
+            for k in minipfn_v1.STRUCTURE
+            if k in source and getattr(base, k) != source[k]
+        }
+        if differ:
+            raise SystemExit(
+                f"원래 run이 {minipfn_v1.NAME} 구조가 아니다 (preset 값, run 값): {differ}"
             )
     source_phases = (speed_options or {}).get("phases")
     if source_phases and base.phases and source_phases != base.phases:

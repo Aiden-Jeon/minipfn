@@ -656,6 +656,36 @@ def test_train_script_kumo_aliases(monkeypatch):
         script.build_config(wrong)
 
 
+def test_train_script_minipfn_v1_guards(monkeypatch):
+    _clear_train_env(monkeypatch)
+    script = _script("train_script_minipfn_v1_guards")
+    task = ["--task", "multitask"]
+    # 열·행 단계만 켠 run(#110 A/B, 분위수 출력·Kumo 온도 없음)은 minipfn-v1 단계로 잇지 않는다
+    stages_only = replace(tabpfn_v3.curriculum(1), **kumo_tabular.STAGES)
+    source = run_architecture({k: str(v) for k, v in vars(stages_only).items()})
+    args = script.parse_args(["--config-name", "minipfn_v1_stage2", *task, "--init-run-id", "x"])
+    with pytest.raises(SystemExit, match="minipfn-v1 구조가 아니다"):
+        script.build_config(args, source)
+    # v3.5 curriculum을 minipfn-v1 run에서 --arch 없이 이으면 어떻게 하는지 알려 주고 멈춘다
+    kumo = run_architecture({k: str(v) for k, v in vars(minipfn_v1.curriculum(1)).items()})
+    args = script.parse_args(["--config-name", "stage2", *task, "--init-run-id", "x"])
+    with pytest.raises(SystemExit, match="--arch v3.5"):
+        script.build_config(args, kumo)
+    # paper 규모는 v3.5 paper의 학습 설정(multitask 붕괴 규칙) 위에 구조만 minipfn-v1
+    args = script.parse_args(["--config-name", "paper", *task, "--arch", "minipfn-v1"])
+    config, arch = script.build_config(args)
+    assert arch == "minipfn-v1"
+    assert config == minipfn_v1.with_architecture(tabpfn_v3.paper("multitask", "v3.5"))
+    assert config.rewind_lr_factor == tabpfn_v3.paper("multitask", "v3.5").rewind_lr_factor
+
+
+def test_minipfn_v1_smoke_rule_needs_a_reduced_model():
+    # inducing 8개여도 행 ICL 층 수·head가 그대로면 smoke가 아니어서 행 ICL 폭을 본다
+    full = replace(minipfn_v1.curriculum(1), n_inducing=8)
+    assert minipfn_v1.architecture_name(full) == "minipfn-v1"
+    assert minipfn_v1.architecture_name(replace(full, n_cls=2)) is None
+
+
 def test_attention_without_softcap_splits_large_batch(monkeypatch):
     # soft-cap 없는 attention(minipfn-v1 preset)은 batch가 CUDA kernel grid 상한(`SDPA_MAX_BATCH`)을
     # 넘으면 나눠 부른다(stage2_kumo 검증: 표 8개 × 10,240행에서 flash attention이 invalid
