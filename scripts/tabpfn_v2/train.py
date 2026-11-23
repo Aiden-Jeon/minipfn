@@ -11,8 +11,10 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
 (arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
 회귀 MLP encoder)이다. `v3`·`v3.5`는 TabPFN-3(arXiv 2605.13986)·3.5(arXiv 2609.17895)의
-열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. `--task multitask`는
-분류·회귀를 한 모델로 같이 학습한다(TabPFN-3.5, `--arch v3.5`만. step마다 task를 번갈아 쓴다).
+열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. `minipfn-v1`은 같은 모델
+클래스로 만든 우리 자체 모델이다(`recipes.minipfn_v1`, 아래). `--task multitask`는
+분류·회귀를 한 모델로 같이 학습한다(TabPFN-3.5·minipfn-v1, `--arch v3.5`·`minipfn-v1`만. step마다
+task를 번갈아 쓴다).
 이어서 학습하거나
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
@@ -65,9 +67,12 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 stage 4는 표 크기를 GPU끼리 나눠 받는다(`--balance-tables on|off`, `TABPFN_V2_BALANCE_TABLES`, 주지
 않으면 preset 값이고 이어 학습하면 원래 run의 값이다).
 stage2~4는 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
-`--config-name stage1_kumo|stage2_kumo|stage3_kumo`는 그 stage 1~3에 Kumo-Tabular 부품을 얹은
-것이다(`recipes.tabpfn_v3.kumo_curriculum`, issue #102·#110: Kumo 식 온도, soft-cap 없음, 열·행
-단계, 회귀 분위수 출력, lr 8e-4 / 1e-4 / 2e-5, stage 1 micro batch 4).
+`--config-name minipfn_v1_stage1|minipfn_v1_stage2|minipfn_v1_stage3`(`--arch minipfn-v1 --task
+multitask`, `--arch`는 생략해도 된다)은 우리 자체 모델 minipfn-v1을 그 stage 1~3으로 학습한다
+(`recipes.minipfn_v1.curriculum`, issue #102·#110: v3.5에 Kumo 식 온도, soft-cap 없음, 열·행 단계
+번갈아 쌓기, 회귀 분위수 출력을 얹은 구조, lr 8e-4 / 1e-4 / 2e-5, stage 1 micro batch 4). 이름을
+붙이기 전의 `stage1_kumo|stage2_kumo|stage3_kumo`는 같은 설정을 내는 별칭이고, 그때처럼
+`--arch v3.5`도 받는다(그 구조는 이제 minipfn-v1이다). run 이름은 `minipfn-v1-…`이다.
 `--kumo-options`(`TABPFN_V2_KUMO_OPTIONS`, 쉼표로 여럿, issue #110)는 Kumo-Tabular 부품 묶음을 켠다
 (`recipes.kumo_tabular.OPTIONS`: decoder_qk_norm, stages, quantile_head, categorical_encoder).
 attention 온도처럼 구조 이름과 따로 켜는 설정이고, 이어 학습·가중치 가져오기에서는 원래 run의
@@ -94,7 +99,7 @@ import mlflow  # noqa: E402
 from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
 from minipfn.models.column_row_transformer import TEMPERATURE_FIELDS, TEMPERATURES  # noqa: E402
-from minipfn.recipes import kumo_tabular, tabpfn_v3  # noqa: E402
+from minipfn.recipes import kumo_tabular, minipfn_v1, tabpfn_v3  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
 from minipfn.training.config import (  # noqa: E402
     ATTENTION_TEMPERATURE_DEFAULTS,
@@ -126,17 +131,24 @@ PRESETS = {
     # TabICLv2 3단계 학습을 옮긴 것과 긴 표 stage 4 (`recipes.tabpfn_v3.curriculum`, --arch v3.5
     # --task multitask). stage2~4는 앞 단계 run에서 가중치를 가져온다(--init-run-id)
     **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
-    # 그 stage 1~3에 Kumo-Tabular 부품(Kumo 식 온도, soft-cap 없음, 열·행 단계, 회귀 분위수 출력)을
-    # 얹은 것 (`recipes.tabpfn_v3.kumo_curriculum`, issue #102·#110)
-    **{
-        f"stage{n}_kumo": partial(tabpfn_v3.kumo_curriculum, n)
-        for n in tabpfn_v3.KUMO_CURRICULUM_STAGES
-    },
+    # 우리 자체 모델 minipfn-v1의 stage 1~3 (`recipes.minipfn_v1.curriculum`, issue #102·#110:
+    # v3.5에 Kumo 식 온도, soft-cap 없음, 열·행 단계, 회귀 분위수 출력). stage2·3은 --init-run-id로
+    # 앞 단계에서
+    **{f"minipfn_v1_stage{n}": partial(minipfn_v1.curriculum, n) for n in minipfn_v1.CURRICULUM},
+    # 이름을 붙이기 전(PR #113·#114)의 이름. 같은 설정을 낸다 (그 이름으로 도는 체인·이어 학습용)
+    **{f"stage{n}_kumo": partial(minipfn_v1.curriculum, n) for n in minipfn_v1.CURRICULUM},
 }
 CONFIG_NAMES = tuple(PRESETS)
 CURRICULUM_NAMES = {
     **{f"stage{n}": n for n in tabpfn_v3.CURRICULUM},
-    **{f"stage{n}_kumo": n for n in tabpfn_v3.KUMO_CURRICULUM_STAGES},
+    **{f"minipfn_v1_stage{n}": n for n in minipfn_v1.CURRICULUM},
+    **{f"stage{n}_kumo": n for n in minipfn_v1.CURRICULUM},
+}
+# 구조가 정해진 preset: 그 구조(`--arch`를 주지 않으면 이것)와, 이름을 붙이기 전에 그 구조를 부르던
+# 이름(별칭 preset만 `--arch`로 받는다. `stage*_kumo`는 `--arch v3.5`로 돌았다)
+PRESET_ARCHITECTURES = {
+    **{f"minipfn_v1_stage{n}": (minipfn_v1.NAME, ()) for n in minipfn_v1.CURRICULUM},
+    **{f"stage{n}_kumo": (minipfn_v1.NAME, ("v3.5",)) for n in minipfn_v1.CURRICULUM},
 }
 TUNED_LONG_NAMES = {f"tuned_stage{n}" for n in recipe.TUNED_LONG}
 # attention 온도 묶음 (`--attention-temperature`, issue #102). 구조 이름(`--arch`)과 따로 켠다
@@ -144,7 +156,13 @@ TEMPERATURE_PRESETS = {"kumo": kumo_tabular.ATTENTION_TEMPERATURE}
 # Kumo-Tabular의 나머지 부품 묶음 (`--kumo-options`, issue #110). 쉼표로 여럿을 준다
 KUMO_OPTIONS = kumo_tabular.OPTIONS
 # MLflow run 이름의 머리
-RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
+RUN_PREFIXES = {
+    "v2": "tabpfn-v2",
+    "v2.5": "tabpfn-v2-5",
+    "v3": "tabpfn-v3",
+    "v3.5": "tabpfn-v3-5",
+    "minipfn-v1": "minipfn-v1",
+}
 
 
 TRUE_VALUES, FALSE_VALUES = ("1", "true", "yes", "on"), ("", "0", "false", "no", "off")
@@ -184,8 +202,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--arch",
         choices=recipes.architectures(),
         default=os.environ.get("TABPFN_V2_ARCH"),
-        help="모델 구조: v2(Nature 2025), v2.5(TabPFN-2.5), v3(TabPFN-3), v3.5(TabPFN-3.5)."
-        " 기본: 새로 학습하면 v2,"
+        help="모델 구조: v2(Nature 2025), v2.5(TabPFN-2.5), v3(TabPFN-3), v3.5(TabPFN-3.5),"
+        " minipfn-v1(우리 모델, recipes/minipfn_v1.py)."
+        " 기본: 새로 학습하면 v2(minipfn_v1_stage*는 minipfn-v1),"
         " 이어서 학습하거나 가중치를 가져오면 원래 run의 구조",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
@@ -471,17 +490,20 @@ def build_config(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
 
+    given = _given_arch(args)
     if source is None:
-        arch = args.arch or "v2"
-        return _overrides(preset(arch), args), arch
-    arch = args.arch or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
+        fixed = PRESET_ARCHITECTURES.get(args.config_name)
+        arch = given or (fixed[0] if fixed else "v2")
+        config = _overrides(preset(arch), args)
+        return config, _run_arch(config, arch)
+    arch = given or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
     # 원래 run이 긴 표 학습을 하지 않는 구조(TabPFN-3·3.5 등)여도 run을 열기 전에 멈춘다
     if args.config_name == "long_tables" and arch not in recipe.LONG_TABLES_MICRO_BATCH:
         raise SystemExit(
             f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
         )
     base = preset(arch or "v2")
-    if args.arch is not None:
+    if given is not None:
         # attention 온도는 구조 이름과 따로 켜는 설정이라 비교하지 않는다 (주지 않으면 원래 run의
         # 값을 쓴다)
         # Kumo 부품(issue #110)도 같다. Kumo식 열·행 단계면 그 폭·블록 수도 비교하지 않는다
@@ -495,7 +517,7 @@ def build_config(
         }
         if differ:
             raise SystemExit(
-                f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
+                f"--arch {given}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
             )
     source_phases = (speed_options or {}).get("phases")
     if source_phases and base.phases and source_phases != base.phases:
@@ -505,7 +527,28 @@ def build_config(
         )
     # 원래 run의 구조·옵션과 인자를 한 번에 바꾼다 (설정 검사가 중간 상태를 보지 않도록)
     changes = {**source, **_source_options(speed_options or {}, args), **_override_values(args)}
-    return _replace(base, changes), arch
+    config = _replace(base, changes)
+    return config, _run_arch(config, arch)
+
+
+def _given_arch(args: argparse.Namespace) -> str | None:
+    """인자로 준 구조 이름 (주지 않으면 None). 구조가 정해진 preset(`PRESET_ARCHITECTURES`)은 그
+    구조만 받고, 별칭 preset은 이름을 붙이기 전의 구조 이름도 받아 지금 이름으로 바꾼다."""
+    fixed = PRESET_ARCHITECTURES.get(args.config_name)
+    if fixed is None or args.arch is None:
+        return args.arch
+    name, old_names = fixed
+    if args.arch == name or args.arch in old_names:
+        return name
+    raise SystemExit(f"--config-name {args.config_name}는 {name} 구조다 (--arch {args.arch})")
+
+
+def _run_arch(config: TrainConfig, arch: str | None) -> str | None:
+    """run 이름에 쓸 구조 이름. v3.5에 열·행 단계 번갈아 쌓기를 켠 것(`--kumo-options stages`)은
+    minipfn-v1 구조라 그 이름으로 바꾼다(`recipes.minipfn_v1.architecture_name`). 그 밖은 그대로."""
+    if arch == "v3.5" and minipfn_v1.architecture_name(config) is not None:
+        return minipfn_v1.NAME
+    return arch
 
 
 def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:

@@ -4,7 +4,8 @@ kumo-tabular)와 공개 소스(NVIDIA/structured-data-models, Apache 2.0. 동작
 
 Kumo-Tabular 모델 전체(ECOC 분류 출력, 분류·회귀 모델 따로 등)는 옮기지 않았다. 그래서 이 모듈에는
 모델 종류가 없고 `TABLE_RECIPES`에 넣지 않는다. 여기 있는 설정은 다른 recipe의 모델(지금은
-`tabpfn_v3`의 `column_row_transformer`)에 덧붙여 켠다.
+`tabpfn_v3`의 `column_row_transformer`)에 덧붙여 켠다. 시험에서 고른 부품(attention 온도·`STAGES`·
+`QUANTILE_HEAD`)을 v3.5에 얹은 구조는 우리 모델 `minipfn-v1`이다(`recipes.minipfn_v1`).
 
 - `ATTENTION_TEMPERATURE` (issue #102): attention 온도. q·k RMSNorm에 gain이 없고
   (`sdm/models/kumo/tabular/block.py`), 열 단계 요약 쪽과 행 ICL은 `LogScale`, 행 단계는

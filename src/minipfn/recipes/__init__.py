@@ -11,8 +11,11 @@
 - `tabpfn_v3`: TabPFN-3·3.5의 구조(`graph_scm` prior + `ColumnRowTransformer` + 공용 학습 루프),
   추론 설정(`default_inference`), 3.5 공개 가중치를 받는 추론 클래스(`TabPFNv3_5Classifier`·
   `TabPFNv3_5Regressor`)
-- `kumo_tabular`: Kumo-Tabular에서 가져온 부품의 설정(attention 온도). 모델 종류가 없어
-  `TABLE_RECIPES`에 넣지 않고, 다른 recipe의 모델에 덧붙여 켠다
+- `kumo_tabular`: Kumo-Tabular에서 가져온 부품의 설정(attention 온도·열·행 단계·분위수 출력 등).
+  모델 종류가 없어 `TABLE_RECIPES`에 넣지 않고, 다른 recipe의 모델에 덧붙여 켠다
+- `minipfn_v1`: 우리 자체 모델 minipfn-v1(재현이 아니다). v3.5 구조에 Kumo-Tabular 부품(열·행 단계
+  번갈아 쌓기, attention 온도, 회귀 분위수 출력)을 얹은 구조와 그 curriculum. 모델 클래스는
+  `tabpfn_v3`와 같은 `column_row_transformer`다
 """
 
 from __future__ import annotations
@@ -24,8 +27,9 @@ from typing import Any
 # 공용 학습 루프(`minipfn.training.loop`)와 전처리 멤버 앙상블을 쓰는 recipe. 모듈마다
 # `MODEL_TYPE`, `ARCHITECTURES`, `architecture_name`, `model_architecture`, `with_architecture`,
 # `default_inference`, `MEMBER_KIND_PRESETS`, `SUPPORTED_SIZE`가 있다. 스크립트·Hub 업로드는
-# recipe를 직접 고르지 않고 아래 함수로 찾는다
-TABLE_RECIPES = ("tabpfn_v2", "tabpfn_v3")
+# recipe를 직접 고르지 않고 아래 함수로 찾는다. 모델 종류가 같은 recipe가 여럿이면(`tabpfn_v3`·
+# `minipfn_v1`) 먼저 적은 것이 그 모델 종류의 기본이다(`recipe_for_model_type`)
+TABLE_RECIPES = ("tabpfn_v2", "tabpfn_v3", "minipfn_v1")
 
 
 def table_recipes() -> tuple[ModuleType, ...]:
@@ -34,18 +38,35 @@ def table_recipes() -> tuple[ModuleType, ...]:
 
 
 def recipe_for_model_type(model_type: str) -> ModuleType:
-    """그 모델 종류(`minipfn.models.MODEL_TYPES`)를 쓰는 recipe. 예전 이름도 받는다."""
+    """그 모델 종류(`minipfn.models.MODEL_TYPES`)를 쓰는 recipe. 예전 이름도 받는다. 같은 모델
+    종류를 쓰는 recipe가 여럿이면 `TABLE_RECIPES`에 먼저 적은 것(column_row_transformer는
+    `tabpfn_v3`). 만든 모델의 recipe는 `recipe_for_model`."""
+    return _recipes_for_model_type(model_type)[0]
+
+
+def _recipes_for_model_type(model_type: str) -> list[ModuleType]:
     from minipfn.models import canonical_model_type
 
     name = canonical_model_type(model_type)
-    for recipe in table_recipes():
-        if recipe.MODEL_TYPE == name:
+    found = [recipe for recipe in table_recipes() if recipe.MODEL_TYPE == name]
+    if not found:
+        raise ValueError(f"{model_type} 모델을 쓰는 recipe가 없다")
+    return found
+
+
+def recipe_for_model(model: Any, task: str) -> ModuleType:
+    """만든 모델의 recipe: 그 모델 종류를 쓰는 recipe 가운데 구조(`model_architecture`)를 알아보는
+    것. 어느 것도 알아보지 못하면 그 모델 종류의 기본 recipe(`recipe_for_model_type`). 예:
+    열·행 단계를 번갈아 쌓은 column_row_transformer는 `minipfn_v1`, 그 밖은 `tabpfn_v3`."""
+    found = _recipes_for_model_type(getattr(model, "model_type", None) or "")
+    for recipe in found:
+        if recipe.model_architecture(model, task) is not None:
             return recipe
-    raise ValueError(f"{model_type} 모델을 쓰는 recipe가 없다")
+    return found[0]
 
 
 def recipe_for_architecture(arch: str) -> ModuleType:
-    """그 구조 이름(`ARCHITECTURES`의 키: v2, v2.5, v3, v3.5)이 있는 recipe."""
+    """그 구조 이름(`ARCHITECTURES`의 키: v2, v2.5, v3, v3.5, minipfn-v1)이 있는 recipe."""
     for recipe in table_recipes():
         if arch in recipe.ARCHITECTURES:
             return recipe
@@ -69,10 +90,11 @@ def default_inference(model: Any, task: str) -> dict:
     """모델의 추론 설정 `{"n_estimators", "member_kinds"}`, TabPFN-3·3.5 recipe는 여기에
     `"max_features_per_member"`·`"feature_subsampling"`(멤버당 열 상한, 3.5는 768·balanced)도
     더한다.
-    모두 `EnsembleClassifier`·`EnsembleRegressor`의 인자다. 모델 종류의 recipe가 정한다. 어느
-    recipe에도 없는 모델 종류(registry에 더한 모델)와 종류가 없는 모델은 v2의 것(`tabpfn_v2`)."""
+    모두 `EnsembleClassifier`·`EnsembleRegressor`의 인자다. 모델의 recipe(`recipe_for_model`)가
+    정한다. 어느 recipe에도 없는 모델 종류(registry에 더한 모델)와 종류가 없는 모델은 v2의 것
+    (`tabpfn_v2`)."""
     try:
-        recipe = recipe_for_model_type(getattr(model, "model_type", None) or "")
+        recipe = recipe_for_model(model, task)
     except ValueError:
         recipe = importlib.import_module("minipfn.recipes.tabpfn_v2")
     return recipe.default_inference(model, task)
@@ -80,8 +102,8 @@ def default_inference(model: Any, task: str) -> dict:
 
 def supported_size(model: Any, task: str) -> dict:
     """모델의 논문 권장 크기 `{"max_train_rows", "max_features"}` (recipe의 `SUPPORTED_SIZE`).
-    구조를 모르면 그 recipe의 첫 구조(v2, v3)의 것."""
-    recipe = recipe_for_model_type(model.model_type)
+    구조를 모르면 그 모델 종류의 기본 recipe의 첫 구조(v2, v3)의 것."""
+    recipe = recipe_for_model(model, task)
     arch = recipe.model_architecture(model, task) or next(iter(recipe.ARCHITECTURES))
     return dict(recipe.SUPPORTED_SIZE[arch])
 

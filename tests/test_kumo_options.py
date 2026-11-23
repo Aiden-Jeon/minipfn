@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from minipfn import recipes
 from minipfn.hub import run_architecture
 from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.inference.preprocessing import Member, MemberPreprocessor
@@ -28,7 +29,7 @@ from minipfn.models.quantile_distribution import (
     quantiles_to_bucket_probs,
 )
 from minipfn.priors.graph_scm import GraphSCMPrior
-from minipfn.recipes import kumo_tabular, tabpfn_v3
+from minipfn.recipes import kumo_tabular, minipfn_v1, tabpfn_v3
 from minipfn.training.config import KUMO_OPTION_DEFAULTS, TrainConfig
 from minipfn.training.loop import train
 from minipfn.training.losses import prior_loss
@@ -172,7 +173,9 @@ def test_interleaved_layout_mixes_columns_before_the_next_column_block():
 
 def test_kumo_stages_parameter_count_and_architecture_name():
     config = replace(tabpfn_v3.curriculum(1), logit_softcap=None, **KUMO, **kumo_tabular.STAGES)
-    assert tabpfn_v3.architecture_name(config) == "v3.5"  # 행 ICL 폭이 같다 (1024)
+    # 행 ICL은 v3.5와 같지만(폭 1024) 열·행 단계를 번갈아 쌓아 v3.5가 아니라 minipfn-v1이다
+    assert tabpfn_v3.architecture_name(config) is None
+    assert minipfn_v1.architecture_name(config) == recipes.architecture_name(config) == "minipfn-v1"
     model_config = config.model_config()
     assert model_config.icl_dim == 1024 and model_config.emsize == 256
     base = replace(tabpfn_v3.curriculum(1), logit_softcap=None, **KUMO).model_config()
@@ -181,8 +184,8 @@ def test_kumo_stages_parameter_count_and_architecture_name():
         now = ColumnRowTransformer(base).num_parameters_by_stage()
     assert wide["row_icl"] == now["row_icl"]
     assert wide["column_stage"] + wide["row_stage"] > 5 * (now["column_stage"] + now["row_stage"])
-    # 폭이 다르면(행 ICL 512) v3.5가 아니다
-    assert tabpfn_v3.architecture_name(replace(config, n_cls=2)) is None
+    # 폭이 다르면(행 ICL 512) minipfn-v1이 아니다
+    assert recipes.architecture_name(replace(config, n_cls=2)) is None
 
 
 # --- Q: 회귀 분위수 출력 ---------------------------------------------------------------------
@@ -365,7 +368,9 @@ def test_train_script_kumo_options(monkeypatch):
     reference, _ = script.build_config(script.parse_args(b_arm))
     for name, values in kumo_tabular.OPTIONS.items():
         config, arch = script.build_config(script.parse_args([*b_arm, "--kumo-options", name]))
-        assert arch == "v3.5" and config == replace(reference, **values)
+        assert config == replace(reference, **values)
+        # 열·행 단계를 번갈아 쌓으면 minipfn-v1 구조다 (run 이름 접두어)
+        assert arch == ("minipfn-v1" if name == "stages" else "v3.5")
     monkeypatch.setenv("TABPFN_V2_KUMO_OPTIONS", "decoder_qk_norm, quantile_head")
     config, _ = script.build_config(script.parse_args(b_arm))
     assert config.decoder_qk_norm and config.regression_head == "quantile"
@@ -455,8 +460,8 @@ def test_pad_features_pads_the_categorical_mask():
     assert out.categorical.tolist() == [[True, False, False, False], [False, True, False, False]]
 
 
-def test_kumo_curriculum_presets():
-    one = tabpfn_v3.kumo_curriculum(1)
+def test_minipfn_v1_curriculum_presets():
+    one = minipfn_v1.curriculum(1)
     expected = replace(
         tabpfn_v3.curriculum(1),
         logit_softcap=None,
@@ -467,42 +472,194 @@ def test_kumo_curriculum_presets():
         **kumo_tabular.QUANTILE_HEAD,
     )
     assert one == expected
-    assert tabpfn_v3.architecture_name(one) == "v3.5"
+    assert minipfn_v1.architecture_name(one) == "minipfn-v1"
+    assert tabpfn_v3.architecture_name(one) is None  # v3.5는 그대로 공식 3.5 구조만
     assert not one.decoder_qk_norm and not one.categorical_encoder  # 효과 없거나 나빠진 부품은 뺀다
-    two, three = tabpfn_v3.kumo_curriculum(2), tabpfn_v3.kumo_curriculum(3)
+    two, three = minipfn_v1.curriculum(2), minipfn_v1.curriculum(3)
     assert (two.lr, three.lr) == (1e-4, 2e-5)
     assert two.max_rows == tabpfn_v3.curriculum(2).max_rows and two.micro_batch == 1
     # 열·행 단계가 넓어 stage 2부터 2,048행 넘는 표는 activation checkpointing
     assert two.activation_checkpointing_rows == three.activation_checkpointing_rows == 2_048
     assert tabpfn_v3.curriculum(2).activation_checkpointing_rows is None
     assert three.logit_softcap is None
-    assert tabpfn_v3.kumo_curriculum(1, steps=1000).warmup_steps == 10
-    with pytest.raises(ValueError, match="kumo curriculum"):
-        tabpfn_v3.kumo_curriculum(4)
+    for stage, config in ((2, two), (3, three)):
+        assert config == replace(
+            tabpfn_v3.curriculum(stage),
+            logit_softcap=None,
+            **KUMO,
+            **kumo_tabular.STAGES,
+            **kumo_tabular.QUANTILE_HEAD,
+            **minipfn_v1.CURRICULUM[stage],
+        )
+    assert minipfn_v1.curriculum(1, steps=1000).warmup_steps == 10
+    with pytest.raises(ValueError, match="minipfn-v1 curriculum"):
+        minipfn_v1.curriculum(4)
+    with pytest.raises(ValueError, match="multitask"):
+        minipfn_v1.curriculum(1, task="classification")
+    with pytest.raises(ValueError, match="minipfn-v1"):
+        minipfn_v1.curriculum(1, arch="v3.5")
 
 
-def test_train_script_kumo_curriculum(monkeypatch):
-    for name in ("TABPFN_V2_CONFIG_NAME", "TABPFN_V2_LOGIT_SOFTCAP", "TABPFN_V2_KUMO_OPTIONS"):
+def test_minipfn_v1_registry_and_inference_match_v3_5():
+    assert recipes.architectures() == ("v2", "v2.5", "v3", "v3.5", "minipfn-v1")
+    assert recipes.recipe_for_architecture("minipfn-v1") is minipfn_v1
+    # 모델 종류의 기본 recipe는 그대로 tabpfn_v3이고, 만든 모델은 구조로 고른다
+    assert recipes.recipe_for_model_type("column_row_transformer") is tabpfn_v3
+    with torch.device("meta"):
+        kumo = minipfn_v1.curriculum(1).build_model()
+        v35 = tabpfn_v3.curriculum(1).build_model()
+    for task in ("classification", "regression"):
+        assert recipes.recipe_for_model(kumo, task) is minipfn_v1
+        assert recipes.recipe_for_model(v35, task) is tabpfn_v3
+        assert minipfn_v1.model_architecture(kumo, task) == "minipfn-v1"
+        assert tabpfn_v3.model_architecture(kumo, task) is None
+        # 추론 설정·권장 크기는 v3.5와 같다 (768열 balanced, 1M행·6,000열)
+        assert recipes.default_inference(kumo, task) == recipes.default_inference(v35, task)
+        assert recipes.supported_size(kumo, task) == recipes.supported_size(v35, task)
+    assert recipes.default_inference(kumo, "regression") == {
+        "n_estimators": 8,
+        "member_kinds": ("standard",),
+        "max_features_per_member": 768,
+        "feature_subsampling": "balanced",
+    }
+    assert recipes.supported_size(kumo, "classification") == {
+        "max_train_rows": 1_000_000,
+        "max_features": 6_000,
+    }
+    assert recipes.resolve_member_kinds("minipfn-v1") == ("standard",)
+
+
+def test_minipfn_v1_smoke_architecture():
+    smoke = minipfn_v1.with_architecture(TrainConfig.smoke("multitask"), keep_size=True)
+    assert smoke.stage_layout == "interleaved" and smoke.column_blocks == smoke.row_blocks == 2
+    assert smoke.emsize == TrainConfig.smoke().emsize and smoke.n_inducing == 8
+    assert smoke.regression_head == "quantile" and smoke.logit_softcap is None
+    assert recipes.architecture_name(smoke) == "minipfn-v1"
+    smoke.model_config()  # 만들 수 있는 설정
+    with pytest.raises(ValueError, match="multitask"):
+        minipfn_v1.with_architecture(TrainConfig.smoke("classification"), keep_size=True)
+    # 번갈아 쌓지 않으면 minipfn-v1이 아니다
+    assert minipfn_v1.architecture_name(replace(smoke, stage_layout="sequential")) is None
+
+
+def test_saved_minipfn_v1_config_is_judged_from_its_fields():
+    # 이름을 붙이기 전에 저장한 checkpoint·Hub config.json에는 구조 이름이 없다. 저장한 모델 설정
+    # (`config_dict`)만으로 다시 만든 모델을 minipfn-v1로 알아보고 v3.5와 같은 추론 설정을 쓴다
+    from minipfn.models import config_from_dict
+
+    saved = config_dict(minipfn_v1.curriculum(1).model_config())
+    assert not {"name", "arch", "architecture"} & set(saved)
+    with torch.device("meta"):
+        model = ColumnRowTransformer(config_from_dict("column_row_transformer", saved))
+    for task in ("classification", "regression"):
+        assert recipes.recipe_for_model(model, task) is minipfn_v1
+        assert recipes.default_inference(model, task)["max_features_per_member"] == 768
+
+
+def test_minipfn_v1_smoke_checkpoint_round_trip(tmp_path, monkeypatch):
+    # 작은 minipfn-v1을 학습해 저장한 checkpoint를 읽어도 minipfn-v1이다
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    config = minipfn_v1.with_architecture(TrainConfig.smoke("multitask"), keep_size=True)
+    small = dict(
+        max_features=8,
+        min_rows=48,
+        max_rows=80,
+        max_cells=80 * 8,
+        steps=2,
+        warmup_steps=1,
+        val_every=2,
+        log_every=1,
+        checkpoint_every=2,
+        keep_every=None,
+        collapse_threshold=None,
+        border_datasets=20,
+    )
+    train(replace(config, **small), tmp_path, mlflow_log=False)
+    model, borders = model_from_state(torch.load(tmp_path / "latest.pt", weights_only=True))
+    assert borders is not None
+    for task in ("classification", "regression"):
+        assert minipfn_v1.model_architecture(model, task) == "minipfn-v1"
+        assert recipes.supported_size(model, task) == tabpfn_v3.SUPPORTED_SIZE["v3.5"]
+
+
+def _clear_train_env(monkeypatch):
+    for name in (
+        "TABPFN_V2_ARCH",
+        "TABPFN_V2_CONFIG_NAME",
+        "TABPFN_V2_LOGIT_SOFTCAP",
+        "TABPFN_V2_KUMO_OPTIONS",
+        "TABPFN_V2_ATTENTION_TEMPERATURE",
+        "TABPFN_V2_LR",
+        "TABPFN_V2_MICRO_BATCH",
+    ):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("TABPFN_V2_ATTENTION_TEMPERATURE", raising=False)
-    monkeypatch.delenv("TABPFN_V2_LR", raising=False)
-    monkeypatch.delenv("TABPFN_V2_MICRO_BATCH", raising=False)
-    script = _script("train_script_kumo_curriculum")
-    common = ["--arch", "v3.5", "--task", "multitask"]
-    config, arch = script.build_config(script.parse_args(["--config-name", "stage1_kumo", *common]))
-    assert arch == "v3.5" and config == tabpfn_v3.kumo_curriculum(1)
-    # stage 2·3은 앞 단계 run의 가중치를 가져온다
+
+
+def test_train_script_minipfn_v1_curriculum(monkeypatch):
+    _clear_train_env(monkeypatch)
+    script = _script("train_script_minipfn_v1_curriculum")
+    task = ["--task", "multitask"]
+    # --arch를 주지 않으면 preset의 구조 (minipfn-v1)
+    for arch in ([], ["--arch", "minipfn-v1"]):
+        args = script.parse_args(["--config-name", "minipfn_v1_stage1", *task, *arch])
+        config, got = script.build_config(args)
+        assert got == "minipfn-v1" and config == minipfn_v1.curriculum(1)
+    assert script.RUN_PREFIXES["minipfn-v1"] == "minipfn-v1"
+    with pytest.raises(SystemExit, match="minipfn-v1 구조"):
+        script.build_config(
+            script.parse_args(["--config-name", "minipfn_v1_stage1", *task, "--arch", "v3.5"])
+        )
+    # stage 2·3은 앞 단계 run의 가중치를 가져온다. 원래 run의 구조로 minipfn-v1을 알아본다
     with pytest.raises(SystemExit):
-        script.parse_args(["--config-name", "stage2_kumo", *common])
-    source = run_architecture({k: str(v) for k, v in vars(config).items()})
-    args = script.parse_args(["--config-name", "stage2_kumo", *common, "--init-run-id", "x"])
-    two, _ = script.build_config(args, source)
-    assert two == tabpfn_v3.kumo_curriculum(2)
+        script.parse_args(["--config-name", "minipfn_v1_stage2", *task])
+    source = run_architecture({k: str(v) for k, v in vars(minipfn_v1.curriculum(1)).items()})
+    for n in (2, 3):
+        for arch in ([], ["--arch", "minipfn-v1"]):
+            args = script.parse_args(
+                ["--config-name", f"minipfn_v1_stage{n}", *task, *arch, "--init-run-id", "x"]
+            )
+            config, got = script.build_config(args, source)
+            assert got == "minipfn-v1" and config == minipfn_v1.curriculum(n)
+    # v3.5 run의 가중치로 minipfn-v1 단계를 이어 가지 않는다
+    v35 = run_architecture({k: str(v) for k, v in vars(tabpfn_v3.curriculum(1)).items()})
+    args = script.parse_args(["--config-name", "minipfn_v1_stage2", *task, "--init-run-id", "x"])
+    with pytest.raises(SystemExit, match="minipfn-v1"):
+        script.build_config(args, v35)
+
+
+def test_train_script_kumo_aliases(monkeypatch):
+    # 이름을 붙이기 전의 preset(stage*_kumo, --arch v3.5로 돌았다)은 같은 설정을 내는 별칭이다
+    _clear_train_env(monkeypatch)
+    script = _script("train_script_kumo_aliases")
+    common = ["--task", "multitask"]
+    source = run_architecture({k: str(v) for k, v in vars(minipfn_v1.curriculum(1)).items()})
+    for n in (1, 2, 3):
+        init = [] if n == 1 else ["--init-run-id", "x"]
+        new, _ = script.build_config(
+            script.parse_args(["--config-name", f"minipfn_v1_stage{n}", *common, *init])
+        )
+        for arch in ([], ["--arch", "v3.5"], ["--arch", "minipfn-v1"]):
+            args = script.parse_args(["--config-name", f"stage{n}_kumo", *common, *arch, *init])
+            config, got = script.build_config(args)
+            assert got == "minipfn-v1" and config == new
+            if n > 1:  # 가중치를 가져와도, 이어 학습해도 (원래 run의 구조로)
+                config, got = script.build_config(args, source)
+                assert got == "minipfn-v1" and config == new
+    resume = script.parse_args(
+        ["--config-name", "stage2_kumo", *common, "--arch", "v3.5", "--resume-run-id", "x"]
+    )
+    source2 = run_architecture({k: str(v) for k, v in vars(minipfn_v1.curriculum(2)).items()})
+    config, got = script.build_config(resume, source2)
+    assert got == "minipfn-v1" and config == minipfn_v1.curriculum(2)
+    wrong = script.parse_args(["--config-name", "stage1_kumo", *common, "--arch", "v3"])
+    with pytest.raises(SystemExit, match="minipfn-v1 구조"):
+        script.build_config(wrong)
 
 
 def test_attention_without_softcap_splits_large_batch(monkeypatch):
-    # soft-cap 없는 attention(Kumo preset)은 batch가 CUDA kernel grid 상한(`SDPA_MAX_BATCH`)을 넘으면
-    # 나눠 부른다(stage2_kumo 검증: 표 8개 × 10,240행에서 flash attention이 invalid argument).
+    # soft-cap 없는 attention(minipfn-v1 preset)은 batch가 CUDA kernel grid 상한(`SDPA_MAX_BATCH`)을
+    # 넘으면 나눠 부른다(stage2_kumo 검증: 표 8개 × 10,240행에서 flash attention이 invalid
+    # argument).
     # 나눠도 출력·gradient가 같다 (CPU에서 상한을 작게 해서 본다)
     from minipfn.models import column_row_transformer as M
 
