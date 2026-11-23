@@ -498,3 +498,24 @@ def test_train_script_kumo_curriculum(monkeypatch):
     args = script.parse_args(["--config-name", "stage2_kumo", *common, "--init-run-id", "x"])
     two, _ = script.build_config(args, source)
     assert two == tabpfn_v3.kumo_curriculum(2)
+
+
+def test_attention_without_softcap_splits_large_batch(monkeypatch):
+    # soft-cap 없는 attention(Kumo preset)은 batch가 CUDA kernel grid 상한(`SDPA_MAX_BATCH`)을 넘으면
+    # 나눠 부른다(stage2_kumo 검증: 표 8개 × 10,240행에서 flash attention이 invalid argument).
+    # 나눠도 출력·gradient가 같다 (CPU에서 상한을 작게 해서 본다)
+    from minipfn.models import column_row_transformer as M
+
+    torch.manual_seed(0)
+    attn = M.Attention(64, 4, qk_norm=True, zero_out=False)
+    x = torch.randn(7, 30, 64)
+    runs = []
+    for max_batch in (65_535, 3):
+        monkeypatch.setattr(M, "SDPA_MAX_BATCH", max_batch)
+        x_ = x.clone().requires_grad_()
+        attn.zero_grad(set_to_none=True)
+        out = attn(x_, n_context=20)
+        out.square().mean().backward()
+        runs.append([out, x_.grad, *(p.grad for p in attn.parameters() if p.grad is not None)])
+    for a, b in zip(*runs, strict=True):
+        assert torch.allclose(a, b, atol=1e-6)
