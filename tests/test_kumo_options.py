@@ -472,7 +472,10 @@ def test_kumo_curriculum_presets():
     two, three = tabpfn_v3.kumo_curriculum(2), tabpfn_v3.kumo_curriculum(3)
     assert (two.lr, three.lr) == (1e-4, 2e-5)
     assert two.max_rows == tabpfn_v3.curriculum(2).max_rows and two.micro_batch == 1
-    assert three.activation_checkpointing_rows == 10_240 and three.logit_softcap is None
+    # 열·행 단계가 넓어 stage 2부터 2,048행 넘는 표는 activation checkpointing
+    assert two.activation_checkpointing_rows == three.activation_checkpointing_rows == 2_048
+    assert tabpfn_v3.curriculum(2).activation_checkpointing_rows is None
+    assert three.logit_softcap is None
     assert tabpfn_v3.kumo_curriculum(1, steps=1000).warmup_steps == 10
     with pytest.raises(ValueError, match="kumo curriculum"):
         tabpfn_v3.kumo_curriculum(4)

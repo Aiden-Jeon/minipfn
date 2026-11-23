@@ -341,6 +341,11 @@ CURRICULUM_WARMUP = 0.01
 # stage 2·3 lr은 스크립트 값 1e-4 / 2e-5 (stage 1과 같은 비율, 여기서 정함. 이 두 단계는 시험하지
 # 않았다). stage 1 micro batch는 4: 열·행 단계가 넓어 GPU당 표 8개(stage 1 1,024행 × 100열)는
 # H100 80 GB를 넘었다(issue #110). stage 2·3은 원래 1이다
+# stage 2·3은 2,048행 넘는 표에서 activation checkpointing을 켠다(`curriculum`은 stage 2 끔, stage 3
+# 10,240행). 열·행 단계가 넓어 stage 2 가장 큰 표(10,240행) 하나가 GPU 한 장(H100 80 GB)을 넘었다
+# (8×H100 smoke, 첫 forward에서 OOM). stage 1은 GPU당 1,024행 표 4개(4,096행)에 60 GB여서 기준을
+# 그 절반으로 잡았다(여기서 정함)
+KUMO_ACTIVATION_CHECKPOINTING_ROWS = 2_048
 KUMO_CURRICULUM = {
     **kumo_tabular.ATTENTION_TEMPERATURE,
     **kumo_tabular.STAGES,
@@ -349,8 +354,8 @@ KUMO_CURRICULUM = {
 }
 KUMO_CURRICULUM_STAGES = {
     1: {"lr": 8e-4, "micro_batch": 4},
-    2: {"lr": 1e-4},
-    3: {"lr": 2e-5},
+    2: {"lr": 1e-4, "activation_checkpointing_rows": KUMO_ACTIVATION_CHECKPOINTING_ROWS},
+    3: {"lr": 2e-5, "activation_checkpointing_rows": KUMO_ACTIVATION_CHECKPOINTING_ROWS},
 }
 
 
@@ -384,8 +389,9 @@ def kumo_curriculum(
     stage: int, task: str = "multitask", arch: str = "v3.5", steps: int | None = None
 ) -> TrainConfig:
     """`curriculum`의 stage 1~3에 Kumo-Tabular 부품을 얹은 설정 (`KUMO_CURRICULUM`): Kumo 식
-    attention 온도, soft-cap 없음, Kumo식 열·행 단계, 회귀 분위수 출력, 단계별 lr
-    (`KUMO_CURRICULUM_STAGES`). 표 크기·optimizer·step 수는 `curriculum` 그대로다."""
+    attention 온도, soft-cap 없음, Kumo식 열·행 단계, 회귀 분위수 출력, 단계별 lr, stage 2·3
+    activation checkpointing 기준 (`KUMO_CURRICULUM_STAGES`). 표 크기·optimizer·step 수는
+    `curriculum` 그대로다."""
     if stage not in KUMO_CURRICULUM_STAGES:
         raise ValueError(
             f"kumo curriculum stage는 {tuple(KUMO_CURRICULUM_STAGES)} 가운데 하나다: {stage}"
