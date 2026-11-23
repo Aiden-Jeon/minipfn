@@ -54,7 +54,9 @@ env_variables:
   TABPFN_V2_EXTRA_ARGS: ""
   # GPU마다 worker 하나를 띄워 데이터셋을 큐에서 비싼 것부터 하나씩 나눠 준다 (eval.py --shards).
   # 본 프로세스가 5분마다 진행률을 찍는다(--heartbeat-minutes). 8로 줄 때는 compute를
-  # GPU_8xH100·8장으로 바꾼다
+  # GPU_8xH100·8장으로 바꾼다. 열·행 교차 구조(minipfn-v1, stage_layout=interleaved) 모델은 큰 표의
+  # 셀 상태(float32, maps_router_eta_1m ~984 GB)를 CPU에 두므로, 동시에 도는 큰 표의 합이 컨테이너
+  # 메모리 한도(8×H100 1.93 TB)의 50% 안일 때만 준다 (eval.py --host-memory-budget-gb)
   TABPFN_V2_SHARDS: "1"
 max_retries: 0
 # BeyondArena core2k(split 2,000개)는 v2 크기 상한 안의 1,685개를 돌린다
