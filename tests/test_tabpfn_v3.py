@@ -364,7 +364,7 @@ def test_one_recipe_lookup_serves_every_model():
     assert recipes.recipe_for_model_type("column_row_transformer") is recipe
     assert recipes.recipe_for_model_type("tabpfn_v2") is tabpfn_v2  # 예전 이름
     assert recipes.recipe_for_architecture("v3.5") is recipe
-    assert recipes.architectures() == ("v2", "v2.5", "v3", "v3.5")
+    assert recipes.architectures() == ("v2", "v2.5", "v3", "v3.5", "minipfn-v1")
     assert recipes.architecture_name(recipe.paper()) == "v3"
     assert recipes.default_inference(_model(arch="v3.5"), "regression")["member_kinds"] == (
         "standard",

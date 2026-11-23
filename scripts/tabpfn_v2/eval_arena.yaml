@@ -15,7 +15,9 @@
 # TFM → GBDT 증류(issue #44)는 TABPFN_V2_EXTRA_ARGS에 `--distill synthetic --student xgboost`(oof,
 # labels; lightgbm)와 다른 --method-name을 준다. 학생은 CPU에서 예측한다.
 # 2.5 checkpoint를 평가할 때는 experiment_name도 tabpfn-v2-5-reproduction으로 바꾼다(멤버 전처리와
-# 크기 상한은 모델 구조로 정해진다).
+# 크기 상한은 모델 구조로 정해진다). minipfn-v1 checkpoint(이름을 붙이기 전 stage*_kumo로 학습한 것도)는
+# 구조로 알아봐 v3.5와 같은 추론 설정(standard 8개·멤버당 768열 balanced)과 크기 상한(1M행·6,000열)을
+# 쓴다(recipes/minipfn_v1.py). 결과 이름은 --method-name minipfn-v1-…로 준다.
 experiment_name: tabpfn-v2-reproduction
 mlflow_run_name: tabpfn-v2-eval-arena
 environment:

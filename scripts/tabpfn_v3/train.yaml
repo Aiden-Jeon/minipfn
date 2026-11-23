@@ -25,6 +25,11 @@
 #                stage 4는 표 크기를 GPU끼리 나눠 받는다(LPT, issue #91). --override env_variables.TABPFN_V2_BALANCE_TABLES=off로 끈다
 #   TabPFN-3(task마다 모델): --override env_variables.TABPFN_V2_ARCH=v3 --override env_variables.TABPFN_V2_TASK=classification
 #                (또는 regression. 53M·58M)
+#   minipfn-v1(우리 모델, recipes/minipfn_v1.py: v3.5 + Kumo식 열·행 단계·온도·분위수 출력):
+#                --override env_variables.TABPFN_V2_ARCH=minipfn-v1 --override env_variables.TABPFN_V2_CONFIG_NAME=minipfn_v1_stage1
+#                (2·3은 TABPFN_V2_INIT_RUN_ID로 앞 단계. TABPFN_V2_STEPS도 그 stage의 step 수로). 예전 이름
+#                stage1_kumo·stage2_kumo·stage3_kumo는 같은 설정의 별칭이고 TABPFN_V2_ARCH=v3.5도 받는다.
+#                run 이름은 minipfn-v1-multitask-<config 이름>으로 (mlflow_run_name override)
 # 학습 step·lr·batch는 두 보고서에 없어서 v2 paper 설정 그대로다(recipes/tabpfn_v3.py의 paper; multitask는
 # 붕괴 규칙만 v2 회귀의 것). 긴 표 이어 학습(long_tables)은 v2·2.5 구조만 쓴다. 그 밖의 환경변수는
 # scripts/tabpfn_v2/train.yaml과 같다.

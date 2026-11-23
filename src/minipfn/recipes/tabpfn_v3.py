@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 from torch import nn
 
 from minipfn.models import DEFAULT_MODEL_TYPE, canonical_model_type
-from minipfn.recipes import kumo_tabular, resolve_member_kinds
+from minipfn.recipes import resolve_member_kinds
 from minipfn.recipes.tabpfn_v2 import TabPFNv2Classifier, TabPFNv2Regressor
 
 if TYPE_CHECKING:
@@ -112,29 +112,24 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
     return replace(config, **_model_changes(config, arch, keep_size), qk_clip=None)
 
 
-# Kumo식 열·행 단계(`stage_layout="interleaved"`, `recipes.kumo_tabular.STAGES`, issue #110)가
-# 바꾸는 열·행 단계 폭. 그 구조는 이 값들을 빼고 견주고, 대신 행 ICL 폭(n_cls × emsize)이 같아야
-# 그 구조로 본다(추론 설정·권장 크기는 행 ICL 이후가 같은 구조의 것을 쓴다)
-INTERLEAVED_STAGE_FIELDS = ("emsize", "n_cls", "n_inducing")
+# 열·행 단계를 번갈아 쌓은 모델(`stage_layout="interleaved"`, `recipes.kumo_tabular.STAGES`)은 이
+# recipe의 구조가 아니다. 그 모델은 `recipes.minipfn_v1`의 구조(`minipfn-v1`)다(행 ICL은 v3.5와
+# 같다)
 
 
 def architecture_name(config) -> str | None:
     """`config`(학습 설정, 또는 `task`·`model_type`과 구조 필드가 있는 것)의 구조가
     `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 크기를 줄인 것도 그 구조로 본다.
-    열·행 단계를 번갈아 쌓은 것(`INTERLEAVED_STAGE_FIELDS`)은 행 ICL 폭이 같으면 그 구조다."""
+    열·행 단계를 번갈아 쌓은 것은 None이다(`recipes.minipfn_v1`)."""
     if canonical_model_type(config.model_type) != MODEL_TYPE:
         return None
-    interleaved = getattr(config, "stage_layout", "sequential") == "interleaved"
+    if getattr(config, "stage_layout", "sequential") != "sequential":
+        return None
     for name in ARCHITECTURES:
         if config.task not in ARCHITECTURES[name]:
             continue
         for keep_size in (False, True):
             changes = _model_changes(config, name, keep_size)
-            if interleaved:
-                icl = changes["n_cls"] * changes["emsize"]
-                if config.n_cls * config.emsize != icl:
-                    continue
-                changes = {k: v for k, v in changes.items() if k not in INTERLEAVED_STAGE_FIELDS}
             if all(getattr(config, k) == v for k, v in changes.items()):
                 return name
     return None
@@ -330,33 +325,6 @@ STAGE4_STEPS = (500, 1_000)
 STAGE4_DEFAULT_STEPS = CURRICULUM[4]["steps"]
 # warmup은 단계 길이의 1% (스크립트 `--warmup_proportion 0.01`)
 CURRICULUM_WARMUP = 0.01
-# Kumo-Tabular 부품을 얹은 curriculum (`kumo_curriculum`, stage 1~3). 시험 학습(8×H100 batch 64,
-# stage 1 처음부터 50k)에서 고른 것만 넣는다:
-# - attention 온도를 Kumo 식으로, soft-cap 없음, stage 1 lr을 TabICLv2 스크립트 값 8e-4로 (issue
-#   #102: 지금 구조는 soft-cap 없이 lr 8e-4면 80k부터 ICL 0층이 폭주했고, Kumo 식은 100k까지 온도가
-#   줄었다. TabArena-Lite d −0.013)
-# - Kumo식 열·행 단계 (`kumo_tabular.STAGES`)와 회귀 분위수 출력 (`kumo_tabular.QUANTILE_HEAD`,
-#   issue #110: 둘 다 BeyondArena 작은 표 d −0.006으로 노이즈 밖, TabArena-Lite는 노이즈 안)
-# - decoder q·k norm(효과 없음)·범주를 아는 셀 encoder(나빠짐)는 넣지 않았다 (issue #110)
-# stage 2·3 lr은 스크립트 값 1e-4 / 2e-5 (stage 1과 같은 비율, 여기서 정함. 이 두 단계는 시험하지
-# 않았다). stage 1 micro batch는 4: 열·행 단계가 넓어 GPU당 표 8개(stage 1 1,024행 × 100열)는
-# H100 80 GB를 넘었다(issue #110). stage 2·3은 원래 1이다
-# stage 2·3은 2,048행 넘는 표에서 activation checkpointing을 켠다(`curriculum`은 stage 2 끔, stage 3
-# 10,240행). 열·행 단계가 넓어 stage 2 가장 큰 표(10,240행) 하나가 GPU 한 장(H100 80 GB)을 넘었다
-# (8×H100 smoke, 첫 forward에서 OOM). stage 1은 GPU당 1,024행 표 4개(4,096행)에 60 GB여서 기준을
-# 그 절반으로 잡았다(여기서 정함)
-KUMO_ACTIVATION_CHECKPOINTING_ROWS = 2_048
-KUMO_CURRICULUM = {
-    **kumo_tabular.ATTENTION_TEMPERATURE,
-    **kumo_tabular.STAGES,
-    **kumo_tabular.QUANTILE_HEAD,
-    "logit_softcap": None,
-}
-KUMO_CURRICULUM_STAGES = {
-    1: {"lr": 8e-4, "micro_batch": 4},
-    2: {"lr": 1e-4, "activation_checkpointing_rows": KUMO_ACTIVATION_CHECKPOINTING_ROWS},
-    3: {"lr": 2e-5, "activation_checkpointing_rows": KUMO_ACTIVATION_CHECKPOINTING_ROWS},
-}
 
 
 def curriculum(
@@ -383,21 +351,6 @@ def curriculum(
     changes.setdefault("max_cells", changes["max_rows"] * changes["max_features"])
     changes["warmup_steps"] = int(CURRICULUM_WARMUP * changes["steps"])
     return replace(paper(task, arch), **changes)
-
-
-def kumo_curriculum(
-    stage: int, task: str = "multitask", arch: str = "v3.5", steps: int | None = None
-) -> TrainConfig:
-    """`curriculum`의 stage 1~3에 Kumo-Tabular 부품을 얹은 설정 (`KUMO_CURRICULUM`): Kumo 식
-    attention 온도, soft-cap 없음, Kumo식 열·행 단계, 회귀 분위수 출력, 단계별 lr, stage 2·3
-    activation checkpointing 기준 (`KUMO_CURRICULUM_STAGES`). 표 크기·optimizer·step 수는
-    `curriculum` 그대로다."""
-    if stage not in KUMO_CURRICULUM_STAGES:
-        raise ValueError(
-            f"kumo curriculum stage는 {tuple(KUMO_CURRICULUM_STAGES)} 가운데 하나다: {stage}"
-        )
-    base = curriculum(stage, task, arch, steps)
-    return replace(base, **KUMO_CURRICULUM, **KUMO_CURRICULUM_STAGES[stage])
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +381,14 @@ def default_inference(model: nn.Module, task: str) -> dict:
     "max_features_per_member": int | None, "feature_subsampling": str}`. weight와 함께 온 설정
     (`model.inference_config`, Hub config.json의 `inference`)이 먼저이고, 그 키가 없으면 모델
     구조(3.5면 v3.5, 그 밖은 v3)의 것. 멤버당 열 상한은 3.5만 있다(3은 None: 모든 열)."""
+    return inference_settings(model, task, INFERENCE[model_architecture(model, task) or "v3"])
+
+
+def inference_settings(model: nn.Module, task: str, preset: dict) -> dict:
+    """`default_inference`의 값: weight와 함께 온 설정(`model.inference_config`)이 먼저이고, 없는
+    키는 `preset`(`INFERENCE`의 한 구조)의 것. 같은 모델 클래스를 쓰는 `recipes.minipfn_v1`도
+    쓴다."""
     saved = getattr(model, "inference_config", None) or {}
-    preset = INFERENCE[model_architecture(model, task) or "v3"]
     return {
         "n_estimators": int(saved.get("n_estimators", preset["n_estimators"][task])),
         "member_kinds": resolve_member_kinds(saved.get("member_kinds") or preset["member_kinds"]),
