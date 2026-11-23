@@ -105,6 +105,7 @@ cell_embedding.py`와 블로그에서 동작만 보고 다시 구현했다):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 from dataclasses import asdict, dataclass
@@ -1078,10 +1079,10 @@ def _host_state(shape: tuple[int, ...], dtype: torch.dtype, pin: bool) -> tuple[
     """CPU 셀 상태 (`ColumnRowTransformer._rows_interleaved_chunked`의 offload): 보통(pageable)
     CPU 텐서를 정확한 크기로 잡고, `pin`이면 그 자리만 pinned로 등록한다(`cudaHostRegister`).
     `torch.empty(..., pin_memory=True)`는 caching host allocator를 쓴다: 크기를 2의 거듭제곱으로
-    올리고(157 GB → 256 GB), 해제한 블록을 `empty_cache` 전까지 프로세스가 들고 있다. 그래서 큰
-    표를 지난 eval worker가 쓰지 않는 수백 GB를 쥐고 남는다. 돌려주는 bool은 등록했는지
-    (`_release_host_state`로 푼다). 등록이 안 되면(memlock 한도 등) 경고하고 pageable로 쓴다(값은
-    같고 복사만 느리다)."""
+    올리고(BeyondArena maps_router_eta_1m의 984 GB → 1 TiB), 해제한 블록을 `empty_cache` 전까지
+    프로세스가 들고 있다. 그래서 큰 표를 지난 eval worker가 쓰지 않는 수백 GB를 쥐고 남는다.
+    돌려주는 bool은 등록했는지(`_release_host_state`로 푼다). 등록이 안 되면(memlock 한도 등)
+    경고하고 pageable로 쓴다(값은 같고 복사만 느리다)."""
     state = torch.empty(shape, dtype=dtype, device="cpu")
     if not pin or state.numel() == 0 or not torch.cuda.is_available():
         return state, False
@@ -1149,6 +1150,9 @@ class ColumnRowTransformer(nn.Module):
     def __init__(self, config: ColumnRowTransformerConfig | None = None) -> None:
         super().__init__()
         self.config = config = config or ColumnRowTransformerConfig()
+        # `hold_host_state` 안에서 forward 사이에 다시 쓰는 CPU 셀 상태 (1차원 텐서, 등록 여부)
+        self._held_host_state: tuple[torch.Tensor, bool] | None = None
+        self._holding_host_state = False
         e, g, d = config.emsize, config.features_per_group, config.icl_dim
         self.offsets = group_offsets(g)
         if config.encoder == "fourier":
@@ -1606,7 +1610,7 @@ class ColumnRowTransformer(nn.Module):
         embed, _ = self._chunk_embedder(x, y_train, task, categorical)
         step = max(1, self.inference_chunk_cells // (b * c))
         device = x.device
-        h, registered = None, False
+        h, release = None, None
         try:
             for r0 in range(0, r, step):
                 r1 = min(r0 + step, r)
@@ -1615,8 +1619,7 @@ class ColumnRowTransformer(nn.Module):
                     shape = (b, r, c, cells.shape[-1])
                     size = math.prod(shape) * cells.element_size()
                     if self._offload_interleaved_state(device, size):
-                        pin = self.interleaved_state_pin
-                        h, registered = _host_state(shape, cells.dtype, pin)
+                        h, release = self._acquire_host_state(shape, cells.dtype)
                     else:
                         h = torch.empty(shape, dtype=cells.dtype, device=device)
                 h[:, r0:r1] = cells
@@ -1656,21 +1659,59 @@ class ColumnRowTransformer(nn.Module):
             return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
         finally:
             # 예외로 나가도 pinned 등록을 푼다 (등록한 채 남으면 그 메모리를 OS가 돌려받지 못한다)
-            if h is not None:
-                _release_host_state(h, registered)
+            if release is not None:
+                release()
+
+    def _acquire_host_state(self, shape: tuple[int, ...], dtype: torch.dtype):
+        """CPU 셀 상태와, forward가 끝날 때 부를 정리 함수(None이면 `hold_host_state`가 놓는다).
+        `hold_host_state` 밖이면 forward마다 새로 잡고 놓는다. 안이면 1차원 버퍼 하나를 잡아 두고
+        크기가 맞으면(dtype이 같고 원소가 충분하면) 앞부분을 `shape`로 다시 쓴다. 채우기가 모든
+        행을 덮어쓰므로 앞 forward의 값은 남지 않는다."""
+        if not self._holding_host_state:
+            state, registered = _host_state(shape, dtype, self.interleaved_state_pin)
+            return state, lambda: _release_host_state(state, registered)
+        numel = math.prod(shape)
+        held = self._held_host_state
+        if held is not None and (held[0].dtype != dtype or held[0].numel() < numel):
+            self._held_host_state = None
+            _release_host_state(*held)
+            held = None
+        if held is None:
+            held = _host_state((numel,), dtype, self.interleaved_state_pin)
+            self._held_host_state = held
+        return held[0][:numel].view(shape), None
+
+    @contextlib.contextmanager
+    def hold_host_state(self):
+        """이 안의 추론 forward들은 CPU 셀 상태(`_rows_interleaved_chunked`의 offload)를 놓지 않고
+        다시 쓴다. 앙상블 멤버마다 수백 GB를 새로 잡고(page fault) pinned 등록·해제하지 않도록
+        (`minipfn.inference.ensemble`이 멤버 forward들을 이 안에서 부른다). 나가면(예외여도)
+        놓는다. 값은 같다. 겹쳐 부르면 바깥 것이 놓는다."""
+        if self._holding_host_state:
+            yield
+            return
+        self._holding_host_state = True
+        try:
+            yield
+        finally:
+            self._holding_host_state = False
+            held, self._held_host_state = self._held_host_state, None
+            if held is not None:
+                _release_host_state(*held)
 
     def _offload_interleaved_state(self, device: torch.device, size: int) -> bool:
         """`_rows_interleaved_chunked`의 셀 상태(`size` 바이트)를 CPU에 둘지."""
         return device.type == "cuda" and size > self.interleaved_state_device_bytes
 
     def inference_host_state_bytes(
-        self, rows: int, columns: int, *, batch: int = 1, itemsize: int = 2
+        self, rows: int, columns: int, *, batch: int = 1, itemsize: int = 4
     ) -> int:
         """추론 forward(`inference=True`) 하나가 CPU에 두는 셀 상태 바이트
         (`_rows_interleaved_chunked`의 offload. 평가 큐가 동시에 도는 큰 표를 고를 때 쓴다,
         `scripts/tabpfn_v2/eval.py --host-memory-budget-gb`). 셀 상태 (B, R, C, E)는 열마다 토큰
         하나다. interleaved가 아니거나 나눠 계산하지 않거나 상태가 장치에 남으면 0. `itemsize`는 셀
-        토큰 dtype의 크기다 (평가는 bfloat16 autocast라 2)."""
+        토큰 dtype의 크기다: 셀 encoder는 bfloat16 autocast에서도 float32를 내므로 4다 (상태도
+        float32, H100에서 확인)."""
         cells = batch * rows * columns
         if self.config.stage_layout != "interleaved" or cells <= self.inference_chunk_cells:
             return 0

@@ -76,6 +76,7 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from typing import Any
 
@@ -326,18 +327,23 @@ class _Base:
         autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
         kwargs = forward_kwargs(model, self.task)
         categorical = uses_categorical(model)
-        for i, x, y in self._iter_inputs(X, y_trains):
-            y, extra = self._model_targets(y)
-            if categorical:  # 멤버 입력 열의 범주 표시 (모듈 docstring)
-                mask = self.preprocessors_[i].categorical_columns()
-                extra = {**extra, "categorical": torch.as_tensor(mask, device=self.device)[None]}
-            with (
-                torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
-                torch.inference_mode(),
-            ):
-                logits = model(x, y, **kwargs, **extra)[0].float()
-            # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
-            yield i, logits
+        # 멤버 forward들이 큰 CPU 버퍼(column_row_transformer interleaved의 셀 상태)를 다시 쓰고,
+        # 멤버를 다 돌면(예외여도) 놓는다
+        hold = getattr(model, "hold_host_state", None)
+        with hold() if hold is not None else contextlib.nullcontext():
+            for i, x, y in self._iter_inputs(X, y_trains):
+                y, extra = self._model_targets(y)
+                if categorical:  # 멤버 입력 열의 범주 표시 (모듈 docstring)
+                    mask = self.preprocessors_[i].categorical_columns()
+                    mask = torch.as_tensor(mask, device=self.device)[None]
+                    extra = {**extra, "categorical": mask}
+                with (
+                    torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
+                    torch.inference_mode(),
+                ):
+                    logits = model(x, y, **kwargs, **extra)[0].float()
+                # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
+                yield i, logits
 
 
 class EnsembleClassifier(_Base):

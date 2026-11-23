@@ -648,20 +648,20 @@ def test_host_state_estimate_only_for_interleaved_models():
     estimate = script.host_state_estimator(factories, caps)
     interleaved.interleaved_state_device_bytes = 1 << 30
     # 멤버 열 = min(feature, 768) + 식별자 1
-    assert estimate("binary", 1_250_000, 988) == 1_250_000 * 769 * e * 2
-    assert estimate("multiclass", 1_250_000, 225) == 1_250_000 * 226 * e * 2
+    assert estimate("binary", 1_250_000, 988) == 1_250_000 * 769 * e * 4
+    assert estimate("multiclass", 1_250_000, 225) == 1_250_000 * 226 * e * 4
     assert estimate("regression", 1_250_000, 988) == 0  # 회귀는 interleaved가 아니다
     assert estimate("binary", 1000, 10) == 0  # 장치에 남는다
     # one-hot으로 펼치면(범주 열이 있을 때만) 열 수는 one-hot 상한까지 늘 수 있다
     factories["classification"].max_one_hot_width = 160
     for mode, categorical, columns in (("all", True, 160), ("all", False, 43), ("off", True, 43)):
         estimate = script.host_state_estimator(factories, caps, mode)
-        assert estimate("binary", 1_250_000, 43, categorical) == 1_250_000 * (columns + 1) * e * 2
-    assert estimate("binary", 1_250_000, 988) == 1_250_000 * 769 * e * 2
+        assert estimate("binary", 1_250_000, 43, categorical) == 1_250_000 * (columns + 1) * e * 4
+    assert estimate("binary", 1_250_000, 988) == 1_250_000 * 769 * e * 4
     # quantile 멤버: 원래 열 + 분위수 열 + SVD 성분(최대 열/2)
     factories["classification"] = factory(interleaved, ("quantile", "power"))
     estimate = script.host_state_estimator(factories, {"classification": None})
-    assert estimate("binary", 1_250_000, 100) == 1_250_000 * 251 * e * 2
+    assert estimate("binary", 1_250_000, 100) == 1_250_000 * 251 * e * 4
 
     grid = pd.DataFrame(
         [
