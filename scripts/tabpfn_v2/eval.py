@@ -336,7 +336,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="--shards: CPU 셀 상태를 쓰는 큰 표(stage_layout=interleaved 모델)는 동시에 도는 합이"
-        " 이 GB 안일 때만 준다 (기본: 컨테이너 메모리 한도(cgroup)의 50%%, 한도를 모르면 끔."
+        " 이 GB 안일 때만 준다 (기본: 컨테이너 메모리 한도(cgroup)의 50%%, 한도가 없거나 못 읽으면"
+        " 물리 메모리(/proc/meminfo)의 50%%."
         " 0: 끔). 큐 순서만 바뀐다",
     )
     # 내부용: stdin으로 받은 데이터셋을 하나씩 돌리는 worker (`--shards`가 띄운다)
@@ -1209,9 +1210,10 @@ def run_queue(
     {번호: 이유}. 둘 다 비어야 성공이다.
 
     `host_budget`(바이트)을 주면 CPU 셀 상태를 쓰는 큰 표(`job["host_bytes"]`, `host_state_bytes`)는
-    지금 도는 큰 표의 합과 더해 예산 안일 때만 준다. 그 사이 쉬는 worker는 큐에서 다음 일(작은 표,
-    예산에 드는 큰 표)을 받는다. 큰 표가 하나도 돌지 않으면 예산보다 커도 준다(혼자 돈다). 큐 순서
-    말고는 바뀌지 않는다 (결과는 데이터셋마다 같다)."""
+    지금 도는 큰 표의 합과 더해 예산 안일 때만 준다. 큰 표가 하나도 돌지 않으면 예산보다 커도 준다
+    (혼자 돈다). 앞에서 기다리는 큰 표가 있으면 그 뒤의 큰 표는 그 표가 시작할 때까지 주지 않는다:
+    비싼 표가 작은 큰 표들에 계속 밀려 꼬리에 남지 않도록(비싼 것 먼저). 그 사이 쉬는 worker는 작은
+    표를 받는다. 큐 순서 말고는 바뀌지 않는다 (결과는 데이터셋마다 같다)."""
     labels = labels or [f"worker {i}" for i in range(n_workers)]
     pending = list(jobs)
     total = sum(j["splits"] for j in jobs)
@@ -1229,10 +1231,14 @@ def run_queue(
         if host_budget is None:
             return 0
         in_use = host_in_use()
+        blocked = False  # 앞에서 기다리는 큰 표가 있다: 뒤의 큰 표는 주지 않는다
         for k, job in enumerate(pending):
             need = job.get("host_bytes", 0)
-            if not need or not in_use or in_use + need <= host_budget:
+            if not need:
                 return k
+            if not blocked and (not in_use or in_use + need <= host_budget):
+                return k
+            blocked = True
             if job["dataset"] not in waiting:
                 waiting.add(job["dataset"])
                 print(
@@ -1362,13 +1368,29 @@ def cgroup_memory_limit(files: tuple[str, ...] = CGROUP_MEMORY_FILES) -> int | N
     return None
 
 
-def host_memory_budget(args: argparse.Namespace, files: tuple[str, ...] = CGROUP_MEMORY_FILES):
+def physical_memory(meminfo: str = "/proc/meminfo") -> int | None:
+    """물리 메모리 (바이트, `MemTotal`). 읽을 수 없으면 None."""
+    try:
+        for line in Path(meminfo).read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024  # kB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def host_memory_budget(
+    args: argparse.Namespace,
+    files: tuple[str, ...] = CGROUP_MEMORY_FILES,
+    meminfo: str = "/proc/meminfo",
+):
     """`run_queue`의 CPU 셀 상태 예산 (바이트, None이면 끔). `--host-memory-budget-gb`(0 이하면 끔),
-    주지 않으면 cgroup 한도의 `HOST_MEMORY_FRACTION`(한도를 모르면 끔)."""
+    주지 않으면 cgroup 한도의 `HOST_MEMORY_FRACTION`. 한도가 없거나("max": 부모 cgroup이 정하는
+    컨테이너 등) 못 읽으면 물리 메모리의 같은 비율, 그것도 모르면 끈다."""
     given = getattr(args, "host_memory_budget_gb", None)
     if given is not None:
         return None if given <= 0 else int(given * 1e9)
-    limit = cgroup_memory_limit(files)
+    limit = cgroup_memory_limit(files) or physical_memory(meminfo)
     return None if limit is None else int(limit * HOST_MEMORY_FRACTION)
 
 
@@ -1407,11 +1429,12 @@ def host_state_estimator(factories: dict, caps: dict, one_hot: str = "off"):
 
 def host_state_bytes(grid, rows: dict[str, int], estimate) -> dict[str, int]:
     """돌릴 split이 있는 데이터셋마다 CPU 셀 상태 어림 (`estimate`, 0인 것은 뺀다). 행은 split의
-    학습 + 테스트 행 가운데 가장 큰 것(`arena.split_rows`), 모르면 학습 행 × 1.25."""
+    학습 + 테스트 행 가운데 가장 큰 것(`arena.split_rows`), 모르면 학습 행 × 1.5 (학습:테스트 2:1
+    split까지 위쪽으로)."""
     todo = grid[grid["skip_reason"].isna()]
     out = {}
     for dataset, part in todo.groupby("dataset"):
-        n_rows = rows.get(dataset) or int(part["max_train_rows"].max() * 1.25)
+        n_rows = rows.get(dataset) or int(part["max_train_rows"].max() * 1.5)
         problem_type = part["problem_type"].iloc[0]
         # 범주 열이 있는지 모르면(None, TabArena) 있다고 본다
         categorical = part["has_categorical"].iloc[0] if "has_categorical" in part else None

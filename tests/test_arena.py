@@ -543,7 +543,8 @@ def test_run_queue_gives_unstarted_work_of_a_dead_worker_to_another(tmp_path, fi
 def test_run_queue_holds_big_tables_within_the_host_budget(tmp_path, capsys):
     script = _eval_script()
     # big_a·big_b는 60씩(예산 100): big_b는 big_a가 끝난 뒤에 시작한다. 그 사이 쉬는 worker들은
-    # 작은 표를 받는다 (큐에서 big_b 뒤에 있어도)
+    # 작은 표를 받는다 (큐에서 big_b 뒤에 있어도). mid(30)는 예산에 들지만 앞에서 big_b가 기다리므로
+    # big_b가 시작한 뒤에 받는다 (비싼 것 먼저)
     spec = [("big_a", 1, 0.6), ("big_b", 1, 0.3), ("mid", 1, 0.3)]
     spec += [(f"small{k}", 1, 0.01) for k in range(4)]
     host = {"big_a": 60, "big_b": 60, "mid": 30}
@@ -554,8 +555,9 @@ def test_run_queue_holds_big_tables_within_the_host_budget(tmp_path, capsys):
     assert missing == [] and failed == {}
     rows = _fake_rows(jobs)
     assert rows["big_b"]["start"] >= rows["big_a"]["end"]
-    # mid(30)는 big_a와 같이 돈다 (60 + 30 ≤ 100). 작은 표는 big_b를 기다리지 않는다
-    assert rows["mid"]["start"] < rows["big_a"]["end"]
+    # mid는 big_a와 같이 돌 수 있지만(60 + 30 ≤ 100) big_b가 시작한 뒤(= big_a가 끝난 뒤)에 받는다
+    assert rows["mid"]["start"] >= rows["big_a"]["end"]
+    assert rows["mid"]["start"] < rows["big_b"]["end"]  # big_b와 같이 돈다 (60 + 30 ≤ 100)
     assert all(rows[f"small{k}"]["end"] < rows["big_a"]["end"] for k in range(4))
     out = capsys.readouterr().out
     assert "big_b waits for host memory (cell state 0 GB, in use 0 / budget 0 GB)" in out
@@ -601,21 +603,28 @@ def test_run_queue_frees_the_budget_of_a_dead_worker(tmp_path):
 def test_host_memory_budget(tmp_path):
     script = _eval_script()
     v2, v1 = tmp_path / "memory.max", tmp_path / "memory.limit_in_bytes"
+    meminfo = tmp_path / "meminfo"
     files = (str(v2), str(v1))
+
+    def budget(args):
+        return script.host_memory_budget(args, files, str(meminfo))
+
     args = argparse.Namespace(host_memory_budget_gb=None)
-    assert script.host_memory_budget(args, files) is None  # 파일이 없다: 끔
-    v1.write_text("9223372036854771712\n")  # v1의 한도 없음
-    assert script.host_memory_budget(args, files) is None
+    assert budget(args) is None  # cgroup도 meminfo도 없다: 끔
+    meminfo.write_text("MemTotal:       2097060284 kB\nMemFree:  1 kB\n")
+    assert budget(args) == 2097060284 * 1024 // 2  # cgroup을 못 읽으면 물리 메모리의 50%
+    v1.write_text("9223372036854771712\n")  # v1의 한도 없음: 물리 메모리
+    assert budget(args) == 2097060284 * 1024 // 2
     v1.write_text("1000000000000\n")
-    assert script.host_memory_budget(args, files) == 500_000_000_000
-    v2.write_text("max\n")  # v2가 먼저: 한도 없음
-    assert script.host_memory_budget(args, files) is None
+    assert budget(args) == 500_000_000_000
+    v2.write_text("max\n")  # v2가 먼저: 한도 없음 → 물리 메모리
+    assert budget(args) == 2097060284 * 1024 // 2
     v2.write_text("2000000000000\n")
-    assert script.host_memory_budget(args, files) == 1_000_000_000_000
+    assert budget(args) == 1_000_000_000_000
     args.host_memory_budget_gb = 700
-    assert script.host_memory_budget(args, files) == 700_000_000_000
+    assert budget(args) == 700_000_000_000
     args.host_memory_budget_gb = 0
-    assert script.host_memory_budget(args, files) is None
+    assert budget(args) is None
     assert script.parse_args(["--host-memory-budget-gb", "800"]).host_memory_budget_gb == 800
     assert script.parse_args([]).host_memory_budget_gb is None
 
@@ -678,13 +687,63 @@ def test_host_state_estimate_only_for_interleaved_models():
         ]
     )  # fmt: skip
     got = script.host_state_bytes(grid, {"big": 1_100_000}, estimate)
-    # 행을 모르면 학습 행 × 1.25, 돌리지 않는 데이터셋과 0인 데이터셋은 뺀다
+    # 행을 모르면 학습 행 × 1.5, 돌리지 않는 데이터셋과 0인 데이터셋은 뺀다
     assert got == {
         "big": estimate("binary", 1_100_000, 100),
-        "guess": estimate("binary", 1_250_000, 100),
+        "guess": estimate("binary", 1_500_000, 100),
     }
     jobs = script.shard_jobs([("big", 1), ("tiny", 1)], Path("/tmp/x"), "beyondarena", "id", got)
     assert jobs[0]["host_bytes"] == got["big"] and "host_bytes" not in jobs[1]
+
+
+def test_run_queue_does_not_let_smaller_big_tables_pass_a_waiting_one(tmp_path):
+    script = _eval_script()
+    # huge(90, 예산 100)는 a(30)가 도는 동안 기다린다. 그 뒤의 b·c(30씩)는 예산에 들지만 huge가
+    # 시작할 때까지 받지 않는다 (huge가 꼬리에 남지 않도록). small은 그 사이 돈다
+    spec = [("a", 1, 0.3), ("huge", 1, 0.3), ("b", 1, 0.05), ("c", 1, 0.05), ("small", 1, 0.01)]
+    jobs = _fake_jobs(tmp_path, spec, {"a": 30, "huge": 90, "b": 30, "c": 30})
+    missing, failed = script.run_queue(
+        jobs, _fake_spawn, 3, heartbeat_s=60, poll_s=0.01, host_budget=100
+    )
+    assert missing == [] and failed == {}
+    rows = _fake_rows(jobs)
+    assert rows["huge"]["start"] >= rows["a"]["end"]
+    assert rows["b"]["start"] >= rows["huge"]["end"] and rows["c"]["start"] >= rows["huge"]["end"]
+    assert rows["small"]["end"] < rows["a"]["end"]
+
+
+@pytest.mark.parametrize("kind", ["standard", "quantile"])
+@pytest.mark.parametrize("one_hot", [False, True])
+def test_host_state_columns_bound_the_member_input_width(kind, one_hot):
+    # 어림(eval.py)의 멤버 열 수가 실제 전처리(`MemberPreprocessor`)가 내는 열 수보다 작지 않다.
+    # 전처리가 열을 늘리게 바뀌면 여기서 걸린다
+    import types
+
+    from minipfn.inference.preprocessing import Member, MemberPreprocessor
+
+    script = _eval_script()
+    rng = np.random.default_rng(0)
+    n, n_num, cats = 200, 6, [3, 5, 2, 12]  # 수치 6열 + 범주 4열 (범주 수 3·5·2·12)
+    X = np.column_stack(
+        [rng.normal(size=(n, n_num))] + [rng.integers(0, k, size=n) for k in cats]
+    ).astype(float)
+    cat_ix = list(range(n_num, n_num + len(cats)))
+    width = 16
+    member = Member(kind=kind, class_permutation=None, target_power=False, seed=0, one_hot=one_hot)
+    prep = MemberPreprocessor(member, cat_ix, width).fit(X)
+    actual = prep.transform(X, np.random.default_rng(1)).shape[1]
+
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(stage_layout="interleaved"),
+        inference_host_state_bytes=lambda rows, columns: columns,  # 열 수를 그대로 돌려준다
+    )
+    factory = types.SimpleNamespace(model=model, member_kinds=(kind,), max_one_hot_width=width)
+    estimate = script.host_state_estimator(
+        {"classification": factory}, {"classification": None}, "all" if one_hot else "off"
+    )
+    assert estimate("binary", 1, X.shape[1], True) >= actual
+    if kind == "standard" and not one_hot:
+        assert estimate("binary", 1, X.shape[1], True) == actual  # 원래 열 + 식별자 1
 
 
 def test_split_rows_takes_the_largest_train_plus_test():
