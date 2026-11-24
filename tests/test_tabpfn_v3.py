@@ -364,7 +364,7 @@ def test_one_recipe_lookup_serves_every_model():
     assert recipes.recipe_for_model_type("column_row_transformer") is recipe
     assert recipes.recipe_for_model_type("tabpfn_v2") is tabpfn_v2  # 예전 이름
     assert recipes.recipe_for_architecture("v3.5") is recipe
-    assert recipes.architectures() == ("v2", "v2.5", "v3", "v3.5", "minipfn-v1")
+    assert recipes.architectures() == ("v2", "v2.5", "v3", "v3.5")
     assert recipes.architecture_name(recipe.paper()) == "v3"
     assert recipes.default_inference(_model(arch="v3.5"), "regression")["member_kinds"] == (
         "standard",
@@ -868,3 +868,24 @@ def test_diag_scale_views_keep_feature_subsampling():
     )
     views = _views(est, model, n_views=4, random_state=0)
     assert views.max_features_per_member == 3 and views.feature_subsampling == "balanced"
+
+
+def test_attention_without_softcap_splits_large_batch(monkeypatch):
+    # soft-cap 없는 attention(v3, v3.5 paper, 공식 3.5 가중치)은 batch가 CUDA kernel grid 상한
+    # (`SDPA_MAX_BATCH`)을 넘으면 나눠 부른다(표 8개 × 10,240행 검증 batch에서 flash attention이
+    # invalid argument, PR #114). 나눠도 출력·gradient가 같다 (CPU에서 상한을 작게 해서 본다)
+    from minipfn.models import column_row_transformer as M
+
+    torch.manual_seed(0)
+    attn = M.Attention(64, 4, qk_norm=True, zero_out=False)
+    x = torch.randn(7, 30, 64)
+    runs = []
+    for max_batch in (65_535, 3):
+        monkeypatch.setattr(M, "SDPA_MAX_BATCH", max_batch)
+        x_ = x.clone().requires_grad_()
+        attn.zero_grad(set_to_none=True)
+        out = attn(x_, n_context=20)
+        out.square().mean().backward()
+        runs.append([out, x_.grad, *(p.grad for p in attn.parameters() if p.grad is not None)])
+    for a, b in zip(*runs, strict=True):
+        assert torch.allclose(a, b, atol=1e-6)

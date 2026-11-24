@@ -470,22 +470,6 @@ class MemberPreprocessor:
         block[np.flatnonzero(known), codes[known].astype(int)] = 1.0
         return block[:, 1:] if n == 2 else block
 
-    def categorical_columns(self) -> np.ndarray:
-        """`transform`이 내는 열마다 범주형 열(번호로 둔 열)인지 (bool, 열 순서는 `transform`과
-        같다). 범주를 아는 셀 encoder 모델(issue #110)에 넘긴다. one-hot으로 펼친 열(0/1)·분위수
-        열·SVD 성분·샘플 식별자 열은 수치 열이다."""
-        mask = np.zeros(len(self.lower), dtype=bool)
-        mask[self.cat_ix] = True
-        if self.member.kind == "quantile":  # 원래 열 + 분위수 열 (`_base`)
-            mask = np.concatenate([mask, np.zeros(len(self.num_ix), dtype=bool)])
-        if self.one_hot_sizes:  # 번호 열을 빼고 one-hot 열을 뒤에 (`_base`)
-            keep = [j for j in range(len(mask)) if j not in self.one_hot_sizes]
-            width = sum(_one_hot_width(n) for n in self.one_hot_sizes.values())
-            mask = np.concatenate([mask[keep], np.zeros(width, dtype=bool)])
-        n_svd = 0 if self.svd is None else self.svd.n_components
-        mask = np.concatenate([mask, np.zeros(n_svd + 1, dtype=bool)])  # SVD 성분 + 식별자 열
-        return mask[self.order]
-
     def transform(
         self, X: np.ndarray, rng: np.random.Generator, is_test: bool = False
     ) -> np.ndarray:

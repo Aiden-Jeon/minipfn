@@ -25,10 +25,6 @@ prior 변형 옵션 (issue #92, 기본은 모두 꺼져 예전과 같은 데이�
 - `mixture_root_prob`: graph SCM 데이터셋을 이 확률로 골라 root 노드를 Gaussian mixture(군집)에서
   뽑는다 (`generators.graph_scm`)
 
-`categorical_mask`(issue #110, 기본 끔): batch에 범주 열 표시 `PriorBatch.categorical` (B, F)를
-더한다(범주를 아는 셀 encoder `categorical_encoder` 학습). 표는 끈 것과 같다. tree SCM과는 같이
-쓰지 않는다(그 생성기는 표시를 내지 않는다)
-
     prior = GraphSCMPrior(task="classification", seed=0)
     batch = prior.sample_batch(8)  # x (8, 행, feature), y (8, 행), n_train
 
@@ -91,11 +87,8 @@ class GraphSCMPrior:
         tree_scm_prob: float = 0.0,
         graph_scm_corrected: bool = False,
         mixture_root_prob: float = 0.0,
-        categorical_mask: bool = False,
     ) -> None:
         check_probability("tree_scm_prob", tree_scm_prob)
-        if categorical_mask and tree_scm_prob:
-            raise ValueError("categorical_mask는 tree_scm_prob와 같이 쓰지 않는다 (모듈 docstring)")
         self._task = task
         if task == "classification":
             min_train_rows = max(min_train_rows, 2)  # 클래스가 2개 이상 학습 행에 나오려면
@@ -135,7 +128,6 @@ class GraphSCMPrior:
             filter_unpredictable=filter_unpredictable,
             corrected=graph_scm_corrected,
             mixture_root_prob=mixture_root_prob,
-            categorical_mask=categorical_mask,
         )
         classification = task == "classification"
         hyperparameters = ClassCount(MAX_CLASSES, binary_prob) if classification else None
@@ -336,8 +328,6 @@ def make_prior(config, seed: int) -> GraphSCMPrior:
         missing_dataset_prob=config.missing_dataset_prob,
         **_sizes(config),
         **{name: getattr(config, name) for name in PRIOR_FIELDS},
-        # 범주를 아는 셀 encoder 모델이면 범주 열 표시를 batch에 더한다 (issue #110)
-        categorical_mask=getattr(config, "categorical_encoder", False),
     )
 
 

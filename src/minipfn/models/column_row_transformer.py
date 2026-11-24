@@ -60,52 +60,10 @@ TabPFN-3.5가 바꾼 것은 설정으로 켠다 (recipe `ARCHITECTURES["v3.5"]`)
 - `task="multitask"`: 분류·회귀를 한 모델로. 정답 encoder(셀·ICL)와 출력층(앞 MLP 포함)만 task마다
   있고 나머지는 같이 쓴다. forward의 `task` 인자가 어느 쪽을 쓸지 고른다. 분류 출력 수는
   `n_out`, 회귀 구간 수는 `n_buckets`
-
-attention 온도 (issue #102, 기본값이면 위 구조 그대로다). Kumo-Tabular(NVIDIA structured-data-models
-`sdm/nn/scaling.py`·`sdm/models/kumo/tabular/block.py`, Apache 2.0. 동작만 보고 다시 구현했다)는
-q·k RMSNorm에 gain을 두지 않고, q에 곱하는 온도를 head마다 스칼라 하나로 둔다. 그러면 logit이
-√(head dim) · a_h · log n (· 2)로 묶인다. 이 모델은 QK-norm gain과 QASSMax 배율이 함께 커지며 ICL
-logit이 수십만이 되어 무너졌다(PR #74).
-
-- `qk_norm_affine`: False면 q·k RMSNorm에 gain이 없다(`qk_norm`일 때만)
-- 단계마다 온도 종류 (`TEMPERATURES`): 열 단계 요약 쪽(`column_summary_temperature`, 기본
-  qassmax), 펼치는 쪽(`column_spread_temperature`, 기본 none), 행 단계(`row_temperature`, 기본
-  none), 행 ICL(`icl_temperature`, 기본 qassmax), 분류 retrieval decoder(`decoder_temperature`,
-  기본 qassmax)
-  - `logscale`: q ← q · a_h · log n. a_h는 head마다 학습되는 스칼라이고 U(0, 1)에서 시작한다(Kumo와
-    같다)
-  - `gated_logscale`: logscale에 (1 + tanh(gate(q)))를 곱한다. gate는 head dim → `qassmax_hidden`
-    → head dim MLP이고 마지막 층이 0으로 시작한다
-  - n은 QASSMax와 같은 key 수다(학습 행 수, 행 단계는 CLS + feature 토큰 수)
-- Kumo는 RoPE를 q·k RMSNorm 앞에 건다. gain이 없으면 회전이 크기를 바꾸지 않아 순서와 상관없이
-  같은 값이라 여기 순서(norm → RoPE) 그대로 둔다. Kumo에는 retrieval decoder가 없다
-
-Kumo-Tabular의 나머지 부품 (issue #110, 기본값이면 위 구조 그대로다. 같은 공개 소스의
-`sdm/models/kumo/tabular/{cell_embedding,row_embedding,model}.py`·`sdm/models/tabfm/
-cell_embedding.py`와 블로그에서 동작만 보고 다시 구현했다):
-
-- `decoder_qk_norm`: 분류 retrieval decoder의 q·k에 head마다 gain 없는 RMSNorm(온도 앞). 그러면
-  decoder logit도 √(head dim) · a_h · log n으로 묶인다(logscale 온도일 때). Kumo에는 decoder가 없어
-  여기서 정함
-- `stage_layout="interleaved"`: 열 단계와 행 단계 블록을 번갈아 쌓는다. 셀 토큰이 [열 블록 i → 행
-  블록 i]를 차례로 지나고(i = 0..블록 수 − 1, `column_blocks`와 `row_blocks`가 같아야 한다), CLS
-  토큰은 행 블록 사이에 이어진다(열 블록에는 들어가지 않는다). 마지막 행 블록은 CLS만 query다.
-  기본 `"sequential"`은 열 블록을 모두 지난 뒤 행 블록을 모두 지난다(지금 구조). Kumo-L은 셀 폭
-  256, 6쌍, head 4, inducing 256, CLS 4개(행 벡터 1024)다(`recipes.kumo_tabular.STAGES`)
-- `regression_head="quantile"`: 회귀 출력을 bar distribution 구간 logit 대신 분위수 999개로
-  (`minipfn.models.quantile_distribution`: 수준 k/1000, 학습 손실은 pinball, 처음 bias는 표준정규
-  분위수, 처음 weight는 0. 출력층 앞은 bar와 같다). 추론은 분위수를 구간 확률로 바꿔 bar
-  distribution 추론 코드를 그대로 쓴다
-- `categorical_encoder`: 범주를 아는 셀 encoder(`encoder="fourier"`일 때만). forward의
-  `categorical`(B, C, 범주 열이면 True)을 받아, 묶음 위치마다 그 열이 범주 열이면 범주 쪽 주파수와
-  Linear를 쓴다(Kumo처럼 수치·범주가 따로). 위치마다 범주 표시를 Linear해 더한다(Kumo의 결측
-  표시 Linear와 같은 식, 여기서 정함). z값·결측 표시·ECDF 갈래는 같이 쓴다. 범주 쪽 주파수의 처음
-  값은 수치 쪽과 같다
 """
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import math
 from dataclasses import asdict, dataclass
@@ -117,30 +75,9 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from minipfn.models.cell_transformer import NAN_INDICATOR, standardize_cells
-from minipfn.models.quantile_distribution import N_QUANTILES, initial_bias
 
 TASKS = ("classification", "regression", "multitask")
 ENCODERS = ("linear", "fourier")
-# 열·행 단계 블록 쌓는 순서, 회귀 출력 (모듈 docstring "Kumo-Tabular의 나머지 부품")
-STAGE_LAYOUTS = ("sequential", "interleaved")
-REGRESSION_HEADS = ("bar", "quantile")
-# 그 부품을 고르는 설정 필드와 기본값 (지금 구조). 학습 설정(`TrainConfig`)도 이 값을 쓴다
-KUMO_OPTION_FIELDS = {
-    "decoder_qk_norm": False,
-    "stage_layout": "sequential",
-    "regression_head": "bar",
-    "categorical_encoder": False,
-}
-# attention 온도 종류 (모듈 docstring "attention 온도"): q에 곱하는 배율
-TEMPERATURES = ("qassmax", "logscale", "gated_logscale", "none")
-# 단계마다 온도를 고르는 설정 필드와 그 기본값 (지금 구조)
-TEMPERATURE_FIELDS = {
-    "column_summary_temperature": "qassmax",
-    "column_spread_temperature": "none",
-    "row_temperature": "none",
-    "icl_temperature": "qassmax",
-    "decoder_temperature": "qassmax",
-}
 N_FOURIER = 32  # TabPFN-3.5 cell encoder의 주파수 수
 N_HARMONICS = 4  # TabPFN-3.5 ECDF의 sin·cos 차수
 # 추론에서 받는 클래스 수 상한 (공식 TabPFN-3.5와 같다). retrieval decoder에는 클래스마다
@@ -155,8 +92,9 @@ SOFTCAP_CHUNK_LOGITS = 1 << 28
 # (추론에서 행 단계의 batch = 행 수가 이보다 클 수 있다)
 FLEX_MAX_BATCH = 65_535
 # soft-cap 없는 attention(`F.scaled_dot_product_attention`)의 CUDA kernel(flash 등)도 grid 한 축이
-# batch라 같은 상한을 넘으면 invalid argument로 실패한다(stage2_kumo 검증: 표 8개 × 10,240행 =
-# 행 단계 batch 81,920). 넘으면 batch를 나눠 부른다(batch마다 따로라 결과는 같다). 학습 batch는
+# batch라 같은 상한을 넘으면 invalid argument로 실패한다(검증 batch 표 8개 × 10,240행 = 행 단계
+# batch 81,920에서 실패, PR #114). 넘으면 batch를 나눠 부른다(batch마다 따로라 결과는 같다).
+# soft-cap 없는 구조(v3, v3.5 paper, 공식 3.5 가중치)의 큰 표 추론이 이 길을 지난다. 학습 batch는
 # 이보다 작아 학습 계산은 그대로다
 SDPA_MAX_BATCH = FLEX_MAX_BATCH
 # flex attention kernel을 쓰는 가장 작은 head 폭 (Triton 행렬곱의 최소 폭). 더 좁으면(작은 smoke
@@ -222,62 +160,16 @@ class ColumnRowTransformerConfig:
     # ICL 앞쪽 층이 하나씩 one-hot attention이 되며 학습이 무너졌다(PR #74 stage 1, 75k~150k).
     # 가중치 모양과 상관없어 checkpoint의 값과 달라도 가중치를 가져올 수 있다
     logit_softcap: float | None = None
-    # attention 온도 (issue #102, 모듈 docstring "attention 온도"). 기본값이면 지금 구조 그대로다
-    qk_norm_affine: bool = True  # False면 q·k RMSNorm에 gain이 없다 (qk_norm일 때만)
-    column_summary_temperature: str = TEMPERATURE_FIELDS["column_summary_temperature"]
-    column_spread_temperature: str = TEMPERATURE_FIELDS["column_spread_temperature"]
-    row_temperature: str = TEMPERATURE_FIELDS["row_temperature"]
-    icl_temperature: str = TEMPERATURE_FIELDS["icl_temperature"]
-    decoder_temperature: str = TEMPERATURE_FIELDS["decoder_temperature"]
-    # Kumo-Tabular의 나머지 부품 (issue #110, 모듈 docstring). 기본값이면 지금 구조 그대로다
-    decoder_qk_norm: bool = KUMO_OPTION_FIELDS["decoder_qk_norm"]
-    stage_layout: str = KUMO_OPTION_FIELDS["stage_layout"]
-    regression_head: str = KUMO_OPTION_FIELDS["regression_head"]
-    categorical_encoder: bool = KUMO_OPTION_FIELDS["categorical_encoder"]
 
     INFO_FIELDS: ClassVar[tuple[str, ...]] = ("max_features", "logit_softcap")
     # 첫 공개 뒤에 더한 필드: 기본값이면 checkpoint·config.json에 적지 않는다
-    ADDED_FIELDS: ClassVar[tuple[str, ...]] = (
-        "logit_softcap",
-        "qk_norm_affine",
-        *TEMPERATURE_FIELDS,
-        *KUMO_OPTION_FIELDS,
-    )
+    ADDED_FIELDS: ClassVar[tuple[str, ...]] = ("logit_softcap",)
 
     def __post_init__(self) -> None:
         if self.task not in TASKS:
             raise ValueError(f"task는 {TASKS} 가운데 하나여야 한다: {self.task}")
         if self.encoder not in ENCODERS:
             raise ValueError(f"encoder는 {ENCODERS} 가운데 하나여야 한다: {self.encoder}")
-        if self.stage_layout not in STAGE_LAYOUTS:
-            raise ValueError(
-                f"stage_layout은 {STAGE_LAYOUTS} 가운데 하나여야 한다: {self.stage_layout}"
-            )
-        if self.stage_layout == "interleaved" and (
-            self.column_blocks != self.row_blocks or self.row_blocks < 1
-        ):
-            raise ValueError(
-                "stage_layout=interleaved는 열·행 블록 수가 같아야 한다:"
-                f" column_blocks {self.column_blocks}, row_blocks {self.row_blocks}"
-            )
-        if self.regression_head not in REGRESSION_HEADS:
-            raise ValueError(
-                f"regression_head는 {REGRESSION_HEADS} 가운데 하나여야 한다: {self.regression_head}"
-            )
-        if self.regression_head != "bar" and "regression" not in self.tasks:
-            raise ValueError(
-                "regression_head는 회귀 출력이 있는 모델(regression·multitask)에만 쓴다"
-            )
-        if self.categorical_encoder and self.encoder != "fourier":
-            raise ValueError("categorical_encoder는 encoder=fourier일 때만 쓴다")
-        for name in TEMPERATURE_FIELDS:
-            if getattr(self, name) not in TEMPERATURES:
-                raise ValueError(
-                    f"{name}는 {TEMPERATURES} 가운데 하나여야 한다: {getattr(self, name)}"
-                )
-        if not self.qk_norm_affine and not self.qk_norm:
-            # QK-norm이 없으면 gain도 없다 (조용히 아무 일도 하지 않는 설정을 막는다)
-            raise ValueError("qk_norm_affine=False는 qk_norm=True일 때만 쓴다")
         if self.logit_softcap is not None and not (
             math.isfinite(self.logit_softcap) and self.logit_softcap > 0
         ):
@@ -303,9 +195,7 @@ class ColumnRowTransformerConfig:
         return ("classification", "regression") if self.task == "multitask" else (self.task,)
 
     def output_size(self, task: str) -> int:
-        """그 task의 출력 수 (분류: 클래스 상한, 회귀: 구간 수, 분위수 출력이면 분위수 수)."""
-        if task == "regression" and self.regression_head == "quantile":
-            return N_QUANTILES
+        """그 task의 출력 수 (분류: 클래스 상한, 회귀: 구간 수)."""
         if task == "classification" or self.task != "multitask":
             return self.n_out
         return self.n_buckets
@@ -418,67 +308,13 @@ class QASSMax(nn.Module):
         return q * base * (1 + torch.tanh(self.query_mlp(q)))
 
 
-class LogScale(nn.Module):
-    """q ← q · a_h · log n (모듈 docstring "attention 온도"). a_h(`head_scale`)는 head마다 학습되는
-    스칼라이고 U(0, 1)에서 시작한다. `gated`면 (1 + tanh(gate(q)))를 더 곱한다(gate는 처음에 0이라
-    처음 배율은 1)."""
-
-    def __init__(self, nhead: int, head_dim: int, hidden: int, gated: bool = False) -> None:
-        super().__init__()
-        self.head_scale = nn.Parameter(torch.rand(nhead))
-        self.gate = None
-        if gated:
-            self.gate = nn.Sequential(
-                nn.Linear(head_dim, hidden), nn.GELU(), nn.Linear(hidden, head_dim)
-            )
-            nn.init.zeros_(self.gate[2].weight)
-            nn.init.zeros_(self.gate[2].bias)
-
-    def forward(self, q: torch.Tensor, n_keys: int) -> torch.Tensor:
-        # q: (N, H, L, d). log n은 QASSMax처럼 compile할 때 텐서로 (n마다 다시 compile하지 않도록)
-        if torch.compiler.is_compiling():
-            log_n = (torch.ones((), device=q.device) * n_keys).clamp(min=1).log()
-        else:
-            log_n = q.new_full((), math.log(max(n_keys, 1)), dtype=torch.float32)
-        scale = (self.head_scale.float() * log_n).to(q.dtype).view(1, -1, 1, 1)
-        out = q * scale
-        if self.gate is not None:
-            out = out * (1 + torch.tanh(self.gate(q)))
-        return out
-
-
-def _temperature(
-    kind: str, nhead: int, head_dim: int, hidden: int
-) -> tuple[QASSMax | None, LogScale | None]:
-    """온도 종류(`TEMPERATURES`)의 모듈 (QASSMax, LogScale). 쓰는 쪽만 있고 나머지는 None이다.
-    QASSMax는 예전 checkpoint와 같은 이름(`qassmax`)으로 둔다."""
-    if kind not in TEMPERATURES:
-        raise ValueError(f"온도 종류는 {TEMPERATURES} 가운데 하나다: {kind}")
-    if kind == "qassmax":
-        return QASSMax(nhead, head_dim, hidden), None
-    if kind == "none":
-        return None, None
-    return None, LogScale(nhead, head_dim, hidden, gated=kind == "gated_logscale")
-
-
-def _scale_query(module: nn.Module, q: torch.Tensor, n_keys: int) -> torch.Tensor:
-    """`_temperature`로 만든 온도(`module.qassmax`·`module.log_scale`)를 q에 곱한다."""
-    if module.qassmax is not None:
-        return module.qassmax(q, n_keys)
-    if module.log_scale is not None:
-        return module.log_scale(q, n_keys)
-    return q
-
-
 class Attention(nn.Module):
     """multi-head attention. q·k·v를 한 weight(`qkv`, (3D, D))로 둔다.
 
     - `context`를 주면 key·value는 거기서(cross-attention), 아니면 query와 같은 입력에서
     - `n_context`를 주면(self-attention) 앞의 n_context개만 key·value가 되고, 그 뒤 query(테스트
       행)는 첫 head의 key·value만 본다(multi-query)
-    - `temperature`: q에 곱하는 온도 (`TEMPERATURES`, 모듈 docstring). QASSMax는 `qassmax` 모듈,
-      logscale·gated_logscale은 `log_scale` 모듈이다. `qassmax=True`는 temperature="qassmax"와 같다
-    - `qk_norm`: q·k에 RMSNorm (`qk_norm_affine`이면 head dim마다 gain), `rope_base`: q·k에 RoPE
+    - `qassmax`: QASSMax (모듈 docstring), `qk_norm`: q·k에 RMSNorm, `rope_base`: q·k에 RoPE
     - `zero_out`: 출력층을 0으로 시작한다 (처음에는 잔차에 아무것도 더하지 않는다)
     - DiagScale(`minipfn.inference.diag_scale`)이 parameter `diag_scale`(δ, head × head 차원)을
       붙이면 q·k 유사도를 qᵀ(I + diag(δ))k로 바꾼다. q·k에 RMSNorm·RoPE·QASSMax를 거친 뒤 q에
@@ -497,11 +333,9 @@ class Attention(nn.Module):
         qassmax: bool = False,
         qassmax_hidden: int = 64,
         qk_norm: bool = False,
-        qk_norm_affine: bool = True,
         rope_base: float | None = None,
         zero_out: bool = True,
         logit_softcap: float | None = None,
-        temperature: str = "none",
     ) -> None:
         super().__init__()
         self.nhead, self.qk_norm, self.rope_base = nhead, qk_norm, rope_base
@@ -509,17 +343,11 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         if qk_norm:
-            self.q_norm = nn.RMSNorm(dim // nhead, elementwise_affine=qk_norm_affine)
-            self.k_norm = nn.RMSNorm(dim // nhead, elementwise_affine=qk_norm_affine)
+            self.q_norm = nn.RMSNorm(dim // nhead)
+            self.k_norm = nn.RMSNorm(dim // nhead)
         if zero_out:
             nn.init.zeros_(self.out.weight)
-        if qassmax:
-            if temperature not in ("none", "qassmax"):
-                raise ValueError(f"qassmax=True와 temperature={temperature}를 같이 줬다")
-            temperature = "qassmax"
-        self.qassmax, self.log_scale = _temperature(
-            temperature, nhead, dim // nhead, qassmax_hidden
-        )
+        self.qassmax = QASSMax(nhead, dim // nhead, qassmax_hidden) if qassmax else None
 
     @property
     def logit_softcap(self) -> float | None:
@@ -555,7 +383,8 @@ class Attention(nn.Module):
         if self.rope_base is not None:
             # query가 앞쪽 일부(CLS)여도 위치는 key와 같은 0부터다
             q, k = _rope(q, self.rope_base), _rope(k, self.rope_base)
-        q = _scale_query(self, q, k.shape[2])
+        if self.qassmax is not None:
+            q = self.qassmax(q, k.shape[2])
         delta = getattr(self, "diag_scale", None)  # DiagScale이 붙인 δ (클래스 docstring)
         if delta is not None:
             h, d = q.shape[1], q.shape[3]
@@ -785,8 +614,8 @@ class Block(nn.Module):
 
 
 class InducedBlock(nn.Module):
-    """열 단계 블록 하나 (ISAB): inducing point가 학습 행을 요약하고(기본 QASSMax), 모든 행이 그
-    요약을 본다(기본 온도 없음). 온도는 `summary_temperature`·`spread_temperature`."""
+    """열 단계 블록 하나 (ISAB): inducing point가 학습 행을 요약하고(QASSMax), 모든 행이 그 요약을
+    본다."""
 
     def __init__(
         self,
@@ -795,20 +624,15 @@ class InducedBlock(nn.Module):
         n_inducing: int,
         ff_factor: int,
         qassmax_hidden: int,
-        summary_temperature: str = "qassmax",
-        spread_temperature: str = "none",
         **attention,
     ) -> None:
         super().__init__()
         self.inducing = nn.Parameter(nn.init.trunc_normal_(torch.empty(n_inducing, dim), std=0.02))
-        hidden = {"qassmax_hidden": qassmax_hidden}
         self.summarize = Attention(
-            dim, nhead, temperature=summary_temperature, **hidden, **attention
+            dim, nhead, qassmax=True, qassmax_hidden=qassmax_hidden, **attention
         )
         self.summarize_mlp = _mlp(dim, ff_factor)
-        self.broadcast = Attention(
-            dim, nhead, temperature=spread_temperature, **hidden, **attention
-        )
+        self.broadcast = Attention(dim, nhead, **attention)
         self.broadcast_mlp = _mlp(dim, ff_factor)
         # 학습 파라미터가 있으므로 query·context·MLP 앞을 따로 둔다
         self.norms = nn.ModuleDict(
@@ -838,50 +662,24 @@ class FourierCellEncoder(nn.Module):
     """TabPFN-3.5 셀 encoder: 학습 주파수 sin·cos 항 + [z값, 결측 표시, ECDF 조화 항] 항
     → LayerNorm."""
 
-    def __init__(self, g: int, dim: int, categorical: bool = False) -> None:
+    def __init__(self, g: int, dim: int) -> None:
         super().__init__()
         self.frequencies = nn.Parameter(torch.logspace(-1, 1, N_FOURIER))
         self.fourier = nn.Linear(g * 2 * N_FOURIER, dim)
         self.metadata = nn.Linear(g * (2 + 2 * N_HARMONICS), dim)
         self.norm = nn.LayerNorm(dim)
-        self.categorical = categorical
-        if categorical:
-            # 범주를 아는 encoder (모듈 docstring "Kumo-Tabular의 나머지 부품"): 범주 열 위치의
-            # 주파수·Linear와 위치마다 범주 표시 Linear
-            self.cat_frequencies = nn.Parameter(torch.logspace(-1, 1, N_FOURIER))
-            self.cat_fourier = nn.Linear(g * 2 * N_FOURIER, dim, bias=False)
-            self.cat_type = nn.Linear(g, dim, bias=False)
 
-    def forward(
-        self,
-        z: torch.Tensor,
-        indicator: torch.Tensor,
-        u: torch.Tensor,
-        categorical: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # 각각 (B, R, C, G). `categorical`은 묶음 위치마다 범주 열인지 (B, 1, C, G) float
+    def forward(self, z: torch.Tensor, indicator: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        # 각각 (B, R, C, G)
         b, r, c, g = z.shape
+        phase = z[..., None] * self.frequencies.to(z.dtype)  # (B, R, C, G, F)
+        fourier = torch.cat([phase.sin(), phase.cos()], dim=-1).reshape(b, r, c, -1)
         k = torch.arange(1, N_HARMONICS + 1, device=u.device, dtype=u.dtype)
         harmonics = math.pi * u[..., None] * k
         meta = torch.cat(
             [z[..., None], indicator[..., None], harmonics.sin(), harmonics.cos()], dim=-1
         ).reshape(b, r, c, -1)
-        if not self.categorical:
-            phase = z[..., None] * self.frequencies.to(z.dtype)  # (B, R, C, G, F)
-            fourier = torch.cat([phase.sin(), phase.cos()], dim=-1).reshape(b, r, c, -1)
-            return self.norm(self.fourier(fourier) + self.metadata(meta))
-        if categorical is None:
-            categorical = z.new_zeros(b, 1, c, g)
-        m = categorical.to(z.dtype)[..., None]  # (B, 1, C, G, 1)
-        freq = torch.where(
-            m > 0, self.cat_frequencies.to(z.dtype), self.frequencies.to(z.dtype)
-        )  # (B, 1, C, G, F)
-        phase = z[..., None] * freq
-        fourier = torch.cat([phase.sin(), phase.cos()], dim=-1)  # (B, R, C, G, 2F)
-        numeric = (fourier * (1 - m)).reshape(b, r, c, -1)
-        cat = (fourier * m).reshape(b, r, c, -1)
-        out = self.fourier(numeric) + self.cat_fourier(cat) + self.cat_type(m[..., 0])
-        return self.norm(out + self.metadata(meta))
+        return self.norm(self.fourier(fourier) + self.metadata(meta))
 
 
 class TargetEncoder(nn.Module):
@@ -913,23 +711,6 @@ class PreHeadMLP(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         return h + self.mlp(self.norm(h))
-
-
-def _quantile_head(dim: int, n: int, ff_factor: int, head_mlp: bool) -> nn.Module:
-    """분위수 출력층 (`regression_head="quantile"`): bar 출력층과 모양이 같고(`head_mlp`면 Linear
-    하나, 아니면 D → 2D → GELU → n), 마지막 Linear는 weight 0·bias 표준정규 분위수에서 시작한다
-    (처음 예측이 표준정규 분포, `minipfn.models.quantile_distribution`)."""
-    if head_mlp:
-        head = last = nn.Linear(dim, n)
-    else:
-        head = nn.Sequential(
-            nn.Linear(dim, ff_factor * dim), nn.GELU(), nn.Linear(ff_factor * dim, n)
-        )
-        last = head[-1]
-    nn.init.zeros_(last.weight)
-    with torch.no_grad():
-        last.bias.copy_(initial_bias(n))
-    return head
 
 
 class _CellStats:
@@ -980,29 +761,14 @@ class _CellStats:
 
 class RetrievalDecoder(nn.Module):
     """many-class retrieval decoder: 테스트 행(query)이 학습 행(key)에 attention한 가중치로 학습
-    행의 one-hot 정답을 평균한다(head 평균). logit은 log(max(p, 1e-5) + 3e-5). q의 온도는
-    `temperature`(`TEMPERATURES`, 기본 QASSMax)."""
+    행의 one-hot 정답을 평균한다(head 평균). logit은 log(max(p, 1e-5) + 3e-5)."""
 
-    def __init__(
-        self,
-        dim: int,
-        heads: int,
-        head_dim: int,
-        n_classes: int,
-        hidden: int,
-        temperature: str = "qassmax",
-        qk_norm: bool = False,
-    ) -> None:
+    def __init__(self, dim: int, heads: int, head_dim: int, n_classes: int, hidden: int) -> None:
         super().__init__()
         self.heads, self.head_dim, self.n_classes = heads, head_dim, n_classes
         self.q_projection = nn.Linear(dim, heads * head_dim)
         self.k_projection = nn.Linear(dim, heads * head_dim)
-        # gain 없는 q·k RMSNorm (`decoder_qk_norm`, 파라미터 없음)
-        self.qk_norm = qk_norm
-        if qk_norm:
-            self.q_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
-            self.k_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
-        self.qassmax, self.log_scale = _temperature(temperature, heads, head_dim, hidden)
+        self.qassmax = QASSMax(heads, head_dim, hidden)
 
     def forward(
         self,
@@ -1024,9 +790,7 @@ class RetrievalDecoder(nn.Module):
         n_classes = n_classes or self.n_classes
         q = self.q_projection(h[:, n_train:]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_projection(h[:, :n_train]).view(b, -1, self.heads, self.head_dim).transpose(1, 2)
-        if self.qk_norm:
-            q, k = self.q_norm(q), self.k_norm(k)
-        q = _scale_query(self, q, n_train)
+        q = self.qassmax(q, n_train)
         onehot = F.one_hot(y_train.long().clamp(0, n_classes - 1), n_classes).float()
         if fused:
             p = _retrieve(q, k, onehot).mean(1)
@@ -1057,70 +821,6 @@ def _retrieve(q: torch.Tensor, k: torch.Tensor, onehot: torch.Tensor) -> torch.T
     return torch.cat(out, dim=-1)[..., :n_classes]
 
 
-def _clear_cuda_error() -> None:
-    """실패한 CUDA runtime 호출(`cudaHostRegister`)이 남긴 마지막 오류를 지운다. 지우지 않으면 다음
-    kernel launch 검사(`cudaGetLastError`)가 그 오류로 멈춘다. torch의 cudart binding에는
-    `cudaGetLastError`가 없어 이미 올라온 libcudart를 ctypes로 부른다(Linux. 못 찾으면 그대로)."""
-    import ctypes
-
-    try:
-        with open("/proc/self/maps") as f:
-            paths = {line.split()[-1] for line in f if "libcudart.so" in line}
-    except OSError:
-        return
-    for path in sorted(paths):
-        try:
-            ctypes.CDLL(path).cudaGetLastError()
-        except (OSError, AttributeError):
-            continue
-
-
-def _host_state(shape: tuple[int, ...], dtype: torch.dtype, pin: bool) -> tuple[torch.Tensor, bool]:
-    """CPU 셀 상태 (`ColumnRowTransformer._rows_interleaved_chunked`의 offload): 보통(pageable)
-    CPU 텐서를 정확한 크기로 잡고, `pin`이면 그 자리만 pinned로 등록한다(`cudaHostRegister`).
-    `torch.empty(..., pin_memory=True)`는 caching host allocator를 쓴다: 크기를 2의 거듭제곱으로
-    올리고(BeyondArena maps_router_eta_1m의 984 GB → 1 TiB), 해제한 블록을 `empty_cache` 전까지
-    프로세스가 들고 있다. 그래서 큰 표를 지난 eval worker가 쓰지 않는 수백 GB를 쥐고 남는다.
-    돌려주는 bool은 등록했는지(`_release_host_state`로 푼다). 등록이 안 되면(memlock 한도 등)
-    경고하고 pageable로 쓴다(값은 같고 복사만 느리다)."""
-    state = torch.empty(shape, dtype=dtype, device="cpu")
-    if not pin or state.numel() == 0 or not torch.cuda.is_available():
-        return state, False
-    err = int(torch.cuda.cudart().cudaHostRegister(state.data_ptr(), state.nbytes, 0))
-    if err != 0:
-        _clear_cuda_error()
-        import warnings
-
-        warnings.warn(
-            f"셀 상태 {state.nbytes / 2**30:.1f} GiB를 pinned로 등록하지 못했다 (cudaError {err})."
-            " pageable 메모리로 계속한다 (값은 같고 장치 복사가 느리다)",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return state, False
-    return state, True
-
-
-def _release_host_state(state: torch.Tensor, registered: bool) -> None:
-    """`_host_state`의 등록을 푼다 (메모리는 텐서가 해제될 때 OS로 돌아간다). 복사는 모두 동기라
-    끝나 있지만, 혹시 남은 일이 있을 수 있어 장치를 기다린 뒤 푼다. 예외로 나가는 길에서도
-    부르므로(`finally`) 여기서는 새 예외를 내지 않는다(원래 예외를 가리지 않도록)."""
-    if not registered:
-        return
-    import warnings
-
-    try:
-        torch.cuda.synchronize()
-    except RuntimeError:  # 장치가 이미 오류 상태: 원래 예외가 그 이유를 알린다
-        pass
-    err = int(torch.cuda.cudart().cudaHostUnregister(state.data_ptr()))
-    if err != 0:
-        _clear_cuda_error()
-        warnings.warn(
-            f"셀 상태 pinned 등록을 풀지 못했다 (cudaError {err})", RuntimeWarning, stacklevel=3
-        )
-
-
 class ColumnRowTransformer(nn.Module):
     # 모델 종류 (`minipfn.models.MODEL_TYPES`)
     model_type = "column_row_transformer"
@@ -1130,13 +830,6 @@ class ColumnRowTransformer(nn.Module):
     # 열 수
     inference_chunk_cells = 2048 * 768
     inference_column_chunk = 4
-    # `stage_layout="interleaved"`의 추론(`_rows_interleaved_chunked`)이 들고 가는 셀 상태
-    # (B, R, C, E)가 이보다 크면 CPU에 두고 묶음마다 장치로 옮긴다 (아주 큰 표에서 GPU 메모리를
-    # 묶는다)
-    interleaved_state_device_bytes = 16 << 30
-    # CPU에 둔 셀 상태를 그 자리만 pinned로 등록한다 (`_host_state`. False면 pageable로 복사한다.
-    # 값은 같다)
-    interleaved_state_pin = True
     # forward가 추론용 인자(`inference`, `y_classes`·`n_classes`)를 받는다
     # (`minipfn.inference.ensemble.forward_kwargs`)
     supports_inference_options = True
@@ -1150,13 +843,10 @@ class ColumnRowTransformer(nn.Module):
     def __init__(self, config: ColumnRowTransformerConfig | None = None) -> None:
         super().__init__()
         self.config = config = config or ColumnRowTransformerConfig()
-        # `hold_host_state` 안에서 forward 사이에 다시 쓰는 CPU 셀 상태 (1차원 텐서, 등록 여부)
-        self._held_host_state: tuple[torch.Tensor, bool] | None = None
-        self._holding_host_state = False
         e, g, d = config.emsize, config.features_per_group, config.icl_dim
         self.offsets = group_offsets(g)
         if config.encoder == "fourier":
-            self.cell_encoder = FourierCellEncoder(g, e, categorical=config.categorical_encoder)
+            self.cell_encoder = FourierCellEncoder(g, e)
         else:
             self.cell_encoder = nn.Linear(2 * g, e)  # [값 g개, 결측 표시 g개] → 토큰
         # 정답 encoder: 셀 단계·행 ICL 입력 각각, task마다
@@ -1169,12 +859,6 @@ class ColumnRowTransformer(nn.Module):
         if config.target_norm:  # 두 task가 같이 쓴다
             self.cell_target_norm = nn.LayerNorm(e)
             self.icl_target_norm = nn.LayerNorm(d)
-        # 모든 attention이 같이 쓰는 설정 (q·k RMSNorm, soft-cap, 온도 MLP 폭)
-        shared = {
-            "qk_norm": config.qk_norm,
-            "qk_norm_affine": config.qk_norm_affine,
-            "logit_softcap": config.logit_softcap,
-        }
         self.column_blocks = nn.ModuleList(
             InducedBlock(
                 e,
@@ -1182,9 +866,8 @@ class ColumnRowTransformer(nn.Module):
                 config.n_inducing,
                 config.ff_factor,
                 config.qassmax_hidden,
-                summary_temperature=config.column_summary_temperature,
-                spread_temperature=config.column_spread_temperature,
-                **shared,
+                qk_norm=config.qk_norm,
+                logit_softcap=config.logit_softcap,
             )
             for _ in range(config.column_blocks)
         )
@@ -1196,18 +879,22 @@ class ColumnRowTransformer(nn.Module):
                 e,
                 config.row_heads,
                 config.ff_factor,
+                qk_norm=config.qk_norm,
                 rope_base=config.rope_base,
+                logit_softcap=config.logit_softcap,
                 zero_out=False,  # 모듈 docstring "여기서 정한 것"
-                temperature=config.row_temperature,
-                qassmax_hidden=config.qassmax_hidden,
-                **shared,
             )
             for _ in range(config.row_blocks)
         )
         self.row_norm = nn.RMSNorm(e)
-        icl = {"temperature": config.icl_temperature, "qassmax_hidden": config.qassmax_hidden}
+        qassmax = {
+            "qassmax": True,
+            "qassmax_hidden": config.qassmax_hidden,
+            "logit_softcap": config.logit_softcap,
+        }
         self.icl_layers = nn.ModuleList(
-            Block(d, config.nhead, config.ff_factor, **icl, **shared) for _ in range(config.nlayers)
+            Block(d, config.nhead, config.ff_factor, qk_norm=config.qk_norm, **qassmax)
+            for _ in range(config.nlayers)
         )
         self.icl_norm = nn.RMSNorm(d)
         if config.head_mlp:
@@ -1219,16 +906,8 @@ class ColumnRowTransformer(nn.Module):
             n = config.output_size(t)
             if t == "classification":
                 self.heads[t] = RetrievalDecoder(
-                    d,
-                    config.decoder_heads,
-                    config.decoder_head_dim,
-                    n,
-                    config.qassmax_hidden,
-                    temperature=config.decoder_temperature,
-                    qk_norm=config.decoder_qk_norm,
+                    d, config.decoder_heads, config.decoder_head_dim, n, config.qassmax_hidden
                 )
-            elif config.regression_head == "quantile":
-                self.heads[t] = _quantile_head(d, n, config.ff_factor, config.head_mlp)
             elif config.head_mlp:
                 self.heads[t] = nn.Linear(d, n)
             else:  # TabPFN-3 회귀: D → 2D → GELU → 구간 수
@@ -1310,9 +989,7 @@ class ColumnRowTransformer(nn.Module):
             return head.weight if isinstance(head, nn.Linear) else head[-1].weight
         return self.heads["classification"].q_projection.weight
 
-    def _embed_cells(
-        self, x: torch.Tensor, n_train: int, categorical: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _embed_cells(self, x: torch.Tensor, n_train: int) -> torch.Tensor:
         # x: (B, R, C) → 토큰 (B, R, C, E). feature j의 토큰은 열 j + offset들의 셀
         z, indicator, used = standardize_cells(x, n_train)
         zg, ig = _group(z, self.offsets), _group(indicator, self.offsets)
@@ -1321,25 +998,8 @@ class ColumnRowTransformer(nn.Module):
             # 학습 행에서 상수인 열: z를 0으로 둔 것처럼 u도 모든 행에서 0.5 (학습 행은 모두 0.5이고
             # 테스트 행만 0이나 1이 되어 테스트 행에만 있는 신호가 되지 않도록)
             u = torch.where(used > 0, u, 0.5)
-            ug = _group(u, self.offsets)
-            if self.config.categorical_encoder:
-                cat = self._grouped_categorical(categorical, x, None)
-                return self.cell_encoder(zg, ig, ug, cat)
-            return self.cell_encoder(zg, ig, ug)
+            return self.cell_encoder(zg, ig, _group(u, self.offsets))
         return self.cell_encoder(torch.cat([zg, ig], dim=-1))
-
-    def _grouped_categorical(
-        self, categorical: torch.Tensor | None, x: torch.Tensor, cols: torch.Tensor | None
-    ) -> torch.Tensor:
-        """범주 열 표시 (B, C) → 묶음 위치마다 (B, 1, Cj, G) float. `cols`가 None이면 열 C개를
-        circular shift로 묶고(`_group`), (Cj, G)면 그 열 번호들이다. 표시가 없으면 모두 수치 열."""
-        b, c = x.shape[0], x.shape[-1]
-        if categorical is None:
-            categorical = torch.zeros(b, c, dtype=torch.bool, device=x.device)
-        m = categorical.to(device=x.device, dtype=torch.float32)
-        if cols is None:
-            return _group(m[:, None, :], self.offsets)
-        return m[:, cols][:, None]
 
     def _target(self, stage: str, task: str, y_train: torch.Tensor, rows: int, like: torch.Tensor):
         # 학습 행 정답 embedding (B, R, dim). 테스트 행은 0
@@ -1357,17 +1017,12 @@ class ColumnRowTransformer(nn.Module):
         y_classes: torch.Tensor | None = None,
         n_classes: int | None = None,
         inference: bool = False,
-        categorical: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """테스트 행의 logit (B, R - n_train, 출력 수).
 
         x: (B, R, C), 학습 행 다음에 테스트 행. y_train: (B, n_train).
         분류면 y는 0부터 시작하는 클래스 번호, 회귀면 z-정규화한 값이다. `task`는 multitask
         모델에서만 준다("classification" 또는 "regression"). 한 task 모델은 그 task다.
-        회귀 분위수 출력(`regression_head="quantile"`)이면 출력은 분위수 999개다(정렬하지 않은 값).
-
-        `categorical`: 범주 열 표시 (B, C) bool. 범주를 아는 셀 encoder(`categorical_encoder`)만
-        받는다. 주지 않으면 모든 열을 수치 열로 본다.
 
         추론에서만 쓰는 인자:
 
@@ -1390,13 +1045,6 @@ class ColumnRowTransformer(nn.Module):
             raise ValueError("y_classes와 n_classes는 같이 준다")
         if n_classes is not None and n_classes > self.max_classes:
             raise ValueError(f"클래스 {n_classes}개는 상한({self.max_classes}개)보다 많다")
-        if categorical is not None:
-            if not cfg.categorical_encoder:
-                # 조용히 버리지 않는다 (범주 표시를 쓰지 않는 모델)
-                raise ValueError("categorical은 categorical_encoder 모델만 받는다")
-            if categorical.shape != (x.shape[0], x.shape[-1]):
-                expected = (x.shape[0], x.shape[-1])
-                raise ValueError(f"categorical은 (B, C) = {expected}다: {tuple(categorical.shape)}")
         if task == "classification" and not self.training:
             # 정답 embedding 수보다 큰 번호는 embedding·decoder에서 마지막 클래스로 합쳐진다.
             # 학습 중에는 prior가 범위를 지키므로 (GPU 동기화를 피해) 평가·추론에서만 본다
@@ -1414,12 +1062,9 @@ class ColumnRowTransformer(nn.Module):
         n_train = y_train.shape[1]
         ckpt = self._checkpointing(r)
         if inference and b * r * c > self.inference_chunk_cells:
-            if cfg.stage_layout == "interleaved":
-                rows = self._rows_interleaved_chunked(x, y_train, task, categorical)
-            else:
-                rows = self._rows_chunked(x, y_train, task, categorical)
+            rows = self._rows_chunked(x, y_train, task)
         else:
-            rows = self._rows(x, y_train, task, ckpt=ckpt, categorical=categorical)
+            rows = self._rows(x, y_train, task, ckpt=ckpt)
 
         # 3) 행 ICL: 학습 행 벡터에 정답 embedding을 한 번 더 더한다
         rows = rows + self._target("icl", task, y_train, r, rows)
@@ -1437,23 +1082,15 @@ class ColumnRowTransformer(nn.Module):
         return self.heads[task](rows[:, n_train:])
 
     def _rows(
-        self,
-        x: torch.Tensor,
-        y_train: torch.Tensor,
-        task: str,
-        *,
-        ckpt: bool = False,
-        categorical: torch.Tensor | None = None,
+        self, x: torch.Tensor, y_train: torch.Tensor, task: str, *, ckpt: bool = False
     ) -> torch.Tensor:
         """단계 0~2 (셀 encoder, 열 단계, 행 단계): x (B, R, C) → 행 벡터 (B, R, n_cls × E).
         `ckpt`면 블록마다 activation checkpointing (`_call`)."""
         b, r, c = x.shape
         n_train = y_train.shape[1]
-        cells = self._embed_cells(x, n_train, categorical)  # (B, R, C, E)
+        cells = self._embed_cells(x, n_train)  # (B, R, C, E)
         cells = cells + self._target("cell", task, y_train, r, cells)[:, :, None]
         e = cells.shape[-1]
-        if self.config.stage_layout == "interleaved":
-            return self._interleaved(cells, n_train, ckpt=ckpt)
 
         # 1) 열 단계: (B × C, R, E)
         h = cells.permute(0, 2, 1, 3).reshape(b * c, r, e)
@@ -1461,29 +1098,6 @@ class ColumnRowTransformer(nn.Module):
             h = _call(block, ckpt, h, n_train)
         # 2) 행 단계
         return self._row_stage(h.view(b, c, r, e).transpose(1, 2), ckpt=ckpt)
-
-    def _interleaved(
-        self, cells: torch.Tensor, n_train: int, *, ckpt: bool = False
-    ) -> torch.Tensor:
-        """`stage_layout="interleaved"`의 열·행 단계: 셀 토큰 (B, R, C, E)이 [열 블록 i → 행 블록
-        i]를 차례로 지난다. CLS 토큰은 행 블록 사이에 이어지고, 마지막 행 블록은 CLS만 query다.
-        → 행 벡터 (B, R, n_cls × E)."""
-        cfg = self.config
-        b, r, c, e = cells.shape
-        h = cells
-        cls = self.cls_tokens.to(h.dtype).expand(b * r, -1, -1)
-        last = len(self.row_blocks) - 1
-        for i, (column, row) in enumerate(zip(self.column_blocks, self.row_blocks, strict=True)):
-            hc = h.permute(0, 2, 1, 3).reshape(b * c, r, e)
-            hc = _call(column, ckpt, hc, n_train)
-            hr = hc.view(b, c, r, e).transpose(1, 2).reshape(b * r, c, e)
-            tokens = torch.cat([cls.to(hr.dtype), hr], dim=1)
-            if i == last:
-                cls = _call(row, ckpt, tokens, n_queries=cfg.n_cls)
-            else:
-                tokens = _call(row, ckpt, tokens)
-                cls, h = tokens[:, : cfg.n_cls], tokens[:, cfg.n_cls :].view(b, r, c, e)
-        return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
 
     def _row_stage(self, h: torch.Tensor, *, ckpt: bool = False) -> torch.Tensor:
         """행 단계: 셀 토큰 (B, R, C, E) → (B × R, n_cls + C, E) → CLS 출력을 이어 붙인 행 벡터
@@ -1497,13 +1111,7 @@ class ColumnRowTransformer(nn.Module):
         h = _call(self.row_blocks[-1], ckpt, h, n_queries=cfg.n_cls)
         return self.row_norm(h).reshape(b, r, cfg.icl_dim)
 
-    def _rows_chunked(
-        self,
-        x: torch.Tensor,
-        y_train: torch.Tensor,
-        task: str,
-        categorical: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def _rows_chunked(self, x: torch.Tensor, y_train: torch.Tensor, task: str) -> torch.Tensor:
         """`_rows`와 같은 값을 행 묶음으로 나눠 계산한다 (추론용, 공식 TabPFN-3.5 추론 코드의
         chunkwise inference와 같은 순서).
 
@@ -1514,14 +1122,25 @@ class ColumnRowTransformer(nn.Module):
         구한다(`_CellStats`). 그래서 (B, R, C, E) 크기의 텐서를 한 번에 두지 않는다."""
         b, r, c = x.shape
         n_train = y_train.shape[1]
-        embed, groups = self._chunk_embedder(x, y_train, task, categorical)
+        stats = _CellStats(x, n_train, ecdf=self.config.encoder == "fourier")
+        offsets = torch.tensor(self.offsets, device=x.device)
+        groups = (torch.arange(c, device=x.device)[:, None] + offsets) % c  # 열 j에 묶는 열
+        target = None  # 학습 행의 셀 정답 embedding (B, n_train, E), 셀 dtype을 알 때 만든다
+
+        def embed(x_part: torch.Tensor, cols: torch.Tensor | None, shape) -> torch.Tensor:
+            nonlocal target
+            cells = self._encode_cells(*stats.features(x_part, cols), shape)
+            if target is None:
+                target = self._target("cell", task, y_train, n_train, cells)
+            return cells
 
         # (1) 블록마다 요약 (B × C, n_inducing, E)
         summaries: list[torch.Tensor | None] = [None] * len(self.column_blocks)
         for c0 in range(0, c, self.inference_column_chunk):
             src = groups[c0 : c0 + self.inference_column_chunk]  # (Cj, G): 묶는 열
             cj = src.shape[0]
-            cells = embed(x[:, :n_train, src.reshape(-1)], src, train=True)
+            cells = embed(x[:, :n_train, src.reshape(-1)], src.reshape(-1), (cj, src.shape[1]))
+            cells = cells + target[:, :, None]
             e = cells.shape[-1]
             h = cells.permute(0, 2, 1, 3).reshape(b * cj, n_train, e)
             for i, block in enumerate(self.column_blocks):
@@ -1537,7 +1156,10 @@ class ColumnRowTransformer(nn.Module):
         out = None
         for r0 in range(0, r, step):
             r1 = min(r0 + step, r)
-            cells = embed(x[:, r0:r1], None, rows=(r0, r1))  # (B, Rj, C, E)
+            cells = embed(x[:, r0:r1], None, None)  # (B, Rj, C, E)
+            if r0 < n_train:  # 학습 행에만 정답 embedding
+                k = min(r1, n_train) - r0
+                cells = torch.cat([cells[:, :k] + target[:, r0 : r0 + k, None], cells[:, k:]], 1)
             e = cells.shape[-1]
             h = cells.permute(0, 2, 1, 3).reshape(b * c, r1 - r0, e)
             for block, ind in zip(self.column_blocks, summaries, strict=True):
@@ -1548,180 +1170,9 @@ class ColumnRowTransformer(nn.Module):
             out[:, r0:r1] = rows
         return out
 
-    def _chunk_embedder(
-        self,
-        x: torch.Tensor,
-        y_train: torch.Tensor,
-        task: str,
-        categorical: torch.Tensor | None,
-    ):
-        """행·열 일부의 셀 토큰을 만드는 함수 `embed`와 열마다 묶는 열 번호 `groups` (C, G)
-        (`_rows_chunked`·`_rows_interleaved_chunked`). 학습 행 통계(`_CellStats`)는 한 번만
-        구한다. `embed(x_part, src, train=True)`는 학습 행 전체·묶은 열 `src` (Cj, G)의 토큰,
-        `embed(x_part, None, rows=(r0, r1))`는 행 r0..r1·모든 열의 토큰이다. 둘 다 학습 행에는 셀
-        정답 embedding을 더한다."""
-        n_train = y_train.shape[1]
-        c = x.shape[-1]
-        stats = _CellStats(x, n_train, ecdf=self.config.encoder == "fourier")
-        offsets = torch.tensor(self.offsets, device=x.device)
-        groups = (torch.arange(c, device=x.device)[:, None] + offsets) % c  # 열 j에 묶는 열
-        target = None  # 학습 행의 셀 정답 embedding (B, n_train, E), 셀 dtype을 알 때 만든다
-
-        def embed(x_part, src, *, train: bool = False, rows: tuple[int, int] | None = None):
-            nonlocal target
-            cols = None if src is None else src.reshape(-1)
-            shape = None if src is None else tuple(src.shape)
-            cat = None
-            if self.config.categorical_encoder:
-                cat = self._grouped_categorical(categorical, x, src)
-            cells = self._encode_cells(*stats.features(x_part, cols), shape, cat)
-            if target is None:
-                target = self._target("cell", task, y_train, n_train, cells)
-            if train:
-                return cells + target[:, :, None]
-            r0, r1 = rows
-            if r0 < n_train:  # 학습 행에만 정답 embedding
-                k = min(r1, n_train) - r0
-                cells = torch.cat([cells[:, :k] + target[:, r0 : r0 + k, None], cells[:, k:]], 1)
-            return cells
-
-        return embed, groups
-
-    def _rows_interleaved_chunked(
-        self,
-        x: torch.Tensor,
-        y_train: torch.Tensor,
-        task: str,
-        categorical: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """`stage_layout="interleaved"`에서 `_rows`와 같은 값을 나눠 계산한다 (추론용).
-
-        행 블록이 열 사이를 섞으므로, 다음 열 블록의 요약은 앞 행 블록을 지난 학습 행 전체가
-        정한다. 그래서 셀 상태 (B, R, C, E) 하나와 CLS 상태 (B, R, n_cls, E)를 들고, 블록 쌍마다
-        (1) 열을 `inference_column_chunk`개씩 나눠 학습 행의 지금 상태로 요약을 구하고 (2) 행을
-        `inference_chunk_cells / (B × C)`개씩 나눠 펼치기와 행 블록을 계산해 상태를 바꾼다. 요약은
-        (2) 전에 다 구하므로 학습 행 상태가 바뀌기 전의 값이다. 셀 encoder도 행 묶음으로
-        계산한다. 셀 상태가 `interleaved_state_device_bytes`보다 크면 CPU에 둔다. CPU 상태는 caching
-        host allocator를 거치지 않고 정확한 크기로 잡아 forward가 끝나면(예외여도) 바로 놓는다
-        (`_host_state`)."""
-        cfg = self.config
-        b, r, c = x.shape
-        n_train = y_train.shape[1]
-        embed, _ = self._chunk_embedder(x, y_train, task, categorical)
-        step = max(1, self.inference_chunk_cells // (b * c))
-        device = x.device
-        h, release = None, None
-        try:
-            for r0 in range(0, r, step):
-                r1 = min(r0 + step, r)
-                cells = embed(x[:, r0:r1], None, rows=(r0, r1))
-                if h is None:
-                    shape = (b, r, c, cells.shape[-1])
-                    size = math.prod(shape) * cells.element_size()
-                    if self._offload_interleaved_state(device, size):
-                        h, release = self._acquire_host_state(shape, cells.dtype)
-                    else:
-                        h = torch.empty(shape, dtype=cells.dtype, device=device)
-                h[:, r0:r1] = cells
-            e = h.shape[-1]
-            cls = self.cls_tokens.to(h.dtype).expand(b, r, -1, -1).clone()  # (B, R, n_cls, E)
-            last = len(self.row_blocks) - 1
-            blocks = zip(self.column_blocks, self.row_blocks, strict=True)
-            for i, (column, row) in enumerate(blocks):
-                # (1) 학습 행의 지금 상태로 열마다 요약 (B, C, n_inducing, E)
-                summary = None
-                for c0 in range(0, c, self.inference_column_chunk):
-                    c1 = min(c0 + self.inference_column_chunk, c)
-                    ht = h[:, :n_train, c0:c1].to(device).permute(0, 2, 1, 3)
-                    ht = ht.reshape(b * (c1 - c0), n_train, e)
-                    ind = column.summary(ht)
-                    if summary is None:
-                        summary = ind.new_empty(b, c, *ind.shape[1:])
-                    summary[:, c0:c1] = ind.view(b, c1 - c0, *ind.shape[1:])
-                summary = summary.reshape(b * c, *summary.shape[2:])
-                # (2) 행 묶음마다 펼치기 → 행 블록
-                for r0 in range(0, r, step):
-                    r1 = min(r0 + step, r)
-                    rj = r1 - r0
-                    hc = h[:, r0:r1].to(device).permute(0, 2, 1, 3).reshape(b * c, rj, e)
-                    hc = column.spread(hc, summary)
-                    hr = hc.view(b, c, rj, e).transpose(1, 2).reshape(b * rj, c, e)
-                    part = cls[:, r0:r1].reshape(b * rj, cfg.n_cls, e)
-                    tokens = torch.cat([part.to(hr.dtype), hr], dim=1)
-                    if i == last:
-                        out = row(tokens, n_queries=cfg.n_cls)
-                        cls[:, r0:r1] = out.view(b, rj, cfg.n_cls, e).to(cls.dtype)
-                    else:
-                        tokens = row(tokens)
-                        new_cls = tokens[:, : cfg.n_cls].view(b, rj, cfg.n_cls, e)
-                        cls[:, r0:r1] = new_cls.to(cls.dtype)
-                        h[:, r0:r1] = tokens[:, cfg.n_cls :].view(b, rj, c, e).to(h.dtype)
-            return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
-        finally:
-            # 예외로 나가도 pinned 등록을 푼다 (등록한 채 남으면 그 메모리를 OS가 돌려받지 못한다)
-            if release is not None:
-                release()
-
-    def _acquire_host_state(self, shape: tuple[int, ...], dtype: torch.dtype):
-        """CPU 셀 상태와, forward가 끝날 때 부를 정리 함수(None이면 `hold_host_state`가 놓는다).
-        `hold_host_state` 밖이면 forward마다 새로 잡고 놓는다. 안이면 1차원 버퍼 하나를 잡아 두고
-        크기가 맞으면(dtype이 같고 원소가 충분하면) 앞부분을 `shape`로 다시 쓴다. 채우기가 모든
-        행을 덮어쓰므로 앞 forward의 값은 남지 않는다."""
-        if not self._holding_host_state:
-            state, registered = _host_state(shape, dtype, self.interleaved_state_pin)
-            return state, lambda: _release_host_state(state, registered)
-        numel = math.prod(shape)
-        held = self._held_host_state
-        if held is not None and (held[0].dtype != dtype or held[0].numel() < numel):
-            self._held_host_state = None
-            _release_host_state(*held)
-            held = None
-        if held is None:
-            held = _host_state((numel,), dtype, self.interleaved_state_pin)
-            self._held_host_state = held
-        return held[0][:numel].view(shape), None
-
-    @contextlib.contextmanager
-    def hold_host_state(self):
-        """이 안의 추론 forward들은 CPU 셀 상태(`_rows_interleaved_chunked`의 offload)를 놓지 않고
-        다시 쓴다. 앙상블 멤버마다 수백 GB를 새로 잡고(page fault) pinned 등록·해제하지 않도록
-        (`minipfn.inference.ensemble`이 멤버 forward들을 이 안에서 부른다). 나가면(예외여도)
-        놓는다. 값은 같다. 겹쳐 부르면 바깥 것이 놓는다."""
-        if self._holding_host_state:
-            yield
-            return
-        self._holding_host_state = True
-        try:
-            yield
-        finally:
-            self._holding_host_state = False
-            held, self._held_host_state = self._held_host_state, None
-            if held is not None:
-                _release_host_state(*held)
-
-    def _offload_interleaved_state(self, device: torch.device, size: int) -> bool:
-        """`_rows_interleaved_chunked`의 셀 상태(`size` 바이트)를 CPU에 둘지."""
-        return device.type == "cuda" and size > self.interleaved_state_device_bytes
-
-    def inference_host_state_bytes(
-        self, rows: int, columns: int, *, batch: int = 1, itemsize: int = 4
-    ) -> int:
-        """추론 forward(`inference=True`) 하나가 CPU에 두는 셀 상태 바이트
-        (`_rows_interleaved_chunked`의 offload. 평가 큐가 동시에 도는 큰 표를 고를 때 쓴다,
-        `scripts/tabpfn_v2/eval.py --host-memory-budget-gb`). 셀 상태 (B, R, C, E)는 열마다 토큰
-        하나다. interleaved가 아니거나 나눠 계산하지 않거나 상태가 장치에 남으면 0. `itemsize`는 셀
-        토큰 dtype의 크기다: 셀 encoder는 bfloat16 autocast에서도 float32를 내므로 4다 (상태도
-        float32, H100에서 확인)."""
-        cells = batch * rows * columns
-        if self.config.stage_layout != "interleaved" or cells <= self.inference_chunk_cells:
-            return 0
-        size = cells * self.config.emsize * itemsize
-        return size if size > self.interleaved_state_device_bytes else 0
-
-    def _encode_cells(self, z, indicator, u, shape, categorical=None) -> torch.Tensor:
+    def _encode_cells(self, z, indicator, u, shape) -> torch.Tensor:
         """셀 값 (`_CellStats.features`) → 토큰. `shape`이 None이면 열 C개를 circular shift로
-        묶고(`_group`), (Cj, G)면 이미 묶은 열 Cj × G개다. 결과는 (B, 행, Cj, E).
-        `categorical`은 묶은 범주 표시 (`_grouped_categorical`, 범주를 아는 encoder만)."""
+        묶고(`_group`), (Cj, G)면 이미 묶은 열 Cj × G개다. 결과는 (B, 행, Cj, E)."""
 
         def group(t: torch.Tensor) -> torch.Tensor:
             if shape is None:
@@ -1730,7 +1181,5 @@ class ColumnRowTransformer(nn.Module):
 
         zg, ig = group(z), group(indicator)
         if self.config.encoder == "fourier":
-            if categorical is not None:
-                return self.cell_encoder(zg, ig, group(u), categorical)
             return self.cell_encoder(zg, ig, group(u))
         return self.cell_encoder(torch.cat([zg, ig], dim=-1))

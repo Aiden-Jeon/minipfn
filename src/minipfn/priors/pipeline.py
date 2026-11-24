@@ -8,8 +8,7 @@
 - 표 크기(학습 행·전체 행·feature 수)는 조립한 prior가 정해 넘긴다(`minipfn.priors.table_size` 등).
 - 하이퍼파라미터: `(rng, n_train, n_features) -> dict`. 그룹마다 한 번 뽑는다. 쓸 feature 수
   `num_features_used`를 정하면 생성기는 그 수로 만들고, 후처리(`PadFeatures`)가 채운다.
-- 생성기(`Generator`): 그룹 하나의 (x, y). 범주 열 표시를 내는 생성기(graph SCM의
-  `categorical_mask`, issue #110)는 (x, y, 범주 열 표시 (데이터셋, feature) bool)를 낸다.
+- 생성기(`Generator`): 그룹 하나의 (x, y).
 - 후처리(`Transform`): 그룹을 받아 새 그룹을 낸다. None이면 그 그룹을 버리고 하이퍼파라미터부터
   다시 뽑는다(최대 `max_attempts`번).
 
@@ -20,7 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
@@ -51,13 +50,6 @@ class Group:
     y: torch.Tensor  # (행, 데이터셋)
     n_train: int  # 앞의 n_train행이 학습 행
     hp: dict  # 그룹이 공유하는 하이퍼파라미터
-    # 범주 열 표시 (데이터셋, feature) bool. 그것을 내는 생성기만 채운다 (모듈 docstring). 후처리는
-    # 열을 바꾸지 않으면 그대로 넘긴다(`with_tensors`)
-    categorical: torch.Tensor | None = None
-
-    def with_tensors(self, x: torch.Tensor, y: torch.Tensor) -> Group:
-        """x·y만 바꾼 그룹 (열 순서를 바꾸지 않는 후처리. 범주 열 표시 등 나머지는 그대로)."""
-        return replace(self, x=x, y=y)
 
 
 class Generator(Protocol):
@@ -128,8 +120,8 @@ class Pipeline:
         for _ in range(self.max_attempts):
             hp = self.hyperparameters(self.rng, n_train, n_features) if self.hyperparameters else {}
             n_used = hp.get("num_features_used", n_features)
-            x, y, *categorical = self.generator(n_rows, n_used, self.group_size, hp, self.rng)
-            group: Group | None = Group(x, y, n_train, hp, *categorical)
+            x, y = self.generator(n_rows, n_used, self.group_size, hp, self.rng)
+            group: Group | None = Group(x, y, n_train, hp)
             for transform in transforms:
                 group = transform(group, self.rng)
                 if group is None:
@@ -152,7 +144,4 @@ class Pipeline:
         groups = [self.sample_group(n_rows, n_train, n_features) for _ in range(n_groups)]
         x = torch.cat([g.x.float() for g in groups], dim=1)
         y = torch.cat([g.y.float() for g in groups], dim=1)
-        batch = PriorBatch(x.transpose(0, 1).contiguous(), y.transpose(0, 1).contiguous(), n_train)
-        if groups[0].categorical is not None:
-            batch.categorical = torch.cat([g.categorical for g in groups])
-        return batch
+        return PriorBatch(x.transpose(0, 1).contiguous(), y.transpose(0, 1).contiguous(), n_train)

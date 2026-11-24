@@ -589,3 +589,29 @@ def test_logit_softcap_trains_from_uncapped_weights(tmp_path, monkeypatch):
         mlflow_log=False,
     )
     assert all(np.isfinite(out["history"]["train_loss"]))
+
+
+def test_train_script_turns_softcap_off(monkeypatch):
+    # --logit-softcap none·off는 preset의 soft-cap을 끈다. 틀린 값은 멈춘다
+    for name in ("TABPFN_V2_CONFIG_NAME", "TABPFN_V2_LOGIT_SOFTCAP", "TABPFN_V2_INIT_RUN_ID"):
+        monkeypatch.delenv(name, raising=False)
+    script = _script("train_script_softcap")
+    base = ["--config-name", "stage1", "--arch", "v3.5", "--task", "multitask"]
+    config, _ = script.build_config(script.parse_args(base))
+    assert config == tabpfn_v3.curriculum(1)  # 주지 않으면 preset 그대로
+    for value in ("none", "off"):
+        config, _ = script.build_config(script.parse_args([*base, "--logit-softcap", value]))
+        assert config == replace(tabpfn_v3.curriculum(1), logit_softcap=None)
+    monkeypatch.setenv("TABPFN_V2_LOGIT_SOFTCAP", "none")  # 환경변수로도
+    assert script.build_config(script.parse_args(base))[0].logit_softcap is None
+    monkeypatch.setenv("TABPFN_V2_LOGIT_SOFTCAP", "30")
+    assert script.build_config(script.parse_args(base))[0].logit_softcap == 30.0
+    monkeypatch.delenv("TABPFN_V2_LOGIT_SOFTCAP")
+    with pytest.raises(SystemExit, match="logit-softcap"):
+        script.build_config(script.parse_args([*base, "--logit-softcap", "fifty"]))
+    # soft-cap을 끈 run은 이어 학습할 때만 끈 채로 잇는다 (가중치만 가져오면 preset 값)
+    assert script.source_speed_options({"logit_softcap": "None"}, resume=True) == {
+        "logit_softcap": None
+    }
+    assert script.source_speed_options({"logit_softcap": "None"}) == {}
+    assert script.source_speed_options({"logit_softcap": "50.0"}) == {"logit_softcap": 50.0}

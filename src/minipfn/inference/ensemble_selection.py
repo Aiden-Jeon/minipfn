@@ -54,7 +54,6 @@ out-of-fold 손실이 기본부터 거의 0인 데이터셋에서 아주 날카�
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import warnings
 from typing import Any
@@ -64,11 +63,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 
-from minipfn.inference.ensemble import (
-    EnsembleClassifier,
-    EnsembleRegressor,
-    check_basic_ensemble_only,
-)
+from minipfn.inference.ensemble import EnsembleClassifier, EnsembleRegressor
 from minipfn.inference.preprocessing import MEMBER_KINDS, Member
 
 POOL_SIZE = 24
@@ -151,7 +146,6 @@ class _Selection:
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        check_basic_ensemble_only(self.model, self.task, "greedy 선택")
         self.temperatures = check_selection(
             n_estimators=self.n_estimators,
             pool_size=pool_size,
@@ -227,12 +221,10 @@ class _Selection:
         for train_ix, test_ix in splits:
             fold = copy.copy(self)
             fold.fit_members(X.iloc[train_ix], y[train_ix], members)
-            fold_members = fold._member_predictions(X.iloc[test_ix], y[test_ix])
-            with contextlib.closing(fold_members) as predictions:
-                for p, preds in predictions:
-                    oof[1 + p * n_t : 1 + (p + 1) * n_t, test_ix] = preds[:n_t]
-                    if p < self.n_estimators:  # 기본 앙상블: 기본 멤버를 기본 온도로 균일 평균
-                        oof[0, test_ix] += preds[n_t] / self.n_estimators
+            for p, preds in fold._member_predictions(X.iloc[test_ix], y[test_ix]):
+                oof[1 + p * n_t : 1 + (p + 1) * n_t, test_ix] = preds[:n_t]
+                if p < self.n_estimators:  # 기본 앙상블: 기본 멤버를 기본 온도로 균일 평균
+                    oof[0, test_ix] += preds[n_t] / self.n_estimators
         return oof
 
     _min_improvement_abs = 0.0  # 분류는 MIN_IMPROVEMENT_NATS
@@ -319,19 +311,17 @@ class GreedyEnsembleClassifier(_Selection, EnsembleClassifier):
     def _member_predictions(self, X: Any, y: np.ndarray):
         """멤버마다 (번호, 정답 클래스 확률 (온도 수 + 1, n)). 마지막 행은 기본 온도."""
         temps = (*self.temperatures, self.softmax_temperature)
-        with contextlib.closing(self.member_logits(X)) as members:
-            for i, logits in members:
-                rows = torch.arange(len(y), device=logits.device)
-                target = torch.as_tensor(y, device=logits.device)
-                probs = [torch.softmax(logits / t, dim=-1)[rows, target] for t in temps]
-                yield i, torch.stack(probs).double().cpu().numpy()
+        for i, logits in self.member_logits(X):
+            rows = torch.arange(len(y), device=logits.device)
+            target = torch.as_tensor(y, device=logits.device)
+            probs = [torch.softmax(logits / t, dim=-1)[rows, target] for t in temps]
+            yield i, torch.stack(probs).double().cpu().numpy()
 
     def predict_proba(self, X: Any) -> np.ndarray:
         total = 0.0
-        with contextlib.closing(self.member_logits(X)) as members:
-            for i, logits in members:
-                for t, w in self.member_weights_[i].items():
-                    total = total + w * torch.softmax(logits / t, dim=-1)
+        for i, logits in self.member_logits(X):
+            for t, w in self.member_weights_[i].items():
+                total = total + w * torch.softmax(logits / t, dim=-1)
         return total.cpu().numpy()
 
 
@@ -361,23 +351,21 @@ class GreedyEnsembleRegressor(_Selection, EnsembleRegressor):
     def _member_predictions(self, X: Any, y: np.ndarray):
         """멤버마다 (번호, 원래 단위의 평균 (온도 수 + 1, n)). 마지막 행은 기본 온도."""
         temps = (*self.temperatures, self.softmax_temperature)
-        with contextlib.closing(self._iter_logits(X, self.y_trains_)) as members:
-            for i, logits in members:
-                means = [self._member_mean(i, torch.softmax(logits / t, dim=-1)) for t in temps]
-                means = torch.stack(means).double().cpu().numpy()
-                yield i, means * self.y_std_ + self.y_mean_
+        for i, logits in self._iter_logits(X, self.y_trains_):
+            means = [self._member_mean(i, torch.softmax(logits / t, dim=-1)) for t in temps]
+            means = torch.stack(means).double().cpu().numpy()
+            yield i, means * self.y_std_ + self.y_mean_
 
     def _weighted(self, X: Any, mean: bool, distribution: bool):
         # 가중치를 준 (z 평균, 공통 경계 위의 구간 확률)
         total_mean, total_probs = 0.0, 0.0
-        with contextlib.closing(self._iter_logits(X, self.y_trains_)) as members:
-            for i, logits in members:
-                for t, w in self.member_weights_[i].items():
-                    p = torch.softmax(logits / t, dim=-1)
-                    if mean:
-                        total_mean = total_mean + w * self._member_mean(i, p)
-                    if distribution:
-                        total_probs = total_probs + w * self._on_common_borders(i, p)
+        for i, logits in self._iter_logits(X, self.y_trains_):
+            for t, w in self.member_weights_[i].items():
+                p = torch.softmax(logits / t, dim=-1)
+                if mean:
+                    total_mean = total_mean + w * self._member_mean(i, p)
+                if distribution:
+                    total_probs = total_probs + w * self._on_common_borders(i, p)
         return total_mean, total_probs
 
     def predict(self, X: Any) -> np.ndarray:

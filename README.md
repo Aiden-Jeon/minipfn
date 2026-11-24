@@ -2,6 +2,8 @@
 
 Prior-Data Fitted Networks(PFN)와 TabPFN(v1, v2)을 밑바닥부터 작게 구현하고, 논문 결과를 직접 재현하면서 이해하는 hands-on 가이드입니다.
 
+TabPFN 계열을 바탕으로 만든 자체 모델(minipfn-v1)은 독립 프로젝트 [TabSil](https://github.com/Aiden-Jeon/tabsil)로 옮겼습니다. 이 저장소는 TabPFN 재현 가이드만 다룹니다.
+
 PFN은 prior에서 뽑은 합성 데이터셋을 대량으로 학습해, 새 데이터셋이 들어오면 forward pass 한 번으로 posterior predictive distribution(PPD)을 근사하는 모델입니다.
 
 ## 1. How to use

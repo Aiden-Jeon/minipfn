@@ -28,4 +28,4 @@ class Missing:
                 mask = torch.from_numpy(r.random(tuple(x.shape)) < rate).to(x.device)
                 x = x.masked_fill(mask, float("nan"))
             xs.append(x)
-        return group.with_tensors(torch.stack(xs, 1), group.y)
+        return Group(torch.stack(xs, 1), group.y, group.n_train, group.hp)

@@ -437,17 +437,15 @@ for line in iter(sys.stdin.readline, ""):
     Path(job["started"]).touch()
     if job["dataset"] == "bad":
         sys.exit(3)
-    start = time.time()
     time.sleep(job["sleep"])
-    row = {"dataset": job["dataset"], "worker": sys.argv[1], "start": start, "end": time.time()}
     with open(job["results"], "wb") as f:
-        pickle.dump([row], f)
+        pickle.dump([{"dataset": job["dataset"], "worker": sys.argv[1]}], f)
     if job["dataset"] == "last_words":
         sys.exit(5)
 """
 
 
-def _fake_jobs(tmp_path, spec, host_bytes=None):
+def _fake_jobs(tmp_path, spec):
     jobs = []
     for name, splits, sleep in spec:
         out = tmp_path / name
@@ -462,21 +460,7 @@ def _fake_jobs(tmp_path, spec, host_bytes=None):
                 "sleep": sleep,
             }
         )
-        if (host_bytes or {}).get(name):
-            jobs[-1]["host_bytes"] = host_bytes[name]
     return jobs
-
-
-def _fake_rows(jobs):
-    import pickle
-
-    rows = {}
-    for job in jobs:
-        if Path(job["results"]).exists():
-            with open(job["results"], "rb") as f:
-                (row,) = pickle.load(f)
-            rows[row["dataset"]] = row
-    return rows
 
 
 def _fake_spawn(i):
@@ -535,233 +519,6 @@ def test_run_queue_gives_unstarted_work_of_a_dead_worker_to_another(tmp_path, fi
     for job in jobs:
         with open(job["results"], "rb") as f:
             assert pickle.load(f)[0]["dataset"] == job["dataset"]
-
-
-# --- CPU 셀 상태 예산 (`--host-memory-budget-gb`, interleaved 모델의 큰 표) ----------------------
-
-
-def test_run_queue_holds_big_tables_within_the_host_budget(tmp_path, capsys):
-    script = _eval_script()
-    # big_a·big_b는 60씩(예산 100): big_b는 big_a가 끝난 뒤에 시작한다. 그 사이 쉬는 worker들은
-    # 작은 표를 받는다 (큐에서 big_b 뒤에 있어도). mid(30)는 예산에 들지만 앞에서 big_b가 기다리므로
-    # big_b가 시작한 뒤에 받는다 (비싼 것 먼저)
-    spec = [("big_a", 1, 0.6), ("big_b", 1, 0.3), ("mid", 1, 0.3)]
-    spec += [(f"small{k}", 1, 0.01) for k in range(4)]
-    host = {"big_a": 60, "big_b": 60, "mid": 30}
-    jobs = _fake_jobs(tmp_path, spec, host)
-    missing, failed = script.run_queue(
-        jobs, _fake_spawn, 3, heartbeat_s=0.2, poll_s=0.01, host_budget=100
-    )
-    assert missing == [] and failed == {}
-    rows = _fake_rows(jobs)
-    assert rows["big_b"]["start"] >= rows["big_a"]["end"]
-    # mid는 big_a와 같이 돌 수 있지만(60 + 30 ≤ 100) big_b가 시작한 뒤(= big_a가 끝난 뒤)에 받는다
-    assert rows["mid"]["start"] >= rows["big_a"]["end"]
-    assert rows["mid"]["start"] < rows["big_b"]["end"]  # big_b와 같이 돈다 (60 + 30 ≤ 100)
-    assert all(rows[f"small{k}"]["end"] < rows["big_a"]["end"] for k in range(4))
-    out = capsys.readouterr().out
-    assert "big_b waits for host memory (cell state 0 GB, in use 0 / budget 0 GB)" in out
-    assert "host cell state" in out  # heartbeat
-
-
-def test_run_queue_without_budget_keeps_the_queue_order(tmp_path):
-    script = _eval_script()
-    # 예산이 없으면(None, 기본: 비-interleaved 모델이거나 한도를 모를 때) 예전처럼 동시에 준다
-    jobs = _fake_jobs(tmp_path, [("big_a", 1, 0.4), ("big_b", 1, 0.4)], {"big_a": 60, "big_b": 60})
-    missing, failed = script.run_queue(jobs, _fake_spawn, 2, heartbeat_s=60, poll_s=0.01)
-    assert missing == [] and failed == {}
-    rows = _fake_rows(jobs)
-    assert rows["big_b"]["start"] < rows["big_a"]["end"]
-
-
-def test_run_queue_runs_a_table_bigger_than_the_budget_alone(tmp_path):
-    script = _eval_script()
-    # 예산보다 큰 표도 큰 표가 하나도 돌지 않으면 받는다 (멈추지 않는다)
-    spec = [("huge", 1, 0.3), ("big", 1, 0.2), ("small", 1, 0.01)]
-    jobs = _fake_jobs(tmp_path, spec, {"huge": 500, "big": 60})
-    missing, failed = script.run_queue(
-        jobs, _fake_spawn, 2, heartbeat_s=60, poll_s=0.01, host_budget=100
-    )
-    assert missing == [] and failed == {}
-    rows = _fake_rows(jobs)
-    assert rows["big"]["start"] >= rows["huge"]["end"]
-    assert rows["small"]["end"] < rows["huge"]["end"]
-
-
-def test_run_queue_frees_the_budget_of_a_dead_worker(tmp_path):
-    script = _eval_script()
-    # "bad"(큰 표)를 받은 worker가 죽으면 그 몫을 풀어 다음 큰 표가 돈다
-    spec = [("bad", 1, 0.0), ("big", 1, 0.01), ("small", 1, 0.01)]
-    jobs = _fake_jobs(tmp_path, spec, {"bad": 80, "big": 80})
-    missing, failed = script.run_queue(
-        jobs, _fake_spawn, 2, heartbeat_s=60, poll_s=0.01, host_budget=100
-    )
-    assert missing == ["bad"] and failed == {0: "exit 3 while running bad"}
-    assert set(_fake_rows(jobs)) == {"big", "small"}
-
-
-def test_host_memory_budget(tmp_path):
-    script = _eval_script()
-    v2, v1 = tmp_path / "memory.max", tmp_path / "memory.limit_in_bytes"
-    meminfo = tmp_path / "meminfo"
-    files = (str(v2), str(v1))
-
-    def budget(args):
-        return script.host_memory_budget(args, files, str(meminfo))
-
-    args = argparse.Namespace(host_memory_budget_gb=None)
-    assert budget(args) is None  # cgroup도 meminfo도 없다: 끔
-    meminfo.write_text("MemTotal:       2097060284 kB\nMemFree:  1 kB\n")
-    assert budget(args) == 2097060284 * 1024 // 2  # cgroup을 못 읽으면 물리 메모리의 50%
-    v1.write_text("9223372036854771712\n")  # v1의 한도 없음: 물리 메모리
-    assert budget(args) == 2097060284 * 1024 // 2
-    v1.write_text("1000000000000\n")
-    assert budget(args) == 500_000_000_000
-    v2.write_text("max\n")  # v2가 먼저: 한도 없음 → 물리 메모리
-    assert budget(args) == 2097060284 * 1024 // 2
-    v2.write_text("2000000000000\n")
-    assert budget(args) == 1_000_000_000_000
-    args.host_memory_budget_gb = 700
-    assert budget(args) == 700_000_000_000
-    args.host_memory_budget_gb = 0
-    assert budget(args) is None
-    assert script.parse_args(["--host-memory-budget-gb", "800"]).host_memory_budget_gb == 800
-    assert script.parse_args([]).host_memory_budget_gb is None
-
-
-def test_host_state_estimate_only_for_interleaved_models():
-    import types
-
-    from minipfn.models.column_row_transformer import (
-        ColumnRowTransformer,
-        ColumnRowTransformerConfig,
-    )
-
-    script = _eval_script()
-    interleaved = ColumnRowTransformer(
-        ColumnRowTransformerConfig.tiny(
-            task="multitask", stage_layout="interleaved", column_blocks=2, row_blocks=2
-        )
-    )
-    sequential = ColumnRowTransformer(ColumnRowTransformerConfig.tiny(task="multitask"))
-    e = interleaved.config.emsize
-
-    def factory(model, kinds=("standard",)):
-        return types.SimpleNamespace(model=model, member_kinds=kinds)
-
-    # interleaved 모델이 없으면 큐는 예전 그대로 (None)
-    plain = {"classification": factory(sequential), "regression": factory(sequential)}
-    assert script.host_state_estimator(plain, {"classification": 768}) is None
-    factories = {"classification": factory(interleaved), "regression": factory(sequential)}
-    caps = {"classification": 768, "regression": 768}
-    estimate = script.host_state_estimator(factories, caps)
-    interleaved.interleaved_state_device_bytes = 1 << 30
-    # 멤버 열 = min(feature, 768) + 식별자 1
-    assert estimate("binary", 1_250_000, 988) == 1_250_000 * 769 * e * 4
-    assert estimate("multiclass", 1_250_000, 225) == 1_250_000 * 226 * e * 4
-    assert estimate("regression", 1_250_000, 988) == 0  # 회귀는 interleaved가 아니다
-    assert estimate("binary", 1000, 10) == 0  # 장치에 남는다
-    # one-hot으로 펼치면(범주 열이 있을 때만) 열 수는 one-hot 상한까지 늘 수 있다
-    factories["classification"].max_one_hot_width = 160
-    for mode, categorical, columns in (("all", True, 160), ("all", False, 43), ("off", True, 43)):
-        estimate = script.host_state_estimator(factories, caps, mode)
-        assert estimate("binary", 1_250_000, 43, categorical) == 1_250_000 * (columns + 1) * e * 4
-    assert estimate("binary", 1_250_000, 988) == 1_250_000 * 769 * e * 4
-    # quantile 멤버: 원래 열 + 분위수 열 + SVD 성분(최대 열/2)
-    factories["classification"] = factory(interleaved, ("quantile", "power"))
-    estimate = script.host_state_estimator(factories, {"classification": None})
-    assert estimate("binary", 1_250_000, 100) == 1_250_000 * 251 * e * 4
-
-    grid = pd.DataFrame(
-        [
-            {"dataset": "big", "problem_type": "binary", "max_train_rows": 10**6,
-             "n_features": 100, "skip_reason": None},
-            {"dataset": "big", "problem_type": "binary", "max_train_rows": 10**6,
-             "n_features": 100, "skip_reason": None},
-            {"dataset": "guess", "problem_type": "binary", "max_train_rows": 10**6,
-             "n_features": 100, "skip_reason": None},
-            {"dataset": "skipped", "problem_type": "binary", "max_train_rows": 10**6,
-             "n_features": 100, "skip_reason": "x"},
-            {"dataset": "tiny", "problem_type": "binary", "max_train_rows": 100,
-             "n_features": 5, "skip_reason": None},
-        ]
-    )  # fmt: skip
-    got = script.host_state_bytes(grid, {"big": 1_100_000}, estimate)
-    # 행을 모르면 학습 행 × 1.5, 돌리지 않는 데이터셋과 0인 데이터셋은 뺀다
-    assert got == {
-        "big": estimate("binary", 1_100_000, 100),
-        "guess": estimate("binary", 1_500_000, 100),
-    }
-    jobs = script.shard_jobs([("big", 1), ("tiny", 1)], Path("/tmp/x"), "beyondarena", "id", got)
-    assert jobs[0]["host_bytes"] == got["big"] and "host_bytes" not in jobs[1]
-
-
-def test_run_queue_does_not_let_smaller_big_tables_pass_a_waiting_one(tmp_path):
-    script = _eval_script()
-    # huge(90, 예산 100)는 a(30)가 도는 동안 기다린다. 그 뒤의 b·c(30씩)는 예산에 들지만 huge가
-    # 시작할 때까지 받지 않는다 (huge가 꼬리에 남지 않도록). small은 그 사이 돈다
-    spec = [("a", 1, 0.3), ("huge", 1, 0.3), ("b", 1, 0.05), ("c", 1, 0.05), ("small", 1, 0.01)]
-    jobs = _fake_jobs(tmp_path, spec, {"a": 30, "huge": 90, "b": 30, "c": 30})
-    missing, failed = script.run_queue(
-        jobs, _fake_spawn, 3, heartbeat_s=60, poll_s=0.01, host_budget=100
-    )
-    assert missing == [] and failed == {}
-    rows = _fake_rows(jobs)
-    assert rows["huge"]["start"] >= rows["a"]["end"]
-    assert rows["b"]["start"] >= rows["huge"]["end"] and rows["c"]["start"] >= rows["huge"]["end"]
-    assert rows["small"]["end"] < rows["a"]["end"]
-
-
-@pytest.mark.parametrize("kind", ["standard", "quantile"])
-@pytest.mark.parametrize("one_hot", [False, True])
-def test_host_state_columns_bound_the_member_input_width(kind, one_hot):
-    # 어림(eval.py)의 멤버 열 수가 실제 전처리(`MemberPreprocessor`)가 내는 열 수보다 작지 않다.
-    # 전처리가 열을 늘리게 바뀌면 여기서 걸린다
-    import types
-
-    from minipfn.inference.preprocessing import Member, MemberPreprocessor
-
-    script = _eval_script()
-    rng = np.random.default_rng(0)
-    n, n_num, cats = 200, 6, [3, 5, 2, 12]  # 수치 6열 + 범주 4열 (범주 수 3·5·2·12)
-    X = np.column_stack(
-        [rng.normal(size=(n, n_num))] + [rng.integers(0, k, size=n) for k in cats]
-    ).astype(float)
-    cat_ix = list(range(n_num, n_num + len(cats)))
-    width = 16
-    member = Member(kind=kind, class_permutation=None, target_power=False, seed=0, one_hot=one_hot)
-    prep = MemberPreprocessor(member, cat_ix, width).fit(X)
-    actual = prep.transform(X, np.random.default_rng(1)).shape[1]
-
-    model = types.SimpleNamespace(
-        config=types.SimpleNamespace(stage_layout="interleaved"),
-        inference_host_state_bytes=lambda rows, columns: columns,  # 열 수를 그대로 돌려준다
-    )
-    factory = types.SimpleNamespace(model=model, member_kinds=(kind,), max_one_hot_width=width)
-    estimate = script.host_state_estimator(
-        {"classification": factory}, {"classification": None}, "all" if one_hot else "off"
-    )
-    assert estimate("binary", 1, X.shape[1], True) >= actual
-    if kind == "standard" and not one_hot:
-        assert estimate("binary", 1, X.shape[1], True) == actual  # 원래 열 + 식별자 1
-
-
-def test_split_rows_takes_the_largest_train_plus_test():
-    import types
-
-    frame = pd.DataFrame(
-        {
-            "tabarena_task_name": ["a", "a", "b"],
-            "num_instances_train": [100, 80, 1_000_000],
-            "num_instances_test": [10, 50, 250_000],
-        }
-    )
-    collection = types.SimpleNamespace(to_dataframe=lambda: frame)
-    context = types.SimpleNamespace(task_metadata_collection=collection)
-    assert arena.split_rows(context) == {"a": 130, "b": 1_250_000}
-    assert arena.split_rows(context, subsample_rows=90) == {"a": 130, "b": 250_090}
-    empty = types.SimpleNamespace(to_dataframe=pd.DataFrame)
-    assert arena.split_rows(types.SimpleNamespace(task_metadata_collection=empty)) == {}
 
 
 def test_register_factory_gives_the_same_key_to_the_same_function():

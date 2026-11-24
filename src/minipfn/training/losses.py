@@ -1,5 +1,4 @@
-"""prior-fitting 손실 (학습 축): 분류 cross-entropy, 회귀 bar distribution NLL(분위수 출력이면
-pinball 손실, issue #110)과 target 흩기."""
+"""prior-fitting 손실 (학습 축): 분류 cross-entropy, 회귀 bar distribution NLL과 target 흩기."""
 
 from __future__ import annotations
 
@@ -7,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from minipfn.models.bar_distribution import FullSupportBarDistribution
-from minipfn.models.quantile_distribution import pinball_loss
 from minipfn.priors.base import IGNORE_INDEX
 
 
@@ -16,15 +14,11 @@ def prior_loss(
     y_eval: torch.Tensor,
     task: str,
     bar: FullSupportBarDistribution | None,
-    regression_head: str = "bar",
 ) -> torch.Tensor:
-    """검증 행의 평균 손실. 분류: cross-entropy, 회귀: bar distribution NLL. 회귀 분위수 출력
-    (`regression_head="quantile"`)이면 pinball 손실(분위수 수준의 평균, `quantile_distribution`)."""
+    """검증 행의 평균 손실. 분류: cross-entropy, 회귀: bar distribution NLL."""
     logits = logits.float()
     if task == "classification":
         return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y_eval.reshape(-1).long())
-    if regression_head == "quantile":
-        return pinball_loss(logits, y_eval.float()).mean()
     return bar(logits, y_eval.float()).mean()
 
 
