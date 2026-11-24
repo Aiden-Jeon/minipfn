@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import torch
 
 from minipfn.priors.pipeline import Group, Rng
@@ -15,7 +13,7 @@ class Standardize:
 
     def __call__(self, group: Group, rng: Rng) -> Group:
         x = normalize_data(remove_outliers(group.x))
-        return group.with_tensors(x, normalize_data(group.y))
+        return Group(x, normalize_data(group.y), group.n_train, group.hp)
 
 
 class PadFeatures:
@@ -35,8 +33,4 @@ class PadFeatures:
         if self.rescale:
             x = x / (k / self.n_features)
         pad = torch.zeros(n_rows, n_datasets, self.n_features - k, device=x.device)
-        out = group.with_tensors(torch.cat([x, pad], dim=-1), group.y)
-        if group.categorical is not None:  # 채운 열은 수치 열(0)이다
-            fill = group.categorical.new_zeros(n_datasets, self.n_features - k)
-            out = replace(out, categorical=torch.cat([group.categorical, fill], dim=-1))
-        return out
+        return Group(torch.cat([x, pad], dim=-1), group.y, group.n_train, group.hp)

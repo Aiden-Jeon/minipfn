@@ -11,10 +11,8 @@ AI Runtime(`databricks air run -f scripts/tabpfn_v2/train.yaml`)과 로컬에서
 모델 구조는 `--arch`(또는 `TABPFN_V2_ARCH`)로 고른다. 기본 `v2`, `v2.5`는 TabPFN-2.5
 (arXiv 2511.08667)의 구조 변경(층 수 회귀 18·분류 24, 셀 3개 묶기, thinking 행 64개,
 회귀 MLP encoder)이다. `v3`·`v3.5`는 TabPFN-3(arXiv 2605.13986)·3.5(arXiv 2609.17895)의
-열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. `minipfn-v1`은 같은 모델
-클래스로 만든 우리 자체 모델이다(`recipes.minipfn_v1`, 아래). `--task multitask`는
-분류·회귀를 한 모델로 같이 학습한다(TabPFN-3.5·minipfn-v1, `--arch v3.5`·`minipfn-v1`만. step마다
-task를 번갈아 쓴다).
+열 → 행 → 행 ICL 모델(`column_row_transformer`, `recipes.tabpfn_v3`)이다. `--task multitask`는
+분류·회귀를 한 모델로 같이 학습한다(TabPFN-3.5, `--arch v3.5`만. step마다 task를 번갈아 쓴다).
 이어서 학습하거나
 가중치를 가져오면 기본은 원래 run의 구조이고, `--arch`를 주면 그 구조가 원래 run과 같은지 확인한다.
 규모는 인자 또는 환경변수(`TABPFN_V2_TASK`, `TABPFN_V2_CONFIG_NAME`, `TABPFN_V2_STEPS`,
@@ -67,16 +65,6 @@ checkpoint에서 가중치만 가져와 step 0부터 새로 학습한다(`--conf
 stage 4는 표 크기를 GPU끼리 나눠 받는다(`--balance-tables on|off`, `TABPFN_V2_BALANCE_TABLES`, 주지
 않으면 preset 값이고 이어 학습하면 원래 run의 값이다).
 stage2~4는 `--init-run-id`로 앞 단계 run의 가중치를 가져온다.
-`--config-name minipfn_v1_stage1|minipfn_v1_stage2|minipfn_v1_stage3`(`--arch minipfn-v1 --task
-multitask`, `--arch`는 생략해도 된다)은 우리 자체 모델 minipfn-v1을 그 stage 1~3으로 학습한다
-(`recipes.minipfn_v1.curriculum`, issue #102·#110: v3.5에 Kumo 식 온도, soft-cap 없음, 열·행 단계
-번갈아 쌓기, 회귀 분위수 출력을 얹은 구조, lr 8e-4 / 1e-4 / 2e-5, stage 1 micro batch 4). 이름을
-붙이기 전의 `stage1_kumo|stage2_kumo|stage3_kumo`는 같은 설정을 내는 별칭이고, 그때처럼
-`--arch v3.5`도 받는다(그 구조는 이제 minipfn-v1이다). run 이름은 `minipfn-v1-…`이다.
-`--kumo-options`(`TABPFN_V2_KUMO_OPTIONS`, 쉼표로 여럿, issue #110)는 Kumo-Tabular 부품 묶음을 켠다
-(`recipes.kumo_tabular.OPTIONS`: decoder_qk_norm, stages, quantile_head, categorical_encoder).
-attention 온도처럼 구조 이름과 따로 켜는 설정이고, 이어 학습·가중치 가져오기에서는 원래 run의
-값이다.
 실행한 코드와 명령은 run의 `code/`와 tag(`command`, `env.TABPFN_V2_*`)에 남는다.
 """
 
@@ -98,16 +86,9 @@ import mlflow  # noqa: E402
 
 from minipfn import recipes  # noqa: E402
 from minipfn.hub import run_architecture  # noqa: E402
-from minipfn.models.column_row_transformer import TEMPERATURE_FIELDS, TEMPERATURES  # noqa: E402
-from minipfn.recipes import kumo_tabular, minipfn_v1, tabpfn_v3  # noqa: E402
 from minipfn.recipes import tabpfn_v2 as recipe  # noqa: E402
-from minipfn.training.config import (  # noqa: E402
-    ATTENTION_TEMPERATURE_DEFAULTS,
-    KUMO_OPTION_DEFAULTS,
-    SPEED_OPTIONS,
-    TrainConfig,
-    normalize_phases,
-)
+from minipfn.recipes import tabpfn_v3  # noqa: E402
+from minipfn.training.config import SPEED_OPTIONS, TrainConfig, normalize_phases  # noqa: E402
 from minipfn.training.loop import check_source_checkpoint, train  # noqa: E402
 from minipfn.utils import log_run_source  # noqa: E402
 
@@ -131,38 +112,12 @@ PRESETS = {
     # TabICLv2 3단계 학습을 옮긴 것과 긴 표 stage 4 (`recipes.tabpfn_v3.curriculum`, --arch v3.5
     # --task multitask). stage2~4는 앞 단계 run에서 가중치를 가져온다(--init-run-id)
     **{f"stage{n}": partial(tabpfn_v3.curriculum, n) for n in tabpfn_v3.CURRICULUM},
-    # 우리 자체 모델 minipfn-v1의 stage 1~3 (`recipes.minipfn_v1.curriculum`, issue #102·#110:
-    # v3.5에 Kumo 식 온도, soft-cap 없음, 열·행 단계, 회귀 분위수 출력). stage2·3은 --init-run-id로
-    # 앞 단계에서
-    **{f"minipfn_v1_stage{n}": partial(minipfn_v1.curriculum, n) for n in minipfn_v1.CURRICULUM},
-    # 이름을 붙이기 전(PR #113·#114)의 이름. 같은 설정을 낸다 (그 이름으로 도는 체인·이어 학습용)
-    **{f"stage{n}_kumo": partial(minipfn_v1.curriculum, n) for n in minipfn_v1.CURRICULUM},
 }
 CONFIG_NAMES = tuple(PRESETS)
-CURRICULUM_NAMES = {
-    **{f"stage{n}": n for n in tabpfn_v3.CURRICULUM},
-    **{f"minipfn_v1_stage{n}": n for n in minipfn_v1.CURRICULUM},
-    **{f"stage{n}_kumo": n for n in minipfn_v1.CURRICULUM},
-}
-# 구조가 정해진 preset: 그 구조(`--arch`를 주지 않으면 이것)와, 이름을 붙이기 전에 그 구조를 부르던
-# 이름(별칭 preset만 `--arch`로 받는다. `stage*_kumo`는 `--arch v3.5`로 돌았다)
-PRESET_ARCHITECTURES = {
-    **{f"minipfn_v1_stage{n}": (minipfn_v1.NAME, ()) for n in minipfn_v1.CURRICULUM},
-    **{f"stage{n}_kumo": (minipfn_v1.NAME, ("v3.5",)) for n in minipfn_v1.CURRICULUM},
-}
+CURRICULUM_NAMES = {f"stage{n}": n for n in tabpfn_v3.CURRICULUM}
 TUNED_LONG_NAMES = {f"tuned_stage{n}" for n in recipe.TUNED_LONG}
-# attention 온도 묶음 (`--attention-temperature`, issue #102). 구조 이름(`--arch`)과 따로 켠다
-TEMPERATURE_PRESETS = {"kumo": kumo_tabular.ATTENTION_TEMPERATURE}
-# Kumo-Tabular의 나머지 부품 묶음 (`--kumo-options`, issue #110). 쉼표로 여럿을 준다
-KUMO_OPTIONS = kumo_tabular.OPTIONS
 # MLflow run 이름의 머리
-RUN_PREFIXES = {
-    "v2": "tabpfn-v2",
-    "v2.5": "tabpfn-v2-5",
-    "v3": "tabpfn-v3",
-    "v3.5": "tabpfn-v3-5",
-    "minipfn-v1": "minipfn-v1",
-}
+RUN_PREFIXES = {"v2": "tabpfn-v2", "v2.5": "tabpfn-v2-5", "v3": "tabpfn-v3", "v3.5": "tabpfn-v3-5"}
 
 
 TRUE_VALUES, FALSE_VALUES = ("1", "true", "yes", "on"), ("", "0", "false", "no", "off")
@@ -202,9 +157,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--arch",
         choices=recipes.architectures(),
         default=os.environ.get("TABPFN_V2_ARCH"),
-        help="모델 구조: v2(Nature 2025), v2.5(TabPFN-2.5), v3(TabPFN-3), v3.5(TabPFN-3.5),"
-        " minipfn-v1(우리 모델, recipes/minipfn_v1.py)."
-        " 기본: 새로 학습하면 v2(minipfn_v1_stage*는 minipfn-v1),"
+        help="모델 구조: v2(Nature 2025), v2.5(TabPFN-2.5), v3(TabPFN-3), v3.5(TabPFN-3.5)."
+        " 기본: 새로 학습하면 v2,"
         " 이어서 학습하거나 가중치를 가져오면 원래 run의 구조",
     )
     parser.add_argument("--steps", type=int, default=_env("TABPFN_V2_STEPS", int))
@@ -247,42 +201,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--logit-softcap",
-        default=os.environ.get("TABPFN_V2_LOGIT_SOFTCAP") or None,
-        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)."
-        " none·off면 끈다",
-    )
-    # attention 온도 (issue #102, column_row_transformer만. 모델 docstring "attention 온도"). 묶음
-    # 이름(`TEMPERATURE_PRESETS`)을 먼저 적용하고 단계별 인자로 덮어쓴다. 모델 구조라
-    # 이어 학습하거나 가중치를 가져올 때 주지 않으면 원래 run의 값이다(주면 checkpoint와 구조가
-    # 달라 멈춘다)
-    temperature_choices = {
-        "attention_temperature": tuple(sorted(TEMPERATURE_PRESETS)),
-        "qk_norm_affine": ("on", "off"),
-        **dict.fromkeys(TEMPERATURE_FIELDS, TEMPERATURES),
-    }
-    helps = {
-        "attention_temperature": "attention 온도 묶음 (kumo: recipes/kumo_tabular.py)",
-        "qk_norm_affine": "q·k RMSNorm의 gain (off: 없음, qk_norm 구조만)",
-        "column_summary_temperature": "열 단계 요약 쪽(inducing → 학습 행)의 온도",
-        "column_spread_temperature": "열 단계 펼치는 쪽(행 → inducing)의 온도",
-        "row_temperature": "행 단계(CLS·feature)의 온도",
-        "icl_temperature": "행 ICL의 온도",
-        "decoder_temperature": "분류 retrieval decoder의 온도",
-    }
-    for name, choices in temperature_choices.items():
-        parser.add_argument(
-            "--" + name.replace("_", "-"),
-            choices=choices,
-            default=os.environ.get("TABPFN_V2_" + name.upper()) or None,
-            help=helps[name] + ". 모델 구조라 이어 학습·가중치 가져오기에서는 바꾸지 않는다",
-        )
-    # Kumo-Tabular의 나머지 부품 (issue #110, recipes/kumo_tabular.py의 OPTIONS). attention 온도처럼
-    # 구조 이름과 따로 켜고, 이어 학습·가중치 가져오기에서는 원래 run의 값이다
-    parser.add_argument(
-        "--kumo-options",
-        default=os.environ.get("TABPFN_V2_KUMO_OPTIONS") or None,
-        help="Kumo-Tabular 부품 묶음, 쉼표로 여럿 (" + ", ".join(KUMO_OPTIONS) + ")."
-        " 모델 구조라 이어 학습·가중치 가져오기에서는 바꾸지 않는다",
+        type=float,
+        default=_env("TABPFN_V2_LOGIT_SOFTCAP", float),
+        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)",
     )
     parser.add_argument(
         "--muon-distributed",
@@ -341,15 +262,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--init-step", type=int, default=_env("TABPFN_V2_INIT_STEP", int))
     parser.add_argument("--out-dir", default=os.environ.get("TABPFN_V2_OUT_DIR", "tabpfn_v2_run"))
     args = parser.parse_args(argv)
-    # argparse는 환경변수에서 온 기본값을 choices로 보지 않는다. 틀린 값이 조용히 기본 구조로
-    # 돌아가지 않도록 멈춘다 (인자로 주면 argparse가 이미 봤다)
-    for name, choices in temperature_choices.items():
-        value = getattr(args, name)
-        if value is not None and value not in choices:
-            raise SystemExit(f"TABPFN_V2_{name.upper()}={value!r}는 {choices} 가운데 하나여야 한다")
-    unknown = [o for o in _kumo_option_names(args.kumo_options) if o not in KUMO_OPTIONS]
-    if unknown:
-        raise SystemExit(f"--kumo-options의 {unknown}는 {tuple(KUMO_OPTIONS)} 가운데 하나여야 한다")
     if args.resume_step is not None and not args.resume_run_id:
         parser.error("--resume-step은 --resume-run-id와 같이 줘야 한다")
     if args.init_step is not None and not args.init_run_id:
@@ -399,9 +311,8 @@ def source_params(params: dict[str, str], tags: dict[str, str]) -> dict[str, str
     return params
 
 
-def source_speed_options(params: dict[str, str], resume: bool = False) -> dict:
-    """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict.
-    `resume`이면 같은 run을 잇는다 (가중치만 가져오는 것이 아니라)."""
+def source_speed_options(params: dict[str, str]) -> dict:
+    """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict."""
     defaults = TrainConfig()
     out = {}
     for name in SPEED_OPTIONS:
@@ -414,13 +325,9 @@ def source_speed_options(params: dict[str, str], resume: bool = False) -> dict:
                     out[name] = phases
                 continue
             if name == "logit_softcap":
-                # 켠 run에서는 늘 잇는다. 끈 run("None")은 이어 학습할 때만 잇는다: 같은 run은
-                # 원래 값 그대로 가야 하고(issue #102의 soft-cap 없는 arm), 가중치만 가져올 때(앞
-                # 단계 run, soft-cap 이전 run)는 preset의 soft-cap을 지우지 않는다
+                # 켠 run에서만 잇는다 (끈 run에서 가져와도 preset의 soft-cap을 지우지 않도록)
                 if text != "None":
                     out[name] = float(text)
-                elif resume:
-                    out[name] = None
                 continue
             out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
     return out
@@ -486,69 +393,25 @@ def build_config(
                 raise SystemExit(str(e)) from None
         if args.config_name == "paper" and arch in tabpfn_v3.ARCHITECTURES:
             return tabpfn_v3.paper(args.task, arch)  # multitask의 학습 설정도 이 recipe가 정한다
-        if args.config_name == "paper" and arch == minipfn_v1.NAME:
-            # 학습 설정은 v3.5 paper(multitask 붕괴 규칙 포함), 구조만 minipfn-v1
-            try:
-                return minipfn_v1.with_architecture(tabpfn_v3.paper(args.task, "v3.5"), arch)
-            except ValueError as e:
-                raise SystemExit(str(e)) from None
         return recipes.recipe_for_architecture(arch).with_architecture(
             PRESETS[args.config_name](args.task), arch, keep_size=keep_size
         )
 
-    given = _given_arch(args)
     if source is None:
-        fixed = PRESET_ARCHITECTURES.get(args.config_name)
-        arch = given or (fixed[0] if fixed else "v2")
-        config = _overrides(preset(arch), args)
-        return config, _run_arch(config, arch)
-    arch = given or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
-    if (
-        given is None
-        and arch == minipfn_v1.NAME
-        and args.config_name in CURRICULUM_NAMES
-        and args.config_name not in PRESET_ARCHITECTURES
-    ):
-        # v3.5 curriculum을 minipfn-v1 run에서 이어 가려는 것. 예전(이름을 붙이기 전)처럼 하려면
-        # --arch v3.5를 준다
-        raise SystemExit(
-            f"원래 run은 {minipfn_v1.NAME} 구조다. minipfn_v1_stage* preset을 쓰거나,"
-            f" v3.5 curriculum({args.config_name})에 그 구조를 얹으려면 --arch v3.5를 준다"
-        )
+        arch = args.arch or "v2"
+        return _overrides(preset(arch), args), arch
+    arch = args.arch or recipes.architecture_name(replace(TrainConfig(task=args.task), **source))
     # 원래 run이 긴 표 학습을 하지 않는 구조(TabPFN-3·3.5 등)여도 run을 열기 전에 멈춘다
     if args.config_name == "long_tables" and arch not in recipe.LONG_TABLES_MICRO_BATCH:
         raise SystemExit(
             f"long_tables는 {tuple(recipe.LONG_TABLES_MICRO_BATCH)} 구조만 쓴다: {source}"
         )
     base = preset(arch or "v2")
-    if given is not None:
-        # attention 온도는 구조 이름과 따로 켜는 설정이라 비교하지 않는다 (주지 않으면 원래 run의
-        # 값을 쓴다)
-        # Kumo 부품(issue #110)도 같다. Kumo식 열·행 단계면 그 폭·블록 수도 비교하지 않는다
-        separate = {*ATTENTION_TEMPERATURE_DEFAULTS, *KUMO_OPTION_DEFAULTS}
-        if source.get("stage_layout") == "interleaved":
-            separate |= set(kumo_tabular.STAGES)
-        differ = {
-            k: (getattr(base, k), v)
-            for k, v in source.items()
-            if getattr(base, k) != v and k not in separate
-        }
+    if args.arch is not None:
+        differ = {k: (getattr(base, k), v) for k, v in source.items() if getattr(base, k) != v}
         if differ:
             raise SystemExit(
-                f"--arch {given}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
-            )
-    if args.config_name in PRESET_ARCHITECTURES:
-        # 구조가 정해진 preset은 원래 run도 그 구조여야 한다. 위 비교는 온도·Kumo 부품을 빼고 보므로
-        # (예: 열·행 단계만 켠 #110 A/B run) 여기서 그 값까지 본다. 원래 run의 값으로 덮어쓰면
-        # 분위수 출력이나 온도가 없는 모델이 minipfn-v1 이름으로 학습된다
-        differ = {
-            k: (getattr(base, k), source[k])
-            for k in minipfn_v1.STRUCTURE
-            if k in source and getattr(base, k) != source[k]
-        }
-        if differ:
-            raise SystemExit(
-                f"원래 run이 {minipfn_v1.NAME} 구조가 아니다 (preset 값, run 값): {differ}"
+                f"--arch {args.arch}가 원래 run의 모델 구조와 다르다 (--arch 값, run 값): {differ}"
             )
     source_phases = (speed_options or {}).get("phases")
     if source_phases and base.phases and source_phases != base.phases:
@@ -558,28 +421,7 @@ def build_config(
         )
     # 원래 run의 구조·옵션과 인자를 한 번에 바꾼다 (설정 검사가 중간 상태를 보지 않도록)
     changes = {**source, **_source_options(speed_options or {}, args), **_override_values(args)}
-    config = _replace(base, changes)
-    return config, _run_arch(config, arch)
-
-
-def _given_arch(args: argparse.Namespace) -> str | None:
-    """인자로 준 구조 이름 (주지 않으면 None). 구조가 정해진 preset(`PRESET_ARCHITECTURES`)은 그
-    구조만 받고, 별칭 preset은 이름을 붙이기 전의 구조 이름도 받아 지금 이름으로 바꾼다."""
-    fixed = PRESET_ARCHITECTURES.get(args.config_name)
-    if fixed is None or args.arch is None:
-        return args.arch
-    name, old_names = fixed
-    if args.arch == name or args.arch in old_names:
-        return name
-    raise SystemExit(f"--config-name {args.config_name}는 {name} 구조다 (--arch {args.arch})")
-
-
-def _run_arch(config: TrainConfig, arch: str | None) -> str | None:
-    """run 이름에 쓸 구조 이름. v3.5에 열·행 단계 번갈아 쌓기를 켠 것(`--kumo-options stages`)은
-    minipfn-v1 구조라 그 이름으로 바꾼다(`recipes.minipfn_v1.architecture_name`). 그 밖은 그대로."""
-    if arch == "v3.5" and minipfn_v1.architecture_name(config) is not None:
-        return minipfn_v1.NAME
-    return arch
+    return _replace(base, changes), arch
 
 
 def _overrides(config: TrainConfig, args: argparse.Namespace) -> TrainConfig:
@@ -614,6 +456,7 @@ def _override_values(args: argparse.Namespace) -> dict:
         "optimizer": args.optimizer,
         "muon_weight_decay": args.muon_weight_decay,
         "muon_distributed": args.muon_distributed,
+        "logit_softcap": args.logit_softcap,
         "size_rule": args.size_rule,
         "min_rows": args.min_rows,
         "max_rows": args.max_rows,
@@ -647,36 +490,7 @@ def _override_values(args: argparse.Namespace) -> dict:
         overrides["collapse_threshold"] = _optional_float(args.collapse_threshold)
     if args.qk_clip is not None:
         overrides["qk_clip"] = _optional_float(args.qk_clip)
-    if args.logit_softcap is not None:
-        try:
-            overrides["logit_softcap"] = _optional_float(args.logit_softcap)
-        except ValueError:
-            raise SystemExit(f"--logit-softcap은 수나 none·off다: {args.logit_softcap!r}") from None
-    return {**overrides, **_temperature_values(args), **_kumo_values(args)}
-
-
-def _kumo_option_names(text: str | None) -> list[str]:
-    return [o.strip() for o in (text or "").split(",") if o.strip()]
-
-
-def _kumo_values(args: argparse.Namespace) -> dict:
-    """`--kumo-options`로 고른 Kumo-Tabular 부품 묶음을 합친 것 (주지 않으면 빈 dict)."""
-    values = {}
-    for name in _kumo_option_names(args.kumo_options):
-        values.update(KUMO_OPTIONS[name])
-    return values
-
-
-def _temperature_values(args: argparse.Namespace) -> dict:
-    """attention 온도 인자 (`--attention-temperature` 묶음 뒤에 단계별 인자). 주지 않은 것은
-    빠진다."""
-    values = dict(TEMPERATURE_PRESETS.get(args.attention_temperature, {}))
-    if args.qk_norm_affine is not None:
-        values["qk_norm_affine"] = args.qk_norm_affine == "on"
-    for name in TEMPERATURE_FIELDS:
-        if getattr(args, name) is not None:
-            values[name] = getattr(args, name)
-    return values
+    return overrides
 
 
 def _check_source(path: str, config: TrainConfig, *, resume: bool) -> float:
@@ -719,7 +533,7 @@ def main(argv: list[str] | None = None) -> None:
         if params["task"] != args.task:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
-        speed_options = source_speed_options(params, resume=bool(args.resume_run_id))
+        speed_options = source_speed_options(params)
         if args.init_run_id:
             # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다.
             # 표 크기 나누기도 앞 단계 run(끈 값)이 아니라 이번 preset·인자를 따른다 (stage 4)

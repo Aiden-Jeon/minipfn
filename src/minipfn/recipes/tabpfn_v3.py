@@ -112,18 +112,10 @@ def with_architecture(config: TrainConfig, arch: str, keep_size: bool = False) -
     return replace(config, **_model_changes(config, arch, keep_size), qk_clip=None)
 
 
-# 열·행 단계를 번갈아 쌓은 모델(`stage_layout="interleaved"`, `recipes.kumo_tabular.STAGES`)은 이
-# recipe의 구조가 아니다. 그 모델은 `recipes.minipfn_v1`의 구조(`minipfn-v1`)다(행 ICL은 v3.5와
-# 같다)
-
-
 def architecture_name(config) -> str | None:
     """`config`(학습 설정, 또는 `task`·`model_type`과 구조 필드가 있는 것)의 구조가
-    `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 크기를 줄인 것도 그 구조로 본다.
-    열·행 단계를 번갈아 쌓은 것은 None이다(`recipes.minipfn_v1`)."""
+    `ARCHITECTURES`의 어느 것인지 (없으면 None). smoke처럼 크기를 줄인 것도 그 구조로 본다."""
     if canonical_model_type(config.model_type) != MODEL_TYPE:
-        return None
-    if getattr(config, "stage_layout", "sequential") != "sequential":
         return None
     for name in ARCHITECTURES:
         if config.task not in ARCHITECTURES[name]:
@@ -381,14 +373,8 @@ def default_inference(model: nn.Module, task: str) -> dict:
     "max_features_per_member": int | None, "feature_subsampling": str}`. weight와 함께 온 설정
     (`model.inference_config`, Hub config.json의 `inference`)이 먼저이고, 그 키가 없으면 모델
     구조(3.5면 v3.5, 그 밖은 v3)의 것. 멤버당 열 상한은 3.5만 있다(3은 None: 모든 열)."""
-    return inference_settings(model, task, INFERENCE[model_architecture(model, task) or "v3"])
-
-
-def inference_settings(model: nn.Module, task: str, preset: dict) -> dict:
-    """`default_inference`의 값: weight와 함께 온 설정(`model.inference_config`)이 먼저이고, 없는
-    키는 `preset`(`INFERENCE`의 한 구조)의 것. 같은 모델 클래스를 쓰는 `recipes.minipfn_v1`도
-    쓴다."""
     saved = getattr(model, "inference_config", None) or {}
+    preset = INFERENCE[model_architecture(model, task) or "v3"]
     return {
         "n_estimators": int(saved.get("n_estimators", preset["n_estimators"][task])),
         "member_kinds": resolve_member_kinds(saved.get("member_kinds") or preset["member_kinds"]),
