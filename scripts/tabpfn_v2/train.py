@@ -201,9 +201,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--logit-softcap",
-        type=float,
-        default=_env("TABPFN_V2_LOGIT_SOFTCAP", float),
-        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)",
+        default=os.environ.get("TABPFN_V2_LOGIT_SOFTCAP") or None,
+        help="attention logit soft-cap c (logit <- c * tanh(logit / c), column_row_transformer만)."
+        " none·off면 끈다",
     )
     parser.add_argument(
         "--muon-distributed",
@@ -311,8 +311,9 @@ def source_params(params: dict[str, str], tags: dict[str, str]) -> dict[str, str
     return params
 
 
-def source_speed_options(params: dict[str, str]) -> dict:
-    """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict."""
+def source_speed_options(params: dict[str, str], resume: bool = False) -> dict:
+    """원래 run의 학습 가속 옵션 (MLflow param, 문자열). 그 옵션이 생기기 전의 run은 빈 dict.
+    `resume`이면 같은 run을 잇는다 (가중치만 가져오는 것이 아니라)."""
     defaults = TrainConfig()
     out = {}
     for name in SPEED_OPTIONS:
@@ -325,9 +326,13 @@ def source_speed_options(params: dict[str, str]) -> dict:
                     out[name] = phases
                 continue
             if name == "logit_softcap":
-                # 켠 run에서만 잇는다 (끈 run에서 가져와도 preset의 soft-cap을 지우지 않도록)
+                # 켠 run에서는 늘 잇는다. 끈 run("None")은 이어 학습할 때만 잇는다: 같은 run은
+                # 원래 값 그대로 가야 하고(soft-cap을 끄고 학습한 run), 가중치만 가져올 때(앞 단계
+                # run, soft-cap 이전 run)는 preset의 soft-cap을 지우지 않는다
                 if text != "None":
                     out[name] = float(text)
+                elif resume:
+                    out[name] = None
                 continue
             out[name] = text == "True" if isinstance(default, bool) else type(default)(text)
     return out
@@ -456,7 +461,6 @@ def _override_values(args: argparse.Namespace) -> dict:
         "optimizer": args.optimizer,
         "muon_weight_decay": args.muon_weight_decay,
         "muon_distributed": args.muon_distributed,
-        "logit_softcap": args.logit_softcap,
         "size_rule": args.size_rule,
         "min_rows": args.min_rows,
         "max_rows": args.max_rows,
@@ -490,6 +494,11 @@ def _override_values(args: argparse.Namespace) -> dict:
         overrides["collapse_threshold"] = _optional_float(args.collapse_threshold)
     if args.qk_clip is not None:
         overrides["qk_clip"] = _optional_float(args.qk_clip)
+    if args.logit_softcap is not None:
+        try:
+            overrides["logit_softcap"] = _optional_float(args.logit_softcap)
+        except ValueError:
+            raise SystemExit(f"--logit-softcap은 수나 none·off다: {args.logit_softcap!r}") from None
     return overrides
 
 
@@ -533,7 +542,7 @@ def main(argv: list[str] | None = None) -> None:
         if params["task"] != args.task:
             raise SystemExit(f"원래 run은 {params['task']} 모델이다 (--task {args.task}).")
         source = run_architecture(params)
-        speed_options = source_speed_options(params)
+        speed_options = source_speed_options(params, resume=bool(args.resume_run_id))
         if args.init_run_id:
             # 가중치만 가져오면 step 0부터 새 스케줄이라 원래 run의 구간(절대 step)은 잇지 않는다.
             # 표 크기 나누기도 앞 단계 run(끈 값)이 아니라 이번 preset·인자를 따른다 (stage 4)
