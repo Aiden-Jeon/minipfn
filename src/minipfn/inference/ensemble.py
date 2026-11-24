@@ -76,6 +76,7 @@ sklearn 스타일 `EnsembleClassifier`·`EnsembleRegressor`. `forward(x, y_train
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from typing import Any
 
@@ -326,18 +327,23 @@ class _Base:
         autocast = self.device.type == "cuda"  # 학습과 같은 bfloat16
         kwargs = forward_kwargs(model, self.task)
         categorical = uses_categorical(model)
-        for i, x, y in self._iter_inputs(X, y_trains):
-            y, extra = self._model_targets(y)
-            if categorical:  # 멤버 입력 열의 범주 표시 (모듈 docstring)
-                mask = self.preprocessors_[i].categorical_columns()
-                extra = {**extra, "categorical": torch.as_tensor(mask, device=self.device)[None]}
-            with (
-                torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
-                torch.inference_mode(),
-            ):
-                logits = model(x, y, **kwargs, **extra)[0].float()
-            # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
-            yield i, logits
+        # 멤버 forward들이 큰 CPU 버퍼(column_row_transformer interleaved의 셀 상태)를 다시 쓰고,
+        # 멤버를 다 돌면(예외여도) 놓는다
+        hold = getattr(model, "hold_host_state", None)
+        with hold() if hold is not None else contextlib.nullcontext():
+            for i, x, y in self._iter_inputs(X, y_trains):
+                y, extra = self._model_targets(y)
+                if categorical:  # 멤버 입력 열의 범주 표시 (모듈 docstring)
+                    mask = self.preprocessors_[i].categorical_columns()
+                    mask = torch.as_tensor(mask, device=self.device)[None]
+                    extra = {**extra, "categorical": mask}
+                with (
+                    torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=autocast),
+                    torch.inference_mode(),
+                ):
+                    logits = model(x, y, **kwargs, **extra)[0].float()
+                # autocast 밖에서 넘긴다: 받는 쪽의 계산(회귀 평균의 행렬곱 등)은 float32로 한다
+                yield i, logits
 
 
 class EnsembleClassifier(_Base):
@@ -400,15 +406,16 @@ class EnsembleClassifier(_Base):
     def member_logits(self, X: Any):
         """멤버마다 (번호, 원래 클래스 순서의 logit (n, 클래스 수))."""
         n_classes = len(self.classes_)
-        for i, logits in self._iter_logits(X, self.y_trains_):
-            perm = self.preprocessors_[i].member.class_permutation
-            yield i, logits[:, :n_classes][:, perm]  # 섞은 번호의 logit을 원래 클래스 순서로
+        with contextlib.closing(self._iter_logits(X, self.y_trains_)) as members:
+            for i, logits in members:
+                perm = self.preprocessors_[i].member.class_permutation
+                yield i, logits[:, :n_classes][:, perm]  # 섞은 번호의 logit을 원래 클래스 순서로
 
     def predict_proba(self, X: Any) -> np.ndarray:
-        probs = [
-            torch.softmax(logits / self.softmax_temperature, dim=-1)
-            for _, logits in self.member_logits(X)
-        ]
+        with contextlib.closing(self.member_logits(X)) as members:
+            probs = [
+                torch.softmax(logits / self.softmax_temperature, dim=-1) for _, logits in members
+            ]
         return torch.stack(probs).mean(0).cpu().numpy()
 
     def predict(self, X: Any) -> np.ndarray:
@@ -673,7 +680,8 @@ class EnsembleRegressor(_Base):
         """
         if self.regression_mean == "mixture":
             return self._mixture(self._official_probs(X))
-        probs = [self._on_common_borders(i, p) for i, p in self._member_probs(X)]
+        with contextlib.closing(self._member_probs(X)) as members:
+            probs = [self._on_common_borders(i, p) for i, p in members]
         return self._mixture(probs)
 
     def predict(self, X: Any) -> np.ndarray:
@@ -682,7 +690,8 @@ class EnsembleRegressor(_Base):
         docstring)."""
         if self.regression_mean == "mixture":
             return self._mixture_mean(self._official_probs(X))
-        return self._mean([self._member_mean(i, p) for i, p in self._member_probs(X)])
+        with contextlib.closing(self._member_probs(X)) as members:
+            return self._mean([self._member_mean(i, p) for i, p in members])
 
     def predict_full(self, X: Any) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         """(`predict`의 평균, `predict_distribution`의 log 확률과 경계)를 forward 한 번으로 낸다.
@@ -691,43 +700,47 @@ class EnsembleRegressor(_Base):
             probs = self._official_probs(X)
             return (self._mixture_mean(probs), *self._mixture(probs))
         means, probs = [], []
-        for i, p in self._member_probs(X):
-            means.append(self._member_mean(i, p))
-            probs.append(self._on_common_borders(i, p))
+        with contextlib.closing(self._member_probs(X)) as members:
+            for i, p in members:
+                means.append(self._member_mean(i, p))
+                probs.append(self._on_common_borders(i, p))
         return (self._mean(means), *self._mixture(probs))
 
     def _bucket_logits(self, X: Any):
         """멤버마다 (번호, 자기 공간의 구간 logit을 온도로 나눈 것). 분위수 출력 모델은 분위수를
         구간 확률로 바꾼 log 확률이고 온도로 나누지 않는다 (모듈 docstring)."""
         quantile = quantile_regressor(self.model)
-        for i, logits in self._iter_logits(X, self.y_trains_):
-            if quantile:
-                p = quantiles_to_bucket_probs(logits, self.borders)
-                yield i, p.clamp_min(1e-30).log()
-            else:
-                yield i, logits / self.softmax_temperature
+        with contextlib.closing(self._iter_logits(X, self.y_trains_)) as members:
+            for i, logits in members:
+                if quantile:
+                    p = quantiles_to_bucket_probs(logits, self.borders)
+                    yield i, p.clamp_min(1e-30).log()
+                else:
+                    yield i, logits / self.softmax_temperature
 
     def _member_probs(self, X: Any):
         """멤버마다 (번호, 자기 공간의 구간 확률)."""
-        for i, logits in self._bucket_logits(X):
-            yield i, torch.softmax(logits, dim=-1)
+        with contextlib.closing(self._bucket_logits(X)) as members:
+            for i, logits in members:
+                yield i, torch.softmax(logits, dim=-1)
 
     def _official_probs(self, X: Any) -> list[torch.Tensor]:
         """`regression_mean="mixture"`: 멤버마다 공통 경계 위의 구간 확률 (클래스 docstring)."""
         probs = []
-        for i, logits in self._bucket_logits(X):
-            official = self.official_maps_[i]
-            if official is None:  # target 변환이 없는 멤버는 경계가 공통 경계 그대로다
-                probs.append(torch.softmax(logits, dim=-1))
-                continue
-            frm, cancel, descending = official
-            if descending:
-                logits = logits.flip(-1)
-            if cancel is not None:
-                mask = torch.as_tensor(cancel, device=logits.device)
-                logits = logits.masked_fill(mask, -torch.inf)
-            p = torch.softmax(logits, dim=-1)
-            probs.append(_probs_on_full_support_borders(p, frm, self.borders))
+        with contextlib.closing(self._bucket_logits(X)) as members:
+            for i, logits in members:
+                official = self.official_maps_[i]
+                if official is None:  # target 변환이 없는 멤버는 경계가 공통 경계 그대로다
+                    probs.append(torch.softmax(logits, dim=-1))
+                    continue
+                frm, cancel, descending = official
+                if descending:
+                    logits = logits.flip(-1)
+                if cancel is not None:
+                    mask = torch.as_tensor(cancel, device=logits.device)
+                    logits = logits.masked_fill(mask, -torch.inf)
+                p = torch.softmax(logits, dim=-1)
+                probs.append(_probs_on_full_support_borders(p, frm, self.borders))
         return probs
 
     def _mixture_mean(self, probs: list[torch.Tensor]) -> np.ndarray:

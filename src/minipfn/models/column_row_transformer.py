@@ -105,6 +105,7 @@ cell_embedding.py`와 블로그에서 동작만 보고 다시 구현했다):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 from dataclasses import asdict, dataclass
@@ -1056,6 +1057,70 @@ def _retrieve(q: torch.Tensor, k: torch.Tensor, onehot: torch.Tensor) -> torch.T
     return torch.cat(out, dim=-1)[..., :n_classes]
 
 
+def _clear_cuda_error() -> None:
+    """실패한 CUDA runtime 호출(`cudaHostRegister`)이 남긴 마지막 오류를 지운다. 지우지 않으면 다음
+    kernel launch 검사(`cudaGetLastError`)가 그 오류로 멈춘다. torch의 cudart binding에는
+    `cudaGetLastError`가 없어 이미 올라온 libcudart를 ctypes로 부른다(Linux. 못 찾으면 그대로)."""
+    import ctypes
+
+    try:
+        with open("/proc/self/maps") as f:
+            paths = {line.split()[-1] for line in f if "libcudart.so" in line}
+    except OSError:
+        return
+    for path in sorted(paths):
+        try:
+            ctypes.CDLL(path).cudaGetLastError()
+        except (OSError, AttributeError):
+            continue
+
+
+def _host_state(shape: tuple[int, ...], dtype: torch.dtype, pin: bool) -> tuple[torch.Tensor, bool]:
+    """CPU 셀 상태 (`ColumnRowTransformer._rows_interleaved_chunked`의 offload): 보통(pageable)
+    CPU 텐서를 정확한 크기로 잡고, `pin`이면 그 자리만 pinned로 등록한다(`cudaHostRegister`).
+    `torch.empty(..., pin_memory=True)`는 caching host allocator를 쓴다: 크기를 2의 거듭제곱으로
+    올리고(BeyondArena maps_router_eta_1m의 984 GB → 1 TiB), 해제한 블록을 `empty_cache` 전까지
+    프로세스가 들고 있다. 그래서 큰 표를 지난 eval worker가 쓰지 않는 수백 GB를 쥐고 남는다.
+    돌려주는 bool은 등록했는지(`_release_host_state`로 푼다). 등록이 안 되면(memlock 한도 등)
+    경고하고 pageable로 쓴다(값은 같고 복사만 느리다)."""
+    state = torch.empty(shape, dtype=dtype, device="cpu")
+    if not pin or state.numel() == 0 or not torch.cuda.is_available():
+        return state, False
+    err = int(torch.cuda.cudart().cudaHostRegister(state.data_ptr(), state.nbytes, 0))
+    if err != 0:
+        _clear_cuda_error()
+        import warnings
+
+        warnings.warn(
+            f"셀 상태 {state.nbytes / 2**30:.1f} GiB를 pinned로 등록하지 못했다 (cudaError {err})."
+            " pageable 메모리로 계속한다 (값은 같고 장치 복사가 느리다)",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return state, False
+    return state, True
+
+
+def _release_host_state(state: torch.Tensor, registered: bool) -> None:
+    """`_host_state`의 등록을 푼다 (메모리는 텐서가 해제될 때 OS로 돌아간다). 복사는 모두 동기라
+    끝나 있지만, 혹시 남은 일이 있을 수 있어 장치를 기다린 뒤 푼다. 예외로 나가는 길에서도
+    부르므로(`finally`) 여기서는 새 예외를 내지 않는다(원래 예외를 가리지 않도록)."""
+    if not registered:
+        return
+    import warnings
+
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError:  # 장치가 이미 오류 상태: 원래 예외가 그 이유를 알린다
+        pass
+    err = int(torch.cuda.cudart().cudaHostUnregister(state.data_ptr()))
+    if err != 0:
+        _clear_cuda_error()
+        warnings.warn(
+            f"셀 상태 pinned 등록을 풀지 못했다 (cudaError {err})", RuntimeWarning, stacklevel=3
+        )
+
+
 class ColumnRowTransformer(nn.Module):
     # 모델 종류 (`minipfn.models.MODEL_TYPES`)
     model_type = "column_row_transformer"
@@ -1069,6 +1134,9 @@ class ColumnRowTransformer(nn.Module):
     # (B, R, C, E)가 이보다 크면 CPU에 두고 묶음마다 장치로 옮긴다 (아주 큰 표에서 GPU 메모리를
     # 묶는다)
     interleaved_state_device_bytes = 16 << 30
+    # CPU에 둔 셀 상태를 그 자리만 pinned로 등록한다 (`_host_state`. False면 pageable로 복사한다.
+    # 값은 같다)
+    interleaved_state_pin = True
     # forward가 추론용 인자(`inference`, `y_classes`·`n_classes`)를 받는다
     # (`minipfn.inference.ensemble.forward_kwargs`)
     supports_inference_options = True
@@ -1082,6 +1150,9 @@ class ColumnRowTransformer(nn.Module):
     def __init__(self, config: ColumnRowTransformerConfig | None = None) -> None:
         super().__init__()
         self.config = config = config or ColumnRowTransformerConfig()
+        # `hold_host_state` 안에서 forward 사이에 다시 쓰는 CPU 셀 상태 (1차원 텐서, 등록 여부)
+        self._held_host_state: tuple[torch.Tensor, bool] | None = None
+        self._holding_host_state = False
         e, g, d = config.emsize, config.features_per_group, config.icl_dim
         self.offsets = group_offsets(g)
         if config.encoder == "fourier":
@@ -1530,60 +1601,122 @@ class ColumnRowTransformer(nn.Module):
         (1) 열을 `inference_column_chunk`개씩 나눠 학습 행의 지금 상태로 요약을 구하고 (2) 행을
         `inference_chunk_cells / (B × C)`개씩 나눠 펼치기와 행 블록을 계산해 상태를 바꾼다. 요약은
         (2) 전에 다 구하므로 학습 행 상태가 바뀌기 전의 값이다. 셀 encoder도 행 묶음으로
-        계산한다. 셀 상태가 `interleaved_state_device_bytes`보다 크면 CPU에 둔다."""
+        계산한다. 셀 상태가 `interleaved_state_device_bytes`보다 크면 CPU에 둔다. CPU 상태는 caching
+        host allocator를 거치지 않고 정확한 크기로 잡아 forward가 끝나면(예외여도) 바로 놓는다
+        (`_host_state`)."""
         cfg = self.config
         b, r, c = x.shape
         n_train = y_train.shape[1]
         embed, _ = self._chunk_embedder(x, y_train, task, categorical)
         step = max(1, self.inference_chunk_cells // (b * c))
         device = x.device
-        h = None
-        for r0 in range(0, r, step):
-            r1 = min(r0 + step, r)
-            cells = embed(x[:, r0:r1], None, rows=(r0, r1))
-            if h is None:
-                shape = (b, r, c, cells.shape[-1])
-                size = math.prod(shape) * cells.element_size()
-                offload = device.type == "cuda" and size > self.interleaved_state_device_bytes
-                h = torch.empty(
-                    shape,
-                    dtype=cells.dtype,
-                    device="cpu" if offload else device,
-                    pin_memory=offload,
-                )
-            h[:, r0:r1] = cells
-        e = h.shape[-1]
-        cls = self.cls_tokens.to(h.dtype).expand(b, r, -1, -1).clone()  # (B, R, n_cls, E)
-        last = len(self.row_blocks) - 1
-        for i, (column, row) in enumerate(zip(self.column_blocks, self.row_blocks, strict=True)):
-            # (1) 학습 행의 지금 상태로 열마다 요약 (B, C, n_inducing, E)
-            summary = None
-            for c0 in range(0, c, self.inference_column_chunk):
-                c1 = min(c0 + self.inference_column_chunk, c)
-                ht = h[:, :n_train, c0:c1].to(device).permute(0, 2, 1, 3)
-                ht = ht.reshape(b * (c1 - c0), n_train, e)
-                ind = column.summary(ht)
-                if summary is None:
-                    summary = ind.new_empty(b, c, *ind.shape[1:])
-                summary[:, c0:c1] = ind.view(b, c1 - c0, *ind.shape[1:])
-            summary = summary.reshape(b * c, *summary.shape[2:])
-            # (2) 행 묶음마다 펼치기 → 행 블록
+        h, release = None, None
+        try:
             for r0 in range(0, r, step):
                 r1 = min(r0 + step, r)
-                rj = r1 - r0
-                hc = h[:, r0:r1].to(device).permute(0, 2, 1, 3).reshape(b * c, rj, e)
-                hc = column.spread(hc, summary)
-                hr = hc.view(b, c, rj, e).transpose(1, 2).reshape(b * rj, c, e)
-                part = cls[:, r0:r1].reshape(b * rj, cfg.n_cls, e)
-                tokens = torch.cat([part.to(hr.dtype), hr], dim=1)
-                if i == last:
-                    out = row(tokens, n_queries=cfg.n_cls)
-                    cls[:, r0:r1] = out.view(b, rj, cfg.n_cls, e).to(cls.dtype)
-                else:
-                    tokens = row(tokens)
-                    cls[:, r0:r1] = tokens[:, : cfg.n_cls].view(b, rj, cfg.n_cls, e).to(cls.dtype)
-                    h[:, r0:r1] = tokens[:, cfg.n_cls :].view(b, rj, c, e).to(h.dtype)
-        return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
+                cells = embed(x[:, r0:r1], None, rows=(r0, r1))
+                if h is None:
+                    shape = (b, r, c, cells.shape[-1])
+                    size = math.prod(shape) * cells.element_size()
+                    if self._offload_interleaved_state(device, size):
+                        h, release = self._acquire_host_state(shape, cells.dtype)
+                    else:
+                        h = torch.empty(shape, dtype=cells.dtype, device=device)
+                h[:, r0:r1] = cells
+            e = h.shape[-1]
+            cls = self.cls_tokens.to(h.dtype).expand(b, r, -1, -1).clone()  # (B, R, n_cls, E)
+            last = len(self.row_blocks) - 1
+            blocks = zip(self.column_blocks, self.row_blocks, strict=True)
+            for i, (column, row) in enumerate(blocks):
+                # (1) 학습 행의 지금 상태로 열마다 요약 (B, C, n_inducing, E)
+                summary = None
+                for c0 in range(0, c, self.inference_column_chunk):
+                    c1 = min(c0 + self.inference_column_chunk, c)
+                    ht = h[:, :n_train, c0:c1].to(device).permute(0, 2, 1, 3)
+                    ht = ht.reshape(b * (c1 - c0), n_train, e)
+                    ind = column.summary(ht)
+                    if summary is None:
+                        summary = ind.new_empty(b, c, *ind.shape[1:])
+                    summary[:, c0:c1] = ind.view(b, c1 - c0, *ind.shape[1:])
+                summary = summary.reshape(b * c, *summary.shape[2:])
+                # (2) 행 묶음마다 펼치기 → 행 블록
+                for r0 in range(0, r, step):
+                    r1 = min(r0 + step, r)
+                    rj = r1 - r0
+                    hc = h[:, r0:r1].to(device).permute(0, 2, 1, 3).reshape(b * c, rj, e)
+                    hc = column.spread(hc, summary)
+                    hr = hc.view(b, c, rj, e).transpose(1, 2).reshape(b * rj, c, e)
+                    part = cls[:, r0:r1].reshape(b * rj, cfg.n_cls, e)
+                    tokens = torch.cat([part.to(hr.dtype), hr], dim=1)
+                    if i == last:
+                        out = row(tokens, n_queries=cfg.n_cls)
+                        cls[:, r0:r1] = out.view(b, rj, cfg.n_cls, e).to(cls.dtype)
+                    else:
+                        tokens = row(tokens)
+                        new_cls = tokens[:, : cfg.n_cls].view(b, rj, cfg.n_cls, e)
+                        cls[:, r0:r1] = new_cls.to(cls.dtype)
+                        h[:, r0:r1] = tokens[:, cfg.n_cls :].view(b, rj, c, e).to(h.dtype)
+            return self.row_norm(cls).reshape(b, r, cfg.icl_dim)
+        finally:
+            # 예외로 나가도 pinned 등록을 푼다 (등록한 채 남으면 그 메모리를 OS가 돌려받지 못한다)
+            if release is not None:
+                release()
+
+    def _acquire_host_state(self, shape: tuple[int, ...], dtype: torch.dtype):
+        """CPU 셀 상태와, forward가 끝날 때 부를 정리 함수(None이면 `hold_host_state`가 놓는다).
+        `hold_host_state` 밖이면 forward마다 새로 잡고 놓는다. 안이면 1차원 버퍼 하나를 잡아 두고
+        크기가 맞으면(dtype이 같고 원소가 충분하면) 앞부분을 `shape`로 다시 쓴다. 채우기가 모든
+        행을 덮어쓰므로 앞 forward의 값은 남지 않는다."""
+        if not self._holding_host_state:
+            state, registered = _host_state(shape, dtype, self.interleaved_state_pin)
+            return state, lambda: _release_host_state(state, registered)
+        numel = math.prod(shape)
+        held = self._held_host_state
+        if held is not None and (held[0].dtype != dtype or held[0].numel() < numel):
+            self._held_host_state = None
+            _release_host_state(*held)
+            held = None
+        if held is None:
+            held = _host_state((numel,), dtype, self.interleaved_state_pin)
+            self._held_host_state = held
+        return held[0][:numel].view(shape), None
+
+    @contextlib.contextmanager
+    def hold_host_state(self):
+        """이 안의 추론 forward들은 CPU 셀 상태(`_rows_interleaved_chunked`의 offload)를 놓지 않고
+        다시 쓴다. 앙상블 멤버마다 수백 GB를 새로 잡고(page fault) pinned 등록·해제하지 않도록
+        (`minipfn.inference.ensemble`이 멤버 forward들을 이 안에서 부른다). 나가면(예외여도)
+        놓는다. 값은 같다. 겹쳐 부르면 바깥 것이 놓는다."""
+        if self._holding_host_state:
+            yield
+            return
+        self._holding_host_state = True
+        try:
+            yield
+        finally:
+            self._holding_host_state = False
+            held, self._held_host_state = self._held_host_state, None
+            if held is not None:
+                _release_host_state(*held)
+
+    def _offload_interleaved_state(self, device: torch.device, size: int) -> bool:
+        """`_rows_interleaved_chunked`의 셀 상태(`size` 바이트)를 CPU에 둘지."""
+        return device.type == "cuda" and size > self.interleaved_state_device_bytes
+
+    def inference_host_state_bytes(
+        self, rows: int, columns: int, *, batch: int = 1, itemsize: int = 4
+    ) -> int:
+        """추론 forward(`inference=True`) 하나가 CPU에 두는 셀 상태 바이트
+        (`_rows_interleaved_chunked`의 offload. 평가 큐가 동시에 도는 큰 표를 고를 때 쓴다,
+        `scripts/tabpfn_v2/eval.py --host-memory-budget-gb`). 셀 상태 (B, R, C, E)는 열마다 토큰
+        하나다. interleaved가 아니거나 나눠 계산하지 않거나 상태가 장치에 남으면 0. `itemsize`는 셀
+        토큰 dtype의 크기다: 셀 encoder는 bfloat16 autocast에서도 float32를 내므로 4다 (상태도
+        float32, H100에서 확인)."""
+        cells = batch * rows * columns
+        if self.config.stage_layout != "interleaved" or cells <= self.inference_chunk_cells:
+            return 0
+        size = cells * self.config.emsize * itemsize
+        return size if size > self.interleaved_state_device_bytes else 0
 
     def _encode_cells(self, z, indicator, u, shape, categorical=None) -> torch.Tensor:
         """셀 값 (`_CellStats.features`) → 토큰. `shape`이 None이면 열 C개를 circular shift로

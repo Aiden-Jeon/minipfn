@@ -391,6 +391,22 @@ def dataset_queue(grid: pd.DataFrame, subsample_rows: int | None = None) -> list
     return [(d, int(splits[d])) for d in order]
 
 
+def split_rows(context, subsample_rows: int | None = None) -> dict[str, int]:
+    """데이터셋마다 split의 학습 + 테스트 행 수 가운데 가장 큰 것 (task metadata의
+    `num_instances_train`·`num_instances_test`. grid에는 학습 행만 있다). 추론 forward 하나가 보는
+    행 수다. `subsample_rows`(`--subsample-train-rows`)면 학습 행을 그만큼으로 잘라 센다. 행 수를
+    모르는 metadata면 빈 dict."""
+    frame = context.task_metadata_collection.to_dataframe()
+    needed = {"tabarena_task_name", "num_instances_train", "num_instances_test"}
+    if frame.empty or not needed <= set(frame.columns):
+        return {}
+    train = frame["num_instances_train"].astype(float)
+    if subsample_rows is not None:
+        train = train.clip(upper=float(subsample_rows))
+    rows = train + frame["num_instances_test"].astype(float)
+    return {d: int(n) for d, n in rows.groupby(frame["tabarena_task_name"]).max().items()}
+
+
 def _run_id(fingerprint: str, method: str, bagging: int) -> str:
     import hashlib
 

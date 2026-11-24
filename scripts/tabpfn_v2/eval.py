@@ -331,6 +331,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=5.0,
         help="--shards: 이 간격(분)마다 진행률(끝난 split, worker별 데이터셋·경과 시간)을 찍는다",
     )
+    parser.add_argument(
+        "--host-memory-budget-gb",
+        type=float,
+        default=None,
+        help="--shards: CPU 셀 상태를 쓰는 큰 표(stage_layout=interleaved 모델)는 동시에 도는 합이"
+        " 이 GB 안일 때만 준다 (기본: 컨테이너 메모리 한도(cgroup)의 50%%, 한도가 없거나 못 읽으면"
+        " 물리 메모리(/proc/meminfo)의 50%%."
+        " 0: 끔). 큐 순서만 바뀐다",
+    )
     # 내부용: stdin으로 받은 데이터셋을 하나씩 돌리는 worker (`--shards`가 띄운다)
     parser.add_argument("--shard-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -1081,7 +1090,8 @@ def run_arena(args: argparse.Namespace, out_dir: Path, use_mlflow: bool) -> dict
     results = None
     if args.shards > 1:
         cache_id = arena._run_id(fingerprint, args.method_name, args.bagging)  # 진행률 표시용
-        results = run_shards(args, suite, limits, datasets, out_dir, cache_id)
+        estimate = host_state_estimator(factories, feature_caps(args, factories), one_hot)
+        results = run_shards(args, suite, limits, datasets, out_dir, cache_id, estimate)
     pool = start_bag_pool(args, out_dir) if args.bag_gpus else None
     make.bag_pool = pool
     try:
@@ -1131,10 +1141,16 @@ def shard_worker_command(argv: list[str], worker_dir: Path) -> list[str]:
 
 
 def shard_jobs(
-    queue: list[tuple[str, int]], out_dir: Path, suite: str, cache_id: str = ""
+    queue: list[tuple[str, int]],
+    out_dir: Path,
+    suite: str,
+    cache_id: str = "",
+    host_bytes: dict[str, int] | None = None,
 ) -> list[dict]:
     """큐의 데이터셋마다 worker에 넘길 일: 데이터셋, split 수, `arena.run`의 out-dir, 결과 파일,
-    받았다는 표시 파일, 이 실행의 split 캐시 폴더(`runs/<cache_id>`, 진행률 표시용).
+    받았다는 표시 파일, 이 실행의 split 캐시 폴더(`runs/<cache_id>`, 진행률 표시용). `host_bytes`에
+    0보다 큰 값이 있는 데이터셋은 그 값(CPU 셀 상태 어림, `host_state_bytes`)을 `host_bytes`로
+    단다(`run_queue`의 예산).
 
     out-dir은 worker가 아니라 데이터셋으로 정한다. 그래서 다시 돌리면 어느 worker가 받아도 끝난
     split(캐시)을 다시 쓴다. 폴더 이름에는 이름의 hash를 붙인다(`a/b`와 `a_b`, 대소문자만 다른
@@ -1156,6 +1172,8 @@ def shard_jobs(
                 "cache": str(dataset_dir / "runs" / cache_id),
             }
         )
+        if (host_bytes or {}).get(dataset):
+            jobs[-1]["host_bytes"] = int(host_bytes[dataset])
     return jobs
 
 
@@ -1179,6 +1197,7 @@ def run_queue(
     heartbeat_s: float = 300.0,
     poll_s: float = 2.0,
     labels: list[str] | None = None,
+    host_budget: int | None = None,
 ) -> tuple[list[str], dict[int, str]]:
     """worker `n_workers`개(`spawn(i)`가 stdin이 PIPE인 Popen을 돌려준다)에 `jobs`를 앞에서부터
     하나씩 나눠 준다. 일을 받은 worker가 결과 파일(`job["results"]`)을 남기면 다음 일을 준다.
@@ -1188,17 +1207,50 @@ def run_queue(
     worker가 죽으면 남은 일은 나머지 worker가 받는다. 죽은 worker가 받았다는 표시
     (`job["started"]`)를 남기기 전이면 그 일도 다시 준다. 표시를 남긴 뒤면 다시 주지 않는다(같은
     데이터셋이 worker를 하나씩 다 죽이지 않도록). 돌려주는 것: 결과가 없는 데이터셋과 실패한 worker
-    {번호: 이유}. 둘 다 비어야 성공이다."""
+    {번호: 이유}. 둘 다 비어야 성공이다.
+
+    `host_budget`(바이트)을 주면 CPU 셀 상태를 쓰는 큰 표(`job["host_bytes"]`, `host_state_bytes`)는
+    지금 도는 큰 표의 합과 더해 예산 안일 때만 준다. 큰 표가 하나도 돌지 않으면 예산보다 커도 준다
+    (혼자 돈다). 앞에서 기다리는 큰 표가 있으면 그 뒤의 큰 표는 그 표가 시작할 때까지 주지 않는다:
+    비싼 표가 작은 큰 표들에 계속 밀려 꼬리에 남지 않도록(비싼 것 먼저). 그 사이 쉬는 worker는 작은
+    표를 받는다. 큐 순서 말고는 바뀌지 않는다 (결과는 데이터셋마다 같다)."""
     labels = labels or [f"worker {i}" for i in range(n_workers)]
     pending = list(jobs)
     total = sum(j["splits"] for j in jobs)
     current: dict[int, tuple[dict, float]] = {}  # worker → (일, 받은 시각)
     done: set[str] = set()
     failed: dict[int, str] = {}
+    waiting: set[str] = set()  # 예산 때문에 미룬 큰 표 (한 번만 알린다)
     start = last_beat = time.monotonic()
 
-    def assign(i: int, proc) -> None:
-        job = pending.pop(0)
+    def host_in_use() -> int:
+        return sum(job.get("host_bytes", 0) for job, _ in current.values())
+
+    def next_job() -> int | None:
+        # 줄 일의 큐 번호: 앞에서부터, 큰 표는 예산 안일 때만 (docstring)
+        if host_budget is None:
+            return 0
+        in_use = host_in_use()
+        blocked = False  # 앞에서 기다리는 큰 표가 있다: 뒤의 큰 표는 주지 않는다
+        for k, job in enumerate(pending):
+            need = job.get("host_bytes", 0)
+            if not need:
+                return k
+            if not blocked and (not in_use or in_use + need <= host_budget):
+                return k
+            blocked = True
+            if job["dataset"] not in waiting:
+                waiting.add(job["dataset"])
+                print(
+                    f"shards: {job['dataset']} waits for host memory (cell state "
+                    f"{need / 1e9:.0f} GB, in use {in_use / 1e9:.0f} / budget "
+                    f"{host_budget / 1e9:.0f} GB)",
+                    flush=True,
+                )
+        return None
+
+    def assign(i: int, proc, k: int = 0) -> None:
+        job = pending.pop(k)
         # 지난 실행의 것을 이 실행의 것으로 보지 않도록
         for stale in (job["results"], job["started"]):
             Path(stale).unlink(missing_ok=True)
@@ -1206,11 +1258,12 @@ def run_queue(
             proc.stdin.write(json.dumps(job) + "\n")
             proc.stdin.flush()
         except OSError:  # 이미 죽었다 (BrokenPipeError 등): 일은 다른 worker에게 돌려준다
-            pending.insert(0, job)
+            pending.insert(k, job)
             failed.setdefault(i, "stdin closed")
             return
         current[i] = (job, time.monotonic())
-        print(f"shards: {labels[i]} ← {job['dataset']} ({job['splits']} splits)", flush=True)
+        host = f", cell state {job['host_bytes'] / 1e9:.0f} GB" if job.get("host_bytes") else ""
+        print(f"shards: {labels[i]} ← {job['dataset']} ({job['splits']} splits{host})", flush=True)
 
     def close(proc) -> None:
         if not proc.stdin.closed:
@@ -1227,6 +1280,11 @@ def run_queue(
             f"(datasets {len(done)}/{len(jobs)}, queue {len(pending)})",
             flush=True,
         )
+        if host_budget is not None and any(j.get("host_bytes") for j in jobs):
+            print(
+                f"  host cell state {host_in_use() / 1e9:.0f} / budget {host_budget / 1e9:.0f} GB",
+                flush=True,
+            )
         for i in range(n_workers):
             if i in current:
                 job, since = current[i]
@@ -1262,7 +1320,10 @@ def run_queue(
             # 쉬는 worker(살아 있고 일이 없다)에게 남은 일을 준다
             for i, proc in enumerate(procs):
                 if pending and i not in current and i not in failed and proc.poll() is None:
-                    assign(i, proc)
+                    k = next_job()
+                    if k is None:  # 남은 일이 모두 예산을 기다린다
+                        break
+                    assign(i, proc, k)
             if not current and (not pending or all(i in failed for i in range(n_workers))):
                 for proc in procs:
                     close(proc)
@@ -1284,12 +1345,117 @@ def run_queue(
     return missing, failed
 
 
-def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "") -> list:
+# `--host-memory-budget-gb`를 주지 않으면 컨테이너 메모리 한도(cgroup)의 이 비율을 CPU 셀 상태에
+# 쓴다. 나머지는 worker들의 다른 메모리(표, 멤버마다 전처리한 학습 행 등)에 남긴다
+HOST_MEMORY_FRACTION = 0.5
+CGROUP_MEMORY_FILES = (
+    "/sys/fs/cgroup/memory.max",  # cgroup v2
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+)
+
+
+def cgroup_memory_limit(files: tuple[str, ...] = CGROUP_MEMORY_FILES) -> int | None:
+    """이 컨테이너의 메모리 한도 (바이트). 읽을 수 없거나 한도가 없으면("max", v1의 아주 큰 값)
+    None."""
+    for name in files:
+        try:
+            text = Path(name).read_text().strip()
+        except OSError:
+            continue
+        if text.isdigit() and int(text) < 1 << 60:
+            return int(text)
+        return None  # "max" 또는 v1의 "한도 없음"
+    return None
+
+
+def physical_memory(meminfo: str = "/proc/meminfo") -> int | None:
+    """물리 메모리 (바이트, `MemTotal`). 읽을 수 없으면 None."""
+    try:
+        for line in Path(meminfo).read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024  # kB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def host_memory_budget(
+    args: argparse.Namespace,
+    files: tuple[str, ...] = CGROUP_MEMORY_FILES,
+    meminfo: str = "/proc/meminfo",
+):
+    """`run_queue`의 CPU 셀 상태 예산 (바이트, None이면 끔). `--host-memory-budget-gb`(0 이하면 끔),
+    주지 않으면 cgroup 한도의 `HOST_MEMORY_FRACTION`. 한도가 없거나("max": 부모 cgroup이 정하는
+    컨테이너 등) 못 읽으면 물리 메모리의 같은 비율, 그것도 모르면 끈다."""
+    given = getattr(args, "host_memory_budget_gb", None)
+    if given is not None:
+        return None if given <= 0 else int(given * 1e9)
+    limit = cgroup_memory_limit(files) or physical_memory(meminfo)
+    return None if limit is None else int(limit * HOST_MEMORY_FRACTION)
+
+
+def host_state_estimator(factories: dict, caps: dict, one_hot: str = "off"):
+    """`(problem_type, 행, feature, 범주 열이 있는지) → 멤버 forward 하나가 CPU에 두는 셀 상태
+    바이트` 어림 (위쪽으로). 모델의 `inference_host_state_bytes`(column_row_transformer
+    `stage_layout="interleaved"`만 0이 아니다)에 멤버 입력 열 수를 준다: 원래 열(멤버당 상한
+    `caps`), 범주 열이 있고 `one_hot` 모드가 펼치면 one-hot 상한(`max_one_hot_width`)까지, quantile
+    멤버는 분위수 열과 SVD 성분(최대 열/2)까지, 그리고 샘플 식별자 1. interleaved 모델이 없으면 None
+    (큐는 예전 그대로)."""
+    configs = [getattr(getattr(f, "model", None), "config", None) for f in factories.values()]
+    if not any(getattr(c, "stage_layout", None) == "interleaved" for c in configs):
+        return None
+
+    def task_of(problem_type: str) -> str:
+        return "regression" if problem_type == "regression" else "classification"
+
+    def estimate(problem_type: str, rows: int, n_features: int, categorical: bool = True) -> int:
+        factory = factories.get(task_of(problem_type))
+        fn = getattr(getattr(factory, "model", None), "inference_host_state_bytes", None)
+        if fn is None:
+            return 0
+        cap = caps.get(task_of(problem_type))
+        columns = n_features if cap is None else min(n_features, cap)
+        kinds = tuple(getattr(factory, "member_kinds", ()))
+        width = getattr(factory, "max_one_hot_width", None)
+        if categorical and width and one_hot_kinds(one_hot, kinds):
+            # 펼친 열 수는 원래 열 수와 상한 가운데 큰 것을 넘지 않는다 (`one_hot_sizes`)
+            columns = max(columns, width)
+        if "quantile" in kinds:
+            columns = 2 * columns + columns // 2
+        return int(fn(rows, columns + 1))
+
+    return estimate
+
+
+def host_state_bytes(grid, rows: dict[str, int], estimate) -> dict[str, int]:
+    """돌릴 split이 있는 데이터셋마다 CPU 셀 상태 어림 (`estimate`, 0인 것은 뺀다). 행은 split의
+    학습 + 테스트 행 가운데 가장 큰 것(`arena.split_rows`), 모르면 학습 행 × 1.5 (학습:테스트 2:1
+    split까지 위쪽으로)."""
+    todo = grid[grid["skip_reason"].isna()]
+    out = {}
+    for dataset, part in todo.groupby("dataset"):
+        n_rows = rows.get(dataset) or int(part["max_train_rows"].max() * 1.5)
+        problem_type = part["problem_type"].iloc[0]
+        # 범주 열이 있는지 모르면(None, TabArena) 있다고 본다
+        categorical = part["has_categorical"].iloc[0] if "has_categorical" in part else None
+        categorical = True if categorical is None or pd.isna(categorical) else bool(categorical)
+        need = estimate(problem_type, int(n_rows), int(part["n_features"].max()), categorical)
+        if need:
+            out[dataset] = need
+    return out
+
+
+def run_shards(
+    args, suite, limits, datasets, out_dir: Path, cache_id: str = "", host_estimate=None
+) -> list:
     """GPU마다 worker 프로세스를 하나씩 띄우고, 데이터셋을 비싼 것부터(`arena.dataset_queue`) 큐에서
     하나씩 나눠 준다(`run_queue`). 하나 끝낸 worker가 바로 다음 것을 받으므로 먼저 끝난 GPU가 놀지
     않는다. worker들의 split 결과를 모아 돌려준다. worker의 출력은 `<out-dir>/shards/shard<i>.log`,
     test-time·증류 기록(jsonl)은 끝나면 이 실행의 파일 뒤에 붙인다. worker가 하나라도 실패하거나
-    결과가 없는 데이터셋이 있으면 멈춘다(그 데이터셋이 조용히 imputed가 되지 않도록)."""
+    결과가 없는 데이터셋이 있으면 멈춘다(그 데이터셋이 조용히 imputed가 되지 않도록).
+
+    `host_estimate(problem_type, 행, feature)`(`host_state_estimator`)가 CPU 셀 상태를 쓴다고 하는
+    큰 표는 동시에 도는 합이 `--host-memory-budget-gb`(`host_memory_budget`) 안일 때만 준다."""
     import pickle
     import subprocess
 
@@ -1301,17 +1467,31 @@ def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "")
     # 부모가 이미 GPU를 골라 두었으면(CUDA_VISIBLE_DEVICES) worker i는 그 목록의 i번째를 쓴다
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     devices = visible.split(",") if visible else [str(i) for i in range(max(n_gpus, args.shards))]
-    grid = arena.task_grid(arena.make_context(suite), suite, limits)
+    context = arena.make_context(suite)
+    grid = arena.task_grid(context, suite, limits)
     if datasets is not None:
         # worker를 띄우기 전에 멈춘다 (점수를 낼 때의 `arena.run`도 같은 이유로 멈춘다)
         unknown = sorted(set(datasets) - set(grid["dataset"]))
         if unknown:
             raise SystemExit(f"{suite.name}에 없는 데이터셋: {unknown}")
         grid = grid[grid["dataset"].isin(datasets)]
-    queue = arena.dataset_queue(grid, getattr(args, "subsample_train_rows", None))
-    jobs = shard_jobs(queue, out_dir, args.suite, cache_id)
+    subsample = getattr(args, "subsample_train_rows", None)
+    queue = arena.dataset_queue(grid, subsample)
+    host_bytes = {}
+    if host_estimate is not None and queue:
+        host_bytes = host_state_bytes(grid, arena.split_rows(context, subsample), host_estimate)
+    jobs = shard_jobs(queue, out_dir, args.suite, cache_id, host_bytes)
     if not jobs:  # 돌릴 split이 없다: 점수만 낸다 (모두 imputed)
         return []
+    budget = host_memory_budget(args) if host_bytes else None
+    if host_bytes:
+        big = sorted(host_bytes.items(), key=lambda t: (-t[1], t[0]))
+        limit = "off" if budget is None else f"{budget / 1e9:.0f} GB"
+        print(
+            f"shards: host cell state budget {limit}; "
+            + ", ".join(f"{d} {b / 1e9:.0f} GB" for d, b in big),
+            flush=True,
+        )
     n_workers = min(args.shards, len(jobs))
     threads = max(1, (os.cpu_count() or 1) // n_workers)
     # 부모가 받아 둔 checkpoint(runs:/)를 worker가 다시 받지 않도록 같은 폴더를 가리킨다
@@ -1346,7 +1526,12 @@ def run_shards(args, suite, limits, datasets, out_dir: Path, cache_id: str = "")
     labels = [f"shard {i} (GPU {devices[i]})" for i in range(n_workers)]
     try:
         missing, failed = run_queue(
-            jobs, spawn, n_workers, heartbeat_s=args.heartbeat_minutes * 60, labels=labels
+            jobs,
+            spawn,
+            n_workers,
+            heartbeat_s=args.heartbeat_minutes * 60,
+            labels=labels,
+            host_budget=budget,
         )
     finally:
         for log in logs:
